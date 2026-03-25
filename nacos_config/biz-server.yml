@@ -1,0 +1,8 @@
+server:
+  port: 8010
+spring:
+  jackson:
+    time-zone: GMT+8  # 解决后端传递前端时区问题
+    date-format: yyyy-MM-dd HH:mm:ss  # 解决后端传递前端时间格式问题
+    generator:
+      write_numbers_as_strings: true  # 解决后端Long类型传递前端数值变化问题

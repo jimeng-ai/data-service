@@ -1,0 +1,25 @@
+spring:
+  application:
+    name: sys-server
+  cloud:
+    nacos:
+      server-addr: localhost:8848
+      username: nacos
+      password: nacos
+      discovery:
+        namespace: c4a1ae5e-f5c4-4bb7-9f91-5bbfb2bfd764
+      config:
+        shared-configs:
+          - data-id: sys-server.yml
+            refresh: true
+          - data-id: default-mysql.yml
+            refresh: true
+          - data-id: default-redis.yml
+            refresh: true
+          - data-id: default-rabbitmq.yml
+            refresh: true
+          - data-id: knife4j.yml
+            refresh: true
+        namespace: c4a1ae5e-f5c4-4bb7-9f91-5bbfb2bfd764
+        file-extension: yml
+        group: DEFAULT_GROUP

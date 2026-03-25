@@ -1,0 +1,14 @@
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+  com.jimeng.common.core.config.RedissonConfig,\
+  com.jimeng.common.core.config.EasyExcelConfig,\
+  com.jimeng.common.core.config.CommonWebConfig,\
+  com.jimeng.common.core.config.FeignConfig,\
+  com.jimeng.common.core.config.RedisConfig,\
+  com.jimeng.common.core.config.QueryDslConfiguration,\
+  com.jimeng.common.core.ascept.TokenBucketLimitAop,\
+  com.jimeng.common.core.handler.GlobalExceptionHandler,\
+  com.jimeng.common.core.utils.SseServiceUtil,\
+  com.jimeng.common.core.service.RoomReceiverService,\
+  com.jimeng.common.core.service.RequestService,\
+  com.jimeng.common.core.config.OkHttpConfig,\
+  com.jimeng.common.core.service.FreemarkerService

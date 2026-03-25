@@ -1,0 +1,23 @@
+FROM openjdk:17-jdk-slim
+MAINTAINER seven
+
+# 在主机 /var/lib/docker目录下创建一个临时文件，并链接到容器的 /tmp
+VOLUME /tmp
+
+# 将jar包添加到容器中，并命名为 springboot_docker.jar
+ADD sys-server-1.0-SNAPSHOT.jar /sys-server.jar
+
+# 设置JVM运行参数， 这里限定下内存大小，减少开销
+ENV JAVA_OPTS="\
+-server \
+-Xms256m \
+-Xmx512m \
+-XX:MetaspaceSize=256m \
+-XX:MaxMetaspaceSize=512m"
+
+#空参数，方便创建容器时传参
+ENV PARAMS=""
+
+# 运行jar包
+# 入口点， 执行JAVA运行命令
+ENTRYPOINT ["sh","-c","java -jar $JAVA_OPTS sys-service.jar $PARAMS"]

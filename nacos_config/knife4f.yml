@@ -1,0 +1,28 @@
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+    enable-version: true
+    enable-swagger-models: true
+    enable-document-manage: true
+    swagger-model-name: 实体类
+    enable-footer: false
+    enable-footer-custom: true
+    footer-custom-content: Copyright © 2024 基础模板系统
+    enable-search: true
+    enable-dynamic-parameter: true
+  cors: true
+  production: false
+
+springdoc:
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  group-configs:
+    - group: default
+      paths-to-match: /**

@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+      routes:
+        - id: data-server
+          uri: lb://data-server
+          predicates:
+            - Path=/data/**
+        # sys-server 业务路由
+        - id: sys-server
+          uri: lb://sys-server
+          predicates:
+            - Path=/admin/sys/**
+        # sys-server 文档路由
+        - id: sys-server-doc
+          uri: lb://sys-server
+          predicates:
+            - Path=/sys-server/doc.html,/sys-server/v3/api-docs/**,/sys-server/swagger-resources/**,/sys-server/webjars/**
+          filters:
+            - StripPrefix=1
+        # 通用文档路由（兜底）- 将根路径的文档请求转发到 sys-server
+        - id: gateway-doc-fallback
+          uri: lb://sys-server
+          predicates:
+            - Path=/v3/api-docs/**,/swagger-resources/**,/webjars/**
+          order: 9999
+    nacos:
+      server-addr: localhost:8848
+#      username: nacos
+#      password: nacos
+      discovery:
+        namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
+      config:
+        shared-configs:
+          - data-id: gateway.yml
+            refresh: true
+          - data-id: default-mysql.yml
+            refresh: true
+        namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
+        file-extension: yml
+        group: DEFAULT_GROUP
