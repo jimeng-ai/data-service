@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.jimeng.persistence.mapper.PoiCategoryDictMapper">
+
+    <!-- 通用查询映射结果 -->
+    <resultMap id="BaseResultMap" type="com.jimeng.persistence.entity.PoiCategoryDict">
+        <id column="id" property="id" />
+        <result column="sort_no" property="sortNo" />
+        <result column="new_type" property="newType" />
+        <result column="big_category_cn" property="bigCategoryCn" />
+        <result column="mid_category_cn" property="midCategoryCn" />
+        <result column="sub_category_cn" property="subCategoryCn" />
+        <result column="big_category_en" property="bigCategoryEn" />
+        <result column="mid_category_en" property="midCategoryEn" />
+        <result column="sub_category_en" property="subCategoryEn" />
+        <result column="deleted" property="deleted" />
+        <result column="create_time" property="createTime" />
+        <result column="create_user" property="createUser" />
+        <result column="update_time" property="updateTime" />
+        <result column="update_user" property="updateUser" />
+    </resultMap>
+
+    <!-- 通用查询结果列 -->
+    <sql id="Base_Column_List">
+        id, sort_no, new_type, big_category_cn, mid_category_cn, sub_category_cn,
+        big_category_en, mid_category_en, sub_category_en,
+        deleted, create_time, create_user, update_time, update_user
+    </sql>
+
+</mapper>
