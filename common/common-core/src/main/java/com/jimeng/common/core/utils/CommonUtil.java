@@ -21,6 +21,10 @@ public class CommonUtil {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
+    public static ObjectMapper getObjectMapper(){
+        return OBJECT_MAPPER;
+    }
+
     /**
      * 将对象转成Map
      *
