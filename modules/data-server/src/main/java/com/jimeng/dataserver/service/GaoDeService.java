@@ -78,8 +78,8 @@ public class GaoDeService {
                 List<GaoDeDTO.POI> around = getPOIByAround(aroundPOI).getPois();
 
                 Map<String, List<GaoDeDTO.POI>> map = new HashMap<>();
-                map.put("周边POI", around);
-                map.put("商用写字楼", build);
+                map.put("around_poi", around);
+                map.put("building", build);
                 resultMap.put(typecodeCluster.getTypecode(), map);
                 break;
             }
