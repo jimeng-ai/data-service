@@ -55,5 +55,59 @@
       "required": ["region", "types"],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "gaode.poi.category.dict.search",
+    "description": "查询POI分类字典，可用于补全region相关分类上下文与types/newType候选",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "newType": {"type": "string"},
+        "bigCategoryCn": {"type": "string"},
+        "midCategoryCn": {"type": "string"},
+        "subCategoryCn": {"type": "string"},
+        "bigCategoryEn": {"type": "string"},
+        "midCategoryEn": {"type": "string"},
+        "subCategoryEn": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.poi.category.dict.get_by_id",
+    "description": "按ID查询POI分类字典详情",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer", "minimum": 1}
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.adcode.citycode.dict.search",
+    "description": "查询行政区编码字典，获取城市code或行政区adcode/citycode",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "nameCn": {"type": "string"},
+        "adcode": {"type": "string"},
+        "citycode": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.adcode.citycode.dict.get_by_id",
+    "description": "按ID查询行政区编码字典详情",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer", "minimum": 1}
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    }
   }
 ]
