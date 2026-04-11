@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.jimeng.persistence.mapper.AiModelCallContentMapper">
+
+    <resultMap id="BaseResultMap" type="com.jimeng.persistence.entity.AiModelCallContent">
+        <id column="id" property="id"/>
+        <result column="log_id" property="logId"/>
+        <result column="req_headers" property="reqHeaders"/>
+        <result column="req_body" property="reqBody"/>
+        <result column="resp_body" property="respBody"/>
+        <result column="stream_events" property="streamEvents"/>
+        <result column="deleted" property="deleted"/>
+        <result column="create_time" property="createTime"/>
+        <result column="create_user" property="createUser"/>
+        <result column="update_time" property="updateTime"/>
+        <result column="update_user" property="updateUser"/>
+    </resultMap>
+
+    <sql id="Base_Column_List">
+        id, log_id, req_headers, req_body, resp_body, stream_events, deleted, create_time, create_user, update_time, update_user
+    </sql>
+
+</mapper>

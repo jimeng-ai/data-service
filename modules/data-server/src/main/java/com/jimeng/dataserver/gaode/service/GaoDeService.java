@@ -164,10 +164,11 @@ public class GaoDeService {
         CommonUtil.putIfNotEmpty(params, "show_fields", poi.getShowFields());
         CommonUtil.putIfNotEmpty(params, "page_size", poi.getPageSize());
         CommonUtil.putIfNotEmpty(params, "page_num", poi.getPageNum());
-        Object obj = requestService.get(url, null, params);
-        log.info("【高德地图】关键词搜索POI请求结果：{}", obj);
+        RequestService.HttpResp httpResp = requestService.get(url, null, params);
+        String responseBody = httpResp.getBody();
+        log.info("【高德地图】关键词搜索POI请求结果：{}，响应码：{}", responseBody, httpResp.getStatusCode());
         try {
-            return CommonUtil.getObjectMapper().readValue(String.valueOf(obj), GaoDeDTO.KeywordPOIResp.class);
+            return CommonUtil.getObjectMapper().readValue(String.valueOf(responseBody), GaoDeDTO.KeywordPOIResp.class);
         } catch (JsonProcessingException e) {
             throw new ServiceException(ExceptionCode.JSON_PARSE_ERROR, "高德地图关键词搜索POI返回结果解析失败", e.toString());
         }
@@ -187,10 +188,11 @@ public class GaoDeService {
         CommonUtil.putIfNotEmpty(params, "show_fields", poi.getShowFields());
         CommonUtil.putIfNotEmpty(params, "page_size", poi.getPageSize());
         CommonUtil.putIfNotEmpty(params, "page_num", poi.getPageNum());
-        Object obj = requestService.get(url, null, params);
-        log.info("【高德地图】周边搜索POI请求结果：{}", obj);
+        RequestService.HttpResp httpResp = requestService.get(url, null, params);
+        String responseBody = httpResp.getBody();
+        log.info("【高德地图】周边搜索POI请求结果：{}，响应码：{}", responseBody, httpResp.getStatusCode());
         try {
-            return CommonUtil.getObjectMapper().readValue(String.valueOf(obj), GaoDeDTO.AroundPOIResp.class);
+            return CommonUtil.getObjectMapper().readValue(String.valueOf(responseBody), GaoDeDTO.AroundPOIResp.class);
         } catch (JsonProcessingException e) {
             throw new ServiceException(ExceptionCode.JSON_PARSE_ERROR, "高德地图周边搜索POI返回结果解析失败", e.toString());
         }

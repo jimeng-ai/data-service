@@ -1,0 +1,59 @@
+[
+  {
+    "name": "gaode.poi.keyword.search",
+    "description": "按关键词和区域检索POI",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "keywords": {"type": "string"},
+        "region": {"type": "string"},
+        "types": {"type": "string"},
+        "pageSize": {"type": "integer", "minimum": 1, "maximum": 50},
+        "pageNum": {"type": "integer", "minimum": 1}
+      },
+      "required": ["region"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.poi.around.search",
+    "description": "按中心点检索周边POI",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "location": {"type": "string", "description": "经纬度,格式: lon,lat"},
+        "region": {"type": "string"},
+        "types": {"type": "string"},
+        "radius": {"type": "integer", "minimum": 1, "maximum": 50000}
+      },
+      "required": ["location", "region"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.poi.cluster",
+    "description": "按typecode分组并执行POI聚类",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "region": {"type": "string"},
+        "types": {"type": "string"}
+      },
+      "required": ["region", "types"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "gaode.poi.analysis.around",
+    "description": "获取聚类中心点周边POI及写字楼分布",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "region": {"type": "string"},
+        "types": {"type": "string"}
+      },
+      "required": ["region", "types"],
+      "additionalProperties": false
+    }
+  }
+]
