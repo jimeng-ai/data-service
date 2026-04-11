@@ -1,6 +1,6 @@
-package com.jimeng.dataserver.controller;
+package com.jimeng.dataserver.gaode.controller;
 
-import com.jimeng.dataserver.service.AdcodeCitycodeDictService;
+import com.jimeng.dataserver.gaode.service.AdcodeCitycodeDictService;
 import com.jimeng.persistence.entity.AdcodeCitycodeDict;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;

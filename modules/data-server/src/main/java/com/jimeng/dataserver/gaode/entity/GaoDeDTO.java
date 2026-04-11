@@ -1,4 +1,4 @@
-package com.jimeng.dataserver.entity;
+package com.jimeng.dataserver.gaode.entity;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;

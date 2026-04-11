@@ -1,4 +1,4 @@
-package com.jimeng.dataserver.entity;
+package com.jimeng.dataserver.gaode.entity;
 
 import jakarta.validation.constraints.NotBlank;
 import lombok.AllArgsConstructor;

@@ -1,6 +1,6 @@
-package com.jimeng.dataserver.service;
+package com.jimeng.dataserver.gaode.service;
 
-import com.jimeng.dataserver.entity.GaoDeDTO;
+import com.jimeng.dataserver.gaode.entity.GaoDeDTO;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 

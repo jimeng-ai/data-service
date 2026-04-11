@@ -1,4 +1,4 @@
-package com.jimeng.dataserver.service;
+package com.jimeng.dataserver.gaode.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;

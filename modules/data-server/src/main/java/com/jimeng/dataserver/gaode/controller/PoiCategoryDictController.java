@@ -1,6 +1,6 @@
-package com.jimeng.dataserver.controller;
+package com.jimeng.dataserver.gaode.controller;
 
-import com.jimeng.dataserver.service.PoiCategoryDictService;
+import com.jimeng.dataserver.gaode.service.PoiCategoryDictService;
 import com.jimeng.persistence.entity.PoiCategoryDict;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;

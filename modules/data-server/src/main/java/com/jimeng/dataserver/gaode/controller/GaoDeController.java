@@ -1,8 +1,8 @@
-package com.jimeng.dataserver.controller;
+package com.jimeng.dataserver.gaode.controller;
 
-import com.jimeng.dataserver.entity.BizDTO;
-import com.jimeng.dataserver.entity.GaoDeDTO;
-import com.jimeng.dataserver.service.GaoDeService;
+import com.jimeng.dataserver.gaode.entity.BizDTO;
+import com.jimeng.dataserver.gaode.entity.GaoDeDTO;
+import com.jimeng.dataserver.gaode.service.GaoDeService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;

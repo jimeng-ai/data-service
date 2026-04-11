@@ -1,12 +1,12 @@
-package com.jimeng.dataserver.service;
+package com.jimeng.dataserver.gaode.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
-import com.jimeng.dataserver.entity.BizDTO;
-import com.jimeng.dataserver.entity.GaoDeDTO;
+import com.jimeng.dataserver.gaode.entity.BizDTO;
+import com.jimeng.dataserver.gaode.entity.GaoDeDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
