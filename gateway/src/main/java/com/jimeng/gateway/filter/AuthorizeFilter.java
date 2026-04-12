@@ -28,6 +28,7 @@ import reactor.core.publisher.Mono;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * @Author spider
@@ -103,7 +104,10 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
 
             // 将userId放入请求头，用于下游服务使用
             ServerWebExchange modifiedExchange = exchange.mutate()
-                    .request(builder -> builder.header("user-id", userId))
+                    .request(builder -> {
+                        builder.header("user-id", userId);
+                        builder.header("x-trace-id", UUID.randomUUID().toString());
+                    })
                     .build();
 
             log.debug("Authentication successful for user: {} on path: {}", userId, urlPath);
