@@ -57,8 +57,11 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
         String urlPath = request.getURI().getRawPath();
         // 判断是否在白名单
         if (!whetherThePathIsNotVerified(urlPath)) {
-            // 放行
-            return chain.filter(exchange);
+            // 白名单路径也注入 trace-id，确保下游服务日志可追踪
+            ServerWebExchange whiteListExchange = exchange.mutate()
+                    .request(builder -> builder.header("x-trace-id", UUID.randomUUID().toString()))
+                    .build();
+            return chain.filter(whiteListExchange);
         }
         // 获取token
         HttpHeaders headers = request.getHeaders();

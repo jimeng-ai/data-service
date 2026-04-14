@@ -14,6 +14,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -74,6 +78,13 @@ public class ClaudeService {
         String url = buildMessagesUrl();
         int toolRound = 0;
 
+        // 多轮 token 累加变量
+        int totalInputTokens = 0;
+        int totalOutputTokens = 0;
+
+        // 提取 trace-id
+        String traceId = extractTraceId();
+
         while (true) {
             long roundStart = System.currentTimeMillis();
             Long logId = safeRecordRequest(body, headers);
@@ -93,8 +104,17 @@ public class ClaudeService {
                     return parsedResponse;
                 }
 
+                // 累加本轮 token 用量
+                int[] accumulated = accumulateUsageResult(responseMap, totalInputTokens, totalOutputTokens);
+                totalInputTokens = accumulated[0];
+                totalOutputTokens = accumulated[1];
+
                 List<ToolUseCall> toolCalls = skillRuntimeService.extractToolUseCalls(responseMap);
                 if (toolCalls.isEmpty()) {
+                    // 多轮调用结束，注入聚合信息
+                    if (toolRound > 0) {
+                        return buildAggregatedResponse(responseMap, totalInputTokens, totalOutputTokens, toolRound + 1, traceId);
+                    }
                     return parsedResponse;
                 }
                 if (toolRound >= Math.max(maxToolRounds, 1)) {
@@ -103,6 +123,9 @@ public class ClaudeService {
 
                 List<Map<String, Object>> toolResultBlocks = skillRuntimeService.buildToolResultBlocks(toolCalls);
                 if (toolResultBlocks.isEmpty()) {
+                    if (toolRound > 0) {
+                        return buildAggregatedResponse(responseMap, totalInputTokens, totalOutputTokens, toolRound + 1, traceId);
+                    }
                     return parsedResponse;
                 }
                 skillRuntimeService.appendAssistantAndToolResultMessages(body, responseMap, toolResultBlocks);
@@ -192,5 +215,72 @@ public class ClaudeService {
             return JSONUtil.parse(raw);
         }
         return raw;
+    }
+
+    private String extractTraceId() {
+        try {
+            ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attributes == null) {
+                return null;
+            }
+            HttpServletRequest request = attributes.getRequest();
+            String traceId = request.getHeader("trace-id");
+            if (StrUtil.isNotBlank(traceId)) {
+                return traceId;
+            }
+            return request.getHeader("x-trace-id");
+        } catch (Exception e) {
+            log.warn("提取trace-id失败: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private int[] accumulateUsageResult(Map<String, Object> responseMap, int currentInput, int currentOutput) {
+        Object usageObj = responseMap.get("usage");
+        if (usageObj instanceof Map) {
+            Map<String, Object> usage = (Map<String, Object>) usageObj;
+            currentInput += toInt(usage.get("input_tokens"));
+            currentOutput += toInt(usage.get("output_tokens"));
+        }
+        return new int[]{currentInput, currentOutput};
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object buildAggregatedResponse(Map<String, Object> responseMap, int totalInput, int totalOutput, int toolRounds, String traceId) {
+        // 构建汇总 usage
+        Map<String, Object> aggregatedUsage;
+        Object existingUsage = responseMap.get("usage");
+        if (existingUsage instanceof Map) {
+            aggregatedUsage = new LinkedHashMap<>((Map<String, Object>) existingUsage);
+        } else {
+            aggregatedUsage = new LinkedHashMap<>();
+        }
+        aggregatedUsage.put("input_tokens", totalInput);
+        aggregatedUsage.put("output_tokens", totalOutput);
+        aggregatedUsage.put("total_tokens", totalInput + totalOutput);
+        responseMap.put("usage", aggregatedUsage);
+
+        // 注入 trace-id 和轮次数
+        if (StrUtil.isNotBlank(traceId)) {
+            responseMap.put("x-trace-id", traceId);
+        }
+        responseMap.put("tool_rounds", toolRounds);
+
+        return responseMap;
+    }
+
+    private int toInt(Object value) {
+        if (value == null) {
+            return 0;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 }
