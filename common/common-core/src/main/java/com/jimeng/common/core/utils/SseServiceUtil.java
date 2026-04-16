@@ -65,4 +65,39 @@ public class SseServiceUtil {
         }
     }
 
+    /**
+     * 发送带 event type 的 SSE 事件
+     *
+     * @param key       SSE 连接标识
+     * @param eventName SSE 事件名称（客户端通过 addEventListener 监听）
+     * @param data      事件数据
+     */
+    public void sendEvent(String key, String eventName, String data) {
+        SseEmitter sseEmitter = sseManagerMap.get(key);
+        if (sseEmitter == null) {
+            throw new ServiceException(ExceptionCode.SSE_NOT_FOUND, "sse连接不存在");
+        }
+        try {
+            SseEmitter.SseEventBuilder event = SseEmitter.event()
+                    .name(eventName)
+                    .data(data);
+            sseEmitter.send(event);
+        } catch (IOException e) {
+            throw new ServiceException(ExceptionCode.SSE_SEND_ERROR, e.getMessage());
+        }
+    }
+
+    /**
+     * 完成 SSE 连接并从管理 Map 中移除
+     *
+     * @param key SSE 连接标识
+     */
+    public void complete(String key) {
+        SseEmitter sseEmitter = sseManagerMap.get(key);
+        if (sseEmitter != null) {
+            sseEmitter.complete();
+            sseManagerMap.remove(key);
+        }
+    }
+
 }

@@ -124,6 +124,36 @@ public class AiModelCallRecordService {
         aiModelCallContentMapper.update(null, wrapper);
     }
 
+    /**
+     * 记录流式响应结果。直接使用累积器提供的 token 用量，
+     * 将流事件 JSON 存入 content 表的 stream_events 字段。
+     *
+     * @param logId            日志记录 ID
+     * @param httpStatus       HTTP 状态码
+     * @param inputTokens      输入 token 数
+     * @param outputTokens     输出 token 数
+     * @param streamEventsJson 流事件 JSON 字符串
+     * @param latencyMs        延迟毫秒数
+     */
+    public void recordStreamResponse(Long logId, Integer httpStatus,
+                                     int inputTokens, int outputTokens,
+                                     String streamEventsJson, Integer latencyMs) {
+        AiModelCallLog logEntity = new AiModelCallLog();
+        logEntity.setId(logId);
+        logEntity.setHttpStatus(httpStatus);
+        logEntity.setLatencyMs(latencyMs);
+        logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
+        logEntity.setInputTokens(inputTokens);
+        logEntity.setOutputTokens(outputTokens);
+        logEntity.setTotalTokens(inputTokens + outputTokens);
+        aiModelCallLogMapper.updateById(logEntity);
+
+        LambdaUpdateWrapper<AiModelCallContent> wrapper = new LambdaUpdateWrapper<>();
+        wrapper.eq(AiModelCallContent::getLogId, logId);
+        wrapper.set(AiModelCallContent::getStreamEvents, streamEventsJson);
+        aiModelCallContentMapper.update(null, wrapper);
+    }
+
     public void recordException(Long logId, Throwable throwable, Integer latencyMs) {
         AiModelCallLog logEntity = new AiModelCallLog();
         logEntity.setId(logId);

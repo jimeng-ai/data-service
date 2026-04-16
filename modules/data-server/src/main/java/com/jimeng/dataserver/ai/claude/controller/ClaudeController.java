@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.claude.controller;
 
+import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -8,8 +9,11 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 @Tag(name = "Claude消息管理", description = "Claude统一消息接口（文本、图片、文档、工具）")
 @RestController
@@ -18,10 +22,23 @@ import java.util.Map;
 public class ClaudeController {
 
     private final ClaudeService claudeService;
+    private final SseServiceUtil sseServiceUtil;
 
     @Operation(summary = "Claude统一消息接口", description = "同一个接口支持文本、图片、文档和tools")
     @PostMapping("/messages")
     public Object messages(@RequestBody Map<String, Object> requestBody) {
+        if (Boolean.TRUE.equals(requestBody.get("stream"))) {
+            return messagesStream(requestBody);
+        }
         return claudeService.messages(requestBody);
+    }
+
+    private SseEmitter messagesStream(Map<String, Object> requestBody) {
+        String connectionId = UUID.randomUUID().toString();
+        SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
+        CompletableFuture.runAsync(() -> {
+            claudeService.messagesStream(requestBody, connectionId);
+        });
+        return emitter;
     }
 }

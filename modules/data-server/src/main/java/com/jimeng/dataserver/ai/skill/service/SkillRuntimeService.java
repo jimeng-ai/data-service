@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
@@ -28,6 +29,8 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 @Slf4j
 public class SkillRuntimeService {
+
+    private static final String ACTIVATE_SKILLS_TOOL_NAME = "activate_skills";
 
     @Value("${skill.enabled}")
     private boolean skillEnabled;
@@ -60,27 +63,31 @@ public class SkillRuntimeService {
         }
 
         List<String> explicitNames = extractExplicitSkillNamesAndStrip(messages);
-        List<SkillPackage> selectedSkills;
-        if (explicitNames.isEmpty()) {
-            // 不做关键词匹配：直接把可用 skill 暴露给模型，由模型自行判断是否调用。
-            selectedSkills = selectSkillsForModelDecide(skillMap);
-            if (!selectedSkills.isEmpty()) {
-                log.info("模型自判断skills: {}", selectedSkills.stream().map(SkillPackage::getName).toList());
+
+        if (!explicitNames.isEmpty()) {
+            // 显式前缀指定：直接全量注入（与现有行为一致），跳过 Discovery Phase
+            List<SkillPackage> selectedSkills = resolveSelectedSkills(skillMap, explicitNames);
+            if (selectedSkills.isEmpty()) {
+                return SkillApplyResult.disabled();
             }
-        } else {
-            selectedSkills = resolveSelectedSkills(skillMap, explicitNames);
+            injectSkillSystemPrompt(body, selectedSkills);
+            mergeSkillTools(body, selectedSkills);
+            ensureToolChoiceAuto(body);
+            List<String> selectedNames = selectedSkills.stream().map(SkillPackage::getName).toList();
+            return SkillApplyResult.activated(selectedNames);
         }
 
-        if (selectedSkills.isEmpty()) {
+        // Discovery Phase：仅注入摘要 + activate_skills 元工具
+        List<SkillPackage> allSkills = selectSkillsForModelDecide(skillMap);
+        if (allSkills.isEmpty()) {
             return SkillApplyResult.disabled();
         }
-
-        injectSkillSystemPrompt(body, selectedSkills);
-        mergeSkillTools(body, selectedSkills);
+        log.info("Discovery Phase skills: {}", allSkills.stream().map(SkillPackage::getName).toList());
+        injectSkillSummaryPrompt(body, allSkills);
+        injectActivateSkillsTool(body);
         ensureToolChoiceAuto(body);
-
-        List<String> finalSelectedNames = selectedSkills.stream().map(SkillPackage::getName).toList();
-        return new SkillApplyResult(true, finalSelectedNames);
+        List<String> allNames = allSkills.stream().map(SkillPackage::getName).toList();
+        return SkillApplyResult.discovery(allNames);
     }
 
     public List<ToolUseCall> extractToolUseCalls(Map<String, Object> responseMap) {
@@ -154,6 +161,127 @@ public class SkillRuntimeService {
         userToolResultMessage.put("role", "user");
         userToolResultMessage.put("content", new ArrayList<>(toolResultBlocks));
         messages.add(userToolResultMessage);
+    }
+
+    /**
+     * 判断一个 ToolUseCall 是否为 activate_skills 调用。
+     */
+    public boolean isActivateSkillsCall(ToolUseCall call) {
+        return call != null && ACTIVATE_SKILLS_TOOL_NAME.equals(call.getToolName());
+    }
+
+    /**
+     * Activation Phase：处理模型返回的 activate_skills 调用，完成从 Discovery Phase 到 Activation Phase 的转换。
+     * 解析 skill_names 参数，验证每个名称，注入完整 Skill 内容，移除元工具，构建 tool_result block。
+     */
+    public ActivationResult handleActivateSkills(Map<String, Object> body,
+                                                  ToolUseCall activateCall,
+                                                  Map<String, SkillPackage> skillMap) {
+        // 1. 解析 skill_names 参数
+        List<String> requestedNames = parseSkillNames(activateCall.getInput());
+
+        // 2. 验证并解析 SkillPackage，区分有效和无效名称
+        List<String> validNames = new ArrayList<>();
+        List<String> invalidNames = new ArrayList<>();
+        List<SkillPackage> selectedSkills = new ArrayList<>();
+        int limit = Math.max(maxSelected, 1);
+        for (String name : requestedNames) {
+            SkillPackage pkg = skillPackageLoaderService.findByName(skillMap, name);
+            if (pkg != null) {
+                validNames.add(pkg.getName());
+                selectedSkills.add(pkg);
+            } else {
+                invalidNames.add(name);
+            }
+            if (selectedSkills.size() >= limit) {
+                break;
+            }
+        }
+
+        // 3. 构建 tool_result payload
+        Map<String, Object> toolResultPayload;
+        boolean success;
+        if (validNames.isEmpty()) {
+            // 全部无效
+            success = false;
+            toolResultPayload = new LinkedHashMap<>();
+            toolResultPayload.put("error", "invalid_skill_names");
+            toolResultPayload.put("message", "以下 Skill 名称无效: " + invalidNames);
+        } else {
+            success = true;
+            toolResultPayload = new LinkedHashMap<>();
+            toolResultPayload.put("activated_skills", validNames);
+            if (!invalidNames.isEmpty()) {
+                toolResultPayload.put("invalid_skills", invalidNames);
+            }
+        }
+
+        // 4. 注入完整 Skill 内容到 body
+        if (!selectedSkills.isEmpty()) {
+            injectSkillSystemPrompt(body, selectedSkills);
+            mergeSkillTools(body, selectedSkills);
+            removeActivateSkillsTool(body);
+        }
+
+        // 5. 构建 tool_result block
+        Map<String, Object> toolResultBlock = new LinkedHashMap<>();
+        toolResultBlock.put("type", "tool_result");
+        toolResultBlock.put("tool_use_id", activateCall.getToolUseId());
+        toolResultBlock.put("content", JSONUtil.toJsonStr(toolResultPayload));
+        if (!success) {
+            toolResultBlock.put("is_error", true);
+        }
+
+        return new ActivationResult(success, validNames, toolResultBlock);
+    }
+
+    /**
+     * 从 tools 列表中移除 activate_skills 元工具。
+     */
+    private void removeActivateSkillsTool(Map<String, Object> body) {
+        Object toolsObj = body.get("tools");
+        if (!(toolsObj instanceof List<?> toolsList) || toolsList.isEmpty()) {
+            return;
+        }
+
+        List<Object> filtered = new ArrayList<>();
+        for (Object toolObj : toolsList) {
+            if (toolObj instanceof Map<?, ?> toolMap) {
+                String name = getString(toolMap.get("name"));
+                if (ACTIVATE_SKILLS_TOOL_NAME.equals(name)) {
+                    continue;
+                }
+            }
+            filtered.add(toolObj);
+        }
+        body.put("tools", filtered);
+    }
+
+    /**
+     * 从 activate_skills 调用的 input 中解析 skill_names 字段。
+     * 处理 null、非 List 类型、空列表等异常情况。
+     */
+    private List<String> parseSkillNames(Map<String, Object> input) {
+        if (input == null || input.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Object skillNamesObj = input.get("skill_names");
+        if (!(skillNamesObj instanceof List<?> skillNamesList)) {
+            return Collections.emptyList();
+        }
+        if (skillNamesList.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> names = new ArrayList<>();
+        for (Object item : skillNamesList) {
+            if (item != null) {
+                String name = String.valueOf(item).trim();
+                if (!name.isEmpty()) {
+                    names.add(name);
+                }
+            }
+        }
+        return names;
     }
 
     private List<SkillPackage> selectSkillsForModelDecide(Map<String, SkillPackage> skillMap) {
@@ -256,17 +384,43 @@ public class SkillRuntimeService {
         if (StrUtil.isBlank(skillPrompt)) {
             return;
         }
+        appendToSystemPrompt(body, skillPrompt);
+    }
+
+    /**
+     * Discovery Phase：仅注入 Skill 的 name 和 description 摘要列表到 system prompt。
+     */
+    private void injectSkillSummaryPrompt(Map<String, Object> body, List<SkillPackage> skills) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(skillSystemPrompt).append("\n\n");
+        sb.append("以下是可用的 Skill 列表。如果用户的问题需要使用某个 Skill，");
+        sb.append("请调用 activate_skills 工具激活对应的 Skill。\n\n");
+        for (SkillPackage skill : skills) {
+            sb.append("- **").append(skill.getName()).append("**: ");
+            sb.append(skill.getDescription()).append("\n");
+        }
+        appendToSystemPrompt(body, sb.toString().trim());
+    }
+
+    /**
+     * 将文本追加到 body 的 system prompt 中。
+     * 支持 system 字段为 null、String、List（block 格式）等多种格式。
+     */
+    private void appendToSystemPrompt(Map<String, Object> body, String text) {
+        if (StrUtil.isBlank(text)) {
+            return;
+        }
 
         Object existingSystem = body.get("system");
         if (existingSystem == null) {
-            body.put("system", skillPrompt);
+            body.put("system", text);
             return;
         }
         if (existingSystem instanceof String systemText) {
             if (StrUtil.isBlank(systemText)) {
-                body.put("system", skillPrompt);
+                body.put("system", text);
             } else {
-                body.put("system", systemText + "\n\n" + skillPrompt);
+                body.put("system", systemText + "\n\n" + text);
             }
             return;
         }
@@ -275,12 +429,12 @@ public class SkillRuntimeService {
             List<Object> blocks = (List<Object>) systemBlocks;
             Map<String, Object> newBlock = new LinkedHashMap<>();
             newBlock.put("type", "text");
-            newBlock.put("text", skillPrompt);
+            newBlock.put("text", text);
             blocks.add(newBlock);
             return;
         }
 
-        body.put("system", String.valueOf(existingSystem) + "\n\n" + skillPrompt);
+        body.put("system", String.valueOf(existingSystem) + "\n\n" + text);
     }
 
     private String buildSkillSystemPrompt(List<SkillPackage> selectedSkills) {
@@ -335,6 +489,49 @@ public class SkillRuntimeService {
         if (!merged.isEmpty()) {
             body.put("tools", merged);
         }
+    }
+
+    /**
+     * Discovery Phase：向 tools 列表追加 activate_skills 元工具定义。
+     */
+    private void injectActivateSkillsTool(Map<String, Object> body) {
+        Map<String, Object> tool = buildActivateSkillsToolDefinition();
+        Object existingTools = body.get("tools");
+        List<Object> toolsList;
+        if (existingTools instanceof List<?> existing) {
+            toolsList = new ArrayList<>(existing);
+        } else {
+            toolsList = new ArrayList<>();
+        }
+        toolsList.add(tool);
+        body.put("tools", toolsList);
+    }
+
+    /**
+     * 构建 activate_skills 工具的 JSON schema 定义。
+     */
+    private Map<String, Object> buildActivateSkillsToolDefinition() {
+        Map<String, Object> tool = new LinkedHashMap<>();
+        tool.put("name", ACTIVATE_SKILLS_TOOL_NAME);
+        tool.put("description", "激活指定的 Skill 以获取其完整指令和工具集。"
+                + "当用户的问题需要使用某个 Skill 的能力时，调用此工具并传入需要激活的 Skill 名称列表。");
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        Map<String, Object> skillNamesField = new LinkedHashMap<>();
+        skillNamesField.put("type", "array");
+        skillNamesField.put("description", "需要激活的 Skill 名称列表");
+        Map<String, Object> items = new LinkedHashMap<>();
+        items.put("type", "string");
+        skillNamesField.put("items", items);
+        properties.put("skill_names", skillNamesField);
+
+        schema.put("properties", properties);
+        schema.put("required", List.of("skill_names"));
+        tool.put("input_schema", schema);
+        return tool;
     }
 
     private void ensureToolChoiceAuto(Map<String, Object> body) {
