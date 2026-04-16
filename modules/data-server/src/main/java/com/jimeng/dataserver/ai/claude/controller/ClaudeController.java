@@ -1,9 +1,11 @@
 package com.jimeng.dataserver.ai.claude.controller;
 
+import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -26,19 +28,34 @@ public class ClaudeController {
 
     @Operation(summary = "Claude统一消息接口", description = "同一个接口支持文本、图片、文档和tools")
     @PostMapping("/messages")
-    public Object messages(@RequestBody Map<String, Object> requestBody) {
+    public Object messages(@RequestBody Map<String, Object> requestBody,
+                           HttpServletRequest request) {
         if (Boolean.TRUE.equals(requestBody.get("stream"))) {
-            return messagesStream(requestBody);
+            return messagesStream(requestBody, request);
         }
         return claudeService.messages(requestBody);
     }
 
-    private SseEmitter messagesStream(Map<String, Object> requestBody) {
+    private SseEmitter messagesStream(Map<String, Object> requestBody,
+                                      HttpServletRequest request) {
         String connectionId = UUID.randomUUID().toString();
+        // 在请求线程中提取 trace-id，避免异步线程拿不到 RequestContext
+        String traceId = extractTraceId(request);
         SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
         CompletableFuture.runAsync(() -> {
-            claudeService.messagesStream(requestBody, connectionId);
+            claudeService.messagesStream(requestBody, connectionId, traceId);
         });
         return emitter;
+    }
+
+    private String extractTraceId(HttpServletRequest request) {
+        if (request == null) {
+            return null;
+        }
+        String traceId = request.getHeader("trace-id");
+        if (StrUtil.isNotBlank(traceId)) {
+            return traceId;
+        }
+        return request.getHeader("x-trace-id");
     }
 }

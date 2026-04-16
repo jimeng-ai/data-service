@@ -178,7 +178,7 @@ public class ClaudeService {
      * @param requestBody  请求体
      * @param connectionId SSE 连接标识
      */
-    public void messagesStream(Map<String, Object> requestBody, String connectionId) {
+    public void messagesStream(Map<String, Object> requestBody, String connectionId, String traceId) {
         if (requestBody == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "请求体不能为空");
         }
@@ -212,6 +212,10 @@ public class ClaudeService {
         }
 
         Map<String, String> headers = buildHeaders();
+        // 将 trace-id 放入 headers，供 recordRequest 在异步线程中读取
+        if (StrUtil.isNotBlank(traceId)) {
+            headers.put("trace-id", traceId);
+        }
         String url = buildMessagesUrl();
         int toolRound = 0;
 
@@ -219,10 +223,8 @@ public class ClaudeService {
         int totalInputTokens = 0;
         int totalOutputTokens = 0;
 
-        // 提取 trace-id
-        String traceId = extractTraceId();
-
-        try {
+        // 总耗时起点
+        long totalStartTime = System.currentTimeMillis();        try {
             while (true) {
                 long roundStart = System.currentTimeMillis();
                 Long logId = safeRecordRequest(body, headers);
@@ -299,9 +301,10 @@ public class ClaudeService {
                     // 记录流式响应日志
                     Map<String, Object> responseMap = accumulator.buildResponseMap();
                     String streamEventsJson = JSONUtil.toJsonStr(responseMap);
+                    String requestId = responseMap.get("id") != null ? String.valueOf(responseMap.get("id")) : null;
                     safeRecordStreamResponse(logId, 200,
                             accumulator.getInputTokens(), accumulator.getOutputTokens(),
-                            streamEventsJson, latencyMs);
+                            streamEventsJson, latencyMs, requestId);
 
                     // 累加本轮 token 用量
                     totalInputTokens += accumulator.getInputTokens();
@@ -310,7 +313,8 @@ public class ClaudeService {
                     // 判断是否包含 tool_use
                     if (!skillApplyResult.isEnabled() || !accumulator.hasToolUse()) {
                         // Final_Round: 发送 summary 事件并关闭连接
-                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound > 0 ? toolRound + 1 : 0, traceId);
+                        double elapsedSeconds = (System.currentTimeMillis() - totalStartTime) / 1000.0;
+                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound > 0 ? toolRound + 1 : 0, traceId, elapsedSeconds);
                         sseServiceUtil.complete(connectionId);
                         return;
                     }
@@ -319,7 +323,8 @@ public class ClaudeService {
                     List<ToolUseCall> toolCalls = skillRuntimeService.extractToolUseCalls(responseMap);
                     if (toolCalls.isEmpty()) {
                         // 无 tool 调用，视为 Final_Round
-                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound > 0 ? toolRound + 1 : 0, traceId);
+                        double elapsedSeconds = (System.currentTimeMillis() - totalStartTime) / 1000.0;
+                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound > 0 ? toolRound + 1 : 0, traceId, elapsedSeconds);
                         sseServiceUtil.complete(connectionId);
                         return;
                     }
@@ -353,7 +358,8 @@ public class ClaudeService {
                     // 执行 tools
                     List<Map<String, Object>> toolResultBlocks = skillRuntimeService.buildToolResultBlocks(toolCalls);
                     if (toolResultBlocks.isEmpty()) {
-                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound + 1, traceId);
+                        double elapsedSeconds = (System.currentTimeMillis() - totalStartTime) / 1000.0;
+                        sendSummaryEvent(connectionId, totalInputTokens, totalOutputTokens, toolRound + 1, traceId, elapsedSeconds);
                         sseServiceUtil.complete(connectionId);
                         return;
                     }
@@ -392,7 +398,7 @@ public class ClaudeService {
     /**
      * 发送 summary 事件，包含聚合的 token 用量和轮次信息。
      */
-    private void sendSummaryEvent(String connectionId, int inputTokens, int outputTokens, int toolRounds, String traceId) {
+    private void sendSummaryEvent(String connectionId, int inputTokens, int outputTokens, int toolRounds, String traceId, double elapsedSeconds) {
         Map<String, Object> summary = new LinkedHashMap<>();
         summary.put("input_tokens", inputTokens);
         summary.put("output_tokens", outputTokens);
@@ -400,6 +406,7 @@ public class ClaudeService {
         if (toolRounds > 0) {
             summary.put("tool_rounds", toolRounds);
         }
+        summary.put("elapsed_seconds", elapsedSeconds);
         if (StrUtil.isNotBlank(traceId)) {
             summary.put("x-trace-id", traceId);
         }
@@ -523,13 +530,14 @@ public class ClaudeService {
 
     private void safeRecordStreamResponse(Long logId, Integer httpStatus,
                                           int inputTokens, int outputTokens,
-                                          String streamEventsJson, Integer latencyMs) {
+                                          String streamEventsJson, Integer latencyMs,
+                                          String requestId) {
         if (logId == null) {
             return;
         }
         try {
             aiModelCallRecordService.recordStreamResponse(logId, httpStatus,
-                    inputTokens, outputTokens, streamEventsJson, latencyMs);
+                    inputTokens, outputTokens, streamEventsJson, latencyMs, requestId);
         } catch (Exception e) {
             log.warn("模型调用日志记录流式响应阶段失败: {}", e.getMessage());
         }

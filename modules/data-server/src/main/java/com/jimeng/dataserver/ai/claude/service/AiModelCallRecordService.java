@@ -137,7 +137,8 @@ public class AiModelCallRecordService {
      */
     public void recordStreamResponse(Long logId, Integer httpStatus,
                                      int inputTokens, int outputTokens,
-                                     String streamEventsJson, Integer latencyMs) {
+                                     String streamEventsJson, Integer latencyMs,
+                                     String requestId) {
         AiModelCallLog logEntity = new AiModelCallLog();
         logEntity.setId(logId);
         logEntity.setHttpStatus(httpStatus);
@@ -146,6 +147,9 @@ public class AiModelCallRecordService {
         logEntity.setInputTokens(inputTokens);
         logEntity.setOutputTokens(outputTokens);
         logEntity.setTotalTokens(inputTokens + outputTokens);
+        if (StrUtil.isNotBlank(requestId)) {
+            logEntity.setRequestId(requestId);
+        }
         aiModelCallLogMapper.updateById(logEntity);
 
         LambdaUpdateWrapper<AiModelCallContent> wrapper = new LambdaUpdateWrapper<>();
