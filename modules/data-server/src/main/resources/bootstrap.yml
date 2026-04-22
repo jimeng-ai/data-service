@@ -47,7 +47,7 @@ ai:
 skill:
   enabled: true
   explicit-prefix: "$"
-  max-tool-rounds: 6
+  max-tool-rounds: 10
   max-selected: 3
   skill-system-prompt: "## 角色定义
 你是一个高度智能、全能的通用型个人智能助手。你具备广泛的知识基础和强大的逻辑推理能力、工具（Skill/Tool）调用决策能力，你能够精准理解用户意图，自主评估任务需求。你的核心目标是为用户提供精准、可靠、全方位的协助。

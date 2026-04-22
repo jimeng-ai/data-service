@@ -12,7 +12,6 @@
     <artifactId>modules</artifactId>
     <packaging>pom</packaging>
     <modules>
-        <module>sys-server</module>
         <module>data-server</module>
     </modules>
 
