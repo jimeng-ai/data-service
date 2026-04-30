@@ -5,12 +5,10 @@ import com.jimeng.common.core.redisson.RedissonDistributedLocker;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import org.springframework.util.StringUtils;
 
 /**
  * @Author Moonlight
@@ -21,7 +19,14 @@ import java.util.List;
 @Configuration
 public class RedissonConfig {
 
-    private final List<String> redisConfigList = new ArrayList<>(Arrays.asList("redis://localhost:6379"));
+    @Value("${spring.data.redis.host:localhost}")
+    private String host;
+
+    @Value("${spring.data.redis.port:6379}")
+    private int port;
+
+    @Value("${spring.data.redis.password:}")
+    private String password;
 
     @Bean
     public DistributedLocker distributedLocker() {
@@ -30,9 +35,11 @@ public class RedissonConfig {
 
     @Bean
     public RedissonClient redissonClient() {
-        String[] configArray = redisConfigList.toArray(new String[0]);
         Config config = new Config();
-        config.useSingleServer().setAddress(configArray[0]);
+        var serverConfig = config.useSingleServer().setAddress("redis://" + host + ":" + port);
+        if (StringUtils.hasText(password)) {
+            serverConfig.setPassword(password);
+        }
         // 集群模式
 //        config.useClusterServers().setScanInterval(2000).addNodeAddress(configArray);
         return Redisson.create(config);
