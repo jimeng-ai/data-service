@@ -32,6 +32,12 @@ ai-api:
     api-key: sk-WelE7G36N2wj0DXL6c2026C890214eCcA87027C46000E2Fa
     model: claude-opus-4-6
     max-tokens: 8192
+  openai:
+    base-Url: https://api.shubiaobiao.cn
+    api-key: sk-WelE7G36N2wj0DXL6c2026C890214eCcA87027C46000E2Fa
+    model: gpt-5.3-codex
+    max-completion-tokens: 8192
+    temperature: 1
 
 ai:
   system-prompt: "## 角色定义

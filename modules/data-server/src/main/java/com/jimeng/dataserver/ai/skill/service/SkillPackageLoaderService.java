@@ -1,12 +1,15 @@
 package com.jimeng.dataserver.ai.skill.service;
 
 import cn.hutool.core.util.StrUtil;
+import com.jimeng.common.core.enums.ExceptionCode;
+import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 @Service
@@ -29,6 +33,7 @@ public class SkillPackageLoaderService {
 
     private static final String SKILL_FILE = "SKILL.md";
     private static final String TOOLS_FILE = "tools.json";
+    private static final Pattern SKILL_NAME_PATTERN = Pattern.compile("[A-Za-z][A-Za-z0-9_-]{0,63}");
 
     @Value("${skill.root-dir:skills}")
     private String skillRootDir;
@@ -59,14 +64,56 @@ public class SkillPackageLoaderService {
     public List<Map<String, Object>> listSkillSummaries() {
         List<Map<String, Object>> summaries = new ArrayList<>();
         for (SkillPackage skillPackage : loadSkillPackages().values()) {
-            Map<String, Object> item = new LinkedHashMap<>();
-            item.put("name", skillPackage.getName());
-            item.put("description", skillPackage.getDescription());
-            item.put("path", skillPackage.getRootPath().toString());
-            item.put("toolCount", skillPackage.getTools().size());
-            summaries.add(item);
+            summaries.add(toSkillSummary(skillPackage));
         }
         return summaries;
+    }
+
+    public Map<String, Object> uploadSkillMarkdown(MultipartFile file, boolean overwrite) {
+        if (file == null || file.isEmpty()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "上传的SKILL.md文件不能为空");
+        }
+
+        String raw;
+        try {
+            raw = new String(file.getBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new ServiceException(e, ExceptionCode.INTERNAL_SERVER_ERROR.getResultCode(), "读取上传文件失败");
+        }
+        if (StrUtil.isBlank(raw)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md内容不能为空");
+        }
+
+        ParsedSkillMarkdown parsed = parseSkillMarkdown(raw, "");
+        validateUploadedSkill(parsed);
+
+        Path root = resolveRootPathForWrite();
+        Path skillDir = root.resolve(parsed.name).normalize();
+        if (!skillDir.startsWith(root)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "非法skill名称: " + parsed.name);
+        }
+
+        Path skillFile = skillDir.resolve(SKILL_FILE);
+        boolean existed = Files.exists(skillFile);
+        if (existed && !overwrite) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill已存在，如需覆盖请传overwrite=true: " + parsed.name);
+        }
+
+        try {
+            Files.createDirectories(skillDir);
+            Files.writeString(skillFile, normalizeLineEndings(raw), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new ServiceException(e, ExceptionCode.INTERNAL_SERVER_ERROR.getResultCode(), "保存SKILL.md失败");
+        }
+
+        SkillPackage skillPackage = loadSingleSkill(skillDir);
+        if (skillPackage == null) {
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存后加载skill失败: " + parsed.name);
+        }
+
+        Map<String, Object> summary = toSkillSummary(skillPackage);
+        summary.put("overwritten", existed);
+        return summary;
     }
 
     public SkillPackage findByName(Map<String, SkillPackage> skillMap, String name) {
@@ -156,7 +203,7 @@ public class SkillPackageLoaderService {
         if (raw == null) {
             raw = "";
         }
-        String normalized = raw.replace("\r\n", "\n");
+        String normalized = normalizeLineEndings(raw);
 
         String name = fallbackName;
         String description = "";
@@ -198,6 +245,42 @@ public class SkillPackageLoaderService {
         return new ParsedSkillMarkdown(name, description, body);
     }
 
+    private void validateUploadedSkill(ParsedSkillMarkdown parsed) {
+        if (parsed == null || StrUtil.isBlank(parsed.name)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md frontmatter必须包含name");
+        }
+        if (!SKILL_NAME_PATTERN.matcher(parsed.name).matches()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "skill名称只能包含字母、数字、下划线、中划线，且必须以字母开头，长度不超过64");
+        }
+        if (StrUtil.isBlank(parsed.description)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md frontmatter必须包含description");
+        }
+        if (StrUtil.isBlank(parsed.body)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md正文不能为空");
+        }
+    }
+
+    private Map<String, Object> toSkillSummary(SkillPackage skillPackage) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("name", skillPackage.getName());
+        item.put("description", skillPackage.getDescription());
+        item.put("path", skillPackage.getRootPath().toString());
+        item.put("toolCount", skillPackage.getTools().size());
+        return item;
+    }
+
+    private String normalizeLineEndings(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String normalized = raw.replace("\r\n", "\n").replace('\r', '\n');
+        if (normalized.startsWith("\uFEFF")) {
+            return normalized.substring(1);
+        }
+        return normalized;
+    }
+
     private Map<String, Object> castToStringObjectMap(Map<?, ?> source) {
         Map<String, Object> map = new LinkedHashMap<>();
         if (source == null) {
@@ -230,6 +313,19 @@ public class SkillPackageLoaderService {
             return moduleFallback;
         }
         return preferred;
+    }
+
+    private Path resolveRootPathForWrite() {
+        Path root = resolveRootPath();
+        if (root == null) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "未配置skill.root-dir");
+        }
+        try {
+            Files.createDirectories(root);
+            return root.toAbsolutePath().normalize();
+        } catch (IOException e) {
+            throw new ServiceException(e, ExceptionCode.INTERNAL_SERVER_ERROR.getResultCode(), "创建skill根目录失败");
+        }
     }
 
     private static class ParsedSkillMarkdown {

@@ -90,6 +90,46 @@ public class SkillRuntimeService {
         return SkillApplyResult.discovery(allNames);
     }
 
+    public SkillApplyResult applyOpenAiSkillContext(Map<String, Object> body) {
+        if (!skillEnabled || body == null) {
+            return SkillApplyResult.disabled();
+        }
+
+        Object messagesObj = body.get("messages");
+        if (!(messagesObj instanceof List<?> messages) || messages.isEmpty()) {
+            return SkillApplyResult.disabled();
+        }
+
+        Map<String, SkillPackage> skillMap = skillPackageLoaderService.loadSkillPackages();
+        if (skillMap.isEmpty()) {
+            return SkillApplyResult.disabled();
+        }
+
+        List<String> explicitNames = extractExplicitSkillNamesAndStrip(messages);
+        if (!explicitNames.isEmpty()) {
+            List<SkillPackage> selectedSkills = resolveSelectedSkills(skillMap, explicitNames);
+            if (selectedSkills.isEmpty()) {
+                return SkillApplyResult.disabled();
+            }
+            injectOpenAiSkillSystemPrompt(body, selectedSkills);
+            mergeOpenAiSkillTools(body, selectedSkills);
+            ensureOpenAiToolChoiceAuto(body);
+            List<String> selectedNames = selectedSkills.stream().map(SkillPackage::getName).toList();
+            return SkillApplyResult.activated(selectedNames);
+        }
+
+        List<SkillPackage> allSkills = selectSkillsForModelDecide(skillMap);
+        if (allSkills.isEmpty()) {
+            return SkillApplyResult.disabled();
+        }
+        log.info("OpenAI Discovery Phase skills: {}", allSkills.stream().map(SkillPackage::getName).toList());
+        injectOpenAiSkillSummaryPrompt(body, allSkills);
+        injectOpenAiActivateSkillsTool(body);
+        ensureOpenAiToolChoiceAuto(body);
+        List<String> allNames = allSkills.stream().map(SkillPackage::getName).toList();
+        return SkillApplyResult.discovery(allNames);
+    }
+
     public List<ToolUseCall> extractToolUseCalls(Map<String, Object> responseMap) {
         if (responseMap == null || responseMap.isEmpty()) {
             return Collections.emptyList();
@@ -119,6 +159,53 @@ public class SkillRuntimeService {
         return calls;
     }
 
+    public List<ToolUseCall> extractOpenAiToolUseCalls(Map<String, Object> responseMap) {
+        if (responseMap == null || responseMap.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Object choicesObj = responseMap.get("choices");
+        if (!(choicesObj instanceof List<?> choices) || choices.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<ToolUseCall> calls = new ArrayList<>();
+        for (Object choiceObj : choices) {
+            if (!(choiceObj instanceof Map<?, ?> choiceMap)) {
+                continue;
+            }
+            Object messageObj = choiceMap.get("message");
+            if (!(messageObj instanceof Map<?, ?> messageMap)) {
+                messageObj = choiceMap.get("delta");
+            }
+            if (!(messageObj instanceof Map<?, ?> msgMap)) {
+                continue;
+            }
+            Object toolCallsObj = msgMap.get("tool_calls");
+            if (!(toolCallsObj instanceof List<?> toolCalls)) {
+                continue;
+            }
+            for (Object toolCallObj : toolCalls) {
+                if (!(toolCallObj instanceof Map<?, ?> toolCallMap)) {
+                    continue;
+                }
+                String toolUseId = getString(toolCallMap.get("id"));
+                Object functionObj = toolCallMap.get("function");
+                if (!(functionObj instanceof Map<?, ?> functionMap)) {
+                    continue;
+                }
+                String toolName = getString(functionMap.get("name"));
+                if (StrUtil.isBlank(toolUseId) || StrUtil.isBlank(toolName)) {
+                    log.warn("忽略不完整的OpenAI tool_call, id={}, name={}", toolUseId, toolName);
+                    continue;
+                }
+                Object argumentsObj = functionMap.get("arguments");
+                Map<String, Object> input = parseOpenAiToolArguments(argumentsObj);
+                calls.add(new ToolUseCall(toolUseId, toolName, input));
+            }
+        }
+        return calls;
+    }
+
     public List<Map<String, Object>> buildToolResultBlocks(List<ToolUseCall> toolCalls) {
         List<ToolExecutionResult> executionResults = skillToolExecutorRegistryService.executeAll(toolCalls);
         List<Map<String, Object>> blocks = new ArrayList<>();
@@ -133,6 +220,20 @@ public class SkillRuntimeService {
             blocks.add(block);
         }
         return blocks;
+    }
+
+    public List<Map<String, Object>> buildOpenAiToolResultMessages(List<ToolUseCall> toolCalls) {
+        List<ToolExecutionResult> executionResults = skillToolExecutorRegistryService.executeAll(toolCalls);
+        List<Map<String, Object>> messages = new ArrayList<>();
+        for (ToolExecutionResult result : executionResults) {
+            Map<String, Object> message = new LinkedHashMap<>();
+            message.put("role", "tool");
+            message.put("tool_call_id", result.getToolUseId());
+            message.put("name", result.getToolName());
+            message.put("content", JSONUtil.toJsonStr(result.getPayload()));
+            messages.add(message);
+        }
+        return messages;
     }
 
     public void appendAssistantAndToolResultMessages(Map<String, Object> body,
@@ -161,6 +262,31 @@ public class SkillRuntimeService {
         userToolResultMessage.put("role", "user");
         userToolResultMessage.put("content", new ArrayList<>(toolResultBlocks));
         messages.add(userToolResultMessage);
+    }
+
+    public void appendOpenAiAssistantAndToolResultMessages(Map<String, Object> body,
+                                                           Map<String, Object> responseMap,
+                                                           List<Map<String, Object>> toolResultMessages) {
+        if (body == null || responseMap == null || toolResultMessages == null || toolResultMessages.isEmpty()) {
+            return;
+        }
+        Object messagesObj = body.get("messages");
+        if (!(messagesObj instanceof List<?> rawMessages)) {
+            return;
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Object> messages = (List<Object>) rawMessages;
+
+        Map<String, Object> assistantMessage = extractOpenAiAssistantMessage(responseMap);
+        if (!assistantMessage.isEmpty()) {
+            messages.add(assistantMessage);
+        }
+        if (!hasOpenAiToolCalls(assistantMessage)) {
+            log.warn("OpenAI assistant消息不包含有效tool_calls，跳过追加tool结果");
+            return;
+        }
+        messages.addAll(filterOpenAiToolResultMessages(assistantMessage, toolResultMessages));
     }
 
     /**
@@ -235,6 +361,59 @@ public class SkillRuntimeService {
         return new ActivationResult(success, validNames, toolResultBlock);
     }
 
+    public ActivationResult handleOpenAiActivateSkills(Map<String, Object> body,
+                                                       ToolUseCall activateCall,
+                                                       Map<String, SkillPackage> skillMap) {
+        List<String> requestedNames = parseSkillNames(activateCall.getInput());
+
+        List<String> validNames = new ArrayList<>();
+        List<String> invalidNames = new ArrayList<>();
+        List<SkillPackage> selectedSkills = new ArrayList<>();
+        int limit = Math.max(maxSelected, 1);
+        for (String name : requestedNames) {
+            SkillPackage pkg = skillPackageLoaderService.findByName(skillMap, name);
+            if (pkg != null) {
+                validNames.add(pkg.getName());
+                selectedSkills.add(pkg);
+            } else {
+                invalidNames.add(name);
+            }
+            if (selectedSkills.size() >= limit) {
+                break;
+            }
+        }
+
+        Map<String, Object> toolResultPayload;
+        boolean success;
+        if (validNames.isEmpty()) {
+            success = false;
+            toolResultPayload = new LinkedHashMap<>();
+            toolResultPayload.put("error", "invalid_skill_names");
+            toolResultPayload.put("message", "以下 Skill 名称无效: " + invalidNames);
+        } else {
+            success = true;
+            toolResultPayload = new LinkedHashMap<>();
+            toolResultPayload.put("activated_skills", validNames);
+            if (!invalidNames.isEmpty()) {
+                toolResultPayload.put("invalid_skills", invalidNames);
+            }
+        }
+
+        if (!selectedSkills.isEmpty()) {
+            injectOpenAiSkillSystemPrompt(body, selectedSkills);
+            mergeOpenAiSkillTools(body, selectedSkills);
+            removeOpenAiActivateSkillsTool(body);
+        }
+
+        Map<String, Object> toolResultMessage = new LinkedHashMap<>();
+        toolResultMessage.put("role", "tool");
+        toolResultMessage.put("tool_call_id", activateCall.getToolUseId());
+        toolResultMessage.put("name", activateCall.getToolName());
+        toolResultMessage.put("content", JSONUtil.toJsonStr(toolResultPayload));
+
+        return new ActivationResult(success, validNames, toolResultMessage);
+    }
+
     /**
      * 从 tools 列表中移除 activate_skills 元工具。
      */
@@ -249,6 +428,28 @@ public class SkillRuntimeService {
             if (toolObj instanceof Map<?, ?> toolMap) {
                 String name = getString(toolMap.get("name"));
                 if (ACTIVATE_SKILLS_TOOL_NAME.equals(name)) {
+                    continue;
+                }
+            }
+            filtered.add(toolObj);
+        }
+        body.put("tools", filtered);
+    }
+
+    private void removeOpenAiActivateSkillsTool(Map<String, Object> body) {
+        Object toolsObj = body.get("tools");
+        if (!(toolsObj instanceof List<?> toolsList) || toolsList.isEmpty()) {
+            return;
+        }
+
+        List<Object> filtered = new ArrayList<>();
+        for (Object toolObj : toolsList) {
+            if (toolObj instanceof Map<?, ?> rawTool) {
+                Map<String, Object> tool = castToStringObjectMap(rawTool);
+                if (ACTIVATE_SKILLS_TOOL_NAME.equals(getOpenAiToolName(tool))) {
+                    continue;
+                }
+                if (ACTIVATE_SKILLS_TOOL_NAME.equals(getString(tool.get("name")))) {
                     continue;
                 }
             }
@@ -387,6 +588,14 @@ public class SkillRuntimeService {
         appendToSystemPrompt(body, skillPrompt);
     }
 
+    private void injectOpenAiSkillSystemPrompt(Map<String, Object> body, List<SkillPackage> selectedSkills) {
+        String skillPrompt = buildSkillSystemPrompt(selectedSkills);
+        if (StrUtil.isBlank(skillPrompt)) {
+            return;
+        }
+        appendToOpenAiSystemMessage(body, skillPrompt);
+    }
+
     /**
      * Discovery Phase：仅注入 Skill 的 name 和 description 摘要列表到 system prompt。
      */
@@ -400,6 +609,18 @@ public class SkillRuntimeService {
             sb.append(skill.getDescription()).append("\n");
         }
         appendToSystemPrompt(body, sb.toString().trim());
+    }
+
+    private void injectOpenAiSkillSummaryPrompt(Map<String, Object> body, List<SkillPackage> skills) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(skillSystemPrompt).append("\n\n");
+        sb.append("以下是可用的 Skill 列表。如果用户的问题需要使用某个 Skill，");
+        sb.append("请调用 activate_skills 工具激活对应的 Skill。\n\n");
+        for (SkillPackage skill : skills) {
+            sb.append("- **").append(skill.getName()).append("**: ");
+            sb.append(skill.getDescription()).append("\n");
+        }
+        appendToOpenAiSystemMessage(body, sb.toString().trim());
     }
 
     /**
@@ -435,6 +656,41 @@ public class SkillRuntimeService {
         }
 
         body.put("system", String.valueOf(existingSystem) + "\n\n" + text);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendToOpenAiSystemMessage(Map<String, Object> body, String text) {
+        if (StrUtil.isBlank(text)) {
+            return;
+        }
+        Object messagesObj = body.get("messages");
+        if (!(messagesObj instanceof List<?> rawMessages)) {
+            return;
+        }
+
+        List<Object> messages = (List<Object>) rawMessages;
+        for (Object messageObj : messages) {
+            if (!(messageObj instanceof Map<?, ?> rawMessage)) {
+                continue;
+            }
+            Map<String, Object> message = (Map<String, Object>) rawMessage;
+            String role = getString(message.get("role"));
+            if (!"system".equals(role) && !"developer".equals(role)) {
+                continue;
+            }
+            Object contentObj = message.get("content");
+            if (contentObj instanceof String content) {
+                message.put("content", StrUtil.isBlank(content) ? text : content + "\n\n" + text);
+            } else {
+                message.put("content", getString(contentObj) + "\n\n" + text);
+            }
+            return;
+        }
+
+        Map<String, Object> systemMessage = new LinkedHashMap<>();
+        systemMessage.put("role", "system");
+        systemMessage.put("content", text);
+        messages.add(0, systemMessage);
     }
 
     private String buildSkillSystemPrompt(List<SkillPackage> selectedSkills) {
@@ -491,11 +747,66 @@ public class SkillRuntimeService {
         }
     }
 
+    private void mergeOpenAiSkillTools(Map<String, Object> body, List<SkillPackage> selectedSkills) {
+        List<Map<String, Object>> merged = new ArrayList<>();
+        Set<String> names = new LinkedHashSet<>();
+
+        Object existingToolsObj = body.get("tools");
+        if (existingToolsObj instanceof List<?> existingTools) {
+            for (Object toolObj : existingTools) {
+                if (!(toolObj instanceof Map<?, ?> rawTool)) {
+                    continue;
+                }
+                Map<String, Object> tool = normalizeOpenAiTool(castToStringObjectMap(rawTool));
+                String name = getOpenAiToolName(tool);
+                if (StrUtil.isBlank(name) || !names.add(name)) {
+                    continue;
+                }
+                merged.add(tool);
+            }
+        }
+
+        for (SkillPackage skill : selectedSkills) {
+            for (SkillToolDefinition tool : skill.getTools()) {
+                if (tool == null || StrUtil.isBlank(tool.getModelName()) || !names.add(tool.getModelName())) {
+                    continue;
+                }
+                merged.add(tool.toOpenAiTool());
+            }
+        }
+
+        if (!merged.isEmpty()) {
+            body.put("tools", merged);
+        }
+    }
+
     /**
      * Discovery Phase：向 tools 列表追加 activate_skills 元工具定义。
      */
     private void injectActivateSkillsTool(Map<String, Object> body) {
         Map<String, Object> tool = buildActivateSkillsToolDefinition();
+        Object existingTools = body.get("tools");
+        List<Object> toolsList;
+        if (existingTools instanceof List<?> existing) {
+            toolsList = new ArrayList<>(existing);
+        } else {
+            toolsList = new ArrayList<>();
+        }
+        toolsList.add(tool);
+        body.put("tools", toolsList);
+    }
+
+    private void injectOpenAiActivateSkillsTool(Map<String, Object> body) {
+        Map<String, Object> claudeTool = buildActivateSkillsToolDefinition();
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", claudeTool.get("name"));
+        function.put("description", claudeTool.get("description"));
+        function.put("parameters", claudeTool.get("input_schema"));
+
+        Map<String, Object> tool = new LinkedHashMap<>();
+        tool.put("type", "function");
+        tool.put("function", function);
+
         Object existingTools = body.get("tools");
         List<Object> toolsList;
         if (existingTools instanceof List<?> existing) {
@@ -541,6 +852,159 @@ public class SkillRuntimeService {
         Map<String, Object> auto = new LinkedHashMap<>();
         auto.put("type", "auto");
         body.put("tool_choice", auto);
+    }
+
+    private void ensureOpenAiToolChoiceAuto(Map<String, Object> body) {
+        if (body == null || body.containsKey("tool_choice")) {
+            return;
+        }
+        body.put("tool_choice", "auto");
+    }
+
+    private Map<String, Object> parseOpenAiToolArguments(Object argumentsObj) {
+        if (argumentsObj instanceof Map<?, ?> rawMap) {
+            return castToStringObjectMap(rawMap);
+        }
+        String arguments = getString(argumentsObj);
+        if (StrUtil.isBlank(arguments) || !JSONUtil.isTypeJSON(arguments)) {
+            return Collections.emptyMap();
+        }
+        try {
+            return castToStringObjectMap(JSONUtil.parseObj(arguments));
+        } catch (Exception e) {
+            log.warn("OpenAI tool arguments解析失败: {}", e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    private Map<String, Object> extractOpenAiAssistantMessage(Map<String, Object> responseMap) {
+        Object choicesObj = responseMap.get("choices");
+        if (!(choicesObj instanceof List<?> choices) || choices.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Object choiceObj = choices.get(0);
+        if (!(choiceObj instanceof Map<?, ?> choiceMap)) {
+            return Collections.emptyMap();
+        }
+        Object messageObj = choiceMap.get("message");
+        if (!(messageObj instanceof Map<?, ?> rawMessage)) {
+            return Collections.emptyMap();
+        }
+        Map<String, Object> assistantMessage = castToStringObjectMap(rawMessage);
+        assistantMessage.putIfAbsent("role", "assistant");
+        normalizeOpenAiAssistantToolCallMessage(assistantMessage);
+        return assistantMessage;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void normalizeOpenAiAssistantToolCallMessage(Map<String, Object> assistantMessage) {
+        Object toolCallsObj = assistantMessage.get("tool_calls");
+        if (!(toolCallsObj instanceof List<?> toolCalls) || toolCalls.isEmpty()) {
+            return;
+        }
+
+        if (assistantMessage.get("content") == null) {
+            assistantMessage.put("content", "");
+        }
+
+        List<Object> normalizedToolCalls = new ArrayList<>();
+        for (Object toolCallObj : toolCalls) {
+            if (!(toolCallObj instanceof Map<?, ?> rawToolCall)) {
+                continue;
+            }
+            Map<String, Object> toolCall = castToStringObjectMap(rawToolCall);
+            String id = getString(toolCall.get("id"));
+            if (StrUtil.isBlank(id)) {
+                continue;
+            }
+
+            Object functionObj = toolCall.get("function");
+            if (!(functionObj instanceof Map<?, ?> rawFunction)) {
+                continue;
+            }
+            Map<String, Object> function = castToStringObjectMap(rawFunction);
+            if (StrUtil.isBlank(getString(function.get("name")))) {
+                continue;
+            }
+            function.put("arguments", function.get("arguments") == null ? "{}" : String.valueOf(function.get("arguments")));
+
+            toolCall.put("type", StrUtil.blankToDefault(getString(toolCall.get("type")), "function"));
+            toolCall.put("function", function);
+            normalizedToolCalls.add(toolCall);
+        }
+        assistantMessage.put("tool_calls", normalizedToolCalls);
+    }
+
+    private boolean hasOpenAiToolCalls(Map<String, Object> assistantMessage) {
+        if (assistantMessage == null || assistantMessage.isEmpty()) {
+            return false;
+        }
+        Object toolCallsObj = assistantMessage.get("tool_calls");
+        return toolCallsObj instanceof List<?> toolCalls && !toolCalls.isEmpty();
+    }
+
+    private List<Map<String, Object>> filterOpenAiToolResultMessages(Map<String, Object> assistantMessage,
+                                                                     List<Map<String, Object>> toolResultMessages) {
+        Object toolCallsObj = assistantMessage.get("tool_calls");
+        if (!(toolCallsObj instanceof List<?> toolCalls) || toolCalls.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        Set<String> validIds = new LinkedHashSet<>();
+        for (Object toolCallObj : toolCalls) {
+            if (!(toolCallObj instanceof Map<?, ?> toolCall)) {
+                continue;
+            }
+            String id = getString(toolCall.get("id"));
+            if (StrUtil.isNotBlank(id)) {
+                validIds.add(id);
+            }
+        }
+
+        List<Map<String, Object>> filtered = new ArrayList<>();
+        for (Map<String, Object> toolResultMessage : toolResultMessages) {
+            String id = getString(toolResultMessage.get("tool_call_id"));
+            if (validIds.contains(id)) {
+                filtered.add(toolResultMessage);
+            } else {
+                log.warn("跳过无匹配assistant tool_call的tool结果, tool_call_id={}", id);
+            }
+        }
+        return filtered;
+    }
+
+    private Map<String, Object> normalizeOpenAiTool(Map<String, Object> tool) {
+        Object functionObj = tool.get("function");
+        if (functionObj instanceof Map<?, ?> rawFunction) {
+            Map<String, Object> function = castToStringObjectMap(rawFunction);
+            String normalizedName = normalizeModelToolName(getString(function.get("name")));
+            if (StrUtil.isNotBlank(normalizedName)) {
+                function.put("name", normalizedName);
+            }
+            tool.put("type", "function");
+            tool.put("function", function);
+            return tool;
+        }
+
+        String name = normalizeModelToolName(getString(tool.get("name")));
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", name);
+        function.put("description", tool.get("description"));
+        Object inputSchema = tool.containsKey("input_schema") ? tool.get("input_schema") : tool.get("parameters");
+        function.put("parameters", inputSchema);
+
+        Map<String, Object> normalized = new LinkedHashMap<>();
+        normalized.put("type", "function");
+        normalized.put("function", function);
+        return normalized;
+    }
+
+    private String getOpenAiToolName(Map<String, Object> tool) {
+        Object functionObj = tool.get("function");
+        if (!(functionObj instanceof Map<?, ?> function)) {
+            return "";
+        }
+        return getString(function.get("name"));
     }
 
     private String getString(Object value) {

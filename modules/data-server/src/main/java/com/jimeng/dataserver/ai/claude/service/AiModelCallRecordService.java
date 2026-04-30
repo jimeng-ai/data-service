@@ -35,12 +35,20 @@ public class AiModelCallRecordService {
     private final AiModelCallContentMapper aiModelCallContentMapper;
 
     public Long recordRequest(Map<String, Object> requestBody, Map<String, String> requestHeaders) {
+        return recordRequest(requestBody, requestHeaders, "anthropic", "/v1/messages", "claude-opus-4-6");
+    }
+
+    public Long recordRequest(Map<String, Object> requestBody, Map<String, String> requestHeaders,
+                              String provider, String endpoint, String defaultModel) {
         AiModelCallLog logEntity = new AiModelCallLog();
-        logEntity.setProvider("anthropic");
-        logEntity.setEndpoint("/v1/messages");
-        logEntity.setModel(getString(requestBody, "model", "claude-opus-4-6"));
+        logEntity.setProvider(provider);
+        logEntity.setEndpoint(endpoint);
+        logEntity.setModel(getString(requestBody, "model", defaultModel));
         logEntity.setStream(getBoolean(requestBody, "stream"));
-        logEntity.setMaxTokens(getInteger(requestBody, "max_tokens"));
+        logEntity.setMaxTokens(firstNonNull(
+                getInteger(requestBody, "max_tokens"),
+                getInteger(requestBody, "max_completion_tokens")
+        ));
         logEntity.setTemperature(getDecimal(requestBody, "temperature"));
         logEntity.setTopP(getDecimal(requestBody, "top_p"));
         logEntity.setRetryCount(0);
@@ -172,12 +180,15 @@ public class AiModelCallRecordService {
         if (usage == null) {
             return;
         }
-        Integer input = usage.getInt("input_tokens");
-        Integer output = usage.getInt("output_tokens");
+        Integer input = firstNonNull(usage.getInt("input_tokens"), usage.getInt("prompt_tokens"));
+        Integer output = firstNonNull(usage.getInt("output_tokens"), usage.getInt("completion_tokens"));
         logEntity.setInputTokens(input);
         logEntity.setOutputTokens(output);
         if (input != null || output != null) {
-            logEntity.setTotalTokens((input == null ? 0 : input) + (output == null ? 0 : output));
+            logEntity.setTotalTokens(firstNonNull(
+                    usage.getInt("total_tokens"),
+                    (input == null ? 0 : input) + (output == null ? 0 : output)
+            ));
         }
     }
 
@@ -192,6 +203,9 @@ public class AiModelCallRecordService {
                 continue;
             }
             Object nameObj = toolMap.get("name");
+            if (nameObj == null && toolMap.get("function") instanceof Map<?, ?> functionMap) {
+                nameObj = functionMap.get("name");
+            }
             if (nameObj != null && StrUtil.isNotBlank(String.valueOf(nameObj))) {
                 names.add(String.valueOf(nameObj));
             }
@@ -222,9 +236,9 @@ public class AiModelCallRecordService {
                     String type = blockMap.get("type") == null ? null : String.valueOf(blockMap.get("type"));
                     if ("text".equals(type)) {
                         flags.hasText = true;
-                    } else if ("image".equals(type)) {
+                    } else if ("image".equals(type) || "image_url".equals(type) || "input_image".equals(type)) {
                         flags.hasImage = true;
-                    } else if ("document".equals(type)) {
+                    } else if ("document".equals(type) || "file".equals(type) || "input_file".equals(type)) {
                         flags.hasDocument = true;
                     }
                 }
@@ -347,6 +361,19 @@ public class AiModelCallRecordService {
             return false;
         }
         return Boolean.parseBoolean(String.valueOf(value));
+    }
+
+    @SafeVarargs
+    private <T> T firstNonNull(T... values) {
+        if (values == null) {
+            return null;
+        }
+        for (T value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private Map<String, String> maskSensitiveHeaders(Map<String, String> headers) {

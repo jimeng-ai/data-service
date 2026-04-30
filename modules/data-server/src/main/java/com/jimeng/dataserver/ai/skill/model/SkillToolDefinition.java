@@ -44,6 +44,18 @@ public class SkillToolDefinition {
         return tool;
     }
 
+    public Map<String, Object> toOpenAiTool() {
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", modelName);
+        function.put("description", description);
+        function.put("parameters", inputSchema);
+
+        Map<String, Object> tool = new LinkedHashMap<>();
+        tool.put("type", "function");
+        tool.put("function", function);
+        return tool;
+    }
+
     private String normalizeModelName(String source) {
         if (source == null) {
             return "skill_tool";
