@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.claude.stream;
 
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.jimeng.dataserver.ai.conversation.AiStreamAccumulator;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
@@ -10,12 +11,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * 流式事件累积器：在 Claude API 流式输出过程中累积所有事件，
- * 流结束后重建完整响应 Map，供 SkillRuntimeService 提取 tool_use 调用。
- */
 @Slf4j
-public class ClaudeStreamEventAccumulator {
+public class ClaudeStreamEventAccumulator implements AiStreamAccumulator {
 
     private String messageId;
     private String model;
@@ -26,12 +23,21 @@ public class ClaudeStreamEventAccumulator {
     private int inputTokens = 0;
     private int outputTokens = 0;
 
-    /**
-     * 处理单个流式事件，累积到内部状态中。
-     *
-     * @param eventType 事件类型，如 message_start、content_block_start 等
-     * @param jsonData  事件的 JSON 数据
-     */
+    @Override
+    public void accumulateEvent(String eventType, String data) {
+        accumulate(eventType, data);
+    }
+
+    @Override
+    public String getRequestId() {
+        return messageId;
+    }
+
+    @Override
+    public String toJson() {
+        return JSONUtil.toJsonStr(buildResponseMap());
+    }
+
     public void accumulate(String eventType, String jsonData) {
         if (eventType == null || jsonData == null) {
             return;

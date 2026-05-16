@@ -8,7 +8,9 @@ import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
 import org.springframework.context.annotation.FilterType;
 
-@SpringBootApplication
+@SpringBootApplication(exclude = {
+        org.springframework.boot.autoconfigure.elasticsearch.ElasticsearchClientAutoConfiguration.class
+})
 @EnableDiscoveryClient
 @EnableAspectJAutoProxy
 @ComponentScan(basePackages = {

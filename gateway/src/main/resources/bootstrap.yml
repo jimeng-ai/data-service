@@ -30,9 +30,9 @@ spring:
             - Path=/v3/api-docs/**,/swagger-resources/**,/webjars/**
           order: 9999
     nacos:
-      server-addr: 8.148.207.108:8848
-      username: nacos
-      password: nacos
+      server-addr: localhost:8848
+#      username: nacos
+#      password: nacos
       discovery:
         namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
       config:

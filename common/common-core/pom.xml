@@ -51,6 +51,14 @@
             <groupId>com.alibaba</groupId>
             <artifactId>easyexcel</artifactId>
             <version>${easyexcel.version}</version>
+            <exclusions>
+                <!-- EasyExcel 3.2.1 拖入 poi-ooxml-schemas:4.1.2，与 Tika 自带的 poi-ooxml-lite 5.2.5 冲突，
+                     运行期会抛 NoSuchFieldError: POIXMLProperties.Factory。POI 5.x 已用 poi-ooxml-lite 取代 schemas 包。 -->
+                <exclusion>
+                    <groupId>org.apache.poi</groupId>
+                    <artifactId>poi-ooxml-schemas</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <!--spring-cloud-openfeign 依赖-->
         <dependency>

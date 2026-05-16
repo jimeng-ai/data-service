@@ -1,0 +1,46 @@
+version: "3.8"
+
+# 本地 RAG 开发环境：单节点 Elasticsearch 8.13.4 + IK 中文分词插件
+#
+# 启动：docker compose -f docker/docker-compose.es.yml up -d
+# 停止：docker compose -f docker/docker-compose.es.yml down
+# 验证：
+#   curl http://localhost:9200
+#   curl http://localhost:9200/_cat/plugins?v   # 应能看到 analysis-ik
+#   curl -XPOST 'http://localhost:9200/_analyze' -H 'Content-Type: application/json' \
+#        -d '{"analyzer":"ik_max_word","text":"中文分词测试"}'
+#
+# IK 插件版本必须与 ES 镜像主版本号严格一致
+
+services:
+  elasticsearch:
+    image: elasticsearch:8.13.4
+    container_name: rag-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - ELASTIC_PASSWORD=changeme
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - rag-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    # 首次启动自动安装 IK 分词插件（与 ES 主版本号严格对齐）
+    command: >
+      bash -c "
+        if ! ./bin/elasticsearch-plugin list | grep -q analysis-ik; then
+          ./bin/elasticsearch-plugin install --batch https://release.infinilabs.com/analysis-ik/stable/elasticsearch-analysis-ik-8.13.4.zip;
+        fi &&
+        /usr/local/bin/docker-entrypoint.sh
+      "
+
+volumes:
+  rag-es-data:
+    driver: local

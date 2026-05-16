@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import jakarta.annotation.PostConstruct;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -24,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -38,20 +40,32 @@ public class SkillPackageLoaderService {
     @Value("${skill.root-dir:skills}")
     private String skillRootDir;
 
+    private final AtomicReference<Map<String, SkillPackage>> skillCache = new AtomicReference<>();
+
+    @PostConstruct
+    public void init() {
+        skillCache.set(loadFromDisk());
+    }
+
     public Map<String, SkillPackage> loadSkillPackages() {
+        Map<String, SkillPackage> cached = skillCache.get();
+        if (cached != null) return cached;
+        Map<String, SkillPackage> loaded = loadFromDisk();
+        skillCache.compareAndSet(null, loaded);
+        return skillCache.get();
+    }
+
+    private Map<String, SkillPackage> loadFromDisk() {
         Path root = resolveRootPath();
         if (root == null || !Files.isDirectory(root)) {
             return Collections.emptyMap();
         }
-
         Map<String, SkillPackage> byName = new LinkedHashMap<>();
         try (Stream<Path> stream = Files.list(root)) {
             List<Path> skillDirs = stream.filter(Files::isDirectory).sorted().toList();
             for (Path skillDir : skillDirs) {
                 SkillPackage skillPackage = loadSingleSkill(skillDir);
-                if (skillPackage == null || StrUtil.isBlank(skillPackage.getName())) {
-                    continue;
-                }
+                if (skillPackage == null || StrUtil.isBlank(skillPackage.getName())) continue;
                 byName.put(skillPackage.getName(), skillPackage);
             }
         } catch (IOException e) {
@@ -111,6 +125,7 @@ public class SkillPackageLoaderService {
             throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存后加载skill失败: " + parsed.name);
         }
 
+        skillCache.set(null);  // invalidate cache so next call reloads from disk
         Map<String, Object> summary = toSkillSummary(skillPackage);
         summary.put("overwritten", existed);
         return summary;

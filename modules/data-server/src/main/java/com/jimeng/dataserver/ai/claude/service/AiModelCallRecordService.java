@@ -105,10 +105,12 @@ public class AiModelCallRecordService {
         logEntity.setLatencyMs(latencyMs);
         logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
 
+        boolean isStream = false;
         if (StrUtil.isNotBlank(responseBody) && JSONUtil.isTypeJSON(responseBody)) {
             JSONObject root = JSONUtil.parseObj(responseBody);
             logEntity.setRequestId(root.getStr("id"));
             fillUsage(logEntity, root.getJSONObject("usage"));
+            isStream = Boolean.TRUE.equals(root.getBool("stream"));
 
             JSONObject error = root.getJSONObject("error");
             if (error != null) {
@@ -121,10 +123,9 @@ public class AiModelCallRecordService {
         }
         aiModelCallLogMapper.updateById(logEntity);
 
-        boolean stream = Boolean.TRUE.equals(getStreamById(logId));
         LambdaUpdateWrapper<AiModelCallContent> wrapper = new LambdaUpdateWrapper<>();
         wrapper.eq(AiModelCallContent::getLogId, logId);
-        if (stream) {
+        if (isStream) {
             wrapper.set(AiModelCallContent::getStreamEvents, responseBody);
         } else {
             wrapper.set(AiModelCallContent::getRespBody, responseBody);
@@ -245,11 +246,6 @@ public class AiModelCallRecordService {
             }
         }
         return flags;
-    }
-
-    private Boolean getStreamById(Long logId) {
-        AiModelCallLog entity = aiModelCallLogMapper.selectById(logId);
-        return entity == null ? null : entity.getStream();
     }
 
     private boolean isSuccess(Integer httpStatus) {

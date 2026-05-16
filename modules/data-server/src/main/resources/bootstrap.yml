@@ -3,9 +3,9 @@ spring:
     name: data-server
   cloud:
     nacos:
-      server-addr: 8.148.207.108:8848
-      username: nacos
-      password: nacos
+      server-addr: localhost:8848
+#      username: nacos
+#      password: nacos
       discovery:
         namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
       config:
@@ -28,14 +28,14 @@ spring:
 
 ai-api:
   claude:
-    base-Url: https://api.shubiaobiao.cn
-    api-key: sk-WelE7G36N2wj0DXL6c2026C890214eCcA87027C46000E2Fa
-    model: claude-opus-4-6
+    base-Url: https://openrouter.ai/api
+    api-key: ${OPENROUTER_API_KEY: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}
+    model: anthropic/claude-opus-4.6
     max-tokens: 8192
   openai:
-    base-Url: https://api.shubiaobiao.cn
-    api-key: sk-WelE7G36N2wj0DXL6c2026C890214eCcA87027C46000E2Fa
-    model: gpt-5.3-codex
+    base-Url: https://openrouter.ai/api
+    api-key: ${OPENROUTER_API_KEY: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}
+    model: openai/gpt-5.5
     max-completion-tokens: 8192
     temperature: 1
 
@@ -49,6 +49,43 @@ ai:
 - 避免带有强烈的个人主观情绪或偏见，始终保持中立的顾问立场。
 - 禁止在上下文信息已足够支撑准确回答的情况下滥用或强制调用工具。
 - 禁止在缺少关键必填参数或参数不合法时尝试强行调用工具。"
+
+rag:
+  elasticsearch:
+    hosts: "http://localhost:9200"
+    username:
+    password:
+    index-name: kb_chunks
+    connection-timeout: 5s
+    socket-timeout: 60s
+  openrouter:
+    base-url: "https://openrouter.ai/api/v1"
+    api-key: ${OPENROUTER_API_KEY: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}
+    embedding-model: "openai/text-embedding-ada-002"
+    embedding-dims: 1536
+    rerank-model: "cohere/rerank-4-pro"
+    timeout: 30s
+  chunk:
+    target-size-tokens: 600
+    max-size-tokens: 800
+    overlap-tokens: 80
+    sentence-splitter: "(?<=[。！？.!?])\\s+"
+  contextualization:
+    enabled: true
+    text-model: "anthropic/claude-haiku-4.5"
+    image-model: "anthropic/claude-sonnet-4.6"
+    max-output-tokens: 200
+    prompt-cache-ttl-seconds: 300
+  retrieval:
+    bm25-top-k: 50
+    vector-top-k: 50
+    rrf-rank-constant: 60
+    rerank-top-k: 10
+  ingestion:
+    queue: rag.ingestion
+    concurrency: 2
+    max-retries: 3
+    minio-bucket: rag-documents
 
 skill:
   enabled: true
