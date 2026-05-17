@@ -107,6 +107,13 @@
             <version>${jtokkit.version}</version>
         </dependency>
 
+        <!-- JSON 格式日志（Filebeat 直接拿去送 ES，无需 grok 解析） -->
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+            <version>7.4</version>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -171,6 +171,7 @@ public class AiConversationLoop {
 
                     if (!skillApplyResult.isEnabled() || toolCalls.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
+                        logFinalAnswer(connectionId, rc, responseMap, totalIn, totalOut, elapsed);
                         sendSummary(connectionId, totalIn, totalOut,
                                 toolRound > 0 ? toolRound + 1 : 0, traceId, elapsed);
                         sseServiceUtil.complete(connectionId);
@@ -223,6 +224,64 @@ public class AiConversationLoop {
             sendError(connectionId, e.getClass().getSimpleName(), e.getMessage());
             sseServiceUtil.complete(connectionId);
         }
+    }
+
+    // ------------------------------------------------------------------ final answer log
+
+    /**
+     * 流结束时打印 LLM 最终答复全文，便于 Kibana 按 connectionId 复盘整条 RAG 链路。
+     * elapsedSeconds 传 -1 表示尚未到收尾阶段（中间轮 tool_use 之间也可调用）。
+     */
+    private void logFinalAnswer(String connectionId, CallRecordConfig rc,
+                                 Map<String, Object> responseMap,
+                                 int totalIn, int totalOut, double elapsedSeconds) {
+        String text = extractAssistantText(responseMap);
+        if (text == null) return;
+        if (elapsedSeconds >= 0) {
+            log.info("LLM/answer connectionId={} provider={} model={} input_tokens={} output_tokens={} elapsed={}s\n{}",
+                    connectionId, rc.provider(), rc.defaultModel(), totalIn, totalOut, elapsedSeconds, text);
+        } else {
+            log.info("LLM/answer.intermediate connectionId={} provider={} input_tokens={} output_tokens={}\n{}",
+                    connectionId, rc.provider(), totalIn, totalOut, text);
+        }
+    }
+
+    /**
+     * 协议兼容地从 responseMap 抽出 assistant 文本：
+     * - Anthropic 风格：content: [{type: "text", text: "..."}]
+     * - OpenAI 风格：choices: [{message: {content: "..."}}]
+     */
+    @SuppressWarnings("unchecked")
+    private static String extractAssistantText(Map<String, Object> responseMap) {
+        if (responseMap == null || responseMap.isEmpty()) return null;
+
+        // Anthropic
+        Object content = responseMap.get("content");
+        if (content instanceof List<?> blocks) {
+            StringBuilder sb = new StringBuilder();
+            for (Object block : blocks) {
+                if (!(block instanceof Map<?, ?> m)) continue;
+                if ("text".equals(m.get("type"))) {
+                    Object t = m.get("text");
+                    if (t != null) sb.append(t);
+                }
+            }
+            if (sb.length() > 0) return sb.toString().trim();
+        }
+
+        // OpenAI
+        Object choices = responseMap.get("choices");
+        if (choices instanceof List<?> list && !list.isEmpty()) {
+            Object first = list.get(0);
+            if (first instanceof Map<?, ?> choice) {
+                Object msg = choice.get("message");
+                if (msg instanceof Map<?, ?> m) {
+                    Object c = m.get("content");
+                    if (c != null) return String.valueOf(c).trim();
+                }
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------ SSE event helpers

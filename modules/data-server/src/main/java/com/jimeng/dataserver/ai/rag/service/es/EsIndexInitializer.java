@@ -9,6 +9,7 @@ import co.elastic.clients.elasticsearch._types.mapping.Property;
 import co.elastic.clients.elasticsearch._types.mapping.TextProperty;
 import co.elastic.clients.elasticsearch.cat.PluginsResponse;
 import co.elastic.clients.elasticsearch.cat.plugins.PluginsRecord;
+import com.jimeng.dataserver.ai.provider.ProviderRegistry;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -36,6 +37,7 @@ public class EsIndexInitializer {
 
     private final ElasticsearchClient esClient;
     private final RagProperties ragProperties;
+    private final ProviderRegistry providerRegistry;
 
     @PostConstruct
     public void init() throws IOException {
@@ -70,7 +72,7 @@ public class EsIndexInitializer {
             log.info("Elasticsearch 索引 [{}] 已存在", indexName);
             return;
         }
-        int dims = ragProperties.getOpenrouter().getEmbeddingDims();
+        int dims = providerRegistry.embedding().dims();
         Map<String, Property> properties = buildMapping(dims);
         esClient.indices().create(c -> c
                 .index(indexName)

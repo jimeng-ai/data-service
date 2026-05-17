@@ -25,6 +25,8 @@ build/
 ### VS Code ###
 .vscode/
 
+.mcp.json
+
 ### Mac OS ###
 .DS_Store
 /.idea/

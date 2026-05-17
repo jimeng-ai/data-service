@@ -1,10 +1,10 @@
 package com.jimeng.dataserver.ai.rag.service.embed;
 
 import cn.hutool.crypto.SecureUtil;
-import com.jimeng.dataserver.ai.rag.client.OpenRouterEmbeddingClient;
-import com.jimeng.dataserver.ai.rag.config.RagProperties;
-import lombok.RequiredArgsConstructor;
+import com.jimeng.dataserver.ai.provider.ProviderRegistry;
+import com.jimeng.dataserver.ai.provider.spi.EmbeddingClient;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -14,31 +14,36 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 批量 embedding，按 contextualized_content 的 sha256 做 Redis 缓存（避免重复计费）。
+ * 批量 embedding，按 (provider, model, text) 的 sha256 做 Redis 缓存（避免重复计费 + 切换 provider 时不串货）。
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class EmbeddingService {
 
     private static final int BATCH_SIZE = 100;
     private static final String CACHE_PREFIX = "rag:emb:";
     private static final long CACHE_TTL_DAYS = 30;
 
-    private final OpenRouterEmbeddingClient client;
-    private final RagProperties ragProperties;
+    private final ProviderRegistry providerRegistry;
     private final StringRedisTemplate redis;
+
+    // @Lazy 打破循环：ProviderRegistry → ChatClient → AiConversationLoop → SkillRuntimeService
+    //   → SkillToolExecutorRegistryService → RagSkillToolExecutor → HybridSearchService → EmbeddingService → ProviderRegistry
+    public EmbeddingService(@Lazy ProviderRegistry providerRegistry, StringRedisTemplate redis) {
+        this.providerRegistry = providerRegistry;
+        this.redis = redis;
+    }
 
     public List<float[]> embedAll(List<String> texts) {
         if (texts == null || texts.isEmpty()) return Collections.emptyList();
-        int dims = ragProperties.getOpenrouter().getEmbeddingDims();
-        String model = ragProperties.getOpenrouter().getEmbeddingModel();
+        EmbeddingClient client = providerRegistry.embedding();
+        int dims = client.dims();
+        String model = client.modelId();
+        String cachePrefix = CACHE_PREFIX + client.providerName() + ":";
 
         float[][] result = new float[texts.size()][];
         List<Integer> missingIdx = new ArrayList<>();
@@ -47,7 +52,7 @@ public class EmbeddingService {
 
         // 1. Redis 缓存查
         for (int i = 0; i < texts.size(); i++) {
-            String key = cacheKey(model, texts.get(i));
+            String key = cacheKey(cachePrefix, model, texts.get(i));
             String cached = redis.opsForValue().get(key);
             float[] vec = cached != null ? decode(cached, dims) : null;
             if (vec != null) {
@@ -58,7 +63,8 @@ public class EmbeddingService {
                 missingKey.add(key);
             }
         }
-        log.info("embedding 缓存命中 {} / {}", texts.size() - missingIdx.size(), texts.size());
+        log.info("embedding 缓存命中 {} / {} (provider={}, model={})",
+                texts.size() - missingIdx.size(), texts.size(), client.providerName(), model);
 
         // 2. 缺失的分批请求
         for (int from = 0; from < missingText.size(); from += BATCH_SIZE) {
@@ -80,8 +86,8 @@ public class EmbeddingService {
         return embedAll(List.of(text)).get(0);
     }
 
-    private String cacheKey(String model, String text) {
-        return CACHE_PREFIX + model + ":" + SecureUtil.sha256(text);
+    private String cacheKey(String prefix, String model, String text) {
+        return prefix + model + ":" + SecureUtil.sha256(text);
     }
 
     private String encode(float[] vec) {
@@ -101,11 +107,6 @@ public class EmbeddingService {
         } catch (Exception e) {
             return null;
         }
-    }
-
-    @SuppressWarnings("unused")
-    private static Map<String, Object> usageDummy() {
-        return new HashMap<>(0);
     }
 
     public byte[] textBytes(String text) {

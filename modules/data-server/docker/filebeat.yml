@@ -1,0 +1,42 @@
+# Filebeat 配置：抓取 /var/log/app 下的 JSON 日志，按天写到 ES 索引 data-server-yyyy.MM.dd
+#
+# 注意：本机宿主目录 ${user.home}/logs/data-server 会被 docker-compose 挂载到 /var/log/app。
+
+filebeat.inputs:
+  - type: filestream
+    id: data-server
+    enabled: true
+    paths:
+      - /var/log/app/*.log
+    parsers:
+      - ndjson:
+          # LogstashEncoder 输出每行一个 JSON
+          target: ""                  # 字段平铺到根（不嵌套）
+          overwrite_keys: true        # 用日志里的 @timestamp / message 等覆盖 Filebeat 自动加的
+          add_error_key: true
+          expand_keys: true
+
+# 关掉 Filebeat 自带的 host 模块抓取（只送应用日志）
+filebeat.config.modules:
+  enabled: false
+
+# 直接送 ES（生产环境一般经 Logstash，但本地 dev 没必要多一层）
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "data-server-%{+yyyy.MM.dd}"
+
+# Filebeat 默认会用 ILM + 自管 index template，这里关掉，让索引名按我们的规则走
+setup.ilm.enabled: false
+setup.template.name: "data-server"
+setup.template.pattern: "data-server-*"
+setup.template.enabled: true
+setup.template.overwrite: false
+
+# 不写 monitoring/processors 进 ES（保持索引干净）
+processors:
+  - drop_fields:
+      fields: ["agent", "ecs", "input", "log.offset", "log.file.device_id", "log.file.inode", "host"]
+      ignore_missing: true
+
+logging.level: info
+logging.to_files: false

@@ -1,6 +1,4 @@
-version: "3.8"
-
-# 本地 RAG 开发环境：单节点 Elasticsearch 8.13.4 + IK 中文分词插件
+# 本地 RAG 开发环境：单节点 Elasticsearch 8.13.4 + IK 中文分词插件 + Kibana 8.13.4
 #
 # 启动：docker compose -f docker/docker-compose.es.yml up -d
 # 停止：docker compose -f docker/docker-compose.es.yml down
@@ -9,8 +7,9 @@ version: "3.8"
 #   curl http://localhost:9200/_cat/plugins?v   # 应能看到 analysis-ik
 #   curl -XPOST 'http://localhost:9200/_analyze' -H 'Content-Type: application/json' \
 #        -d '{"analyzer":"ik_max_word","text":"中文分词测试"}'
+#   open http://localhost:5601                   # Kibana UI（首次启动需等 30~60s 初始化）
 #
-# IK 插件版本必须与 ES 镜像主版本号严格一致
+# IK 插件版本与 Kibana 版本必须与 ES 镜像主版本号严格一致
 
 services:
   elasticsearch:
@@ -40,6 +39,38 @@ services:
         fi &&
         /usr/local/bin/docker-entrypoint.sh
       "
+
+  kibana:
+    image: kibana:8.13.4
+    container_name: rag-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_HOST=0.0.0.0
+      - I18N_LOCALE=zh-CN
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  # 日志采集：抓取宿主机 ~/logs/data-server/*.log（LogstashEncoder JSON）→ ES
+  # 如果 data-server 写日志到别处，改下面这一行 volume 即可
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.4
+    container_name: rag-filebeat
+    user: root                          # 需要 root 读宿主机挂入的文件
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ${HOME}/logs/data-server:/var/log/app:ro
+    command: ["-e", "--strict.perms=false"]
 
 volumes:
   rag-es-data:

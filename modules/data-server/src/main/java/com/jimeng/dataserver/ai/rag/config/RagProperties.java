@@ -12,7 +12,6 @@ import java.time.Duration;
 public class RagProperties {
 
     private Elasticsearch elasticsearch = new Elasticsearch();
-    private OpenRouter openrouter = new OpenRouter();
     private Chunk chunk = new Chunk();
     private Contextualization contextualization = new Contextualization();
     private Retrieval retrieval = new Retrieval();
@@ -29,16 +28,6 @@ public class RagProperties {
     }
 
     @Data
-    public static class OpenRouter {
-        private String baseUrl = "https://openrouter.ai/api/v1";
-        private String apiKey;
-        private String embeddingModel = "openai/text-embedding-ada-002";
-        private int embeddingDims = 1536;
-        private String rerankModel = "cohere/rerank-4-pro";
-        private Duration timeout = Duration.ofSeconds(30);
-    }
-
-    @Data
     public static class Chunk {
         private int targetSizeTokens = 600;
         private int maxSizeTokens = 800;
@@ -46,12 +35,13 @@ public class RagProperties {
         private String sentenceSplitter = "(?<=[。！？.!?])\\s+";
     }
 
+    /**
+     * 上下文化业务开关。模型 ID 等已迁移到 providers.&lt;name&gt;.contextualization.*；
+     * 这里仅保留与具体 provider 无关的策略字段。
+     */
     @Data
     public static class Contextualization {
         private boolean enabled = true;
-        private String textModel = "claude-haiku-4-5";
-        private String imageModel = "claude-sonnet-4-6";
-        private int maxOutputTokens = 200;
         private int promptCacheTtlSeconds = 300;
     }
 

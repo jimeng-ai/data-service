@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.rag.model.AnswerRequest;
 import com.jimeng.dataserver.ai.rag.service.answer.RagAnswerService;
+import com.jimeng.dataserver.web.MdcAsyncSupport;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
@@ -38,7 +39,8 @@ public class RagAnswerController {
         String connectionId = UUID.randomUUID().toString();
         SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
         String traceId = extractTraceId(request);
-        streamExecutor.execute(() -> ragAnswerService.streamAnswer(req, connectionId, traceId));
+        streamExecutor.execute(MdcAsyncSupport.wrap(connectionId,
+                () -> ragAnswerService.streamAnswer(req, connectionId, traceId)));
         return emitter;
     }
 

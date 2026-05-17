@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  data-server 日志配置：
+  - 控制台保留（开发期 IDE 直接看）
+  - 文件输出 JSON（每行一条 LogstashEncoder 编码），Filebeat 抓取后送 ES
+  - 默认路径 ${user.home}/logs/data-server/，可通过 -DLOG_PATH=... 或 LOG_PATH 环境变量覆盖
+  - 滚动策略：按天 + 单文件 100MB，保留 7 天，总量上限 5GB
+-->
+<configuration>
+
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="data-server"/>
+    <property name="LOG_PATH" value="${LOG_PATH:-${user.home}/logs/data-server}"/>
+
+    <!-- 控制台：保留 Spring Boot 默认彩色格式，IDE 友好 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) %magenta([%thread]) %cyan(%logger{36}) - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 文件：JSON 格式，Filebeat 直接拿。LogstashEncoder 会自动带 @timestamp / level / logger_name /
+         thread_name / message / stack_trace / mdc，开箱即用 -->
+    <appender name="FILE_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/${APP_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>5GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- 把 app 名作为静态字段写到每条日志里，Kibana 可按 app 字段筛选 -->
+            <customFields>{"app":"${APP_NAME}"}</customFields>
+        </encoder>
+    </appender>
+
+    <!-- 调低噪声 -->
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="com.alibaba.nacos" level="WARN"/>
+    <logger name="org.elasticsearch.client" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE_JSON"/>
+    </root>
+
+</configuration>

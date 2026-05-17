@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.openai.controller;
 import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.openai.service.OpenAiService;
+import com.jimeng.dataserver.web.MdcAsyncSupport;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
@@ -46,7 +47,8 @@ public class OpenAiController {
         String connectionId = UUID.randomUUID().toString();
         String traceId = extractTraceId(request);
         SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
-        streamExecutor.execute(() -> openAiService.chatCompletionsStream(requestBody, connectionId, traceId));
+        streamExecutor.execute(MdcAsyncSupport.wrap(connectionId,
+                () -> openAiService.chatCompletionsStream(requestBody, connectionId, traceId)));
         return emitter;
     }
 

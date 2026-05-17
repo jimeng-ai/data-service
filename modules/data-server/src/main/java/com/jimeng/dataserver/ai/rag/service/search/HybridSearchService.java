@@ -16,14 +16,17 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * ES retrievers API 双路检索（BM25 + KNN）+ RRF 融合。
+ * 双路检索 BM25 + KNN，融合用 Java 手写 RRF。
  *
- * <p>用 RestClient low-level 发原始 JSON 是为了不被 Java Client DSL 是否覆盖 retrievers/RRF 卡住
- * （8.11+ 后端支持，但 Java Client DSL 跟得不一定齐）。结构稳定，便于后续调参。
+ * <p>ES 内置的 RRF（无论是 retriever.rrf 还是 rank.rrf）属 Platinum/Enterprise 付费特性，
+ * basic 许可证会 403。因此这里改为：分别发两次 _search（BM25 / KNN，都是 basic 可用），
+ * 在 Java 里按 1/(k + rank) 做 RRF 融合。和 ES 内置 RRF 行为等价。
  */
 @Slf4j
 @Service
@@ -37,9 +40,73 @@ public class HybridSearchService {
     public List<SearchResultItem> search(Long kbId, String query, List<Long> docIds, int topK) throws IOException {
         if (query == null || query.isBlank()) return Collections.emptyList();
         float[] qVec = embeddingService.embedOne(query);
+        RagProperties.Retrieval r = ragProperties.getRetrieval();
         String index = ragProperties.getElasticsearch().getIndexName();
-        String body = buildSearchBody(kbId, query, qVec, docIds, topK);
 
+        JSONArray filters = buildFilters(kbId, docIds);
+
+        List<SearchResultItem> bm25Hits = executeSearch(index, buildBm25Body(query, filters, r.getBm25TopK()));
+        List<SearchResultItem> knnHits = executeSearch(index, buildKnnBody(qVec, filters, r.getVectorTopK()));
+
+        return rrfMerge(bm25Hits, knnHits, r.getRrfRankConstant(), topK);
+    }
+
+    // ------------------------------------------------------------------ filters
+
+    private JSONArray buildFilters(Long kbId, List<Long> docIds) {
+        JSONArray filters = JSONUtil.createArray();
+        filters.put(JSONUtil.createObj().set("term", JSONUtil.createObj().set("kb_id", String.valueOf(kbId))));
+        if (docIds != null && !docIds.isEmpty()) {
+            JSONArray docIdStrs = new JSONArray();
+            for (Long id : docIds) docIdStrs.put(String.valueOf(id));
+            filters.put(JSONUtil.createObj().set("terms", JSONUtil.createObj().set("doc_id", docIdStrs)));
+        }
+        return filters;
+    }
+
+    // ------------------------------------------------------------------ BM25
+
+    private String buildBm25Body(String query, JSONArray filters, int size) {
+        JSONObject body = JSONUtil.createObj()
+                .set("query", JSONUtil.createObj()
+                        .set("bool", JSONUtil.createObj()
+                                .set("must", JSONUtil.createObj()
+                                        .set("match", JSONUtil.createObj().set("contextualized_content", query)))
+                                .set("filter", filters)))
+                .set("size", size)
+                .set("_source", sourceFields());
+        return body.toString();
+    }
+
+    // ------------------------------------------------------------------ KNN
+
+    private String buildKnnBody(float[] qVec, JSONArray filters, int k) {
+        JSONArray vec = new JSONArray();
+        for (float v : qVec) vec.put(v);
+        JSONObject knn = JSONUtil.createObj()
+                .set("field", "embedding")
+                .set("query_vector", vec)
+                .set("k", k)
+                .set("num_candidates", Math.max(k * 4, 200));
+        if (filters != null && !filters.isEmpty()) {
+            knn.set("filter", JSONUtil.createObj().set("bool", JSONUtil.createObj().set("filter", filters)));
+        }
+        JSONObject body = JSONUtil.createObj()
+                .set("knn", knn)
+                .set("size", k)
+                .set("_source", sourceFields());
+        return body.toString();
+    }
+
+    private JSONArray sourceFields() {
+        return JSONUtil.createArray()
+                .put("chunk_id").put("kb_id").put("doc_id").put("chunk_index").put("chunk_type")
+                .put("heading_path").put("page_num").put("content").put("image_url");
+    }
+
+    // ------------------------------------------------------------------ HTTP
+
+    private List<SearchResultItem> executeSearch(String index, String body) throws IOException {
         Request req = new Request("POST", "/" + index + "/_search");
         req.setJsonEntity(body);
         Response resp = restClient.performRequest(req);
@@ -48,52 +115,6 @@ public class HybridSearchService {
         }
         String respBody = new String(resp.getEntity().getContent().readAllBytes());
         return parseHits(respBody);
-    }
-
-    private String buildSearchBody(Long kbId, String query, float[] qVec, List<Long> docIds, int topK) {
-        RagProperties.Retrieval r = ragProperties.getRetrieval();
-
-        // 公共过滤
-        JSONObject kbTerm = JSONUtil.createObj().set("term", JSONUtil.createObj().set("kb_id", String.valueOf(kbId)));
-        JSONArray filters = JSONUtil.createArray().put(kbTerm);
-        if (docIds != null && !docIds.isEmpty()) {
-            JSONArray docIdStrs = new JSONArray();
-            for (Long id : docIds) docIdStrs.put(String.valueOf(id));
-            filters.put(JSONUtil.createObj().set("terms", JSONUtil.createObj().set("doc_id", docIdStrs)));
-        }
-
-        // BM25 retriever (standard)
-        JSONObject matchQuery = JSONUtil.createObj()
-                .set("query", JSONUtil.createObj()
-                        .set("bool", JSONUtil.createObj()
-                                .set("must", JSONUtil.createObj()
-                                        .set("match", JSONUtil.createObj().set("contextualized_content", query)))
-                                .set("filter", filters)));
-        JSONObject standardRetriever = JSONUtil.createObj().set("standard", matchQuery);
-
-        // KNN retriever
-        JSONArray vec = new JSONArray();
-        for (float v : qVec) vec.put(v);
-        JSONObject knnRetriever = JSONUtil.createObj().set("knn", JSONUtil.createObj()
-                .set("field", "embedding")
-                .set("query_vector", vec)
-                .set("k", r.getVectorTopK())
-                .set("num_candidates", Math.max(r.getVectorTopK() * 4, 200))
-                .set("filter", JSONUtil.createObj().set("bool", JSONUtil.createObj().set("filter", filters))));
-
-        // RRF
-        JSONObject rrf = JSONUtil.createObj()
-                .set("retrievers", JSONUtil.createArray().put(standardRetriever).put(knnRetriever))
-                .set("rank_window_size", Math.max(r.getBm25TopK(), r.getVectorTopK()))
-                .set("rank_constant", r.getRrfRankConstant());
-
-        JSONObject body = JSONUtil.createObj()
-                .set("retriever", JSONUtil.createObj().set("rrf", rrf))
-                .set("size", topK)
-                .set("_source", JSONUtil.createArray()
-                        .put("chunk_id").put("kb_id").put("doc_id").put("chunk_index").put("chunk_type")
-                        .put("heading_path").put("page_num").put("content").put("image_url"));
-        return body.toString();
     }
 
     private List<SearchResultItem> parseHits(String body) {
@@ -121,6 +142,36 @@ public class HybridSearchService {
                     .build());
         }
         return out;
+    }
+
+    // ------------------------------------------------------------------ RRF fusion (Java)
+
+    private List<SearchResultItem> rrfMerge(List<SearchResultItem> a, List<SearchResultItem> b, int k, int topK) {
+        Map<String, Double> scores = new LinkedHashMap<>();
+        Map<String, SearchResultItem> items = new LinkedHashMap<>();
+        accumulate(a, scores, items, k);
+        accumulate(b, scores, items, k);
+        return scores.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(topK)
+                .map(e -> {
+                    SearchResultItem it = items.get(e.getKey());
+                    it.setRrfScore(e.getValue());
+                    return it;
+                })
+                .collect(Collectors.toList());
+    }
+
+    private void accumulate(List<SearchResultItem> hits, Map<String, Double> scores,
+                            Map<String, SearchResultItem> items, int k) {
+        for (int i = 0; i < hits.size(); i++) {
+            SearchResultItem it = hits.get(i);
+            String id = it.getChunkId();
+            if (id == null) continue;
+            double contribution = 1.0 / (k + i + 1.0);
+            scores.merge(id, contribution, Double::sum);
+            items.putIfAbsent(id, it);
+        }
     }
 
     private Long parseLong(String s) {

@@ -18,6 +18,8 @@
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
+        <!-- 让 javac 把方法参数名写进 class 文件，Spring 不再回退到已 deprecated 的 LocalVariableTable -->
+        <maven.compiler.parameters>true</maven.compiler.parameters>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>3.0.2</spring-boot.version>
         <spring-cloud.version>2022.0.0</spring-cloud.version>
