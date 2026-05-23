@@ -1,40 +1,38 @@
-{
-  "tools": [
-    {
-      "name": "rag.search",
-      "description": "在企业知识库中检索与 query 最相关的 top-K 文档片段。底层走 BM25 + 向量混合检索 + Reranker 精排。仅在用户问题明显需要企业内部资料时使用。",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "kb_id": {
-            "type": "integer",
-            "description": "知识库 ID（必填）。可以先调用 rag.kb.list 拿到列表"
-          },
-          "query": {
-            "type": "string",
-            "description": "检索查询词。应是用户问题的核心、检索友好的表达"
-          },
-          "top_k": {
-            "type": "integer",
-            "description": "返回前 K 条精排后的 chunks。默认 10",
-            "default": 10
-          },
-          "rerank": {
-            "type": "boolean",
-            "description": "是否启用 Reranker 精排。默认 true。若希望快速召回可设 false",
-            "default": true
-          }
+[
+  {
+    "name": "rag.search",
+    "description": "在企业知识库中检索与 query 最相关的 top-K 文档片段。底层走 BM25 + 向量混合检索 + Reranker 精排。仅在用户问题明显需要企业内部资料时使用。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "integer",
+          "description": "知识库 ID（必填）。可以先调用 rag.kb.list 拿到列表"
         },
-        "required": ["kb_id", "query"]
-      }
-    },
-    {
-      "name": "rag.kb.list",
-      "description": "列出当前可用的所有企业知识库，返回 id / name / description。在不知道 kb_id 时先调用此工具。",
-      "input_schema": {
-        "type": "object",
-        "properties": {}
-      }
+        "query": {
+          "type": "string",
+          "description": "检索查询词。应是用户问题的核心、检索友好的表达"
+        },
+        "top_k": {
+          "type": "integer",
+          "description": "返回前 K 条精排后的 chunks。默认 10",
+          "default": 10
+        },
+        "rerank": {
+          "type": "boolean",
+          "description": "是否启用 Reranker 精排。默认 true。若希望快速召回可设 false",
+          "default": true
+        }
+      },
+      "required": ["kb_id", "query"]
     }
-  ]
-}
+  },
+  {
+    "name": "rag.kb.list",
+    "description": "列出当前可用的所有企业知识库，返回 id / name / description。在不知道 kb_id 时先调用此工具。",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]

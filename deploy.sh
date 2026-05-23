@@ -5,14 +5,14 @@
 # 作用：
 #   1. 检查并安装宿主环境：Xcode CLT / Homebrew / JDK 17 / Maven / Docker Desktop
 #   2. 用 docker-compose 起基础设施：Nacos / MySQL / Redis / RabbitMQ / Elasticsearch
-#   3. 执行 mvn clean install -DskipTests
 #
 # 用法：
-#   ./deploy.sh              # 全流程
-#   ./deploy.sh check        # 只检查环境，不安装、不启动
-#   ./deploy.sh infra        # 只起/重启基础设施
-#   ./deploy.sh build        # 只跑 mvn clean install
-#   ./deploy.sh down         # 停止并清理基础设施容器（保留数据卷）
+#   ./deploy.sh                # 默认：装环境 + 起 docker 基础设施（不跑 mvn build）
+#   ./deploy.sh check          # 只检查环境，不安装、不启动
+#   ./deploy.sh infra          # 只起/重启基础设施
+#   ./deploy.sh build          # 只跑 mvn clean install -DskipTests
+#   ./deploy.sh all-with-build # 装环境 + 起 docker + mvn build（完整流程）
+#   ./deploy.sh down           # 停止并清理基础设施容器（保留数据卷）
 #
 set -euo pipefail
 
@@ -24,7 +24,7 @@ REQUIRED_MAVEN_MAJOR=3
 REQUIRED_MAVEN_MINOR=6
 
 # 端口占用检查列表
-PORTS_TO_CHECK=(8848 9848 3306 6379 5672 15672 9200 9300)
+PORTS_TO_CHECK=(8848 9848 3306 6379 5672 15672 9200 9300 9000 9001 5601)
 
 # ---------- 美化输出 ----------
 if [[ -t 1 ]]; then
@@ -182,6 +182,52 @@ check_ports() {
   return 0
 }
 
+# ---------- 检查宿主机是否已存在 Nacos ----------
+# 我们 compose 起的是容器版 Nacos(ds-nacos)，宿主机如果也跑着一个独立 Nacos，
+# 会跟容器抢 8848/9848 端口，因此这里只做检测和提示，不强制处理。
+check_existing_nacos() {
+  step "检查宿主机是否独立安装/运行了 Nacos"
+  local found=0
+
+  # 1) 端口 8848 占用情况
+  if lsof -nP -iTCP:8848 -sTCP:LISTEN >/dev/null 2>&1; then
+    local who pid
+    who="$(lsof -nP -iTCP:8848 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1}')"
+    pid="$(lsof -nP -iTCP:8848 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $2}')"
+    if [[ "$who" == "com.docke" || "$who" == "docker" || "$who" == "vpnkit" ]]; then
+      ok "端口 8848 已被 Docker 占用（应该是已经在跑的 ds-nacos）"
+    else
+      warn "端口 8848 被进程 ${who}(pid=${pid}) 占用，疑似宿主机已运行 Nacos"
+      warn "建议先停掉宿主机版 Nacos 再跑本脚本，否则 docker 容器会因端口冲突起不来"
+      found=1
+    fi
+  fi
+
+  # 2) 常见安装目录
+  local d
+  for d in "/opt/nacos" "/usr/local/nacos" "${HOME}/nacos" "${HOME}/Applications/nacos"; do
+    if [[ -d "$d" && -x "$d/bin/startup.sh" ]]; then
+      warn "检测到 Nacos 安装目录：${d}"
+      found=1
+    fi
+  done
+
+  # 3) Java 进程里有没有 nacos
+  if pgrep -f "nacos.nacos" >/dev/null 2>&1 || pgrep -f "NacosServerMainApplication" >/dev/null 2>&1; then
+    local proc
+    proc="$(pgrep -af 'nacos.nacos|NacosServerMainApplication' | head -1)"
+    warn "发现疑似 Nacos 的 Java 进程：${proc}"
+    found=1
+  fi
+
+  if (( found == 0 )); then
+    ok "宿主机未检测到独立 Nacos，将使用 docker 容器 ds-nacos"
+  else
+    warn "本脚本不会去停宿主机版 Nacos，请自行确认后再继续"
+  fi
+  return 0
+}
+
 # ---------- docker compose 工具兼容 ----------
 compose() {
   if docker compose version >/dev/null 2>&1; then
@@ -193,8 +239,17 @@ compose() {
 
 # ---------- 起基础设施 ----------
 start_infra() {
-  step "启动基础设施（Nacos / MySQL / Redis / RabbitMQ / Elasticsearch）"
-  compose up -d
+  step "启动基础设施（Nacos / MySQL / Redis / RabbitMQ / Elasticsearch / MinIO）"
+  if ! compose up -d; then
+    err "docker compose up 失败。常见原因："
+    err "  1) Docker Desktop 未真正就绪，重试一次；"
+    err "  2) 端口被占用，先 './deploy.sh check' 看冲突；"
+    err "  3) 镜像拉取失败（网络），可手动 'docker pull redis:7-alpine' 试试。"
+    err "详细日志见上方输出，或执行 'docker compose -f ${COMPOSE_FILE} logs'。"
+    exit 1
+  fi
+  log "compose 已提交，当前容器状态："
+  docker ps --filter "name=ds-" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
   log "等待容器健康检查通过（最多 5 分钟）..."
   local i=0
   while :; do
@@ -217,8 +272,11 @@ start_infra() {
   - Nacos      : http://localhost:8848/nacos        (无鉴权 / 默认)
   - MySQL      : localhost:3306    root / root123456
   - Redis      : localhost:6379    无密码
-  - RabbitMQ   : http://localhost:15672              admin / admin123456
+  - RabbitMQ   : http://localhost:15672              guest / guest
   - Elasticsearch : http://localhost:9200
+  - Kibana     : http://localhost:5601              (ES 可视化 UI，首次启动 ~30s)
+  - MinIO API  : http://localhost:9000              minioadmin / minioadmin
+  - MinIO Console : http://localhost:9001            minioadmin / minioadmin
 
 EOF
 }
@@ -263,6 +321,7 @@ check_only() {
   fi
 
   check_ports
+  check_existing_nacos
 
   echo
   if (( fail == 0 )); then ok "环境齐备，可以直接 './deploy.sh' 一把梭"
@@ -280,6 +339,7 @@ main() {
     infra)
       ensure_docker
       check_ports
+      check_existing_nacos
       start_infra
       ;;
     build)
@@ -298,10 +358,10 @@ main() {
       ensure_maven
       ensure_docker
       check_ports
+      check_existing_nacos
       start_infra
-      mvn_build
       echo
-      ok "全部完成。下一步建议："
+      ok "环境就绪，docker 基础设施已启动。下一步建议："
       cat <<EOF
   1. 打开 http://localhost:8848/nacos ，在命名空间 fe9e39ae-06af-49c3-9c5b-6060df2cf93e
      下导入下列 data-id 配置（参考 nacos_config/ 目录里的历史样例）：
@@ -310,14 +370,28 @@ main() {
        - sys-server.yml
        - default-mysql.yml / default-redis.yml / default-rabbitmq.yml
        - default-okhttp.yml / knife4j.yml
-  2. 启动服务（按顺序）：
+  2. 需要打包时执行：./deploy.sh build
+  3. 启动服务（按顺序）：
        mvn -pl modules/data-server -am spring-boot:run
        mvn -pl gateway -am spring-boot:run
 EOF
       ;;
+    all-with-build)
+      ensure_xcode_clt
+      ensure_brew
+      ensure_jdk
+      ensure_maven
+      ensure_docker
+      check_ports
+      check_existing_nacos
+      start_infra
+      mvn_build
+      echo
+      ok "全部完成（环境 + docker + mvn build）。"
+      ;;
     *)
       err "未知子命令：$cmd"
-      echo "用法：$0 [check|infra|build|down|all]"
+      echo "用法：$0 [check|infra|build|down|all|all-with-build]"
       exit 1
       ;;
   esac

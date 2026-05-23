@@ -4,6 +4,8 @@ services:
   nacos:
     image: nacos/nacos-server:v2.3.0
     container_name: ds-nacos
+    # 该镜像没有 arm64 manifest，Apple Silicon 上需要走 Rosetta 模拟 amd64
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       MODE: standalone
@@ -64,8 +66,11 @@ services:
     container_name: ds-rabbitmq
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: admin123456
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      # guest 用户默认只允许 loopback 登录，宿主机上的 data-server 走的是
+      # docker 端口映射 → 在 broker 看来是远端连接，因此需要放开。
+      RABBITMQ_LOOPBACK_USERS: "none"
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -76,6 +81,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: ds-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # 控制台 UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
@@ -98,11 +122,54 @@ services:
       - "9300:9300"
     volumes:
       - es_data:/usr/share/elasticsearch/data
+    # 首次启动自动安装 analysis-ik 中文分词插件（data-server 启动会强校验）
+    # 插件版本必须与 ES 镜像主版本号严格一致
+    command: >
+      bash -c "
+        if ! ./bin/elasticsearch-plugin list | grep -q analysis-ik; then
+          ./bin/elasticsearch-plugin install --batch https://release.infinilabs.com/analysis-ik/stable/elasticsearch-analysis-ik-8.13.4.zip;
+        fi &&
+        /usr/local/bin/docker-entrypoint.sh elasticsearch
+      "
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
+
+  # 把宿主机 ~/logs/data-server/*.log 采集到 ES，索引 data-server-yyyy.MM.dd
+  # filebeat.yml 复用 modules/data-server/docker/filebeat.yml，不重复一份
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.4
+    container_name: ds-filebeat
+    restart: unless-stopped
+    user: root
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ../modules/data-server/docker/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ${HOME}/logs/data-server:/var/log/app:ro
+    command: ["-e", "--strict.perms=false"]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: ds-kibana
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_HOST: "0.0.0.0"
+      I18N_LOCALE: zh-CN
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
 
 volumes:
   nacos_data:
@@ -111,3 +178,4 @@ volumes:
   redis_data:
   rabbitmq_data:
   es_data:
+  minio_data:
