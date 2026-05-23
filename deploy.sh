@@ -82,8 +82,14 @@ ensure_brew() {
 
 # ---------- JDK 17 ----------
 current_java_major() {
-  command -v java >/dev/null 2>&1 || { echo ""; return; }
-  java -version 2>&1 | awk -F\" '/version/ {print $2}' | awk -F. '{print ($1=="1"?$2:$1)}'
+  command -v java >/dev/null 2>&1 || { echo ""; return 0; }
+  # 注意：macOS 自带的 /usr/bin/java 在没装 JDK 时会以非 0 退出；
+  # 配合 set -euo pipefail 会让外层 major="$(...)" 静默挂掉。
+  # 这里吞掉非 0，保证函数始终返回 0，由调用方根据输出是否为空判断。
+  local out
+  out="$(java -version 2>&1 || true)"
+  echo "$out" | awk -F\" '/version/ {print $2}' | awk -F. '{print ($1=="1"?$2:$1)}' || true
+  return 0
 }
 
 ensure_jdk() {
