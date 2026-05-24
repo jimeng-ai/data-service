@@ -1,4 +1,0 @@
-okhttp:
-  read-timeout: 90000
-  connect-timeout: 90000
-  write-timeout: 90000
