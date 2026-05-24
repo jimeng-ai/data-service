@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -26,7 +27,7 @@ public class DocumentController {
     private final DocumentService documentService;
 
     @Operation(summary = "上传文档到知识库", description = "将文件上传到指定知识库并触发异步入库流程（解析 → 切片 → 上下文化 → 向量化 → 入 ES）")
-    @PostMapping("/kb/{kbId}/documents")
+    @PostMapping(value = "/kb/{kbId}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public KbDocument upload(@Parameter(description = "知识库 ID") @PathVariable Long kbId,
                              @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file) throws Exception {
         return documentService.upload(kbId, file);
