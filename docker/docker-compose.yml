@@ -2,10 +2,8 @@ name: data-service-infra
 
 services:
   nacos:
-    image: nacos/nacos-server:v2.3.0
+    image: nacos/nacos-server:v2.4.3
     container_name: ds-nacos
-    # 该镜像没有 arm64 manifest，Apple Silicon 上需要走 Rosetta 模拟 amd64
-    platform: linux/amd64
     restart: unless-stopped
     environment:
       MODE: standalone
@@ -30,7 +28,7 @@ services:
     container_name: ds-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_ROOT_PASSWORD: 123456
       TZ: Asia/Shanghai
     command:
       - --character-set-server=utf8mb4
@@ -41,7 +39,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123456"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p123456"]
       interval: 10s
       timeout: 5s
       retries: 20
