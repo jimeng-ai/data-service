@@ -216,4 +216,144 @@ CREATE TABLE IF NOT EXISTS `kb_chunk` (
     KEY `idx_kb` (`kb_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='RAG 文档切片（与 ES 双写）';
 
+-- ============================================================================
+-- Agent 平台 / HTTP 插件系统（多租户）
+-- 设计文档：~/.claude/plans/agent-agent-indexed-feather.md
+-- 租户隔离：所有表都带 tenant_id (VARCHAR(64))，与 ai_model_call_log.tenant_id 对齐；
+-- 数据访问层由 MyBatis-Plus TenantLineInnerInterceptor 自动注入过滤。
+-- ============================================================================
+
+-- 插件主表：定义一个对外的 HTTP API 插件
+CREATE TABLE IF NOT EXISTS `plugin` (
+    `id`              BIGINT       NOT NULL                COMMENT '主键，MyBatis-Plus 雪花算法生成',
+    `tenant_id`       VARCHAR(64)  NOT NULL                COMMENT '租户 ID（来自 X-Tenant-Id）',
+    `code`            VARCHAR(64)  NOT NULL                COMMENT '插件 slug，租户内唯一，如 jira / weather',
+    `name`            VARCHAR(128) NOT NULL                COMMENT '插件展示名',
+    `description`     VARCHAR(1024) DEFAULT NULL           COMMENT '插件描述（给 LLM 看的简介）',
+    `version`         VARCHAR(32)  DEFAULT NULL            COMMENT '插件版本',
+    `base_url`        VARCHAR(512) DEFAULT NULL            COMMENT '默认 base URL（可被 url_template 覆盖）',
+    `auth_type`       VARCHAR(32)  NOT NULL DEFAULT 'NONE' COMMENT '认证类型：NONE/API_KEY/BEARER/BASIC/HMAC',
+    `auth_config`     JSON         DEFAULT NULL            COMMENT '认证非密配置（位置/算法/签名模板等）',
+    `status`          VARCHAR(16)  NOT NULL DEFAULT 'DRAFT' COMMENT '状态：DRAFT/PUBLISHED/DISABLED',
+    `owner_id`        VARCHAR(64)  DEFAULT NULL            COMMENT '插件所有者用户 ID',
+    `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除：0-未删除，1-已删除',
+    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_plugin_tenant_code` (`tenant_id`, `code`),
+    KEY `idx_plugin_tenant_status` (`tenant_id`, `status`),
+    KEY `idx_plugin_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件主表';
+
+-- 插件下的工具（一对多）
+CREATE TABLE IF NOT EXISTS `plugin_tool` (
+    `id`              BIGINT       NOT NULL                COMMENT '主键',
+    `tenant_id`       VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `plugin_id`       BIGINT       NOT NULL                COMMENT '所属插件 ID',
+    `name`            VARCHAR(128) NOT NULL                COMMENT '工具名（喂给 LLM），租户内唯一，约定 <plugin_code>.<verb>.<noun>',
+    `description`     TEXT         DEFAULT NULL            COMMENT '工具描述（LLM 判断何时调用）',
+    `input_schema`    JSON         DEFAULT NULL            COMMENT 'Claude input_schema 格式的 JSON Schema',
+    `enabled`         TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '是否启用：0-禁用，1-启用',
+    `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_plugin_tool_tenant_name` (`tenant_id`, `name`),
+    KEY `idx_plugin_tool_plugin_id` (`plugin_id`),
+    KEY `idx_plugin_tool_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件工具表';
+
+-- 工具与 HTTP 调用映射（一对一）
+CREATE TABLE IF NOT EXISTS `plugin_http_mapping` (
+    `id`                 BIGINT       NOT NULL                COMMENT '主键',
+    `tenant_id`          VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `plugin_tool_id`     BIGINT       NOT NULL                COMMENT '所属工具 ID',
+    `method`             VARCHAR(8)   NOT NULL                COMMENT 'HTTP 方法：GET/POST/PUT/PATCH/DELETE',
+    `url_template`       VARCHAR(1024) NOT NULL               COMMENT 'URL 模板，支持 {{namespace.path}} 占位',
+    `headers_template`   JSON         DEFAULT NULL            COMMENT 'Header 模板（JSON 对象，值可含占位符）',
+    `query_template`     JSON         DEFAULT NULL            COMMENT 'Query 参数模板',
+    `body_template`      JSON         DEFAULT NULL            COMMENT 'Body 模板（节点树，叶子可含占位符）',
+    `body_content_type`  VARCHAR(64)  DEFAULT 'application/json' COMMENT 'Body Content-Type',
+    `response_extract`   VARCHAR(512) DEFAULT NULL            COMMENT '响应抽取 JSONPath（如 $.main），为空则返完整响应',
+    `response_max_items` INT          DEFAULT 50              COMMENT '数组截断阈值，避免上下文爆炸',
+    `timeout_ms`         INT          DEFAULT NULL            COMMENT 'HTTP 超时（毫秒），为空走全局默认',
+    `deleted`            TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`        VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`        VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_plugin_http_mapping_tool` (`plugin_tool_id`),
+    KEY `idx_plugin_http_mapping_tenant` (`tenant_id`),
+    KEY `idx_plugin_http_mapping_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件工具的 HTTP 调用映射';
+
+-- 插件凭证（明文存储，预留 encryption_version 字段以便未来加密）
+CREATE TABLE IF NOT EXISTS `plugin_credential` (
+    `id`                  BIGINT       NOT NULL                COMMENT '主键',
+    `tenant_id`           VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `plugin_id`           BIGINT       NOT NULL                COMMENT '所属插件 ID',
+    `owner_id`            VARCHAR(64)  DEFAULT NULL            COMMENT '所属用户 ID（NULL=租户内共享）',
+    `alias`               VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '凭证别名，如 prod / test',
+    `credential_data`     TEXT         NOT NULL                COMMENT '凭证内容（明文 JSON 字符串）',
+    `encryption_version`  INT          NOT NULL DEFAULT 0      COMMENT '加密版本：0=明文；预留未来加密',
+    `is_default`          TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否是该插件的默认凭证',
+    `deleted`             TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`         VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`         VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_plugin_credential_tenant_plugin_alias` (`tenant_id`, `plugin_id`, `alias`),
+    KEY `idx_plugin_credential_default` (`plugin_id`, `is_default`),
+    KEY `idx_plugin_credential_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件凭证表';
+
+-- Agent 实体：岗位智能体
+CREATE TABLE IF NOT EXISTS `agent` (
+    `id`              BIGINT       NOT NULL                COMMENT '主键',
+    `tenant_id`       VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `code`            VARCHAR(64)  NOT NULL                COMMENT 'Agent slug，租户内唯一',
+    `name`            VARCHAR(128) NOT NULL                COMMENT 'Agent 展示名',
+    `description`     VARCHAR(1024) DEFAULT NULL           COMMENT 'Agent 描述',
+    `avatar_url`      VARCHAR(512) DEFAULT NULL            COMMENT '头像 URL',
+    `system_prompt`   TEXT         DEFAULT NULL            COMMENT '人设 / 系统提示词',
+    `model`           VARCHAR(128) DEFAULT NULL            COMMENT '默认模型（如 claude-opus-4-1），请求体可 override',
+    `model_params`    JSON         DEFAULT NULL            COMMENT '模型参数默认值 {temperature, max_tokens, ...}',
+    `status`          VARCHAR(16)  NOT NULL DEFAULT 'DRAFT' COMMENT '状态：DRAFT/PUBLISHED/DISABLED',
+    `owner_id`        VARCHAR(64)  DEFAULT NULL            COMMENT 'Agent 所有者用户 ID',
+    `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_agent_tenant_code` (`tenant_id`, `code`),
+    KEY `idx_agent_tenant_status` (`tenant_id`, `status`),
+    KEY `idx_agent_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent 实体表';
+
+-- Agent 与插件多对多绑定
+CREATE TABLE IF NOT EXISTS `agent_plugin` (
+    `id`                 BIGINT       NOT NULL                COMMENT '主键',
+    `tenant_id`          VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `agent_id`           BIGINT       NOT NULL                COMMENT 'Agent ID',
+    `plugin_id`          BIGINT       NOT NULL                COMMENT 'Plugin ID',
+    `credential_alias`   VARCHAR(64)  DEFAULT NULL            COMMENT '凭证别名（NULL = 走 is_default 凭证）',
+    `deleted`            TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`        VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`        VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_agent_plugin_tenant_agent_plugin` (`tenant_id`, `agent_id`, `plugin_id`),
+    KEY `idx_agent_plugin_agent` (`agent_id`),
+    KEY `idx_agent_plugin_plugin` (`plugin_id`),
+    KEY `idx_agent_plugin_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent 与插件绑定表';
+
 SET FOREIGN_KEY_CHECKS = 1;

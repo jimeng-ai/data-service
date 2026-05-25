@@ -1,16 +1,18 @@
 package com.jimeng.dataserver.ai.skill.service;
 
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
-import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
+import com.jimeng.dataserver.ai.skill.model.ToolPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
+import com.jimeng.dataserver.ai.skill.source.ToolPackageRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -42,7 +44,7 @@ public class SkillRuntimeService {
     @Value("${skill.skill-system-prompt}")
     private String skillSystemPrompt;
 
-    private final SkillPackageLoaderService skillPackageLoaderService;
+    private final ToolPackageRegistry toolPackageRegistry;
     private final SkillToolExecutorRegistryService skillToolExecutorRegistryService;
 
     // ------------------------------------------------------------------ public API
@@ -55,19 +57,19 @@ public class SkillRuntimeService {
             return SkillApplyResult.disabled();
         }
 
-        Map<String, SkillPackage> skillMap = skillPackageLoaderService.loadSkillPackages();
+        Map<String, ToolPackage> skillMap = aggregateToolPackages();
         if (skillMap.isEmpty()) return SkillApplyResult.disabled();
 
         List<String> explicitNames = extractExplicitSkillNamesAndStrip(messages);
         if (!explicitNames.isEmpty()) {
-            List<SkillPackage> selected = resolveSelectedSkills(skillMap, explicitNames);
+            List<ToolPackage> selected = resolveSelectedSkills(skillMap, explicitNames);
             if (selected.isEmpty()) return SkillApplyResult.disabled();
             injectFullSkillContext(body, selected, adapter);
             return SkillApplyResult.activated(toNames(selected));
         }
 
         // Discovery Phase
-        List<SkillPackage> allSkills = selectForDiscovery(skillMap);
+        List<ToolPackage> allSkills = selectForDiscovery(skillMap);
         if (allSkills.isEmpty()) return SkillApplyResult.disabled();
         log.info("Discovery Phase skills: {}", toNames(allSkills));
         injectDiscoveryContext(body, allSkills, adapter);
@@ -76,17 +78,17 @@ public class SkillRuntimeService {
 
     public ActivationResult handleActivateSkills(Map<String, Object> body,
                                                   ToolUseCall activateCall,
-                                                  Map<String, SkillPackage> skillMap,
+                                                  Map<String, ToolPackage> skillMap,
                                                   AiProtocolAdapter adapter) {
         List<String> requestedNames = parseSkillNames(activateCall.getInput());
 
         List<String> validNames = new ArrayList<>();
         List<String> invalidNames = new ArrayList<>();
-        List<SkillPackage> selected = new ArrayList<>();
+        List<ToolPackage> selected = new ArrayList<>();
         int limit = Math.max(maxSelected, 1);
 
         for (String name : requestedNames) {
-            SkillPackage pkg = skillPackageLoaderService.findByName(skillMap, name);
+            ToolPackage pkg = toolPackageRegistry.findByName(skillMap, name);
             if (pkg != null) {
                 validNames.add(pkg.getName());
                 selected.add(pkg);
@@ -126,7 +128,7 @@ public class SkillRuntimeService {
     // ------------------------------------------------------------------ internals
 
     private void injectFullSkillContext(Map<String, Object> body,
-                                         List<SkillPackage> skills,
+                                         List<ToolPackage> skills,
                                          AiProtocolAdapter adapter) {
         String prompt = buildFullSkillPrompt(skills);
         if (StrUtil.isNotBlank(prompt)) adapter.appendSystemContent(body, prompt);
@@ -135,12 +137,12 @@ public class SkillRuntimeService {
     }
 
     private void injectDiscoveryContext(Map<String, Object> body,
-                                         List<SkillPackage> skills,
+                                         List<ToolPackage> skills,
                                          AiProtocolAdapter adapter) {
         StringBuilder sb = new StringBuilder(skillSystemPrompt).append("\n\n");
         sb.append("以下是可用的 Skill 列表。如果用户的问题需要使用某个 Skill，");
         sb.append("请调用 activate_skills 工具激活对应的 Skill。\n\n");
-        for (SkillPackage skill : skills) {
+        for (ToolPackage skill : skills) {
             sb.append("- **").append(skill.getName()).append("**: ").append(skill.getDescription()).append("\n");
         }
         adapter.appendSystemContent(body, sb.toString().trim());
@@ -151,7 +153,7 @@ public class SkillRuntimeService {
         adapter.ensureToolChoiceAuto(body);
     }
 
-    private void mergeTools(Map<String, Object> body, List<SkillPackage> skills, AiProtocolAdapter adapter) {
+    private void mergeTools(Map<String, Object> body, List<ToolPackage> skills, AiProtocolAdapter adapter) {
         List<Object> merged = new ArrayList<>();
         Set<String> names = new LinkedHashSet<>();
 
@@ -160,7 +162,7 @@ public class SkillRuntimeService {
             if (StrUtil.isNotBlank(name) && names.add(name)) merged.add(toolDef);
         }
 
-        for (SkillPackage skill : skills) {
+        for (ToolPackage skill : skills) {
             for (SkillToolDefinition def : skill.getTools()) {
                 if (def == null || StrUtil.isBlank(def.getModelName())) continue;
                 if (!names.add(def.getModelName())) continue;
@@ -171,10 +173,10 @@ public class SkillRuntimeService {
         if (!merged.isEmpty()) adapter.setToolsList(body, merged);
     }
 
-    private String buildFullSkillPrompt(List<SkillPackage> skills) {
+    private String buildFullSkillPrompt(List<ToolPackage> skills) {
         if (skills == null || skills.isEmpty()) return "";
         StringBuilder sb = new StringBuilder(skillSystemPrompt);
-        for (SkillPackage skill : skills) {
+        for (ToolPackage skill : skills) {
             sb.append("\n[SKILL: ").append(skill.getName()).append("]\n");
             if (StrUtil.isNotBlank(skill.getDescription())) {
                 sb.append("描述: ").append(skill.getDescription()).append("\n");
@@ -186,18 +188,18 @@ public class SkillRuntimeService {
         return sb.toString().trim();
     }
 
-    private List<SkillPackage> selectForDiscovery(Map<String, SkillPackage> skillMap) {
-        List<SkillPackage> all = new ArrayList<>(skillMap.values());
+    private List<ToolPackage> selectForDiscovery(Map<String, ToolPackage> skillMap) {
+        List<ToolPackage> all = new ArrayList<>(skillMap.values());
         int limit = Math.max(maxSelected, 1);
         return all.size() <= limit ? all : new ArrayList<>(all.subList(0, limit));
     }
 
-    private List<SkillPackage> resolveSelectedSkills(Map<String, SkillPackage> skillMap,
+    private List<ToolPackage> resolveSelectedSkills(Map<String, ToolPackage> skillMap,
                                                        List<String> explicitNames) {
         Set<String> dedup = new LinkedHashSet<>(explicitNames);
-        List<SkillPackage> selected = new ArrayList<>();
+        List<ToolPackage> selected = new ArrayList<>();
         for (String name : dedup) {
-            SkillPackage matched = skillPackageLoaderService.findByName(skillMap, name);
+            ToolPackage matched = toolPackageRegistry.findByName(skillMap, name);
             if (matched == null) {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST, "未找到skill: " + name);
             }
@@ -289,7 +291,42 @@ public class SkillRuntimeService {
         return n.length() > 128 ? n.substring(0, 128) : n;
     }
 
-    private List<String> toNames(List<SkillPackage> skills) {
-        return skills.stream().map(SkillPackage::getName).toList();
+    private List<String> toNames(List<ToolPackage> skills) {
+        return skills.stream().map(ToolPackage::getName).toList();
+    }
+
+    /**
+     * 暴露给 AiConversationLoop：拿到当前请求的工具包视图（包含 Skill + 插件，
+     * 已按 AgentContext 过滤——只暴露 Agent 绑定的插件）。
+     */
+    public Map<String, ToolPackage> aggregateToolPackages() {
+        Map<String, ToolPackage> all = toolPackageRegistry.aggregate();
+        return filterByAgentAllowlist(all);
+    }
+
+    /**
+     * 按当前 AgentContext 过滤：
+     * <ul>
+     *   <li>没有 Agent 上下文 → 不过滤（兼容直接调 Claude 不带 agent_id 的旧用法）</li>
+     *   <li>有 Agent 上下文 → Skill（tenantId=null）全部保留；插件只保留 Agent 绑定的</li>
+     * </ul>
+     */
+    private Map<String, ToolPackage> filterByAgentAllowlist(Map<String, ToolPackage> packages) {
+        AgentRuntimeView agent = AgentContext.get();
+        if (agent == null) return packages;
+        if (agent.getAllowedPluginCodes() == null) return packages;
+
+        java.util.LinkedHashMap<String, ToolPackage> filtered = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, ToolPackage> e : packages.entrySet()) {
+            ToolPackage pkg = e.getValue();
+            if (pkg.getTenantId() == null) {
+                // Skill 全局可见
+                filtered.put(e.getKey(), pkg);
+            } else if (agent.getAllowedPluginCodes().contains(pkg.getName())) {
+                // 插件按 Agent 绑定过滤
+                filtered.put(e.getKey(), pkg);
+            }
+        }
+        return filtered;
     }
 }

@@ -4,7 +4,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 
-public class SkillPackage {
+public class SkillPackage implements ToolPackage {
 
     private final String name;
     private final String description;

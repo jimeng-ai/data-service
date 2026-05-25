@@ -11,10 +11,9 @@ import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
-import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
+import com.jimeng.dataserver.ai.skill.model.ToolPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
-import com.jimeng.dataserver.ai.skill.service.SkillPackageLoaderService;
 import com.jimeng.dataserver.ai.skill.service.SkillRuntimeService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -39,7 +38,6 @@ public class AiConversationLoop {
 
     private final RequestService requestService;
     private final SkillRuntimeService skillRuntimeService;
-    private final SkillPackageLoaderService skillPackageLoaderService;
     private final AiModelCallRecordService aiModelCallRecordService;
     private final SseServiceUtil sseServiceUtil;
 
@@ -57,8 +55,8 @@ public class AiConversationLoop {
         if (skillApplyResult.isEnabled()) {
             log.info("启用skills ({}): {}", rc.provider(), skillApplyResult.getSelectedSkillNames());
         }
-        Map<String, SkillPackage> skillMap = skillApplyResult.isDiscoveryPhase()
-                ? skillPackageLoaderService.loadSkillPackages() : null;
+        Map<String, ToolPackage> skillMap = skillApplyResult.isDiscoveryPhase()
+                ? skillRuntimeService.aggregateToolPackages() : null;
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
 
@@ -132,8 +130,8 @@ public class AiConversationLoop {
         if (skillApplyResult.isEnabled()) {
             log.info("流式启用skills ({}): {}", rc.provider(), skillApplyResult.getSelectedSkillNames());
         }
-        Map<String, SkillPackage> skillMap = skillApplyResult.isDiscoveryPhase()
-                ? skillPackageLoaderService.loadSkillPackages() : null;
+        Map<String, ToolPackage> skillMap = skillApplyResult.isDiscoveryPhase()
+                ? skillRuntimeService.aggregateToolPackages() : null;
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
         long totalStart = System.currentTimeMillis();

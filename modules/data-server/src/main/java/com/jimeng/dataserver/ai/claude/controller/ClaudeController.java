@@ -46,6 +46,9 @@ public class ClaudeController {
     private SseEmitter startStream(Map<String, Object> requestBody, HttpServletRequest request) {
         String connectionId = UUID.randomUUID().toString();
         String traceId = extractTraceId(request);
+        // 在主线程完成 Agent 上下文加载（修改 body + 设置 AgentContext ThreadLocal），
+        // 然后让 MdcAsyncSupport 把 ThreadLocal 状态一并传递到 streamExecutor 线程。
+        claudeService.prepareAgentContext(requestBody);
         SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
         streamExecutor.execute(MdcAsyncSupport.wrap(connectionId,
                 () -> claudeService.messagesStream(requestBody, connectionId, traceId)));
