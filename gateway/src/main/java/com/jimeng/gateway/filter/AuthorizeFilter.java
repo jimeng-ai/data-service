@@ -49,6 +49,9 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
         return 99;
     }
 
+    /** 租户头。所有非白名单请求都由网关从 JWT 解出后强制注入；客户端传入的同名头会被丢弃。 */
+    private static final String HEADER_TENANT_ID = "X-Tenant-Id";
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         ServerHttpRequest request = exchange.getRequest();
@@ -57,9 +60,12 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
         String urlPath = request.getURI().getRawPath();
         // 判断是否在白名单
         if (!whetherThePathIsNotVerified(urlPath)) {
-            // 白名单路径也注入 trace-id，确保下游服务日志可追踪
+            // 白名单路径也注入 trace-id，确保下游服务日志可追踪；
+            // 同时剥离客户端可能带的 X-Tenant-Id，避免绕过租户校验。
             ServerWebExchange whiteListExchange = exchange.mutate()
-                    .request(builder -> builder.header("x-trace-id", UUID.randomUUID().toString()))
+                    .request(builder -> builder
+                            .headers(h -> h.remove(HEADER_TENANT_ID))
+                            .header("x-trace-id", UUID.randomUUID().toString()))
                     .build();
             return chain.filter(whiteListExchange);
         }
@@ -105,15 +111,26 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
                 return buildErrorResponse(response, HttpStatus.UNAUTHORIZED, "Invalid token payload");
             }
 
-            // 将userId放入请求头，用于下游服务使用
+            // 租户 ID 由 JWT 决定。客户端任何 X-Tenant-Id 都会被覆盖，
+            // 这是租户隔离的关键不变量——否则 admin 改个 header 就能越权访问别家数据。
+            Object tenantClaim = payload.getClaim("tenant_id");
+            String tenantId = tenantClaim == null ? null : String.valueOf(tenantClaim);
+            if (StrUtil.isBlank(tenantId) || "null".equals(tenantId)) {
+                log.warn("Missing tenant_id claim in token for path: {}", urlPath);
+                return buildErrorResponse(response, HttpStatus.UNAUTHORIZED, "Invalid token payload");
+            }
+
+            // 将userId/tenantId放入请求头，用于下游服务使用
             ServerWebExchange modifiedExchange = exchange.mutate()
                     .request(builder -> {
+                        builder.headers(h -> h.remove(HEADER_TENANT_ID));
                         builder.header("user-id", userId);
+                        builder.header(HEADER_TENANT_ID, tenantId);
                         builder.header("x-trace-id", UUID.randomUUID().toString());
                     })
                     .build();
 
-            log.debug("Authentication successful for user: {} on path: {}", userId, urlPath);
+            log.debug("Authentication successful for user: {} tenant: {} on path: {}", userId, tenantId, urlPath);
             return chain.filter(modifiedExchange);
 
         } catch (Exception e) {

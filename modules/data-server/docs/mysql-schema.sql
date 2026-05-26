@@ -356,4 +356,24 @@ CREATE TABLE IF NOT EXISTS `agent_plugin` (
     KEY `idx_agent_plugin_deleted` (`deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent 与插件绑定表';
 
+-- 管理后台账户表
+-- 启动时 AdminAuthInitializer 会自动写入默认账号 admin / admin123（BCrypt 当场算 hash）
+CREATE TABLE IF NOT EXISTS `sys_admin` (
+    `id`            BIGINT       NOT NULL                       COMMENT '主键（雪花算法分配）',
+    `tenant_id`     VARCHAR(64)  NOT NULL DEFAULT 'default'     COMMENT '所属租户 ID（登录后写入 JWT，gateway 注入 X-Tenant-Id）',
+    `username`      VARCHAR(64)  NOT NULL                       COMMENT '登录名（全局唯一）',
+    `password_hash` VARCHAR(128) NOT NULL                       COMMENT 'BCrypt 哈希',
+    `display_name`  VARCHAR(64)                                 COMMENT '展示名',
+    `status`        TINYINT      NOT NULL DEFAULT 1             COMMENT '1=启用 0=禁用',
+    `last_login_at` DATETIME                                    COMMENT '最近登录时间',
+    `deleted`       TINYINT      NOT NULL DEFAULT 0             COMMENT '0=未删除 1=已删除',
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sys_admin_username` (`username`, `deleted`),
+    KEY `idx_sys_admin_tenant` (`tenant_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='管理后台账户';
+
 SET FOREIGN_KEY_CHECKS = 1;
