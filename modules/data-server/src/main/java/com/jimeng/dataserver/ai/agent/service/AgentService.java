@@ -79,6 +79,13 @@ public class AgentService {
         return agent;
     }
 
+    public Agent unpublish(Long id) {
+        Agent agent = getById(id);
+        agent.setStatus("DRAFT");
+        agentMapper.updateById(agent);
+        return agent;
+    }
+
     // ------------------------------------------------------------------ Agent-Plugin 绑定
 
     public AgentPlugin bindPlugin(Long agentId, Long pluginId, String credentialAlias) {

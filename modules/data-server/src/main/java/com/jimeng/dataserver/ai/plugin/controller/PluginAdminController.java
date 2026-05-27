@@ -84,6 +84,12 @@ public class PluginAdminController {
         return crudService.publish(id);
     }
 
+    @Operation(summary = "下架插件（status = DRAFT）")
+    @PostMapping("/plugins/{id}/unpublish")
+    public Plugin unpublishPlugin(@PathVariable Long id) {
+        return crudService.unpublish(id);
+    }
+
     // ============================ Tool + HTTP Mapping ============================
 
     @Data

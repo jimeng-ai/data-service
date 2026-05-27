@@ -100,6 +100,14 @@ public class PluginCrudService {
         return plugin;
     }
 
+    public Plugin unpublish(Long id) {
+        Plugin plugin = getPlugin(id);
+        plugin.setStatus("DRAFT");
+        pluginMapper.updateById(plugin);
+        registryService.reload();
+        return plugin;
+    }
+
     // ============================ Tool + HTTP Mapping ============================
 
     @Transactional

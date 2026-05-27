@@ -71,6 +71,12 @@ public class AgentAdminController {
         return agentService.publish(id);
     }
 
+    @Operation(summary = "下架 Agent（status = DRAFT）")
+    @PostMapping("/agents/{id}/unpublish")
+    public Agent unpublish(@PathVariable Long id) {
+        return agentService.unpublish(id);
+    }
+
     // ============================ Agent-Plugin 绑定 ============================
 
     @Data
