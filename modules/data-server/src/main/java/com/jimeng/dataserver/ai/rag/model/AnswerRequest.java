@@ -14,7 +14,10 @@ import java.util.List;
 @AllArgsConstructor
 @NoArgsConstructor
 public class AnswerRequest {
-    @Schema(description = "知识库 ID（必填）", example = "1")
+    @Schema(description = "可选：Agent ID。带上后会加载该 Agent 的人设/模型/插件，并注入到本次对话。", example = "1")
+    private String agentId;
+
+    @Schema(description = "知识库 ID（可选）。仅当提供时才执行知识检索（RAG）；为空则纯对话，不强制走 RAG。", example = "1")
     private Long kbId;
 
     @Schema(description = "用户当前轮提问（必填）", example = "高德 POI 一级分类有哪些？")

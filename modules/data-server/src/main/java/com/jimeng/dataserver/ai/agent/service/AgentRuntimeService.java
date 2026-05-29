@@ -17,12 +17,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -54,7 +53,6 @@ public class AgentRuntimeService {
         List<AgentPlugin> bindings = agentPluginMapper.selectList(bindingQuery);
 
         Set<String> allowedPluginCodes = new HashSet<>();
-        Map<String, String> credentialAliases = new HashMap<>();
 
         if (!bindings.isEmpty()) {
             List<Long> pluginIds = bindings.stream().map(AgentPlugin::getPluginId).toList();
@@ -62,18 +60,10 @@ public class AgentRuntimeService {
                     .in(Plugin::getId, pluginIds)
                     .eq(Plugin::getStatus, "PUBLISHED");
             List<Plugin> plugins = pluginMapper.selectList(pluginQuery);
-            Map<Long, Plugin> pluginById = plugins.stream()
-                    .collect(Collectors.toMap(Plugin::getId, Function.identity()));
-
-            for (AgentPlugin b : bindings) {
-                Plugin p = pluginById.get(b.getPluginId());
-                if (p == null) continue;  // 插件未发布或已删
-                allowedPluginCodes.add(p.getCode());
-                if (StringUtils.hasText(b.getCredentialAlias())) {
-                    credentialAliases.put(p.getCode(), b.getCredentialAlias());
-                }
-            }
+            allowedPluginCodes = plugins.stream().map(Plugin::getCode).collect(Collectors.toSet());
         }
+
+        KbBinding kb = parseKbConfig(agent.getKbConfig());
 
         return AgentRuntimeView.builder()
                 .agentId(agent.getId())
@@ -84,7 +74,9 @@ public class AgentRuntimeService {
                 .defaultModel(agent.getModel())
                 .defaultModelParams(parseJsonMap(agent.getModelParams()))
                 .allowedPluginCodes(Collections.unmodifiableSet(allowedPluginCodes))
-                .pluginCredentialAliases(Collections.unmodifiableMap(credentialAliases))
+                .kbIds(kb.kbIds())
+                .kbTopK(kb.topK())
+                .kbScoreThreshold(kb.scoreThreshold())
                 .build();
     }
 
@@ -97,5 +89,50 @@ public class AgentRuntimeService {
             log.warn("解析 agent.model_params 失败, json={}, error={}", json, e.getMessage());
             return Collections.emptyMap();
         }
+    }
+
+    /** 解析 agent.kb_config（{kbIds:[...], topK, scoreThreshold}）。 */
+    private record KbBinding(Set<Long> kbIds, Integer topK, Double scoreThreshold) {}
+
+    @SuppressWarnings("unchecked")
+    private KbBinding parseKbConfig(String json) {
+        if (!StringUtils.hasText(json)) {
+            return new KbBinding(Collections.emptySet(), null, null);
+        }
+        try {
+            Map<String, Object> m = CommonUtil.getObjectMapper().readValue(json, Map.class);
+            Set<Long> ids = new LinkedHashSet<>();
+            Object list = m.get("kbIds");
+            if (list instanceof List<?> l) {
+                for (Object o : l) {
+                    Long id = toLong(o);
+                    if (id != null) ids.add(id);
+                }
+            }
+            return new KbBinding(ids, toInteger(m.get("topK")), toDouble(m.get("scoreThreshold")));
+        } catch (Exception e) {
+            log.warn("解析 agent.kb_config 失败, json={}, error={}", json, e.getMessage());
+            return new KbBinding(Collections.emptySet(), null, null);
+        }
+    }
+
+    private Long toLong(Object o) {
+        if (o == null) return null;
+        if (o instanceof Number n) return n.longValue();
+        try {
+            return Long.parseLong(String.valueOf(o).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private Integer toInteger(Object o) {
+        if (o instanceof Number n) return n.intValue();
+        return null;
+    }
+
+    private Double toDouble(Object o) {
+        if (o instanceof Number n) return n.doubleValue();
+        return null;
     }
 }

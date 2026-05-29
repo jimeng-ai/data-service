@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.persistence.entity.AiModelCallContent;
 import com.jimeng.persistence.entity.AiModelCallLog;
 import com.jimeng.persistence.mapper.AiModelCallContentMapper;
@@ -70,7 +71,10 @@ public class AiModelCallRecordService {
         logEntity.setTenantId(firstNonBlank(
                 getString(requestBody, "tenant_id", null),
                 getHeader(request, "tenant-id"),
-                getHeader(request, "x-tenant-id")
+                getHeader(request, "x-tenant-id"),
+                // 流式问答在异步线程里记录日志，此时已无 HTTP 请求上下文，
+                // 但 MdcAsyncSupport 已把租户传播到 TenantContext，作为兜底来源。
+                TenantContext.get()
         ));
         logEntity.setUserId(firstNonBlank(
                 getString(requestBody, "user_id", null),

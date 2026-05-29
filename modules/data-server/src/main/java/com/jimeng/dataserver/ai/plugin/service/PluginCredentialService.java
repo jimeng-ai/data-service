@@ -10,11 +10,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
  * 凭证服务。
+ *
+ * <p>每个插件在租户内仅有一份凭证（{@code uk(tenant_id, plugin_id)}），不再支持 alias / is_default。
  *
  * <p>当前版本明文存储：{@code credential_data} 直接是 JSON 字符串，
  * 解析后作为 {@code secrets} 命名空间塞进 {@link com.jimeng.dataserver.ai.plugin.dto.PluginExecutionContext}。
@@ -39,58 +40,41 @@ public class PluginCredentialService {
      * 解析出可直接用作 {@code secrets} 命名空间的 Map。
      *
      * @param pluginId 插件 ID
-     * @param alias    凭证别名；为空走 {@code is_default=true}
      */
-    public Map<String, Object> resolveSecrets(Long pluginId, String alias) {
-        PluginCredential cred = findCredential(pluginId, alias);
+    public Map<String, Object> resolveSecrets(Long pluginId) {
+        PluginCredential cred = findByPlugin(pluginId);
         if (cred == null) {
-            throw new CredentialMissingException(
-                    "凭证缺失: pluginId=" + pluginId + ", alias=" + (alias == null ? "<default>" : alias));
+            throw new CredentialMissingException("凭证缺失: pluginId=" + pluginId);
         }
         return parseCredentialJson(cred);
     }
 
-    public PluginCredential findCredential(Long pluginId, String alias) {
-        LambdaQueryWrapper<PluginCredential> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(PluginCredential::getPluginId, pluginId);
-        if (StringUtils.hasText(alias)) {
-            wrapper.eq(PluginCredential::getAlias, alias);
-        } else {
-            wrapper.eq(PluginCredential::getIsDefault, Boolean.TRUE);
-        }
-        wrapper.last("LIMIT 1");
+    public PluginCredential findByPlugin(Long pluginId) {
+        LambdaQueryWrapper<PluginCredential> wrapper = new LambdaQueryWrapper<PluginCredential>()
+                .eq(PluginCredential::getPluginId, pluginId)
+                .last("LIMIT 1");
         return credentialMapper.selectOne(wrapper);
     }
 
-    public List<PluginCredential> listByPlugin(Long pluginId) {
-        LambdaQueryWrapper<PluginCredential> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(PluginCredential::getPluginId, pluginId);
-        wrapper.orderByDesc(PluginCredential::getIsDefault);
-        wrapper.orderByAsc(PluginCredential::getAlias);
-        return credentialMapper.selectList(wrapper);
-    }
-
-    public PluginCredential create(PluginCredential entity) {
+    /**
+     * upsert：插件在租户内有凭证则更新，否则插入。返回最终落库实体。
+     */
+    public PluginCredential save(PluginCredential entity) {
         if (entity.getEncryptionVersion() == null) {
             entity.setEncryptionVersion(0);
         }
-        if (entity.getIsDefault() == null) {
-            entity.setIsDefault(Boolean.FALSE);
-        }
-        if (!StringUtils.hasText(entity.getAlias())) {
-            entity.setAlias("default");
+        PluginCredential existing = findByPlugin(entity.getPluginId());
+        if (existing != null) {
+            existing.setCredentialData(entity.getCredentialData());
+            existing.setEncryptionVersion(entity.getEncryptionVersion());
+            if (entity.getOwnerId() != null) {
+                existing.setOwnerId(entity.getOwnerId());
+            }
+            credentialMapper.updateById(existing);
+            return existing;
         }
         credentialMapper.insert(entity);
         return entity;
-    }
-
-    public PluginCredential update(PluginCredential entity) {
-        credentialMapper.updateById(entity);
-        return entity;
-    }
-
-    public int deleteById(Long id) {
-        return credentialMapper.deleteById(id);
     }
 
     private Map<String, Object> parseCredentialJson(PluginCredential cred) {

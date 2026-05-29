@@ -3,6 +3,8 @@ package com.jimeng.dataserver.ai.rag.service.answer;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
+import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import com.jimeng.dataserver.ai.rag.model.AnswerRequest;
@@ -14,6 +16,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,6 +54,7 @@ public class RagAnswerService {
     private final ClaudeService claudeService;
     private final RagProperties ragProperties;
     private final SseServiceUtil sseServiceUtil;
+    private final AgentRuntimeService agentRuntimeService;
 
     public List<SearchResultItem> retrieve(AnswerRequest req) throws Exception {
         int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
@@ -73,15 +77,83 @@ public class RagAnswerService {
         return rerankHits;
     }
 
+    /** 解析本次检索的知识库范围：显式 kbId 优先，否则用 Agent 绑定的知识库；都没有返回空（=不走 RAG）。 */
+    private List<Long> resolveKbIds(AnswerRequest req) {
+        if (req.getKbId() != null) {
+            return List.of(req.getKbId());
+        }
+        if (StrUtil.isNotBlank(req.getAgentId())) {
+            Long agentId = parseAgentId(req.getAgentId());
+            if (agentId != null) {
+                try {
+                    AgentRuntimeView view = agentRuntimeService.byId(agentId);
+                    if (view.getKbIds() != null && !view.getKbIds().isEmpty()) {
+                        return new ArrayList<>(view.getKbIds());
+                    }
+                } catch (Exception e) {
+                    log.warn("加载 Agent 知识库绑定失败 agentId={}: {}", req.getAgentId(), e.getMessage());
+                }
+            }
+        }
+        return List.of();
+    }
+
+    private Long parseAgentId(String s) {
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 跨一个或多个知识库检索：逐库召回后合并，再统一精排取 topK。 */
+    private List<SearchResultItem> retrieveForKbs(AnswerRequest req, List<Long> kbIds) throws Exception {
+        int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
+        int window = Math.max(ragProperties.getRetrieval().getBm25TopK(), ragProperties.getRetrieval().getVectorTopK());
+        boolean doRerank = req.getRerank() == null || req.getRerank();
+
+        log.info("RAG/retrieve.start kbIds={} topK={} rerank={} docIds={} query={}",
+                kbIds, topK, doRerank, req.getDocIds(), req.getQuery());
+
+        List<SearchResultItem> merged = new ArrayList<>();
+        for (Long kbId : kbIds) {
+            merged.addAll(hybridSearchService.search(kbId, req.getQuery(), req.getDocIds(), window));
+        }
+        logCandidates("RAG/retrieve.rrf", merged, /*rerankPhase*/ false);
+        if (merged.isEmpty()) return merged;
+
+        if (!doRerank) {
+            merged.sort(Comparator.comparingDouble(
+                    (SearchResultItem c) -> c.getRrfScore() == null ? 0d : c.getRrfScore()).reversed());
+            return merged.subList(0, Math.min(topK, merged.size()));
+        }
+        List<SearchResultItem> rerankHits = rerankService.rerank(req.getQuery(), merged, topK);
+        logCandidates("RAG/retrieve.rerank", rerankHits, /*rerankPhase*/ true);
+        return rerankHits;
+    }
+
     public void streamAnswer(AnswerRequest req, String connectionId, String traceId) {
         try {
-            List<SearchResultItem> citations = retrieve(req);
-            // 先把检索到的 chunks 通过 SSE 事件前置发回客户端
+            // 检索范围：① 显式 kbId 优先；② 否则取 Agent 绑定的知识库；③ 都没有则纯对话。
+            // 即「配了知识库才走 RAG」，绝不强制检索。
+            List<Long> kbIds = resolveKbIds(req);
+            boolean useRag = !kbIds.isEmpty();
+            List<SearchResultItem> citations = useRag ? retrieveForKbs(req, kbIds) : List.of();
+            // 始终前置发一个 citations 事件（无 KB 时为空数组），保证前端协议一致。
             sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(citations));
 
-            Map<String, Object> body = buildClaudeBody(req, citations);
-            log.info("RAG/answer.prompt citations={} totalChunkChars={} historyTurns={}",
-                    citations.size(), totalContentChars(citations),
+            Map<String, Object> body = buildClaudeBody(req, citations, useRag);
+
+            // 带 agentId 时加载 Agent 人设/模型/插件上下文：
+            // prepareAgentContext 会把 systemPrompt 前置注入、补默认 model/params，
+            // 并把 AgentContext 设到当前线程（下游工具据此决定可用插件——配了插件才会走）。
+            if (StrUtil.isNotBlank(req.getAgentId())) {
+                body.put("agent_id", req.getAgentId());
+                claudeService.prepareAgentContext(body);
+            }
+
+            log.info("RAG/answer.prompt useRag={} agentId={} citations={} totalChunkChars={} historyTurns={}",
+                    useRag, req.getAgentId(), citations.size(), totalContentChars(citations),
                     req.getHistory() == null ? 0 : req.getHistory().size());
 
             claudeService.messagesStream(body, connectionId, traceId);
@@ -97,27 +169,38 @@ public class RagAnswerService {
         }
     }
 
-    private Map<String, Object> buildClaudeBody(AnswerRequest req, List<SearchResultItem> citations) {
+    private Map<String, Object> buildClaudeBody(AnswerRequest req, List<SearchResultItem> citations, boolean useRag) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("stream", true);
-        body.put("system", SYSTEM_PROMPT);
+        // 仅在走 RAG 时注入知识库问答的系统提示（含引用标签规则）；
+        // 纯对话场景不设 system，交由 Agent 的 systemPrompt 注入（prepareAgentContext）。
+        if (useRag) {
+            body.put("system", SYSTEM_PROMPT);
+        }
 
         List<Map<String, Object>> messages = new ArrayList<>();
         if (req.getHistory() != null) messages.addAll(req.getHistory());
 
-        StringBuilder ctx = new StringBuilder();
-        ctx.append("【知识片段】\n");
-        for (SearchResultItem c : citations) {
-            ctx.append("\n[chunk_id=").append(c.getChunkId()).append(']');
-            if (c.getHeadingPath() != null) ctx.append(" 章节: ").append(c.getHeadingPath());
-            if (c.getPageNum() != null) ctx.append(" 页码: ").append(c.getPageNum());
-            ctx.append('\n').append(c.getContent() == null ? "" : c.getContent()).append('\n');
+        String userContent;
+        if (useRag) {
+            StringBuilder ctx = new StringBuilder();
+            ctx.append("【知识片段】\n");
+            for (SearchResultItem c : citations) {
+                ctx.append("\n[chunk_id=").append(c.getChunkId()).append(']');
+                if (c.getHeadingPath() != null) ctx.append(" 章节: ").append(c.getHeadingPath());
+                if (c.getPageNum() != null) ctx.append(" 页码: ").append(c.getPageNum());
+                ctx.append('\n').append(c.getContent() == null ? "" : c.getContent()).append('\n');
+            }
+            ctx.append("\n【问题】\n").append(req.getQuery());
+            userContent = ctx.toString();
+        } else {
+            // 纯对话：直接把用户问题作为消息内容。
+            userContent = req.getQuery();
         }
-        ctx.append("\n【问题】\n").append(req.getQuery());
 
         Map<String, Object> userMsg = new LinkedHashMap<>();
         userMsg.put("role", "user");
-        userMsg.put("content", ctx.toString());
+        userMsg.put("content", userContent);
         messages.add(userMsg);
 
         body.put("messages", messages);

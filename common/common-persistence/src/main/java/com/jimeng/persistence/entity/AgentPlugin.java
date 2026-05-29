@@ -10,7 +10,7 @@ import lombok.EqualsAndHashCode;
 /**
  * Agent 与插件的多对多绑定。
  *
- * <p>{@code credential_alias} 决定 Agent 调用这个插件时用哪份凭证（为空走 {@code is_default=true}）。
+ * <p>每个插件在租户内只有一份凭证，Agent 调用时直接取该插件的凭证，不再保存别名。
  *
  * @TableName agent_plugin
  */
@@ -31,8 +31,4 @@ public class AgentPlugin extends BaseEntity {
     @Schema(description = "Plugin ID")
     @TableField("plugin_id")
     private Long pluginId;
-
-    @Schema(description = "凭证别名（NULL = 用 is_default 凭证）")
-    @TableField("credential_alias")
-    private String credentialAlias;
 }

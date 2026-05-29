@@ -1,8 +1,6 @@
 package com.jimeng.dataserver.ai.plugin.executor;
 
 import com.jimeng.common.core.tenant.TenantContext;
-import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
-import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.plugin.dto.PluginError;
 import com.jimeng.dataserver.ai.plugin.dto.PluginToolEntry;
 import com.jimeng.dataserver.ai.plugin.service.PluginHttpInvoker;
@@ -59,14 +57,6 @@ public class HttpPluginToolExecutor implements SkillToolExecutor {
             return PluginError.of(PluginError.CODE_CONFIG_INVALID, "租户不匹配").toMap();
         }
 
-        String credentialAlias = resolveCredentialAlias(entry.pluginCode());
-        return invoker.invoke(entry, input, credentialAlias);
-    }
-
-    /** 从 AgentContext 拿当前 Agent 绑定的凭证别名（ClaudeService 在请求入口注入）。 */
-    private String resolveCredentialAlias(String pluginCode) {
-        AgentRuntimeView agent = AgentContext.get();
-        if (agent == null || agent.getPluginCredentialAliases() == null) return null;
-        return agent.getPluginCredentialAliases().get(pluginCode);
+        return invoker.invoke(entry, input);
     }
 }

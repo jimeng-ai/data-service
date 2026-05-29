@@ -10,7 +10,7 @@ import lombok.EqualsAndHashCode;
 /**
  * 插件凭证
  *
- * <p>当前版本：{@code credential_data} 字段明文存储 JSON。
+ * <p>每个插件在租户内仅有一份凭证；{@code credential_data} 字段明文存储 JSON。
  * 未来切加密时 {@code encryption_version} 升到 1+，字段值变成密文 base64，业务代码靠这个字段判断如何解读。
  *
  * @TableName plugin_credential
@@ -33,10 +33,6 @@ public class PluginCredential extends BaseEntity {
     @TableField("owner_id")
     private String ownerId;
 
-    @Schema(description = "凭证别名，如 prod / test")
-    @TableField("alias")
-    private String alias;
-
     @Schema(description = "凭证内容（当前版本：明文 JSON 字符串）")
     @TableField("credential_data")
     private String credentialData;
@@ -44,8 +40,4 @@ public class PluginCredential extends BaseEntity {
     @Schema(description = "加密版本：0=明文；未来加密版本走 1/2/...")
     @TableField("encryption_version")
     private Integer encryptionVersion;
-
-    @Schema(description = "是否是该插件的默认凭证")
-    @TableField("is_default")
-    private Boolean isDefault;
 }

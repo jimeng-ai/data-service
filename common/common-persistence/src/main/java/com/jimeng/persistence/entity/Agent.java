@@ -60,4 +60,8 @@ public class Agent extends BaseEntity {
     @Schema(description = "Agent 所有者用户 ID")
     @TableField("owner_id")
     private String ownerId;
+
+    @Schema(description = "知识库绑定配置 JSON：{kbIds:[...], topK, scoreThreshold}")
+    @TableField("kb_config")
+    private String kbConfig;
 }

@@ -135,38 +135,24 @@ public class PluginAdminController {
         return crudService.getMappingByTool(toolId);
     }
 
-    // ============================ Credentials ============================
+    // ============================ Credential ============================
+    // 每个插件在租户内只有一份凭证，因此用单数路径 + GET/PUT 替代旧的 list/CRUD。
 
-    @Operation(summary = "为插件新增凭证（明文 JSON 落库）")
-    @PostMapping("/plugins/{pluginId}/credentials")
-    public PluginCredential createCredential(@PathVariable Long pluginId,
-                                              @RequestBody PluginCredential credential) {
+    @Operation(summary = "获取插件凭证（不存在返回 null）")
+    @GetMapping("/plugins/{pluginId}/credential")
+    public PluginCredential getCredential(@PathVariable Long pluginId) {
+        // 触发归属校验：跨租户的 pluginId 会抛 404
+        crudService.getPlugin(pluginId);
+        return credentialService.findByPlugin(pluginId);
+    }
+
+    @Operation(summary = "保存插件凭证（upsert）")
+    @PutMapping("/plugins/{pluginId}/credential")
+    public PluginCredential saveCredential(@PathVariable Long pluginId,
+                                            @RequestBody PluginCredential credential) {
+        crudService.getPlugin(pluginId);
         credential.setPluginId(pluginId);
-        return credentialService.create(credential);
-    }
-
-    @Operation(summary = "更新凭证")
-    @PutMapping("/plugins/{pluginId}/credentials/{credentialId}")
-    public PluginCredential updateCredential(@PathVariable Long pluginId,
-                                              @PathVariable Long credentialId,
-                                              @RequestBody PluginCredential credential) {
-        credential.setId(credentialId);
-        credential.setPluginId(pluginId);
-        return credentialService.update(credential);
-    }
-
-    @Operation(summary = "删除凭证")
-    @DeleteMapping("/plugins/{pluginId}/credentials/{credentialId}")
-    public Map<String, Object> deleteCredential(@PathVariable Long pluginId,
-                                                 @PathVariable Long credentialId) {
-        credentialService.deleteById(credentialId);
-        return Map.of("deleted", true);
-    }
-
-    @Operation(summary = "列出某插件的凭证")
-    @GetMapping("/plugins/{pluginId}/credentials")
-    public List<PluginCredential> listCredentials(@PathVariable Long pluginId) {
-        return credentialService.listByPlugin(pluginId);
+        return credentialService.save(credential);
     }
 
     // ============================ 调试 / 缓存 ============================
@@ -175,7 +161,6 @@ public class PluginAdminController {
     public static class PluginTestRequest {
         private String toolName;
         private Map<String, Object> input;
-        private String credentialAlias;  // 可选
     }
 
     @Operation(summary = "试调用：不经 LLM 直接传入参数 → 调插件并返回真实响应")
@@ -188,7 +173,7 @@ public class PluginAdminController {
             throw new ServiceException(ExceptionCode.NOT_FOUND,
                     "找不到工具（请检查插件是否已 PUBLISHED 且工具 enabled=true）: " + req.getToolName());
         }
-        return httpInvoker.invoke(entryOpt.get(), req.getInput(), req.getCredentialAlias());
+        return httpInvoker.invoke(entryOpt.get(), req.getInput());
     }
 
     @Operation(summary = "手动刷新插件缓存")

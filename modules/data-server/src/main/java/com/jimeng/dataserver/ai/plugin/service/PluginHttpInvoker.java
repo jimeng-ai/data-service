@@ -80,7 +80,7 @@ public class PluginHttpInvoker {
     /**
      * 入口：执行一个工具调用。永不抛异常，结果一律可 JSON 序列化返给 LLM。
      */
-    public Object invoke(PluginToolEntry entry, Map<String, Object> input, String credentialAlias) {
+    public Object invoke(PluginToolEntry entry, Map<String, Object> input) {
         if (entry == null) {
             return PluginError.of(PluginError.CODE_CONFIG_INVALID, "PluginToolEntry 为空").toMap();
         }
@@ -89,7 +89,7 @@ public class PluginHttpInvoker {
         Map<String, Object> secrets;
         try {
             secrets = needAuth(entry)
-                    ? credentialService.resolveSecrets(entry.getPlugin().getId(), credentialAlias)
+                    ? credentialService.resolveSecrets(entry.getPlugin().getId())
                     : new LinkedHashMap<>();
         } catch (PluginCredentialService.CredentialMissingException e) {
             log.warn("凭证解析失败: tool={}, error={}", entry.toolName(), e.getMessage());

@@ -29,6 +29,12 @@ public class AgentRuntimeView {
     /** Agent 绑定的插件 code 集合——决定该 Agent 能看到哪些 ToolPackage */
     private final Set<String> allowedPluginCodes;
 
-    /** Map<pluginCode, credentialAlias>——Agent 使用某插件时用哪份凭证 */
-    private final Map<String, String> pluginCredentialAliases;
+    /** Agent 绑定的知识库 ID 集合——非空时对话自动走 RAG 检索 */
+    private final Set<Long> kbIds;
+
+    /** 知识库检索 topK（可空，默认走 rag 配置） */
+    private final Integer kbTopK;
+
+    /** 知识库相似度阈值（可空，预留用于过滤/展示） */
+    private final Double kbScoreThreshold;
 }

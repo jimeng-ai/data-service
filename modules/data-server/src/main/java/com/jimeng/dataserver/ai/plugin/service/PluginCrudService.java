@@ -16,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * Plugin / PluginTool / PluginHttpMapping 三表的 CRUD 聚合服务。
@@ -26,6 +27,13 @@ import java.util.List;
 @RequiredArgsConstructor
 public class PluginCrudService {
 
+    /**
+     * 允许的 auth_type 取值；保持与 {@link com.jimeng.dataserver.ai.plugin.auth.PluginAuthApplier}
+     * 实现类（BEARER / BASIC / API_KEY / HMAC）一致，外加 NONE。
+     */
+    private static final Set<String> VALID_AUTH_TYPES =
+            Set.of("NONE", "BEARER", "BASIC", "API_KEY", "HMAC");
+
     private final PluginMapper pluginMapper;
     private final PluginToolMapper pluginToolMapper;
     private final PluginHttpMappingMapper pluginHttpMappingMapper;
@@ -34,8 +42,10 @@ public class PluginCrudService {
     // ============================ Plugin ============================
 
     public Plugin createPlugin(Plugin plugin) {
+        // code 是「插件→工具→Agent」运行时链路的功能性 slug（按 code 解析工具、绑定 Agent），
+        // 不再要求前端填写「代号」，留空时自动生成一个租户内唯一的 slug。
         if (!StringUtils.hasText(plugin.getCode())) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin.code 不能为空");
+            plugin.setCode("plugin_" + cn.hutool.core.util.IdUtil.fastSimpleUUID().substring(0, 12));
         }
         if (!StringUtils.hasText(plugin.getName())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin.name 不能为空");
@@ -46,6 +56,7 @@ public class PluginCrudService {
         if (!StringUtils.hasText(plugin.getAuthType())) {
             plugin.setAuthType("NONE");
         }
+        validateAuthType(plugin.getAuthType());
         pluginMapper.insert(plugin);
         registryService.reload();
         return plugin;
@@ -55,9 +66,19 @@ public class PluginCrudService {
         if (plugin.getId() == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin.id 不能为空");
         }
+        if (StringUtils.hasText(plugin.getAuthType())) {
+            validateAuthType(plugin.getAuthType());
+        }
         pluginMapper.updateById(plugin);
         registryService.reload();
         return pluginMapper.selectById(plugin.getId());
+    }
+
+    private void validateAuthType(String authType) {
+        if (!VALID_AUTH_TYPES.contains(authType)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "非法的 auth_type: " + authType + "，允许值: " + VALID_AUTH_TYPES);
+        }
     }
 
     public Plugin getPlugin(Long id) {

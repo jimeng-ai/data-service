@@ -293,23 +293,21 @@ CREATE TABLE IF NOT EXISTS `plugin_http_mapping` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件工具的 HTTP 调用映射';
 
 -- 插件凭证（明文存储，预留 encryption_version 字段以便未来加密）
+-- 约束：每个插件在租户内仅有一份凭证。
 CREATE TABLE IF NOT EXISTS `plugin_credential` (
     `id`                  BIGINT       NOT NULL                COMMENT '主键',
     `tenant_id`           VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
     `plugin_id`           BIGINT       NOT NULL                COMMENT '所属插件 ID',
     `owner_id`            VARCHAR(64)  DEFAULT NULL            COMMENT '所属用户 ID（NULL=租户内共享）',
-    `alias`               VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '凭证别名，如 prod / test',
     `credential_data`     TEXT         NOT NULL                COMMENT '凭证内容（明文 JSON 字符串）',
     `encryption_version`  INT          NOT NULL DEFAULT 0      COMMENT '加密版本：0=明文；预留未来加密',
-    `is_default`          TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否是该插件的默认凭证',
     `deleted`             TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
     `create_time`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `create_user`         VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
     `update_time`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
     `update_user`         VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
     PRIMARY KEY (`id`),
-    UNIQUE KEY `uk_plugin_credential_tenant_plugin_alias` (`tenant_id`, `plugin_id`, `alias`),
-    KEY `idx_plugin_credential_default` (`plugin_id`, `is_default`),
+    UNIQUE KEY `uk_plugin_credential_tenant_plugin` (`tenant_id`, `plugin_id`),
     KEY `idx_plugin_credential_deleted` (`deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='插件凭证表';
 
@@ -326,6 +324,7 @@ CREATE TABLE IF NOT EXISTS `agent` (
     `model_params`    JSON         DEFAULT NULL            COMMENT '模型参数默认值 {temperature, max_tokens, ...}',
     `status`          VARCHAR(16)  NOT NULL DEFAULT 'DRAFT' COMMENT '状态：DRAFT/PUBLISHED/DISABLED',
     `owner_id`        VARCHAR(64)  DEFAULT NULL            COMMENT 'Agent 所有者用户 ID',
+    `kb_config`       JSON         DEFAULT NULL            COMMENT '知识库绑定配置 {kbIds, topK, scoreThreshold}',
     `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
     `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
@@ -343,7 +342,6 @@ CREATE TABLE IF NOT EXISTS `agent_plugin` (
     `tenant_id`          VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
     `agent_id`           BIGINT       NOT NULL                COMMENT 'Agent ID',
     `plugin_id`          BIGINT       NOT NULL                COMMENT 'Plugin ID',
-    `credential_alias`   VARCHAR(64)  DEFAULT NULL            COMMENT '凭证别名（NULL = 走 is_default 凭证）',
     `deleted`            TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
     `create_time`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `create_user`        VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
@@ -375,5 +373,43 @@ CREATE TABLE IF NOT EXISTS `sys_admin` (
     UNIQUE KEY `uk_sys_admin_username` (`username`, `deleted`),
     KEY `idx_sys_admin_tenant` (`tenant_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='管理后台账户';
+
+-- 对话会话（控制台「对话」中的一段会话）
+CREATE TABLE IF NOT EXISTS `chat_conversation` (
+    `id`              BIGINT       NOT NULL                COMMENT '主键，雪花算法',
+    `tenant_id`       VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `agent_id`        VARCHAR(64)  NOT NULL                COMMENT '所属 Agent ID',
+    `agent_name`      VARCHAR(128) DEFAULT NULL            COMMENT 'Agent 名称快照',
+    `title`           VARCHAR(255) NOT NULL DEFAULT '新对话' COMMENT '会话标题',
+    `last_message_at` DATETIME     DEFAULT NULL            COMMENT '最近一条消息时间',
+    `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    KEY `idx_chat_conv_tenant_active` (`tenant_id`, `last_message_at`),
+    KEY `idx_chat_conv_agent` (`tenant_id`, `agent_id`),
+    KEY `idx_chat_conv_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='对话会话表';
+
+-- 对话消息（隶属于 chat_conversation）
+CREATE TABLE IF NOT EXISTS `chat_message` (
+    `id`              BIGINT       NOT NULL                COMMENT '主键，雪花算法',
+    `tenant_id`       VARCHAR(64)  NOT NULL                COMMENT '租户 ID',
+    `conversation_id` BIGINT       NOT NULL                COMMENT '所属会话 ID',
+    `role`            VARCHAR(16)  NOT NULL                COMMENT '角色：user / assistant',
+    `content`         LONGTEXT                             COMMENT '消息正文',
+    `citations`       JSON         DEFAULT NULL            COMMENT '引用列表（JSON，可空）',
+    `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
+    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',
+    `update_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    KEY `idx_chat_msg_conv` (`conversation_id`, `create_time`),
+    KEY `idx_chat_msg_tenant` (`tenant_id`),
+    KEY `idx_chat_msg_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='对话消息表';
 
 SET FOREIGN_KEY_CHECKS = 1;

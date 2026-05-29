@@ -88,21 +88,18 @@ public class AgentService {
 
     // ------------------------------------------------------------------ Agent-Plugin 绑定
 
-    public AgentPlugin bindPlugin(Long agentId, Long pluginId, String credentialAlias) {
-        // 复用 mybatis-plus 的 deleteById/insertId；这里查一下是否已绑过
+    public AgentPlugin bindPlugin(Long agentId, Long pluginId) {
+        // 幂等：已绑定直接返回
         LambdaQueryWrapper<AgentPlugin> wrapper = new LambdaQueryWrapper<AgentPlugin>()
                 .eq(AgentPlugin::getAgentId, agentId)
                 .eq(AgentPlugin::getPluginId, pluginId);
         AgentPlugin existing = agentPluginMapper.selectOne(wrapper);
         if (existing != null) {
-            existing.setCredentialAlias(credentialAlias);
-            agentPluginMapper.updateById(existing);
             return existing;
         }
         AgentPlugin binding = new AgentPlugin();
         binding.setAgentId(agentId);
         binding.setPluginId(pluginId);
-        binding.setCredentialAlias(credentialAlias);
         agentPluginMapper.insert(binding);
         return binding;
     }

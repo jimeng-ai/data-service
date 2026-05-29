@@ -82,17 +82,15 @@ public class AgentAdminController {
     @Data
     public static class BindPluginRequest {
         private Long pluginId;
-        /** 可选；为空走该插件的 is_default 凭证 */
-        private String credentialAlias;
     }
 
-    @Operation(summary = "绑定插件（重复绑定会更新 credential_alias）")
+    @Operation(summary = "绑定插件（幂等：重复绑定直接返回已存在的绑定）")
     @PostMapping("/agents/{id}/plugins")
     public AgentPlugin bindPlugin(@PathVariable Long id, @RequestBody BindPluginRequest req) {
         if (req == null || req.getPluginId() == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin_id 不能为空");
         }
-        return agentService.bindPlugin(id, req.getPluginId(), req.getCredentialAlias());
+        return agentService.bindPlugin(id, req.getPluginId());
     }
 
     @Operation(summary = "解绑插件")

@@ -48,4 +48,63 @@
         call_status, error_code, error_msg, cost_usd, deleted, create_time, create_user, update_time, update_user
     </sql>
 
+    <!-- ============================ 仪表盘聚合查询 ============================ -->
+    <!-- ai_model_call_log 不在多租户拦截器白名单内，以下查询均显式带 tenant_id 过滤。 -->
+
+    <select id="selectOverview" resultType="java.util.Map">
+        SELECT
+            COUNT(*)                                                        AS calls,
+            COALESCE(SUM(total_tokens), 0)                                  AS tokens,
+            COALESCE(SUM(input_tokens), 0)                                  AS inputTokens,
+            COALESCE(SUM(output_tokens), 0)                                 AS outputTokens,
+            COALESCE(SUM(cost_usd), 0)                                      AS costUsd,
+            COALESCE(AVG(CASE WHEN call_status = 1 THEN latency_ms END), 0)  AS avgLatencyMs,
+            COALESCE(SUM(CASE WHEN call_status = 1 THEN 1 ELSE 0 END), 0)    AS successCalls
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+    </select>
+
+    <select id="selectDailyTrend" resultType="java.util.Map">
+        SELECT
+            DATE_FORMAT(create_time, '%Y-%m-%d')  AS date,
+            COUNT(*)                               AS calls,
+            COALESCE(SUM(total_tokens), 0)         AS tokens
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+        GROUP BY DATE_FORMAT(create_time, '%Y-%m-%d')
+        ORDER BY date
+    </select>
+
+    <select id="selectTopModels" resultType="java.util.Map">
+        SELECT
+            model                            AS model,
+            COUNT(*)                          AS calls,
+            COALESCE(SUM(total_tokens), 0)    AS tokens
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+          AND model IS NOT NULL
+          AND model &lt;&gt; ''
+        GROUP BY model
+        ORDER BY calls DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectRecentCalls" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+        ORDER BY create_time DESC
+        LIMIT #{limit}
+    </select>
+
 </mapper>
