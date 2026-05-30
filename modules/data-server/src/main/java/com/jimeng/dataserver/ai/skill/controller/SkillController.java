@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.skill.controller;
 
 import com.jimeng.dataserver.ai.skill.service.SkillPackageLoaderService;
+import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -23,6 +24,7 @@ import java.util.Map;
 public class SkillController {
 
     private final SkillPackageLoaderService skillPackageLoaderService;
+    private final SuperAdminGuard superAdminGuard;
 
     @Operation(summary = "获取skill列表", description = "读取本地skills目录，返回skill元信息")
     @GetMapping
@@ -35,6 +37,8 @@ public class SkillController {
     public Map<String, Object> uploadSkill(
             @Parameter(description = "SKILL.md文件") @RequestParam("file") MultipartFile file,
             @Parameter(description = "同名skill存在时是否覆盖") @RequestParam(defaultValue = "false") boolean overwrite) {
+        // Skill 落地到服务器 skills 目录并对全租户生效，属平台级写操作，仅限企业超管。
+        superAdminGuard.requireSuperAdmin();
         return skillPackageLoaderService.uploadSkillMarkdown(file, overwrite);
     }
 }

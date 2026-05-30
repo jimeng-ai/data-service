@@ -10,6 +10,8 @@ import com.jimeng.dataserver.ai.chat.dto.ChatDtos.ConversationDetail;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.ConversationView;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.CreateConversationRequest;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.MessageView;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.ChatConversation;
 import com.jimeng.persistence.entity.ChatMessage;
 import com.jimeng.persistence.mapper.ChatConversationMapper;
@@ -39,6 +41,7 @@ public class ChatConversationService {
 
     private final ChatConversationMapper conversationMapper;
     private final ChatMessageMapper messageMapper;
+    private final PermissionResolver permissionResolver;
 
     // ------------------------------------------------------------------ 会话
 
@@ -46,6 +49,8 @@ public class ChatConversationService {
         if (req == null || !StringUtils.hasText(req.getAgentId())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "agentId 不能为空");
         }
+        // 会话的父资源是 Agent：成员只能对被授权的 Agent 建会话/读写其历史，挡住「凭已知 id 直连未授权 Agent」。
+        assertAgentAccess(req.getAgentId());
         ChatConversation c = new ChatConversation();
         c.setAgentId(req.getAgentId().trim());
         c.setAgentName(StrUtil.blankToDefault(req.getAgentName(), "Agent"));
@@ -66,6 +71,7 @@ public class ChatConversationService {
 
     public ConversationDetail detail(Long id) {
         ChatConversation c = requireConversation(id);
+        assertAgentAccess(c.getAgentId());
         List<ChatMessage> messages = messageMapper.selectList(
                 new LambdaQueryWrapper<ChatMessage>()
                         .eq(ChatMessage::getConversationId, id)
@@ -79,13 +85,15 @@ public class ChatConversationService {
 
     public ConversationView rename(Long id, String title) {
         ChatConversation c = requireConversation(id);
+        assertAgentAccess(c.getAgentId());
         c.setTitle(normalizeTitle(title, c.getTitle()));
         conversationMapper.updateById(c);
         return toView(c, null);
     }
 
     public void delete(Long id) {
-        requireConversation(id);
+        ChatConversation c = requireConversation(id);
+        assertAgentAccess(c.getAgentId());
         // 逻辑删除会话与其消息
         conversationMapper.deleteById(id);
         messageMapper.delete(new LambdaQueryWrapper<ChatMessage>()
@@ -97,6 +105,7 @@ public class ChatConversationService {
     @Transactional
     public MessageView appendMessage(Long conversationId, AppendMessageRequest req) {
         ChatConversation c = requireConversation(conversationId);
+        assertAgentAccess(c.getAgentId());
         if (req == null || !StringUtils.hasText(req.getContent())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "content 不能为空");
         }
@@ -122,6 +131,20 @@ public class ChatConversationService {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /** 校验当前账号对会话所属 Agent 有访问权；超管放行。agentId 非数字（历史脏数据）则跳过，避免误伤。 */
+    private void assertAgentAccess(String agentId) {
+        if (StrUtil.isBlank(agentId)) {
+            return;
+        }
+        long id;
+        try {
+            id = Long.parseLong(agentId.trim());
+        } catch (NumberFormatException e) {
+            return;
+        }
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+    }
 
     private ChatConversation requireConversation(Long id) {
         ChatConversation c = id == null ? null : conversationMapper.selectById(id);

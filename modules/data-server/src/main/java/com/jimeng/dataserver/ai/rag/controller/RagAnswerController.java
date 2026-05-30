@@ -4,6 +4,8 @@ import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.rag.model.AnswerRequest;
 import com.jimeng.dataserver.ai.rag.service.answer.RagAnswerService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.web.MdcAsyncSupport;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -27,6 +29,7 @@ public class RagAnswerController {
 
     private final RagAnswerService ragAnswerService;
     private final SseServiceUtil sseServiceUtil;
+    private final PermissionResolver permissionResolver;
 
     private final ExecutorService streamExecutor = Executors.newCachedThreadPool();
 
@@ -36,12 +39,31 @@ public class RagAnswerController {
                     "可在 history 中带入多轮对话历史。")
     @PostMapping("/answer")
     public SseEmitter answer(@RequestBody AnswerRequest req, HttpServletRequest request) {
+        // 必须在【请求线程】上鉴权：streamAnswer 跑在 streamExecutor 线程，
+        // 而 AdminRequestContext 依赖 RequestContextHolder（请求级 ThreadLocal，不随 MdcAsyncSupport 传递）。
+        // 显式 kbId → 校验该知识库访问权；否则按 agentId → 校验 Agent 访问权（Agent 绑定的库经此间接授权）。
+        assertAnswerAccess(req);
         String connectionId = UUID.randomUUID().toString();
         SseEmitter emitter = sseServiceUtil.getConnection(connectionId, 300_000L);
         String traceId = extractTraceId(request);
         streamExecutor.execute(MdcAsyncSupport.wrap(connectionId,
                 () -> ragAnswerService.streamAnswer(req, connectionId, traceId)));
         return emitter;
+    }
+
+    private void assertAnswerAccess(AnswerRequest req) {
+        if (req == null) return;
+        if (req.getKbId() != null) {
+            permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, req.getKbId());
+            return;
+        }
+        if (StrUtil.isNotBlank(req.getAgentId())) {
+            try {
+                permissionResolver.assertCurrentAccess(ResourceType.AGENT, Long.parseLong(req.getAgentId().trim()));
+            } catch (NumberFormatException ignore) {
+                // 非实例化 agentId（如运行时虚拟会话），无实例可校验，交由后续逻辑处理
+            }
+        }
     }
 
     private String extractTraceId(HttpServletRequest request) {

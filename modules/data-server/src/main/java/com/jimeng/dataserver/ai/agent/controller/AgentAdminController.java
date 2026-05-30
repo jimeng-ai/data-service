@@ -45,6 +45,7 @@ public class AgentAdminController {
     @Operation(summary = "更新 Agent")
     @PutMapping("/agents/{id}")
     public Agent updateAgent(@PathVariable Long id, @RequestBody Agent agent) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         agent.setId(id);
         return agentService.update(agent);
     }
@@ -65,6 +66,7 @@ public class AgentAdminController {
     @Operation(summary = "删除 Agent")
     @DeleteMapping("/agents/{id}")
     public Map<String, Object> delete(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         agentService.delete(id);
         return Map.of("deleted", true);
     }
@@ -72,12 +74,14 @@ public class AgentAdminController {
     @Operation(summary = "发布 Agent（status = PUBLISHED）")
     @PostMapping("/agents/{id}/publish")
     public Agent publish(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         return agentService.publish(id);
     }
 
     @Operation(summary = "下架 Agent（status = DRAFT）")
     @PostMapping("/agents/{id}/unpublish")
     public Agent unpublish(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         return agentService.unpublish(id);
     }
 
@@ -94,12 +98,17 @@ public class AgentAdminController {
         if (req == null || req.getPluginId() == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin_id 不能为空");
         }
+        // 双校验：成员只能把【自己有权的插件】绑到【自己有权的 Agent】上，否则可借 Agent 运行时间接调用未授权插件。
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, req.getPluginId());
         return agentService.bindPlugin(id, req.getPluginId());
     }
 
     @Operation(summary = "解绑插件")
     @DeleteMapping("/agents/{id}/plugins/{pluginId}")
     public Map<String, Object> unbindPlugin(@PathVariable Long id, @PathVariable Long pluginId) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         int affected = agentService.unbindPlugin(id, pluginId);
         return Map.of("unbound", affected);
     }
@@ -107,6 +116,7 @@ public class AgentAdminController {
     @Operation(summary = "列出 Agent 已绑定的插件")
     @GetMapping("/agents/{id}/plugins")
     public List<AgentPlugin> listBindings(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         return agentService.listBindings(id);
     }
 }

@@ -1,6 +1,8 @@
 package com.jimeng.dataserver.ai.rag.controller;
 
 import com.jimeng.dataserver.ai.rag.service.DocumentService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.KbDocument;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -25,35 +27,43 @@ import java.util.List;
 public class DocumentController {
 
     private final DocumentService documentService;
+    private final PermissionResolver permissionResolver;
 
     @Operation(summary = "上传文档到知识库", description = "将文件上传到指定知识库并触发异步入库流程（解析 → 切片 → 上下文化 → 向量化 → 入 ES）")
     @PostMapping(value = "/kb/{kbId}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public KbDocument upload(@Parameter(description = "知识库 ID") @PathVariable Long kbId,
                              @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file) throws Exception {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, kbId);
         return documentService.upload(kbId, file);
     }
 
     @Operation(summary = "查询知识库内文档列表", description = "返回指定知识库下所有文档及各自的入库状态")
     @GetMapping("/kb/{kbId}/documents")
     public List<KbDocument> listByKb(@Parameter(description = "知识库 ID") @PathVariable Long kbId) {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, kbId);
         return documentService.listByKb(kbId);
     }
 
     @Operation(summary = "获取文档详情", description = "按文档 ID 查询单个文档的元信息与入库状态")
     @GetMapping("/documents/{docId}")
     public KbDocument get(@Parameter(description = "文档 ID") @PathVariable Long docId) {
-        return documentService.get(docId);
+        // 文档以 docId 直达，须反查其所属知识库再做实例级鉴权（防止凭 docId 越权读他人知识库文档）。
+        KbDocument doc = documentService.get(docId);
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, doc.getKbId());
+        return doc;
     }
 
     @Operation(summary = "删除文档", description = "删除文档记录，同步清理 MinIO 文件与 ES 中的 chunk 索引")
     @DeleteMapping("/documents/{docId}")
     public void delete(@Parameter(description = "文档 ID") @PathVariable Long docId) throws Exception {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, documentService.get(docId).getKbId());
         documentService.delete(docId);
     }
 
     @Operation(summary = "重新触发入库", description = "对入库失败（FAILED）的文档重新投递到 RabbitMQ 队列，再走一次完整入库流程")
     @PostMapping("/documents/{docId}/retry")
     public KbDocument retry(@Parameter(description = "文档 ID") @PathVariable Long docId) {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, documentService.get(docId).getKbId());
         return documentService.retry(docId);
     }
 }

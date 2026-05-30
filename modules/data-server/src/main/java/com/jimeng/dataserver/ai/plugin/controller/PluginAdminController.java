@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.plugin.service.PluginCredentialService;
 import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.plugin.service.PluginHttpInvoker;
 import com.jimeng.dataserver.ai.plugin.service.PluginRegistryService;
+import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.Plugin;
@@ -46,6 +47,17 @@ public class PluginAdminController {
     private final PluginRegistryService registryService;
     private final PluginHttpInvoker httpInvoker;
     private final PermissionResolver permissionResolver;
+    private final SuperAdminGuard superAdminGuard;
+
+    // 子资源（工具/映射）端点共用：校验当前账号对父插件有访问权，且 toolId 确实属于该插件，
+    // 防止「用自己有权的 pluginId 套别人的 toolId」绕过实例级授权。
+    private void assertToolUnderAccessiblePlugin(Long pluginId, Long toolId) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
+        Long ownerPluginId = crudService.resolvePluginIdByTool(toolId);
+        if (!pluginId.equals(ownerPluginId)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "tool 不属于该插件");
+        }
+    }
 
     // ============================ Plugin ============================
 
@@ -58,6 +70,7 @@ public class PluginAdminController {
     @Operation(summary = "更新插件")
     @PutMapping("/plugins/{id}")
     public Plugin updatePlugin(@PathVariable Long id, @RequestBody Plugin plugin) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
         plugin.setId(id);
         return crudService.updatePlugin(plugin);
     }
@@ -78,6 +91,7 @@ public class PluginAdminController {
     @Operation(summary = "删除插件（级联删除工具/映射）")
     @DeleteMapping("/plugins/{id}")
     public Map<String, Object> deletePlugin(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
         crudService.deletePlugin(id);
         return Map.of("deleted", true);
     }
@@ -85,12 +99,14 @@ public class PluginAdminController {
     @Operation(summary = "发布插件（status = PUBLISHED）")
     @PostMapping("/plugins/{id}/publish")
     public Plugin publishPlugin(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
         return crudService.publish(id);
     }
 
     @Operation(summary = "下架插件（status = DRAFT）")
     @PostMapping("/plugins/{id}/unpublish")
     public Plugin unpublishPlugin(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
         return crudService.unpublish(id);
     }
 
@@ -105,6 +121,7 @@ public class PluginAdminController {
     @Operation(summary = "为插件新增工具（同时建立 HTTP 映射）")
     @PostMapping("/plugins/{pluginId}/tools")
     public PluginTool createTool(@PathVariable Long pluginId, @RequestBody ToolWithMapping body) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         if (body == null || body.getTool() == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "tool 不能为空");
         }
@@ -115,6 +132,7 @@ public class PluginAdminController {
     @PutMapping("/plugins/{pluginId}/tools/{toolId}")
     public PluginTool updateTool(@PathVariable Long pluginId, @PathVariable Long toolId,
                                   @RequestBody ToolWithMapping body) {
+        assertToolUnderAccessiblePlugin(pluginId, toolId);
         return crudService.updateTool(pluginId, toolId,
                 body == null ? null : body.getTool(),
                 body == null ? null : body.getMapping());
@@ -123,6 +141,7 @@ public class PluginAdminController {
     @Operation(summary = "删除工具（连带映射）")
     @DeleteMapping("/plugins/{pluginId}/tools/{toolId}")
     public Map<String, Object> deleteTool(@PathVariable Long pluginId, @PathVariable Long toolId) {
+        assertToolUnderAccessiblePlugin(pluginId, toolId);
         crudService.deleteTool(toolId);
         return Map.of("deleted", true);
     }
@@ -130,12 +149,14 @@ public class PluginAdminController {
     @Operation(summary = "列出插件下的工具")
     @GetMapping("/plugins/{pluginId}/tools")
     public List<PluginTool> listTools(@PathVariable Long pluginId) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         return crudService.listTools(pluginId);
     }
 
     @Operation(summary = "获取工具的 HTTP 映射")
     @GetMapping("/plugins/{pluginId}/tools/{toolId}/mapping")
     public PluginHttpMapping getMapping(@PathVariable Long pluginId, @PathVariable Long toolId) {
+        assertToolUnderAccessiblePlugin(pluginId, toolId);
         return crudService.getMappingByTool(toolId);
     }
 
@@ -145,7 +166,8 @@ public class PluginAdminController {
     @Operation(summary = "获取插件凭证（不存在返回 null）")
     @GetMapping("/plugins/{pluginId}/credential")
     public PluginCredential getCredential(@PathVariable Long pluginId) {
-        // 触发归属校验：跨租户的 pluginId 会抛 404
+        // 凭证含 API key / token 等敏感信息，必须做实例级鉴权（未授权抛 4001），再触发归属校验（跨租户/不存在抛 404）。
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         crudService.getPlugin(pluginId);
         return credentialService.findByPlugin(pluginId);
     }
@@ -154,6 +176,7 @@ public class PluginAdminController {
     @PutMapping("/plugins/{pluginId}/credential")
     public PluginCredential saveCredential(@PathVariable Long pluginId,
                                             @RequestBody PluginCredential credential) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         crudService.getPlugin(pluginId);
         credential.setPluginId(pluginId);
         return credentialService.save(credential);
@@ -170,6 +193,8 @@ public class PluginAdminController {
     @Operation(summary = "试调用：不经 LLM 直接传入参数 → 调插件并返回真实响应")
     @PostMapping("/plugins/{pluginId}/test")
     public Object testInvoke(@PathVariable Long pluginId, @RequestBody PluginTestRequest req) {
+        // 试调用会真实打到插件后端（可能有副作用），必须先做实例级鉴权再放行。
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
         // 校验插件归属当前租户：getPlugin 会查不到时抛 404
         Plugin plugin = crudService.getPlugin(pluginId);
         Optional<PluginToolEntry> entryOpt = registryService.findToolByName(plugin.getTenantId(), req.getToolName());
@@ -183,6 +208,8 @@ public class PluginAdminController {
     @Operation(summary = "手动刷新插件缓存")
     @PostMapping("/plugins/_refresh")
     public Map<String, Object> refresh() {
+        // 全局缓存重载是平台级操作（无资源 id 可校验），仅限企业超管，防止成员高频触发拖垮缓存。
+        superAdminGuard.requireSuperAdmin();
         registryService.reload();
         return Map.of("refreshed", true);
     }

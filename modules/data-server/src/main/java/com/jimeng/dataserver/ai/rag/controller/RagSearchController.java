@@ -7,6 +7,8 @@ import com.jimeng.dataserver.ai.rag.model.SearchRequest;
 import com.jimeng.dataserver.ai.rag.model.SearchResultItem;
 import com.jimeng.dataserver.ai.rag.service.search.HybridSearchService;
 import com.jimeng.dataserver.ai.rag.service.search.RerankService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -26,6 +28,7 @@ public class RagSearchController {
     private final HybridSearchService hybridSearchService;
     private final RerankService rerankService;
     private final RagProperties ragProperties;
+    private final PermissionResolver permissionResolver;
 
     @Operation(summary = "混合检索 chunk",
             description = "在指定知识库内执行 BM25 + 向量召回，按 RRF 融合后可选走 reranker 精排，返回 topK 个 chunk 片段。" +
@@ -35,6 +38,7 @@ public class RagSearchController {
         if (req.getKbId() == null || req.getQuery() == null || req.getQuery().isBlank()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "kbId 与 query 必填");
         }
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, req.getKbId());
         int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
         // 先检索 BM25/KNN top-50（rrf 融合），再 rerank 到 topK
         int rrfWindow = Math.max(ragProperties.getRetrieval().getBm25TopK(),

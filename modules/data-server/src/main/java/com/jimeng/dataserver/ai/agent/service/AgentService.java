@@ -3,6 +3,8 @@ package com.jimeng.dataserver.ai.agent.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.grant.service.CreatorGrantService;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.mapper.AgentMapper;
@@ -26,9 +28,11 @@ public class AgentService {
 
     private final AgentMapper agentMapper;
     private final AgentPluginMapper agentPluginMapper;
+    private final CreatorGrantService creatorGrantService;
 
     // ------------------------------------------------------------------ Agent CRUD
 
+    @Transactional
     public Agent create(Agent agent) {
         if (!StringUtils.hasText(agent.getCode())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "Agent code 不能为空");
@@ -40,6 +44,8 @@ public class AgentService {
             agent.setStatus("DRAFT");
         }
         agentMapper.insert(agent);
+        // 成员自授权：否则建完 Agent 后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
+        creatorGrantService.grantNewResourceToCreator(ResourceType.AGENT, agent.getId());
         return agent;
     }
 

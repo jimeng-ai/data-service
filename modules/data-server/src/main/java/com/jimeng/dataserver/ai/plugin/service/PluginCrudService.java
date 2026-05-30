@@ -3,6 +3,8 @@ package com.jimeng.dataserver.ai.plugin.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.grant.service.CreatorGrantService;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.PluginHttpMapping;
 import com.jimeng.persistence.entity.PluginTool;
@@ -38,9 +40,11 @@ public class PluginCrudService {
     private final PluginToolMapper pluginToolMapper;
     private final PluginHttpMappingMapper pluginHttpMappingMapper;
     private final PluginRegistryService registryService;
+    private final CreatorGrantService creatorGrantService;
 
     // ============================ Plugin ============================
 
+    @Transactional
     public Plugin createPlugin(Plugin plugin) {
         // code 是「插件→工具→Agent」运行时链路的功能性 slug（按 code 解析工具、绑定 Agent），
         // 不再要求前端填写「代号」，留空时自动生成一个租户内唯一的 slug。
@@ -58,6 +62,8 @@ public class PluginCrudService {
         }
         validateAuthType(plugin.getAuthType());
         pluginMapper.insert(plugin);
+        // 成员自授权：否则建完插件后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
+        creatorGrantService.grantNewResourceToCreator(ResourceType.PLUGIN, plugin.getId());
         registryService.reload();
         return plugin;
     }
@@ -183,6 +189,18 @@ public class PluginCrudService {
     public List<PluginTool> listTools(Long pluginId) {
         return pluginToolMapper.selectList(
                 new LambdaQueryWrapper<PluginTool>().eq(PluginTool::getPluginId, pluginId));
+    }
+
+    /**
+     * 按工具 id 反查其所属插件 id；供 controller 对「/plugins/&#123;pluginId&#125;/tools/&#123;toolId&#125;」类子资源端点
+     * 做父资源访问鉴权与「父子归属一致性」校验（防止用自己有权的 pluginId 套别人的 toolId 绕过）。
+     */
+    public Long resolvePluginIdByTool(Long toolId) {
+        PluginTool tool = pluginToolMapper.selectById(toolId);
+        if (tool == null) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "plugin_tool 不存在: " + toolId);
+        }
+        return tool.getPluginId();
     }
 
     public PluginHttpMapping getMappingByTool(Long toolId) {

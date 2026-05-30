@@ -53,6 +53,7 @@ public class KnowledgeBaseController {
     @Operation(summary = "删除知识库", description = "删除知识库及其下所有文档（同步清理 MinIO 文件与 ES 索引）")
     @DeleteMapping("/{id}")
     public void delete(@Parameter(description = "知识库 ID") @PathVariable Long id) throws Exception {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, id);
         kbService.delete(id);
     }
 
