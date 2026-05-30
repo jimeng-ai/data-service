@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS `ai_model_call_content` (
 
 CREATE TABLE IF NOT EXISTS `knowledge_base` (
                                                 `id`          BIGINT       NOT NULL                COMMENT '主键（雪花 ID）',
+                                                `tenant_id`   VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '租户 ID（与 X-Tenant-Id 对齐）',
                                                 `name`        VARCHAR(128) NOT NULL                COMMENT '知识库名称',
     `description` VARCHAR(512) NULL                    COMMENT '描述',
     `deleted`     TINYINT(1)   NOT NULL DEFAULT 0     COMMENT '逻辑删除',
@@ -166,7 +167,8 @@ CREATE TABLE IF NOT EXISTS `knowledge_base` (
     `update_time` DATETIME     NULL                    COMMENT '更新时间',
     `update_user` VARCHAR(64)  NULL                    COMMENT '更新人',
     PRIMARY KEY (`id`),
-    KEY `idx_kb_name` (`name`)
+    KEY `idx_kb_name` (`name`),
+    KEY `idx_kb_tenant` (`tenant_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='RAG 知识库';
 
 CREATE TABLE IF NOT EXISTS `kb_document` (
@@ -278,7 +280,7 @@ CREATE TABLE IF NOT EXISTS `plugin_http_mapping` (
     `query_template`     JSON         DEFAULT NULL            COMMENT 'Query 参数模板',
     `body_template`      JSON         DEFAULT NULL            COMMENT 'Body 模板（节点树，叶子可含占位符）',
     `body_content_type`  VARCHAR(64)  DEFAULT 'application/json' COMMENT 'Body Content-Type',
-    `response_extract`   VARCHAR(512) DEFAULT NULL            COMMENT '响应抽取 JSONPath（如 $.main），为空则返完整响应',
+    `response_extract`   TEXT         DEFAULT NULL            COMMENT '响应抽取：多字段映射 JSON 数组 [{name,path,type,desc}]，或旧版单条 JSONPath（如 $.main）；为空则返完整响应',
     `response_max_items` INT          DEFAULT 50              COMMENT '数组截断阈值，避免上下文爆炸',
     `timeout_ms`         INT          DEFAULT NULL            COMMENT 'HTTP 超时（毫秒），为空走全局默认',
     `deleted`            TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
@@ -411,5 +413,109 @@ CREATE TABLE IF NOT EXISTS `chat_message` (
     KEY `idx_chat_msg_tenant` (`tenant_id`),
     KEY `idx_chat_msg_deleted` (`deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='对话消息表';
+
+-- ============================================================================
+-- 多租户 RBAC（运营 / 企业 / 角色 / 资源授权 / 成员）—— 详见迁移 V20260601__rbac_multitenant.sql
+-- ⚠ 本批 sys_* 表均不纳入 JimengTenantLineHandler.TENANT_AWARE_TABLES（运营跨租户 + 登录早于 TenantContext）。
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS `sys_operator` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `username`      VARCHAR(64)  NOT NULL                COMMENT '登录名（全局唯一）',
+    `password_hash` VARCHAR(128) NOT NULL                COMMENT 'BCrypt 哈希',
+    `display_name`  VARCHAR(64)                          COMMENT '展示名',
+    `status`        TINYINT      NOT NULL DEFAULT 1      COMMENT '1=启用 0=禁用',
+    `last_login_at` DATETIME                             COMMENT '最近登录时间',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sys_operator_username` (`username`, `deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='平台运营账号（跨租户）';
+
+CREATE TABLE IF NOT EXISTS `sys_enterprise` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `tenant_id`     VARCHAR(64)  NOT NULL                COMMENT '租户标识',
+    `name`          VARCHAR(128) NOT NULL                COMMENT '企业名称',
+    `description`   VARCHAR(512)                         COMMENT '描述',
+    `status`        TINYINT      NOT NULL DEFAULT 1      COMMENT '1=启用 0=停用',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sys_enterprise_tenant` (`tenant_id`, `deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业（租户）';
+
+CREATE TABLE IF NOT EXISTS `sys_user` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `tenant_id`     VARCHAR(64)  NOT NULL                COMMENT '所属租户',
+    `username`      VARCHAR(64)  NOT NULL                COMMENT '登录名（全局唯一）',
+    `password_hash` VARCHAR(128) NOT NULL                COMMENT 'BCrypt 哈希',
+    `display_name`  VARCHAR(64)                          COMMENT '展示名',
+    `user_type`     VARCHAR(16)  NOT NULL DEFAULT 'MEMBER' COMMENT 'SUPER_ADMIN | MEMBER',
+    `status`        TINYINT      NOT NULL DEFAULT 1      COMMENT '1=启用 0=禁用',
+    `last_login_at` DATETIME                             COMMENT '最近登录时间',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sys_user_username` (`username`, `deleted`),
+    KEY `idx_sys_user_tenant` (`tenant_id`, `status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业账号（超管/成员）';
+
+CREATE TABLE IF NOT EXISTS `sys_role` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `tenant_id`     VARCHAR(64)  NOT NULL                COMMENT '所属租户',
+    `code`          VARCHAR(64)  NOT NULL                COMMENT '角色 slug，租户内唯一',
+    `name`          VARCHAR(128) NOT NULL                COMMENT '角色名',
+    `description`   VARCHAR(512)                         COMMENT '描述',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sys_role_tenant_code` (`tenant_id`, `code`, `deleted`),
+    KEY `idx_sys_role_tenant` (`tenant_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业自定义角色';
+
+CREATE TABLE IF NOT EXISTS `sys_role_resource` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `tenant_id`     VARCHAR(64)  NOT NULL                COMMENT '所属租户（冗余）',
+    `role_id`       BIGINT       NOT NULL                COMMENT '角色 ID',
+    `resource_type` VARCHAR(32)  NOT NULL                COMMENT 'MENU | AGENT | KNOWLEDGE_BASE | PLUGIN | ...',
+    `resource_id`   BIGINT       NOT NULL DEFAULT 0      COMMENT '实例 id；MENU 类为 0',
+    `resource_code` VARCHAR(128)                         COMMENT '模块码（MENU）或实例 code（冗余）',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    -- 不设唯一键：service「全删全插」保证一致性；MENU 授权 resource_id 恒 0 + 逻辑删除会撞唯一键（见 V20260602）
+    KEY `idx_role_res_role` (`role_id`),
+    KEY `idx_role_res_type` (`tenant_id`, `resource_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='角色-资源授权';
+
+CREATE TABLE IF NOT EXISTS `sys_user_role` (
+    `id`            BIGINT       NOT NULL                COMMENT '主键（雪花）',
+    `tenant_id`     VARCHAR(64)  NOT NULL                COMMENT '所属租户（冗余）',
+    `user_id`       BIGINT       NOT NULL                COMMENT '成员 ID',
+    `role_id`       BIGINT       NOT NULL                COMMENT '角色 ID',
+    `deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+    `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `create_user`   VARCHAR(64),
+    `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `update_user`   VARCHAR(64),
+    PRIMARY KEY (`id`),
+    -- 不设唯一键：service「全删全插」保证一致性；逻辑删除反复保存会撞唯一键（见 V20260602）
+    KEY `idx_user_role_user` (`user_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='成员-角色绑定';
 
 SET FOREIGN_KEY_CHECKS = 1;

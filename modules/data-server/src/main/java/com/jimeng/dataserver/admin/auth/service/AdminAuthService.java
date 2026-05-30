@@ -4,13 +4,17 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.jwt.JWTPayload;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.jimeng.common.core.constant.JWTConstant;
+import com.jimeng.common.core.constant.PlatformConstant;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.auth.dto.ChangePasswordRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginResponse;
-import com.jimeng.persistence.entity.SysAdmin;
-import com.jimeng.persistence.mapper.SysAdminMapper;
+import com.jimeng.persistence.entity.SysEnterprise;
+import com.jimeng.persistence.entity.SysUser;
+import com.jimeng.persistence.mapper.SysEnterpriseMapper;
+import com.jimeng.persistence.mapper.SysUserMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -22,24 +26,25 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 管理后台账户：登录、改密、查询当前用户。
+ * 企业账号（{@code sys_user}：超管 + 成员）登录、改密、查询当前用户。
+ * jm-agent-front 与 jm-admin 企业门户共用 {@code /data/admin/auth/**}。
  *
- * <p>JWT 直接用 hutool 签发；共用 {@link JWTConstant#TOKEN_SECRET}，
- * gateway 的 {@code AuthorizeFilter} 用同一密钥校验。
+ * <p>JWT 直接用 hutool 签发；共用 {@link JWTConstant#TOKEN_SECRET}，gateway 的 {@code AuthorizeFilter}
+ * 用同一密钥校验，并据 {@code tenant_id} claim 注入 {@code X-Tenant-Id}。固定 12 小时。
  *
- * <p>不复用 {@code common-core/JWTUtil#generateToken} —— 那里有个旧 bug
- * （把秒数 3600 当毫秒加进 token 过期时间，导致 token 3.6 秒就过期）。
- * 这里固定 12 小时，admin 用足够。
+ * <p>{@code sys_user}/{@code sys_enterprise} 均不在租户白名单内，查询不会被自动注入 {@code tenant_id}；
+ * 登录发生在 TenantContext 设置之前，按 username 全局解析。
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class AdminAuthService {
 
-    /** Token 过期时间（毫秒），admin 后台 12h 友好。 */
+    /** Token 过期时间（毫秒），12h 友好。 */
     public static final long ADMIN_TOKEN_EXPIRE_MS = 12L * 60 * 60 * 1000;
 
-    private final SysAdminMapper sysAdminMapper;
+    private final SysUserMapper sysUserMapper;
+    private final SysEnterpriseMapper sysEnterpriseMapper;
     private final BCryptPasswordEncoder passwordEncoder;
 
     @Transactional
@@ -47,32 +52,23 @@ public class AdminAuthService {
         if (req == null || StrUtil.isBlank(req.getUsername()) || StrUtil.isBlank(req.getPassword())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "用户名或密码不能为空");
         }
-        SysAdmin admin = sysAdminMapper.selectOne(
-                Wrappers.<SysAdmin>lambdaQuery().eq(SysAdmin::getUsername, req.getUsername()));
-        if (admin == null) {
+        SysUser user = sysUserMapper.selectOne(
+                Wrappers.<SysUser>lambdaQuery().eq(SysUser::getUsername, req.getUsername()));
+        if (user == null) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "用户名或密码错误");
         }
-        if (admin.getStatus() == null || admin.getStatus() != 1) {
+        if (user.getStatus() == null || user.getStatus() != 1) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "账号已禁用");
         }
-        if (!passwordEncoder.matches(req.getPassword(), admin.getPasswordHash())) {
+        if (!passwordEncoder.matches(req.getPassword(), user.getPasswordHash())) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "用户名或密码错误");
         }
+        requireEnterpriseEnabled(user.getTenantId());
 
-        admin.setLastLoginAt(new Date());
-        sysAdminMapper.updateById(admin);
+        user.setLastLoginAt(new Date());
+        sysUserMapper.updateById(user);
 
-        String token = signToken(admin);
-        return LoginResponse.builder()
-                .token(token)
-                .expiresIn(ADMIN_TOKEN_EXPIRE_MS / 1000)
-                .user(LoginResponse.AdminUserView.builder()
-                        .id(admin.getId())
-                        .tenantId(admin.getTenantId())
-                        .username(admin.getUsername())
-                        .displayName(admin.getDisplayName())
-                        .build())
-                .build();
+        return buildResponse(user);
     }
 
     @Transactional
@@ -83,60 +79,68 @@ public class AdminAuthService {
         if (req.getNewPassword().length() < 6) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "新密码至少 6 位");
         }
-        SysAdmin admin = sysAdminMapper.selectById(userId);
-        if (admin == null) {
+        SysUser user = sysUserMapper.selectById(userId);
+        if (user == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "账号不存在");
         }
-        if (!passwordEncoder.matches(req.getOldPassword(), admin.getPasswordHash())) {
+        if (!passwordEncoder.matches(req.getOldPassword(), user.getPasswordHash())) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "旧密码错误");
         }
-        admin.setPasswordHash(passwordEncoder.encode(req.getNewPassword()));
-        sysAdminMapper.updateById(admin);
+        user.setPasswordHash(passwordEncoder.encode(req.getNewPassword()));
+        sysUserMapper.updateById(user);
     }
 
     public LoginResponse.AdminUserView getCurrentUser(Long userId) {
-        SysAdmin admin = sysAdminMapper.selectById(userId);
-        if (admin == null) {
+        SysUser user = sysUserMapper.selectById(userId);
+        if (user == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "账号不存在");
         }
-        return LoginResponse.AdminUserView.builder()
-                .id(admin.getId())
-                .tenantId(admin.getTenantId())
-                .username(admin.getUsername())
-                .displayName(admin.getDisplayName())
-                .build();
+        return toView(user);
     }
 
     /**
-     * 滑动续期：用当前仍然有效的 token 换发一枚新的 12h token。
-     *
-     * <p>该接口走 gateway 鉴权（不在白名单里），所以只有未过期的 token 才能调用，
-     * {@code userId} 来自 gateway 注入的 {@code user-id} 头。复用唯一的 {@link #signToken}
-     * 签发路径，重新签发后 exp = now + {@link #ADMIN_TOKEN_EXPIRE_MS}，窗口随之向后滑动。
-     *
-     * <p>这里重新校验账号状态（{@code getCurrentUser} 不校验），避免给已禁用账号续命。
+     * 滑动续期：用当前仍有效的 token 换发一枚新的 12h token。重新校验账号 + 企业状态，避免给已禁用账号续命。
      */
     public LoginResponse refresh(Long userId) {
-        SysAdmin admin = sysAdminMapper.selectById(userId);
-        if (admin == null) {
+        SysUser user = sysUserMapper.selectById(userId);
+        if (user == null) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "账号不存在");
         }
-        if (admin.getStatus() == null || admin.getStatus() != 1) {
+        if (user.getStatus() == null || user.getStatus() != 1) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "账号已禁用");
         }
+        requireEnterpriseEnabled(user.getTenantId());
+        return buildResponse(user);
+    }
+
+    private void requireEnterpriseEnabled(String tenantId) {
+        SysEnterprise ent = TenantContext.runAsSystem(() -> sysEnterpriseMapper.selectOne(
+                Wrappers.<SysEnterprise>lambdaQuery().eq(SysEnterprise::getTenantId, tenantId)));
+        if (ent == null || ent.getStatus() == null || ent.getStatus() != 1) {
+            throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "企业已停用");
+        }
+    }
+
+    private LoginResponse buildResponse(SysUser user) {
         return LoginResponse.builder()
-                .token(signToken(admin))
+                .token(signToken(user))
                 .expiresIn(ADMIN_TOKEN_EXPIRE_MS / 1000)
-                .user(LoginResponse.AdminUserView.builder()
-                        .id(admin.getId())
-                        .tenantId(admin.getTenantId())
-                        .username(admin.getUsername())
-                        .displayName(admin.getDisplayName())
-                        .build())
+                .user(toView(user))
                 .build();
     }
 
-    private String signToken(SysAdmin admin) {
+    private LoginResponse.AdminUserView toView(SysUser user) {
+        return LoginResponse.AdminUserView.builder()
+                .id(user.getId())
+                .tenantId(user.getTenantId())
+                .username(user.getUsername())
+                .displayName(user.getDisplayName())
+                .realm(PlatformConstant.REALM_ENTERPRISE)
+                .userType(user.getUserType())
+                .build();
+    }
+
+    private String signToken(SysUser user) {
         Date now = new Date();
         Date exp = new Date(now.getTime() + ADMIN_TOKEN_EXPIRE_MS);
         Map<String, Object> payload = new HashMap<>();
@@ -144,9 +148,11 @@ public class AdminAuthService {
         payload.put(JWTPayload.EXPIRES_AT, exp);
         payload.put(JWTPayload.NOT_BEFORE, now);
         // gateway AuthorizeFilter 读 id / tenant_id claim 并分别注入 user-id / X-Tenant-Id 头
-        payload.put("id", String.valueOf(admin.getId()));
-        payload.put("tenant_id", admin.getTenantId());
-        payload.put("username", admin.getUsername());
+        payload.put("id", String.valueOf(user.getId()));
+        payload.put("tenant_id", user.getTenantId());
+        payload.put("username", user.getUsername());
+        payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        payload.put("user_type", user.getUserType());
         return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
     }
 }

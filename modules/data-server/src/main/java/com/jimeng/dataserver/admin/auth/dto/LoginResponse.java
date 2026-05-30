@@ -35,5 +35,9 @@ public class LoginResponse {
         private String username;
         @Schema(description = "展示名")
         private String displayName;
+        @Schema(description = "登录域：OPERATOR（平台运营）/ ENTERPRISE（企业账号）")
+        private String realm;
+        @Schema(description = "企业账号类型：SUPER_ADMIN / MEMBER（运营为空）")
+        private String userType;
     }
 }

@@ -80,6 +80,33 @@ class PluginResponseExtractorTest {
     }
 
     @Test
+    void extract_multiFieldMapping_returnsNamedObject() {
+        String body = "{\"result\":{\"city\":\"温州\",\"realtime\":{\"temperature\":\"17\",\"info\":\"晴\"}}}";
+        String cfg = "[{\"name\":\"city\",\"path\":\"$.result.city\"},"
+                + "{\"name\":\"temp\",\"path\":\"$.result.realtime.temperature\"},"
+                + "{\"name\":\"weather\",\"path\":\"$.result.realtime.info\"}]";
+        Object out = extractor.extract(body, mapping(cfg, null));
+        assertTrue(out instanceof Map);
+        Map<?, ?> m = (Map<?, ?>) out;
+        assertEquals("温州", m.get("city"));
+        assertEquals("17", m.get("temp"));
+        assertEquals("晴", m.get("weather"));
+    }
+
+    @Test
+    void extract_multiFieldMapping_missingPath_yieldsNullValue() {
+        String body = "{\"result\":{\"city\":\"上海\"}}";
+        String cfg = "[{\"name\":\"city\",\"path\":\"$.result.city\"},"
+                + "{\"name\":\"temp\",\"path\":\"$.result.realtime.temperature\"}]";
+        Object out = extractor.extract(body, mapping(cfg, null));
+        assertTrue(out instanceof Map);
+        Map<?, ?> m = (Map<?, ?>) out;
+        assertEquals("上海", m.get("city"));
+        assertTrue(m.containsKey("temp"));
+        assertNull(m.get("temp"));
+    }
+
+    @Test
     void extract_nonJsonBody_returnsRaw() {
         Object out = extractor.extract("plain text", mapping(null, null));
         assertEquals("plain text", out);

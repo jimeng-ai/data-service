@@ -15,6 +15,13 @@ import java.util.Map;
 /**
  * 响应抽取：按 JSONPath 截取子树 + 数组截断。
  *
+ * <p>两种模式：
+ * <ul>
+ *   <li><b>多字段映射</b>：{@code response_extract} 为 {@code [{"name","path"}, ...]} JSON 数组时，
+ *       逐字段抽取并返回 {@code {name: value}} 结构化对象。</li>
+ *   <li><b>单条路径</b>（旧版/兼容）：直接是一条 JSONPath 字符串。</li>
+ * </ul>
+ *
  * <p>JSONPath 支持的子集：
  * <ul>
  *   <li>{@code $} 或留空 → 全文返回</li>
@@ -43,13 +50,58 @@ public class PluginResponseExtractor {
             return rawBody;
         }
 
-        String path = mapping == null ? null : mapping.getResponseExtract();
-        JsonNode extracted = applyPath(root, path);
-
+        String cfg = mapping == null ? null : mapping.getResponseExtract();
         Integer maxItemsCfg = mapping == null ? null : mapping.getResponseMaxItems();
         int maxItems = maxItemsCfg == null || maxItemsCfg <= 0 ? DEFAULT_MAX_ITEMS : maxItemsCfg;
 
+        // 多字段映射模式：response_extract 为 [{"name","path"}, ...] 的 JSON 数组
+        // → 逐个抽取，返回结构化对象 {name: value}，便于在 ToB 控制台按字段配置/展示
+        Map<String, String> fieldMappings = parseFieldMappings(cfg);
+        if (fieldMappings != null) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            for (Map.Entry<String, String> e : fieldMappings.entrySet()) {
+                JsonNode v = applyPath(root, e.getValue());
+                result.put(e.getKey(), nodeToObjectWithTruncation(v, maxItems));
+            }
+            return result;
+        }
+
+        // 旧版：单条 JSONPath
+        JsonNode extracted = applyPath(root, cfg);
         return nodeToObjectWithTruncation(extracted, maxItems);
+    }
+
+    /**
+     * 解析多字段抽取配置：{@code [{"name":"city","path":"$.result.city"}, ...]}。
+     *
+     * <p>非 JSON 数组（旧版单条 JSONPath 如 {@code $.main}，或为空）返回 {@code null}，调用方走旧逻辑。
+     */
+    private Map<String, String> parseFieldMappings(String cfg) {
+        if (!StringUtils.hasText(cfg)) {
+            return null;
+        }
+        String s = cfg.trim();
+        if (s.charAt(0) != '[') {
+            return null;
+        }
+        try {
+            JsonNode arr = CommonUtil.getObjectMapper().readTree(s);
+            if (!arr.isArray()) {
+                return null;
+            }
+            Map<String, String> out = new LinkedHashMap<>();
+            for (JsonNode n : arr) {
+                String name = n.path("name").asText("");
+                String path = n.path("path").asText("");
+                if (!name.isEmpty()) {
+                    out.put(name, path);
+                }
+            }
+            return out.isEmpty() ? null : out;
+        } catch (Exception e) {
+            log.warn("响应抽取多字段配置解析失败，回退单路径: {}", e.getMessage());
+            return null;
+        }
     }
 
     private JsonNode applyPath(JsonNode root, String path) {

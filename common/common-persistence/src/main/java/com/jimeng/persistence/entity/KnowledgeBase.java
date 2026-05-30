@@ -11,6 +11,9 @@ import lombok.EqualsAndHashCode;
 @Data
 public class KnowledgeBase extends BaseEntity {
 
+    @TableField("tenant_id")
+    private String tenantId;
+
     @TableField("name")
     private String name;
 

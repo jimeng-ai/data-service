@@ -7,6 +7,8 @@ import com.jimeng.dataserver.ai.plugin.service.PluginCredentialService;
 import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.plugin.service.PluginHttpInvoker;
 import com.jimeng.dataserver.ai.plugin.service.PluginRegistryService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.PluginCredential;
 import com.jimeng.persistence.entity.PluginHttpMapping;
@@ -43,6 +45,7 @@ public class PluginAdminController {
     private final PluginCredentialService credentialService;
     private final PluginRegistryService registryService;
     private final PluginHttpInvoker httpInvoker;
+    private final PermissionResolver permissionResolver;
 
     // ============================ Plugin ============================
 
@@ -59,15 +62,16 @@ public class PluginAdminController {
         return crudService.updatePlugin(plugin);
     }
 
-    @Operation(summary = "列出当前租户的插件")
+    @Operation(summary = "列出当前租户的插件（成员仅见被授权的）")
     @GetMapping("/plugins")
     public List<Plugin> listPlugins(@RequestParam(required = false) String status) {
-        return crudService.listPlugins(status);
+        return permissionResolver.filterCurrent(crudService.listPlugins(status), ResourceType.PLUGIN, Plugin::getId);
     }
 
     @Operation(summary = "插件详情")
     @GetMapping("/plugins/{id}")
     public Plugin getPlugin(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
         return crudService.getPlugin(id);
     }
 

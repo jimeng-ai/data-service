@@ -1,6 +1,8 @@
 package com.jimeng.dataserver.ai.rag.controller;
 
 import com.jimeng.dataserver.ai.rag.service.KnowledgeBaseService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.KnowledgeBase;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -27,6 +29,7 @@ import java.util.List;
 public class KnowledgeBaseController {
 
     private final KnowledgeBaseService kbService;
+    private final PermissionResolver permissionResolver;
 
     @Operation(summary = "创建知识库", description = "新建一个知识库；后续可向该知识库下上传文档")
     @PostMapping
@@ -34,15 +37,16 @@ public class KnowledgeBaseController {
         return kbService.create(req.getName(), req.getDescription());
     }
 
-    @Operation(summary = "查询知识库列表", description = "返回当前所有知识库（含名称、描述、创建时间等元信息）")
+    @Operation(summary = "查询知识库列表", description = "返回当前租户的知识库（成员仅见被授权的）")
     @GetMapping
     public List<KnowledgeBase> list() {
-        return kbService.list();
+        return permissionResolver.filterCurrent(kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId);
     }
 
     @Operation(summary = "获取知识库详情", description = "按 ID 查询单个知识库的元信息")
     @GetMapping("/{id}")
     public KnowledgeBase get(@Parameter(description = "知识库 ID") @PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, id);
         return kbService.get(id);
     }
 

@@ -35,7 +35,7 @@ public class TenantContextFilter implements Filter {
 
     public static final String HEADER_TENANT_ID = "X-Tenant-Id";
 
-    /** 默认放行路径：基础设施类端点不走业务，无租户概念。 */
+    /** 默认放行路径：基础设施类端点 + 登录端点（登录无 token、无租户概念，不能要求 X-Tenant-Id）。 */
     private static final List<String> DEFAULT_WHITELIST = Arrays.asList(
             "/actuator/**",
             "/doc.html",
@@ -43,7 +43,10 @@ public class TenantContextFilter implements Filter {
             "/webjars/**",
             "/v3/api-docs/**",
             "/favicon.ico",
-            "/error"
+            "/error",
+            // 登录端点：运营 /data/admin/operator/auth/login 与企业 /data/admin/auth/login。
+            // 与 gateway ignore.auth.whites-url 的 /**/auth/login 对齐；登录前没有 token，故无 X-Tenant-Id。
+            "/**/auth/login"
     );
 
     /** 业务方可以在配置里追加 skip 路径，逗号分隔。 */

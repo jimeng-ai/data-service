@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AgentPlugin;
@@ -37,12 +39,15 @@ public class AgentRuntimeService {
     private final AgentMapper agentMapper;
     private final AgentPluginMapper agentPluginMapper;
     private final PluginMapper pluginMapper;
+    private final PermissionResolver permissionResolver;
 
     public AgentRuntimeView byId(Long agentId) {
         Agent agent = agentMapper.selectById(agentId);
         if (agent == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "Agent 不存在或无权访问: " + agentId);
         }
+        // 成员只能运行被授权的 Agent；超管放行。挡住「用已知 id 直连未授权 agent 对话」。
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, agentId);
         if ("DISABLED".equals(agent.getStatus())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "Agent 已禁用: " + agent.getCode());
         }

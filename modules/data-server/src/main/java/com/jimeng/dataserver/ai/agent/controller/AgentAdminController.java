@@ -3,6 +3,8 @@ package com.jimeng.dataserver.ai.agent.controller;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.agent.service.AgentService;
+import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AgentPlugin;
 import io.swagger.v3.oas.annotations.Operation;
@@ -32,6 +34,7 @@ import java.util.Map;
 public class AgentAdminController {
 
     private final AgentService agentService;
+    private final PermissionResolver permissionResolver;
 
     @Operation(summary = "创建 Agent")
     @PostMapping("/agents")
@@ -46,15 +49,16 @@ public class AgentAdminController {
         return agentService.update(agent);
     }
 
-    @Operation(summary = "列出当前租户的 Agent")
+    @Operation(summary = "列出当前租户的 Agent（成员仅见被授权的）")
     @GetMapping("/agents")
     public List<Agent> list(@RequestParam(required = false) String status) {
-        return agentService.list(status);
+        return permissionResolver.filterCurrent(agentService.list(status), ResourceType.AGENT, Agent::getId);
     }
 
     @Operation(summary = "Agent 详情")
     @GetMapping("/agents/{id}")
     public Agent get(@PathVariable Long id) {
+        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
         return agentService.getById(id);
     }
 
