@@ -53,6 +53,12 @@ public class AdminAuthController {
         return adminAuthService.getCurrentUser(parseUserId(userIdHeader));
     }
 
+    @Operation(summary = "滑动续期：用当前有效 token 换发新 token")
+    @PostMapping("/refresh")
+    public LoginResponse refresh(@RequestHeader(value = "user-id", required = false) String userIdHeader) {
+        return adminAuthService.refresh(parseUserId(userIdHeader));
+    }
+
     private Long parseUserId(String header) {
         if (StrUtil.isBlank(header) || "null".equals(header)) {
             throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "缺少 user-id 头");

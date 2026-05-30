@@ -107,6 +107,35 @@ public class AdminAuthService {
                 .build();
     }
 
+    /**
+     * 滑动续期：用当前仍然有效的 token 换发一枚新的 12h token。
+     *
+     * <p>该接口走 gateway 鉴权（不在白名单里），所以只有未过期的 token 才能调用，
+     * {@code userId} 来自 gateway 注入的 {@code user-id} 头。复用唯一的 {@link #signToken}
+     * 签发路径，重新签发后 exp = now + {@link #ADMIN_TOKEN_EXPIRE_MS}，窗口随之向后滑动。
+     *
+     * <p>这里重新校验账号状态（{@code getCurrentUser} 不校验），避免给已禁用账号续命。
+     */
+    public LoginResponse refresh(Long userId) {
+        SysAdmin admin = sysAdminMapper.selectById(userId);
+        if (admin == null) {
+            throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "账号不存在");
+        }
+        if (admin.getStatus() == null || admin.getStatus() != 1) {
+            throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "账号已禁用");
+        }
+        return LoginResponse.builder()
+                .token(signToken(admin))
+                .expiresIn(ADMIN_TOKEN_EXPIRE_MS / 1000)
+                .user(LoginResponse.AdminUserView.builder()
+                        .id(admin.getId())
+                        .tenantId(admin.getTenantId())
+                        .username(admin.getUsername())
+                        .displayName(admin.getDisplayName())
+                        .build())
+                .build();
+    }
+
     private String signToken(SysAdmin admin) {
         Date now = new Date();
         Date exp = new Date(now.getTime() + ADMIN_TOKEN_EXPIRE_MS);
