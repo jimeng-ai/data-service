@@ -30,7 +30,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
  * 插件管理后台接口。
@@ -186,23 +185,35 @@ public class PluginAdminController {
 
     @Data
     public static class PluginTestRequest {
-        private String toolName;
+        // 工具 id 是雪花 id（19 位），超出 JS 安全整数，前端以字符串传入，这里再转 Long
+        private String toolId;
         private Map<String, Object> input;
     }
 
-    @Operation(summary = "试调用：不经 LLM 直接传入参数 → 调插件并返回真实响应")
+    @Operation(summary = "试调用：不经 LLM、不经发布缓存，按 toolId 直取配置 → 调插件并回传请求/curl/响应")
     @PostMapping("/plugins/{pluginId}/test")
     public Object testInvoke(@PathVariable Long pluginId, @RequestBody PluginTestRequest req) {
-        // 试调用会真实打到插件后端（可能有副作用），必须先做实例级鉴权再放行。
-        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
-        // 校验插件归属当前租户：getPlugin 会查不到时抛 404
-        Plugin plugin = crudService.getPlugin(pluginId);
-        Optional<PluginToolEntry> entryOpt = registryService.findToolByName(plugin.getTenantId(), req.getToolName());
-        if (entryOpt.isEmpty()) {
-            throw new ServiceException(ExceptionCode.NOT_FOUND,
-                    "找不到工具（请检查插件是否已 PUBLISHED 且工具 enabled=true）: " + req.getToolName());
+        String rawToolId = req == null ? null : req.getToolId();
+        if (rawToolId == null || rawToolId.isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "toolId 不能为空");
         }
-        return httpInvoker.invoke(entryOpt.get(), req.getInput());
+        Long toolId;
+        try {
+            toolId = Long.valueOf(rawToolId.trim());
+        } catch (NumberFormatException e) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "toolId 非法");
+        }
+        // 试调用会真实打到插件后端（可能有副作用）：做实例级鉴权 + 父子归属校验。
+        // 但不要求插件已发布 / 工具已启用——调试草稿也能直接试跑。
+        assertToolUnderAccessiblePlugin(pluginId, toolId);
+        Plugin plugin = crudService.getPlugin(pluginId);
+        PluginTool tool = crudService.getTool(toolId);
+        PluginHttpMapping mapping = crudService.getMappingByTool(toolId);
+        if (mapping == null) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "该工具尚未配置 HTTP 映射，无法试调用");
+        }
+        PluginToolEntry entry = new PluginToolEntry(plugin, tool, mapping);
+        return httpInvoker.invokeForTest(entry, req.getInput());
     }
 
     @Operation(summary = "手动刷新插件缓存")

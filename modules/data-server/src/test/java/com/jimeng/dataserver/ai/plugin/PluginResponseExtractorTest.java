@@ -107,6 +107,42 @@ class PluginResponseExtractorTest {
     }
 
     @Test
+    void extract_arrayWildcardField_mapsEachItem() {
+        String body = "{\"data\":{\"items\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}}";
+        Object out = extractor.extract(body, mapping("$.data.items[*].name", null));
+        assertTrue(out instanceof List, "[*].field 应返回列表");
+        assertEquals(List.of("Alice", "Bob"), out);
+    }
+
+    @Test
+    void extract_arrayWildcardTerminal_returnsWholeArray() {
+        String body = "{\"items\":[{\"id\":1},{\"id\":2}]}";
+        Object out = extractor.extract(body, mapping("$.items[*]", null));
+        assertTrue(out instanceof List);
+        assertEquals(2, ((List<?>) out).size());
+        assertEquals(1, ((Map<?, ?>) ((List<?>) out).get(0)).get("id"));
+    }
+
+    @Test
+    void extract_multiField_withWildcard_returnsNamedLists() {
+        String body = "{\"result\":[{\"city\":\"温州\",\"temp\":\"17\"},{\"city\":\"上海\",\"temp\":\"20\"}]}";
+        String cfg = "[{\"name\":\"cities\",\"path\":\"$.result[*].city\"},"
+                + "{\"name\":\"temps\",\"path\":\"$.result[*].temp\"}]";
+        Object out = extractor.extract(body, mapping(cfg, null));
+        assertTrue(out instanceof Map);
+        Map<?, ?> m = (Map<?, ?>) out;
+        assertEquals(List.of("温州", "上海"), m.get("cities"));
+        assertEquals(List.of("17", "20"), m.get("temps"));
+    }
+
+    @Test
+    void extract_wildcardField_missingOnSome_skipsNulls() {
+        String body = "{\"items\":[{\"name\":\"Alice\"},{\"id\":2},{\"name\":\"Carol\"}]}";
+        Object out = extractor.extract(body, mapping("$.items[*].name", null));
+        assertEquals(List.of("Alice", "Carol"), out);
+    }
+
+    @Test
     void extract_nonJsonBody_returnsRaw() {
         Object out = extractor.extract("plain text", mapping(null, null));
         assertEquals("plain text", out);

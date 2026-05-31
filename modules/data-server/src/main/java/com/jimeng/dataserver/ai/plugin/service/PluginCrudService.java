@@ -207,4 +207,13 @@ public class PluginCrudService {
         return pluginHttpMappingMapper.selectOne(
                 new LambdaQueryWrapper<PluginHttpMapping>().eq(PluginHttpMapping::getPluginToolId, toolId));
     }
+
+    /** 按 id 直取工具（试调用用：不经发布缓存，可调试草稿/未启用工具） */
+    public PluginTool getTool(Long toolId) {
+        PluginTool tool = pluginToolMapper.selectById(toolId);
+        if (tool == null) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "plugin_tool 不存在: " + toolId);
+        }
+        return tool;
+    }
 }

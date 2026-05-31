@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.plugin.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.persistence.entity.PluginHttpMapping;
 import lombok.extern.slf4j.Slf4j;
@@ -112,18 +113,24 @@ public class PluginResponseExtractor {
         if (normalized.startsWith("$.")) normalized = normalized.substring(2);
         else if (normalized.startsWith("$")) normalized = normalized.substring(1);
 
-        JsonNode current = root;
-        for (String segment : splitSegments(normalized)) {
-            if (current == null || current.isMissingNode() || current.isNull()) {
-                return null;
-            }
-            current = stepInto(current, segment);
-        }
-        return current;
+        return applySegments(root, splitSegments(normalized), 0);
     }
 
-    private JsonNode stepInto(JsonNode node, String segment) {
+    /**
+     * 递归求值剩余路径段。relative 关键点是对 {@code [*]} 通配的处理：
+     * 命中数组后，把<em>剩余</em>路径逐项映射到每个元素，再把结果收成数组返回。
+     * 因此 {@code $.items[*].name} 会返回 {@code ["Alice","Bob"]}，而非旧实现里的 {@code null}。
+     */
+    private JsonNode applySegments(JsonNode node, List<String> segments, int idx) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (idx >= segments.size()) {
+            return node;
+        }
+
         // segment 形如：foo / foo[0] / foo[*] / [0] / [*]
+        String segment = segments.get(idx);
         String key = segment;
         Integer index = null;
         boolean wildcard = false;
@@ -146,18 +153,30 @@ public class PluginResponseExtractor {
             }
         }
 
+        JsonNode current = node;
         if (!key.isEmpty()) {
-            node = node.get(key);
-            if (node == null) return null;
+            current = current.get(key);
+            if (current == null) return null;
         }
+
         if (wildcard) {
-            // 对数组返回原数组节点
-            return node;
+            if (current == null || !current.isArray()) {
+                return null;
+            }
+            // 逐项映射剩余路径；剩余路径为空时即返回元素本身（等价旧的整数组返回）。
+            ArrayNode out = CommonUtil.getObjectMapper().createArrayNode();
+            for (JsonNode el : current) {
+                JsonNode v = applySegments(el, segments, idx + 1);
+                if (v != null && !v.isMissingNode() && !v.isNull()) {
+                    out.add(v);
+                }
+            }
+            return out;
         }
         if (index != null) {
-            return node.isArray() ? node.get(index) : null;
+            current = current.isArray() ? current.get(index) : null;
         }
-        return node;
+        return applySegments(current, segments, idx + 1);
     }
 
     private List<String> splitSegments(String path) {
