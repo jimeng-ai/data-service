@@ -8,7 +8,10 @@ import java.util.List;
  */
 public interface RerankClient {
 
-    List<RerankHit> rerank(String query, List<String> documents, int topN);
+    /**
+     * 重排。返回命中列表 + 本次 usage（供 RerankService 按 token 计费；无 usage 时由其估算）。
+     */
+    RerankResult rerank(String query, List<String> documents, int topN);
 
     /** 由 ProviderRegistry 用于按 ai.provider 选 bean。 */
     String providerName();

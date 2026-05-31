@@ -8,6 +8,7 @@ import com.jimeng.common.core.service.RequestService;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.spi.RerankClient;
 import com.jimeng.dataserver.ai.provider.spi.RerankHit;
+import com.jimeng.dataserver.ai.provider.spi.RerankResult;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
@@ -38,8 +39,10 @@ public class Qwen3RerankClient implements RerankClient {
     }
 
     @Override
-    public List<RerankHit> rerank(String query, List<String> documents, int topN) {
-        if (documents == null || documents.isEmpty()) return List.of();
+    public RerankResult rerank(String query, List<String> documents, int topN) {
+        if (documents == null || documents.isEmpty()) {
+            return RerankResult.of(List.of(), null, config.getRerank().getModel());
+        }
         if (StrUtil.isBlank(config.getApiKey())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "providers." + providerName + ".api-key 未配置");
@@ -69,12 +72,28 @@ public class Qwen3RerankClient implements RerankClient {
                     "rerank 调用失败 provider=" + providerName + " status=" + resp.getStatusCode()
                             + " body=" + resp.getBody());
         }
-        return parseResults(resp.getBody());
+        return RerankResult.of(parseResults(resp.getBody()), extractUsageJson(resp.getBody()),
+                config.getRerank().getModel());
     }
 
     @Override
     public String providerName() {
         return providerName;
+    }
+
+    /** 抽响应里的 usage 对象原文（302.ai qwen3 按 token 计费，部分形态带 usage；无则返回 null 让上层估算）。 */
+    private String extractUsageJson(String json) {
+        if (StrUtil.isBlank(json) || !JSONUtil.isTypeJSON(json)) return null;
+        cn.hutool.json.JSONObject root = JSONUtil.parseObj(json);
+        Object usage = root.get("usage");
+        if (usage == null) {
+            // DashScope 风格：usage 可能嵌在 output 同级或 output 内
+            Object output = root.get("output");
+            if (output instanceof Map<?, ?> outMap) {
+                usage = outMap.get("usage");
+            }
+        }
+        return usage == null ? null : usage.toString();
     }
 
     private List<RerankHit> parseResults(String json) {

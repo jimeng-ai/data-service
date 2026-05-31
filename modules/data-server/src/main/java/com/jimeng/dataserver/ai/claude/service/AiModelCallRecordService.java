@@ -6,6 +6,9 @@ import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
+import com.jimeng.dataserver.ai.claude.pricing.ModelPricing;
+import com.jimeng.dataserver.ai.claude.usage.NormalizedUsage;
+import com.jimeng.dataserver.ai.claude.usage.UsageExtractor;
 import com.jimeng.persistence.entity.AiModelCallContent;
 import com.jimeng.persistence.entity.AiModelCallLog;
 import com.jimeng.persistence.mapper.AiModelCallContentMapper;
@@ -35,6 +38,8 @@ public class AiModelCallRecordService {
 
     private final AiModelCallLogMapper aiModelCallLogMapper;
     private final AiModelCallContentMapper aiModelCallContentMapper;
+    private final UsageExtractor usageExtractor;
+    private final ModelPricing modelPricing;
 
     public Long recordRequest(Map<String, Object> requestBody, Map<String, String> requestHeaders) {
         return recordRequest(requestBody, requestHeaders, "anthropic", "/v1/messages", "claude-opus-4-6");
@@ -104,6 +109,7 @@ public class AiModelCallRecordService {
         logEntity.setHasText(flags.hasText);
         logEntity.setHasImage(flags.hasImage);
         logEntity.setHasDocument(flags.hasDocument);
+        logEntity.setHasVideo(flags.hasVideo);
 
         aiModelCallLogMapper.insert(logEntity);
 
@@ -127,7 +133,8 @@ public class AiModelCallRecordService {
         if (StrUtil.isNotBlank(responseBody) && JSONUtil.isTypeJSON(responseBody)) {
             JSONObject root = JSONUtil.parseObj(responseBody);
             logEntity.setRequestId(root.getStr("id"));
-            fillUsage(logEntity, root.getJSONObject("usage"));
+            NormalizedUsage usage = usageExtractor.extract(root.getJSONObject("usage"));
+            applyUsage(logEntity, usage, resolveModel(root.getStr("model"), logId));
             isStream = Boolean.TRUE.equals(root.getBool("stream"));
 
             JSONObject error = root.getJSONObject("error");
@@ -171,18 +178,93 @@ public class AiModelCallRecordService {
         logEntity.setHttpStatus(httpStatus);
         logEntity.setLatencyMs(latencyMs);
         logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
-        logEntity.setInputTokens(inputTokens);
-        logEntity.setOutputTokens(outputTokens);
-        logEntity.setTotalTokens(inputTokens + outputTokens);
         if (StrUtil.isNotBlank(requestId)) {
             logEntity.setRequestId(requestId);
         }
+        // 从重建的响应体解析 usage（含缓存 token）与 model；解析不到时回退到累积器给的 input/output。
+        NormalizedUsage usage = parseUsage(streamEventsJson);
+        if (usage.getInputTokens() == null) {
+            usage.setInputTokens(inputTokens);
+        }
+        if (usage.getOutputTokens() == null) {
+            usage.setOutputTokens(outputTokens);
+        }
+        if (usage.getTotalTokens() == null) {
+            usage.setTotalTokens(nz(usage.getInputTokens()) + nz(usage.getOutputTokens()));
+        }
+        applyUsage(logEntity, usage, resolveModel(extractModel(streamEventsJson), logId));
         aiModelCallLogMapper.updateById(logEntity);
 
         LambdaUpdateWrapper<AiModelCallContent> wrapper = new LambdaUpdateWrapper<>();
         wrapper.eq(AiModelCallContent::getLogId, logId);
         wrapper.set(AiModelCallContent::getStreamEvents, streamEventsJson);
         aiModelCallContentMapper.update(null, wrapper);
+    }
+
+    /**
+     * 记录一次「按文档聚合」的模型调用。用于 RAG contextualization：一份文档的每个 chunk
+     * 都要调一次 LLM，逐次落库会在 {@code ai_model_call_log} 里产生上千行，因此调用方把整篇
+     * 文档各次 usage 累加成一个 {@link NormalizedUsage}，在此写成一行（一次性成功态，含汇总 cost）。
+     *
+     * @param usage     已累加的归一化用量（input/output/cache 等为整篇文档各次之和）
+     * @param callCount 实际计入的调用次数（写入 content 备注，便于核对）
+     * @return 日志记录 ID
+     */
+    public Long recordAggregatedCall(String provider, String endpoint, String model, String bizType,
+                                     NormalizedUsage usage, int callCount, Integer latencyMs) {
+        Map<String, Object> note = new LinkedHashMap<>();
+        note.put("aggregated", true);
+        note.put("biz_type", bizType);
+        note.put("call_count", callCount);
+        return recordComputedCall(provider, endpoint, model, bizType, usage, 200, latencyMs, note);
+    }
+
+    /**
+     * 记录一次「用量由调用方算好」的合成调用：usage 不来自标准响应解析，而是调用方累加/估算后传入。
+     * 用于 RAG contextualization（按文档聚合）与 rerank（响应常无 usage，按 query+文档估算 token）。
+     * 一次性写一行（含汇总 cost），失败态由 httpStatus 决定。
+     *
+     * @param usage      归一化用量（已由调用方算好）
+     * @param httpStatus HTTP 状态（决定成功/失败态）
+     * @param note       写入 content.req_body 的备注（aggregated / usage_estimated / call_count 等）
+     * @return 日志记录 ID
+     */
+    public Long recordComputedCall(String provider, String endpoint, String model, String bizType,
+                                   NormalizedUsage usage, Integer httpStatus, Integer latencyMs,
+                                   Map<String, Object> note) {
+        AiModelCallLog logEntity = new AiModelCallLog();
+        logEntity.setProvider(provider);
+        logEntity.setEndpoint(endpoint);
+        logEntity.setModel(model);
+        logEntity.setStream(false);
+        logEntity.setRetryCount(0);
+        logEntity.setBizType(bizType);
+        logEntity.setHttpStatus(httpStatus);
+        logEntity.setLatencyMs(latencyMs);
+        logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
+        logEntity.setHasText(true);
+
+        // 租户/用户/链路：可能跑在入库异步线程（无 HTTP 请求），主要靠 TenantContext（Consumer/Filter 已设置）。
+        HttpServletRequest request = currentRequest();
+        logEntity.setTraceId(firstNonBlank(getHeader(request, "trace-id"), getHeader(request, "x-trace-id")));
+        logEntity.setTenantId(firstNonBlank(
+                getHeader(request, "tenant-id"),
+                getHeader(request, "x-tenant-id"),
+                TenantContext.get()));
+        logEntity.setUserId(firstNonBlank(getHeader(request, "user-id"), getHeader(request, "x-user-id")));
+
+        applyUsage(logEntity, usage, model);
+        aiModelCallLogMapper.insert(logEntity);
+
+        AiModelCallContent contentEntity = new AiModelCallContent();
+        contentEntity.setLogId(logEntity.getId());
+        contentEntity.setReqBody(JSONUtil.toJsonStr(note == null ? Map.of() : note));
+        if (usage != null && StrUtil.isNotBlank(usage.getRawJson())) {
+            contentEntity.setRespBody(usage.getRawJson());
+        }
+        aiModelCallContentMapper.insert(contentEntity);
+
+        return logEntity.getId();
     }
 
     public void recordException(Long logId, Throwable throwable, Integer latencyMs) {
@@ -195,20 +277,45 @@ public class AiModelCallRecordService {
         aiModelCallLogMapper.updateById(logEntity);
     }
 
-    private void fillUsage(AiModelCallLog logEntity, JSONObject usage) {
-        if (usage == null) {
-            return;
+    /** 把归一化用量 + 费用写入日志实体（兼容 OpenAI / Anthropic）。 */
+    private void applyUsage(AiModelCallLog logEntity, NormalizedUsage usage, String model) {
+        logEntity.setInputTokens(usage.getInputTokens());
+        logEntity.setOutputTokens(usage.getOutputTokens());
+        logEntity.setTotalTokens(usage.getTotalTokens());
+        logEntity.setCacheReadTokens(usage.getCacheReadTokens());
+        logEntity.setCacheWriteTokens(usage.getCacheWriteTokens());
+        logEntity.setReasoningTokens(usage.getReasoningTokens());
+        logEntity.setUsageRaw(usage.getRawJson());
+        logEntity.setCostUsd(modelPricing.compute(model, usage));
+    }
+
+    /** 解析响应体里的 usage 对象（无 / 非 JSON 时返回空对象，不抛异常）。 */
+    private NormalizedUsage parseUsage(String responseJson) {
+        if (StrUtil.isBlank(responseJson) || !JSONUtil.isTypeJSON(responseJson)) {
+            return new NormalizedUsage();
         }
-        Integer input = firstNonNull(usage.getInt("input_tokens"), usage.getInt("prompt_tokens"));
-        Integer output = firstNonNull(usage.getInt("output_tokens"), usage.getInt("completion_tokens"));
-        logEntity.setInputTokens(input);
-        logEntity.setOutputTokens(output);
-        if (input != null || output != null) {
-            logEntity.setTotalTokens(firstNonNull(
-                    usage.getInt("total_tokens"),
-                    (input == null ? 0 : input) + (output == null ? 0 : output)
-            ));
+        return usageExtractor.extract(JSONUtil.parseObj(responseJson).getJSONObject("usage"));
+    }
+
+    /** 从响应体读取 model（流式重建体含顶层 model）。 */
+    private String extractModel(String responseJson) {
+        if (StrUtil.isBlank(responseJson) || !JSONUtil.isTypeJSON(responseJson)) {
+            return null;
         }
+        return JSONUtil.parseObj(responseJson).getStr("model");
+    }
+
+    /** model 缺失时回落到请求阶段已落库的 model，保证计费能命中单价。 */
+    private String resolveModel(String modelFromResponse, Long logId) {
+        if (StrUtil.isNotBlank(modelFromResponse)) {
+            return modelFromResponse;
+        }
+        AiModelCallLog existing = aiModelCallLogMapper.selectById(logId);
+        return existing == null ? null : existing.getModel();
+    }
+
+    private int nz(Integer v) {
+        return v == null ? 0 : v;
     }
 
     private List<String> extractToolNames(Map<String, Object> requestBody) {
@@ -259,6 +366,8 @@ public class AiModelCallRecordService {
                         flags.hasImage = true;
                     } else if ("document".equals(type) || "file".equals(type) || "input_file".equals(type)) {
                         flags.hasDocument = true;
+                    } else if ("video".equals(type) || "input_video".equals(type) || "video_url".equals(type)) {
+                        flags.hasVideo = true;
                     }
                 }
             }
@@ -420,5 +529,6 @@ public class AiModelCallRecordService {
         private boolean hasText = false;
         private boolean hasImage = false;
         private boolean hasDocument = false;
+        private boolean hasVideo = false;
     }
 }

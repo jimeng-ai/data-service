@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.provider.config;
 
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.SseServiceUtil;
+import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.conversation.AiConversationLoop;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
@@ -50,8 +51,9 @@ public class ProviderBeansConfig {
 
     @Bean(name = "openrouter-embedding")
     public EmbeddingClient openrouterEmbeddingClient(AiProviderProperties props,
-                                                     RequestService requestService) {
-        return newEmbedding("openrouter", props, requestService);
+                                                     RequestService requestService,
+                                                     AiModelCallRecordService recordService) {
+        return newEmbedding("openrouter", props, requestService, recordService);
     }
 
     @Bean(name = "openrouter-rerank")
@@ -62,8 +64,9 @@ public class ProviderBeansConfig {
 
     @Bean(name = "openrouter-contextualization")
     public ContextualizationClient openrouterContextualizationClient(AiProviderProperties props,
-                                                                     RequestService requestService) {
-        return newContextualization("openrouter", props, requestService);
+                                                                     RequestService requestService,
+                                                                     AiModelCallRecordService recordService) {
+        return newContextualization("openrouter", props, requestService, recordService);
     }
 
     // ============================================================ 302ai
@@ -80,8 +83,9 @@ public class ProviderBeansConfig {
 
     @Bean(name = "302ai-embedding")
     public EmbeddingClient ai302EmbeddingClient(AiProviderProperties props,
-                                                RequestService requestService) {
-        return newEmbedding("302ai", props, requestService);
+                                                RequestService requestService,
+                                                AiModelCallRecordService recordService) {
+        return newEmbedding("302ai", props, requestService, recordService);
     }
 
     @Bean(name = "302ai-rerank")
@@ -92,8 +96,9 @@ public class ProviderBeansConfig {
 
     @Bean(name = "302ai-contextualization")
     public ContextualizationClient ai302ContextualizationClient(AiProviderProperties props,
-                                                                RequestService requestService) {
-        return newContextualization("302ai", props, requestService);
+                                                                RequestService requestService,
+                                                                AiModelCallRecordService recordService) {
+        return newContextualization("302ai", props, requestService, recordService);
     }
 
     // ============================================================ factories
@@ -120,8 +125,10 @@ public class ProviderBeansConfig {
 
     private static EmbeddingClient newEmbedding(String providerName,
                                                 AiProviderProperties props,
-                                                RequestService requestService) {
-        return new GenericOpenAiEmbeddingClient(providerName, configOf(providerName, props), requestService);
+                                                RequestService requestService,
+                                                AiModelCallRecordService recordService) {
+        return new GenericOpenAiEmbeddingClient(providerName, configOf(providerName, props),
+                requestService, recordService);
     }
 
     private static RerankClient newRerankByProtocol(String providerName,
@@ -144,7 +151,9 @@ public class ProviderBeansConfig {
 
     private static ContextualizationClient newContextualization(String providerName,
                                                                 AiProviderProperties props,
-                                                                RequestService requestService) {
-        return new DefaultContextualizationClient(providerName, configOf(providerName, props), requestService);
+                                                                RequestService requestService,
+                                                                AiModelCallRecordService recordService) {
+        return new DefaultContextualizationClient(providerName, configOf(providerName, props),
+                requestService, recordService);
     }
 }

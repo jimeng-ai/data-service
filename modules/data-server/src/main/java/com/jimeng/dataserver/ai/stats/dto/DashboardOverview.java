@@ -34,6 +34,9 @@ public class DashboardOverview {
     @Schema(description = "模型用量 Top")
     private List<ModelUsage> topModels;
 
+    @Schema(description = "Agent 用量 Top（按调用次数倒序）")
+    private List<AgentUsage> topAgents;
+
     @Schema(description = "全量模型用量（不截断，用于「查看全部」饼图）")
     private List<ModelUsage> allModels;
 
@@ -73,6 +76,17 @@ public class DashboardOverview {
         private String model;
         private long calls;
         private long tokens;
+    }
+
+    @Data
+    public static class AgentUsage {
+        @Schema(description = "Agent ID（agent 已删除则名称为空）")
+        private Long agentId;
+        private String agentName;
+        private long calls;
+        private long tokens;
+        @Schema(description = "成本（USD）")
+        private double costUsd;
     }
 
     @Data

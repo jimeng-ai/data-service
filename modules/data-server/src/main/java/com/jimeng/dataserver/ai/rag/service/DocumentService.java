@@ -4,6 +4,7 @@ import cn.hutool.crypto.SecureUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.rag.model.IngestionMessage;
 import com.jimeng.dataserver.ai.rag.model.IngestionStatus;
 import com.jimeng.dataserver.ai.rag.service.es.ChunkIndexService;
@@ -53,7 +54,7 @@ public class DocumentService {
             existed.setStatus(IngestionStatus.UPLOADED.code());
             existed.setFailureReason(null);
             kbDocumentMapper.updateById(existed);
-            ingestionQueueProducer.publish(new IngestionMessage(existed.getId(), kbId, null));
+            ingestionQueueProducer.publish(new IngestionMessage(existed.getId(), kbId, null, TenantContext.get()));
             return existed;
         }
 
@@ -69,7 +70,7 @@ public class DocumentService {
         doc.setStatus(IngestionStatus.UPLOADED.code());
         kbDocumentMapper.insert(doc);
 
-        ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), kbId, null));
+        ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), kbId, null, TenantContext.get()));
         return doc;
     }
 
@@ -107,7 +108,7 @@ public class DocumentService {
         doc.setStatus(IngestionStatus.UPLOADED.code());
         doc.setFailureReason(null);
         kbDocumentMapper.updateById(doc);
-        ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), doc.getKbId(), null));
+        ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), doc.getKbId(), null, TenantContext.get()));
         return doc;
     }
 

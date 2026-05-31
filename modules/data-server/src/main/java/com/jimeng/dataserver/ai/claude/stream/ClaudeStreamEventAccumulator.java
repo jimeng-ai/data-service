@@ -22,6 +22,8 @@ public class ClaudeStreamEventAccumulator implements AiStreamAccumulator {
     private int currentBlockIndex = -1;
     private int inputTokens = 0;
     private int outputTokens = 0;
+    private int cacheReadTokens = 0;
+    private int cacheWriteTokens = 0;
 
     @Override
     public void accumulateEvent(String eventType, String data) {
@@ -78,6 +80,12 @@ public class ClaudeStreamEventAccumulator implements AiStreamAccumulator {
         Map<String, Object> usage = new LinkedHashMap<>();
         usage.put("input_tokens", inputTokens);
         usage.put("output_tokens", outputTokens);
+        if (cacheReadTokens > 0) {
+            usage.put("cache_read_input_tokens", cacheReadTokens);
+        }
+        if (cacheWriteTokens > 0) {
+            usage.put("cache_creation_input_tokens", cacheWriteTokens);
+        }
         response.put("usage", usage);
 
         return response;
@@ -125,6 +133,8 @@ public class ClaudeStreamEventAccumulator implements AiStreamAccumulator {
         JSONObject usage = message.getJSONObject("usage");
         if (usage != null) {
             this.inputTokens = usage.getInt("input_tokens", 0);
+            this.cacheReadTokens = usage.getInt("cache_read_input_tokens", this.cacheReadTokens);
+            this.cacheWriteTokens = usage.getInt("cache_creation_input_tokens", this.cacheWriteTokens);
         }
     }
 
@@ -225,7 +235,9 @@ public class ClaudeStreamEventAccumulator implements AiStreamAccumulator {
 
         JSONObject usage = root.getJSONObject("usage");
         if (usage != null) {
-            this.outputTokens = usage.getInt("output_tokens", 0);
+            this.outputTokens = usage.getInt("output_tokens", this.outputTokens);
+            this.cacheReadTokens = usage.getInt("cache_read_input_tokens", this.cacheReadTokens);
+            this.cacheWriteTokens = usage.getInt("cache_creation_input_tokens", this.cacheWriteTokens);
         }
     }
 

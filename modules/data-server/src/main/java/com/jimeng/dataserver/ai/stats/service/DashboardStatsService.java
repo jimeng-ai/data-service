@@ -33,6 +33,7 @@ public class DashboardStatsService {
 
     private static final int MAX_DAYS = 365;
     private static final int TOP_MODELS_LIMIT = 6;
+    private static final int TOP_AGENTS_LIMIT = 8;
     private static final int RECENT_CALLS_LIMIT = 8;
     /** 「查看全部」饼图需要全量模型，给一个足够大的上限即可（单租户模型数远小于此）。 */
     private static final int ALL_MODELS_LIMIT = 100;
@@ -41,8 +42,15 @@ public class DashboardStatsService {
     private final AgentMapper agentMapper;
 
     public DashboardOverview overview(int days) {
+        return overview(TenantContext.get(), days);
+    }
+
+    /**
+     * 指定租户的总览统计。运营侧下钻复用本方法（传入目标租户 id），
+     * 调用方需用 {@code TenantContext.runAsSystem} 包裹，使 agent 名称解析不被错误的租户上下文过滤。
+     */
+    public DashboardOverview overview(String tenantId, int days) {
         int window = Math.max(1, Math.min(days, MAX_DAYS));
-        String tenantId = TenantContext.get();
 
         DashboardOverview result = new DashboardOverview();
         result.setDays(window);
@@ -67,6 +75,7 @@ public class DashboardStatsService {
             result.setTrend(fillTrend(List.of(), startDate, today));
             result.setTopModels(List.of());
             result.setAllModels(List.of());
+            result.setTopAgents(List.of());
             result.setRecentCalls(List.of());
             return result;
         }
@@ -81,6 +90,7 @@ public class DashboardStatsService {
         result.setTopModels(allModels.size() > TOP_MODELS_LIMIT
                 ? new ArrayList<>(allModels.subList(0, TOP_MODELS_LIMIT))
                 : allModels);
+        result.setTopAgents(toAgentUsage(callLogMapper.selectTopAgents(tenantId, start, end, TOP_AGENTS_LIMIT)));
         result.setRecentCalls(toRecentCalls(callLogMapper.selectRecentCalls(tenantId, RECENT_CALLS_LIMIT)));
         return result;
     }
@@ -175,6 +185,32 @@ public class DashboardStatsService {
         return out;
     }
 
+    private List<DashboardOverview.AgentUsage> toAgentUsage(List<Map<String, Object>> rows) {
+        List<DashboardOverview.AgentUsage> out = new ArrayList<>();
+        if (rows == null || rows.isEmpty()) {
+            return out;
+        }
+        Set<Long> agentIds = new HashSet<>();
+        for (Map<String, Object> row : rows) {
+            Long id = asLongObj(row.get("agentId"));
+            if (id != null) {
+                agentIds.add(id);
+            }
+        }
+        Map<Long, String> names = batchAgentNames(agentIds);
+        for (Map<String, Object> row : rows) {
+            DashboardOverview.AgentUsage a = new DashboardOverview.AgentUsage();
+            Long id = asLongObj(row.get("agentId"));
+            a.setAgentId(id);
+            a.setAgentName(id == null ? null : names.get(id));
+            a.setCalls(asLong(row.get("calls")));
+            a.setTokens(asLong(row.get("tokens")));
+            a.setCostUsd(asDouble(row.get("costUsd")));
+            out.add(a);
+        }
+        return out;
+    }
+
     /** 批量把 agentId 解析成 Agent 名称；agent 已删除或查不到时该 id 不在返回 map 中。 */
     private Map<Long, String> resolveAgentNames(List<AiModelCallLog> logs) {
         Set<Long> agentIds = new HashSet<>();
@@ -183,7 +219,11 @@ public class DashboardStatsService {
                 agentIds.add(log.getAgentId());
             }
         }
-        if (agentIds.isEmpty()) {
+        return batchAgentNames(agentIds);
+    }
+
+    private Map<Long, String> batchAgentNames(Set<Long> agentIds) {
+        if (agentIds == null || agentIds.isEmpty()) {
             return Map.of();
         }
         Map<Long, String> names = new HashMap<>();
@@ -204,6 +244,20 @@ public class DashboardStatsService {
             return Long.parseLong(String.valueOf(v).trim());
         } catch (NumberFormatException e) {
             return 0L;
+        }
+    }
+
+    private Long asLongObj(Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof Number number) {
+            return number.longValue();
+        }
+        try {
+            return Long.parseLong(String.valueOf(v).trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

@@ -61,6 +61,9 @@ public class AiModelCallLog extends BaseEntity {
     @TableField("has_document")
     private Boolean hasDocument;
 
+    @TableField("has_video")
+    private Boolean hasVideo;
+
     @TableField("has_tool")
     private Boolean hasTool;
 
@@ -84,6 +87,22 @@ public class AiModelCallLog extends BaseEntity {
 
     @TableField("total_tokens")
     private Integer totalTokens;
+
+    /** 缓存读取 token（OpenAI cached_tokens / Anthropic cache_read_input_tokens）。 */
+    @TableField("cache_read_tokens")
+    private Integer cacheReadTokens;
+
+    /** 缓存写入 token（Anthropic cache_creation_input_tokens；OpenAI 无）。 */
+    @TableField("cache_write_tokens")
+    private Integer cacheWriteTokens;
+
+    /** 推理/思考 token（OpenAI reasoning_tokens；Anthropic 无，已并入 output，仅展示不重复计费）。 */
+    @TableField("reasoning_tokens")
+    private Integer reasoningTokens;
+
+    /** 供应商返回的原始 usage 对象 JSON，便于将来按新字段/模态回溯重算。 */
+    @TableField("usage_raw")
+    private String usageRaw;
 
     @TableField("latency_ms")
     private Integer latencyMs;

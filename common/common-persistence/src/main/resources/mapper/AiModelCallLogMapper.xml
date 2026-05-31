@@ -19,6 +19,7 @@
         <result column="has_text" property="hasText"/>
         <result column="has_image" property="hasImage"/>
         <result column="has_document" property="hasDocument"/>
+        <result column="has_video" property="hasVideo"/>
         <result column="has_tool" property="hasTool"/>
         <result column="tool_names" property="toolNames"/>
         <result column="max_tokens" property="maxTokens"/>
@@ -27,6 +28,10 @@
         <result column="input_tokens" property="inputTokens"/>
         <result column="output_tokens" property="outputTokens"/>
         <result column="total_tokens" property="totalTokens"/>
+        <result column="cache_read_tokens" property="cacheReadTokens"/>
+        <result column="cache_write_tokens" property="cacheWriteTokens"/>
+        <result column="reasoning_tokens" property="reasoningTokens"/>
+        <result column="usage_raw" property="usageRaw"/>
         <result column="latency_ms" property="latencyMs"/>
         <result column="first_token_ms" property="firstTokenMs"/>
         <result column="retry_count" property="retryCount"/>
@@ -42,10 +47,12 @@
         <result column="update_user" property="updateUser"/>
     </resultMap>
 
+    <!-- 注意：刻意不含 usage_raw（大 JSON），最近调用信息流无需该字段。 -->
     <sql id="Base_Column_List">
         id, trace_id, request_id, biz_type, biz_id, scene_code, tenant_id, user_id, agent_id, provider, model, endpoint,
-        stream, has_text, has_image, has_document, has_tool, tool_names, max_tokens, temperature, top_p,
-        input_tokens, output_tokens, total_tokens, latency_ms, first_token_ms, retry_count, http_status,
+        stream, has_text, has_image, has_document, has_video, has_tool, tool_names, max_tokens, temperature, top_p,
+        input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+        latency_ms, first_token_ms, retry_count, http_status,
         call_status, error_code, error_msg, cost_usd, deleted, create_time, create_user, update_time, update_user
     </sql>
 
@@ -99,6 +106,23 @@
         LIMIT #{limit}
     </select>
 
+    <select id="selectTopAgents" resultType="java.util.Map">
+        SELECT
+            agent_id                          AS agentId,
+            COUNT(*)                          AS calls,
+            COALESCE(SUM(total_tokens), 0)    AS tokens,
+            COALESCE(SUM(cost_usd), 0)        AS costUsd
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+          AND agent_id IS NOT NULL
+        GROUP BY agent_id
+        ORDER BY calls DESC
+        LIMIT #{limit}
+    </select>
+
     <select id="selectRecentCalls" resultMap="BaseResultMap">
         SELECT <include refid="Base_Column_List"/>
         FROM ai_model_call_log
@@ -106,6 +130,46 @@
           AND tenant_id = #{tenantId}
         ORDER BY create_time DESC
         LIMIT #{limit}
+    </select>
+
+    <!-- ====================== 运营侧跨租户聚合（无 tenant_id 过滤，调用方须 runAsSystem 包裹） ====================== -->
+
+    <select id="selectCrossTenantOverview" resultType="java.util.Map">
+        SELECT
+            COUNT(*)                                                        AS calls,
+            COALESCE(SUM(total_tokens), 0)                                  AS tokens,
+            COALESCE(SUM(input_tokens), 0)                                  AS inputTokens,
+            COALESCE(SUM(output_tokens), 0)                                 AS outputTokens,
+            COALESCE(SUM(cache_read_tokens), 0)                             AS cacheReadTokens,
+            COALESCE(SUM(cache_write_tokens), 0)                            AS cacheWriteTokens,
+            COALESCE(SUM(cost_usd), 0)                                      AS costUsd,
+            COALESCE(AVG(CASE WHEN call_status = 1 THEN latency_ms END), 0)  AS avgLatencyMs,
+            COALESCE(SUM(CASE WHEN call_status = 1 THEN 1 ELSE 0 END), 0)    AS successCalls,
+            COUNT(DISTINCT tenant_id)                                        AS tenantCount
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+    </select>
+
+    <select id="selectOverviewByTenant" resultType="java.util.Map">
+        SELECT
+            tenant_id                                                       AS tenantId,
+            COUNT(*)                                                        AS calls,
+            COALESCE(SUM(total_tokens), 0)                                  AS tokens,
+            COALESCE(SUM(input_tokens), 0)                                  AS inputTokens,
+            COALESCE(SUM(output_tokens), 0)                                 AS outputTokens,
+            COALESCE(SUM(cache_read_tokens), 0)                             AS cacheReadTokens,
+            COALESCE(SUM(cache_write_tokens), 0)                            AS cacheWriteTokens,
+            COALESCE(SUM(cost_usd), 0)                                      AS costUsd,
+            COALESCE(AVG(CASE WHEN call_status = 1 THEN latency_ms END), 0)  AS avgLatencyMs,
+            COALESCE(SUM(CASE WHEN call_status = 1 THEN 1 ELSE 0 END), 0)    AS successCalls
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+        GROUP BY tenant_id
+        ORDER BY calls DESC
     </select>
 
 </mapper>

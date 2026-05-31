@@ -3,9 +3,11 @@ package com.jimeng.dataserver.ai.provider.impl;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.service.RequestService;
+import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.spi.ContextualizationClient;
 import com.jimeng.dataserver.ai.provider.spi.ContextualizationClientException;
+import com.jimeng.dataserver.ai.provider.spi.ContextualizationResult;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
@@ -28,27 +30,36 @@ public class DefaultContextualizationClient implements ContextualizationClient {
     private final String providerName;
     private final ProviderConfig config;
     private final RequestService requestService;
+    /** 计费记录；可能为 null（极端情况下不影响 contextualization 主流程）。 */
+    private final AiModelCallRecordService recordService;
 
     public DefaultContextualizationClient(String providerName,
                                           ProviderConfig config,
-                                          RequestService requestService) {
+                                          RequestService requestService,
+                                          AiModelCallRecordService recordService) {
         this.providerName = providerName;
         this.config = config;
         this.requestService = requestService;
+        this.recordService = recordService;
     }
 
     @Override
-    public String generateContext(String fullDocument, String chunkContent) {
-        if (StrUtil.isBlank(fullDocument) || StrUtil.isBlank(chunkContent)) return "";
+    public ContextualizationResult generateContext(String fullDocument, String chunkContent) {
+        if (StrUtil.isBlank(fullDocument) || StrUtil.isBlank(chunkContent)) return ContextualizationResult.empty();
         String textModel = config.getContextualization().getTextModel();
         if (StrUtil.isBlank(textModel)) {
             log.warn("providers.{}.contextualization.text-model 未配置，跳过 contextualization", providerName);
-            return "";
+            return ContextualizationResult.empty();
         }
-        if (isAnthropicProtocol()) {
-            return callAnthropic(buildAnthropicTextBody(fullDocument, chunkContent, textModel));
-        }
-        return callOpenAi(buildOpenAiTextBody(fullDocument, chunkContent, textModel));
+        Map<String, Object> body = isAnthropicProtocol()
+                ? buildAnthropicTextBody(fullDocument, chunkContent, textModel)
+                : buildOpenAiTextBody(fullDocument, chunkContent, textModel);
+        // 文本上下文化不在此自行落库：usage 上抛给 ContextualizationService 按整篇文档汇总成一行。
+        RequestService.HttpResp resp = isAnthropicProtocol()
+                ? rawAnthropic(body)
+                : rawOpenAi(body);
+        String text = isAnthropicProtocol() ? handleAnthropicResponse(resp) : handleOpenAiResponse(resp);
+        return new ContextualizationResult(text, extractUsageJson(resp.getBody()), textModel);
     }
 
     @Override
@@ -60,9 +71,9 @@ public class DefaultContextualizationClient implements ContextualizationClient {
             return "";
         }
         if (isAnthropicProtocol()) {
-            return callAnthropic(buildAnthropicImageBody(imageBytes, mediaType, imageModel));
+            return callAnthropic(buildAnthropicImageBody(imageBytes, mediaType, imageModel), "rag_image_desc");
         }
-        return callOpenAi(buildOpenAiImageBody(imageBytes, mediaType, imageModel));
+        return callOpenAi(buildOpenAiImageBody(imageBytes, mediaType, imageModel), "rag_image_desc");
     }
 
     @Override
@@ -72,18 +83,103 @@ public class DefaultContextualizationClient implements ContextualizationClient {
 
     // -------------------------------------------------- HTTP
 
-    private String callAnthropic(Map<String, Object> body) {
+    private String callAnthropic(Map<String, Object> body, String bizType) {
         Map<String, String> headers = buildHeaders(true);
         String url = StrUtil.removeSuffix(config.getBaseUrl(), "/") + "/messages";
-        RequestService.HttpResp resp = requestService.post(url, headers, Map.of(), body);
+        RequestService.HttpResp resp = recordedPost(url, headers, body, bizType);
         return handleAnthropicResponse(resp);
     }
 
-    private String callOpenAi(Map<String, Object> body) {
+    private String callOpenAi(Map<String, Object> body, String bizType) {
         Map<String, String> headers = buildHeaders(false);
         String url = StrUtil.removeSuffix(config.getBaseUrl(), "/") + "/chat/completions";
-        RequestService.HttpResp resp = requestService.post(url, headers, Map.of(), body);
+        RequestService.HttpResp resp = recordedPost(url, headers, body, bizType);
         return handleOpenAiResponse(resp);
+    }
+
+    /** 文本上下文化用：不落库的裸 POST（usage 由上层汇总记账）。 */
+    private RequestService.HttpResp rawAnthropic(Map<String, Object> body) {
+        Map<String, String> headers = buildHeaders(true);
+        String url = StrUtil.removeSuffix(config.getBaseUrl(), "/") + "/messages";
+        return requestService.post(url, headers, Map.of(), body);
+    }
+
+    private RequestService.HttpResp rawOpenAi(Map<String, Object> body) {
+        Map<String, String> headers = buildHeaders(false);
+        String url = StrUtil.removeSuffix(config.getBaseUrl(), "/") + "/chat/completions";
+        return requestService.post(url, headers, Map.of(), body);
+    }
+
+    /** 从响应体抽出 usage 对象原文（无 / 非 JSON 时返回 null）。 */
+    private String extractUsageJson(String json) {
+        if (StrUtil.isBlank(json) || !JSONUtil.isTypeJSON(json)) {
+            return null;
+        }
+        Object usage = JSONUtil.parseObj(json).get("usage");
+        return usage == null ? null : usage.toString();
+    }
+
+    /**
+     * 包了计费记录的 POST：把每次 contextualization / 图片描述调用落到 ai_model_call_log。
+     * 记录失败绝不影响主流程；response 体含 usage，由 RecordService 解析算 cost。
+     *
+     * <p>落库用紧凑 meta 体（不含整篇文档前缀）：contextualization 对每个 chunk 都把整篇文档作为
+     * cached 前缀重发，若把原始 body 入 content 表，一份千 chunk 文档会复制上千份全文，必须 redact。
+     */
+    private RequestService.HttpResp recordedPost(String url, Map<String, String> headers,
+                                                 Map<String, Object> body, String bizType) {
+        Long logId = safeRecordRequest(body, headers, url, bizType);
+        long start = System.currentTimeMillis();
+        try {
+            RequestService.HttpResp resp = requestService.post(url, headers, Map.of(), body);
+            safeRecordResponse(logId, resp.getStatusCode(), resp.getBody(), start);
+            return resp;
+        } catch (RuntimeException e) {
+            safeRecordException(logId, e, start);
+            throw e;
+        }
+    }
+
+    private Long safeRecordRequest(Map<String, Object> body, Map<String, String> headers,
+                                   String url, String bizType) {
+        if (recordService == null) {
+            return null;
+        }
+        try {
+            Object model = body.get("model");
+            Map<String, Object> meta = new LinkedHashMap<>();
+            meta.put("model", model);
+            meta.put("max_tokens", body.get("max_tokens"));
+            meta.put("biz_type", bizType);
+            meta.put("scene_code", providerName);
+            return recordService.recordRequest(meta, headers, providerName, url,
+                    model == null ? null : String.valueOf(model));
+        } catch (Exception e) {
+            log.warn("contextualization 计费 recordRequest 失败 provider={}: {}", providerName, e.getMessage());
+            return null;
+        }
+    }
+
+    private void safeRecordResponse(Long logId, Integer status, String respBody, long startMs) {
+        if (recordService == null || logId == null) {
+            return;
+        }
+        try {
+            recordService.recordResponse(logId, status, respBody, (int) (System.currentTimeMillis() - startMs));
+        } catch (Exception e) {
+            log.warn("contextualization 计费 recordResponse 失败 provider={}: {}", providerName, e.getMessage());
+        }
+    }
+
+    private void safeRecordException(Long logId, Throwable t, long startMs) {
+        if (recordService == null || logId == null) {
+            return;
+        }
+        try {
+            recordService.recordException(logId, t, (int) (System.currentTimeMillis() - startMs));
+        } catch (Exception e) {
+            log.warn("contextualization 计费 recordException 失败 provider={}: {}", providerName, e.getMessage());
+        }
     }
 
     private String handleAnthropicResponse(RequestService.HttpResp resp) {

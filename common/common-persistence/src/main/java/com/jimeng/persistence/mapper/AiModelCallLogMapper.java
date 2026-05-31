@@ -33,7 +33,24 @@ public interface AiModelCallLogMapper extends BaseMapper<AiModelCallLog> {
                                               @Param("end") Date end,
                                               @Param("limit") int limit);
 
+    /** 按 Agent 聚合的调用数 / token / 成本，倒序取前 N（仅含 agent_id 非空的调用）。 */
+    List<Map<String, Object>> selectTopAgents(@Param("tenantId") String tenantId,
+                                              @Param("start") Date start,
+                                              @Param("end") Date end,
+                                              @Param("limit") int limit);
+
     /** 最近 N 条调用记录（用于"最近调用"信息流）。 */
     List<AiModelCallLog> selectRecentCalls(@Param("tenantId") String tenantId,
                                            @Param("limit") int limit);
+
+    /**
+     * 跨租户全平台汇总（运营侧使用，不带 tenant_id 过滤，需 runAsSystem 包裹）。
+     * 额外返回 {@code tenantCount}=窗口内有调用的租户数。
+     */
+    Map<String, Object> selectCrossTenantOverview(@Param("start") Date start,
+                                                  @Param("end") Date end);
+
+    /** 按 tenant_id 分组的汇总（运营侧「各租户用量」主列表，需 runAsSystem 包裹）。 */
+    List<Map<String, Object>> selectOverviewByTenant(@Param("start") Date start,
+                                                     @Param("end") Date end);
 }
