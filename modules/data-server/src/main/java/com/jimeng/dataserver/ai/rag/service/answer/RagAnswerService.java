@@ -9,23 +9,29 @@ import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import com.jimeng.dataserver.ai.rag.model.AnswerRequest;
+import com.jimeng.dataserver.ai.rag.model.CitationItem;
 import com.jimeng.dataserver.ai.rag.model.SearchResultItem;
 import com.jimeng.dataserver.ai.rag.service.search.HybridSearchService;
 import com.jimeng.dataserver.ai.rag.service.search.RerankService;
+import com.jimeng.persistence.entity.KbDocument;
+import com.jimeng.persistence.mapper.KbDocumentMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * RAG 问答：检索 → 拼上下文 → 复用 ClaudeService 流式输出。
  *
- * <p>系统提示要求模型每条断言后追加 [chunk_id=...] 引用标签，便于前端定位回原文。
+ * <p>检索命中的片段以「参考来源」形式由前端在回答下方单独展示（按文档聚合）；
+ * 系统提示明确禁止模型在正文里输出 chunk_id / 引用编号等标记。
  *
  * <p>关键观测点（INFO 日志，可在 Kibana 中按 MDC.connectionId 关联同一次请求）：
  * <ul>
@@ -46,7 +52,8 @@ public class RagAnswerService {
     private static final String SYSTEM_PROMPT =
             "你是一个基于企业知识库的问答助手。请严格遵守：\n"
                     + "1) 仅根据下方提供的【知识片段】回答问题，不要编造未在片段中出现的信息；\n"
-                    + "2) 每条关键论断后用方括号附引用标签，例如 [chunk_id=12345_3]；\n"
+                    + "2) 直接用自然语言作答，不要在回答正文里输出任何 chunk_id、片段编号、引用编号或方括号标签；\n"
+                    + "   （引用来源会由系统在回答下方单独展示，无需你在正文中标注。）\n"
                     + "3) 如果片段不足以回答，明确告知\"未在知识库中找到相关信息\"；\n"
                     + "4) 回答中文且简洁，必要时分点。";
 
@@ -56,6 +63,7 @@ public class RagAnswerService {
     private final RagProperties ragProperties;
     private final SseServiceUtil sseServiceUtil;
     private final AgentRuntimeService agentRuntimeService;
+    private final KbDocumentMapper kbDocumentMapper;
 
     public List<SearchResultItem> retrieve(AnswerRequest req) throws Exception {
         int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
@@ -78,10 +86,20 @@ public class RagAnswerService {
         return rerankHits;
     }
 
-    /** 解析本次检索的知识库范围：显式 kbId 优先，否则用 Agent 绑定的知识库；都没有返回空（=不走 RAG）。 */
-    private List<Long> resolveKbIds(AnswerRequest req) {
+    /**
+     * 解析本次检索计划：知识库范围 + 生效的 topK / 是否精排。
+     *
+     * <p>① 显式 kbId 优先；② 否则取 Agent 绑定的知识库；③ 都没有则返回空 kbIds（=不走 RAG，纯对话）。
+     * <p>topK / rerank 的生效优先级：<b>请求显式传参 &gt; Agent「知识库绑定」配置 &gt; 全局默认</b>。
+     * 真实对话页不传 topK/rerank，因此 Agent 绑定里配的 rerank 开关、topK 在此生效。
+     */
+    private RagPlan resolveRagPlan(AnswerRequest req) {
         if (req.getKbId() != null) {
-            return List.of(req.getKbId());
+            // 显式 kbId（如检索调试/直连）：无 Agent 绑定，故不带相似度阈值。
+            return new RagPlan(List.of(req.getKbId()),
+                    effectiveTopK(req.getTopK(), null),
+                    effectiveRerank(req.getRerank(), null),
+                    null);
         }
         if (StrUtil.isNotBlank(req.getAgentId())) {
             Long agentId = parseAgentId(req.getAgentId());
@@ -89,14 +107,32 @@ public class RagAnswerService {
                 try {
                     AgentRuntimeView view = agentRuntimeService.byId(agentId);
                     if (view.getKbIds() != null && !view.getKbIds().isEmpty()) {
-                        return new ArrayList<>(view.getKbIds());
+                        return new RagPlan(new ArrayList<>(view.getKbIds()),
+                                effectiveTopK(req.getTopK(), view.getKbTopK()),
+                                effectiveRerank(req.getRerank(), view.getKbRerank()),
+                                view.getKbScoreThreshold());
                     }
                 } catch (Exception e) {
                     log.warn("加载 Agent 知识库绑定失败 agentId={}: {}", req.getAgentId(), e.getMessage());
                 }
             }
         }
-        return List.of();
+        return new RagPlan(List.of(), 0, true, null);
+    }
+
+    /** 本次检索计划：知识库范围 + 生效 topK + 是否精排 + 相似度阈值（可空，来自 Agent 绑定）。 */
+    private record RagPlan(List<Long> kbIds, int topK, boolean rerank, Double threshold) {}
+
+    private int effectiveTopK(Integer reqTopK, Integer bindingTopK) {
+        if (reqTopK != null) return reqTopK;
+        if (bindingTopK != null) return bindingTopK;
+        return ragProperties.getRetrieval().getRerankTopK();
+    }
+
+    private boolean effectiveRerank(Boolean reqRerank, Boolean bindingRerank) {
+        if (reqRerank != null) return reqRerank;
+        if (bindingRerank != null) return bindingRerank;
+        return true;
     }
 
     private Long parseAgentId(String s) {
@@ -107,17 +143,17 @@ public class RagAnswerService {
         }
     }
 
-    /** 跨一个或多个知识库检索：逐库召回后合并，再统一精排取 topK。 */
-    private List<SearchResultItem> retrieveForKbs(AnswerRequest req, List<Long> kbIds) throws Exception {
-        int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
+    /** 跨一个或多个知识库检索：逐库召回后合并，再按检索计划统一精排取 topK。 */
+    private List<SearchResultItem> retrieveForKbs(AnswerRequest req, RagPlan plan) throws Exception {
+        int topK = plan.topK();
         int window = Math.max(ragProperties.getRetrieval().getBm25TopK(), ragProperties.getRetrieval().getVectorTopK());
-        boolean doRerank = req.getRerank() == null || req.getRerank();
+        boolean doRerank = plan.rerank();
 
         log.info("RAG/retrieve.start kbIds={} topK={} rerank={} docIds={} query={}",
-                kbIds, topK, doRerank, req.getDocIds(), req.getQuery());
+                plan.kbIds(), topK, doRerank, req.getDocIds(), req.getQuery());
 
         List<SearchResultItem> merged = new ArrayList<>();
-        for (Long kbId : kbIds) {
+        for (Long kbId : plan.kbIds()) {
             merged.addAll(hybridSearchService.search(kbId, req.getQuery(), req.getDocIds(), window));
         }
         logCandidates("RAG/retrieve.rrf", merged, /*rerankPhase*/ false);
@@ -126,24 +162,48 @@ public class RagAnswerService {
         if (!doRerank) {
             merged.sort(Comparator.comparingDouble(
                     (SearchResultItem c) -> c.getRrfScore() == null ? 0d : c.getRrfScore()).reversed());
-            return merged.subList(0, Math.min(topK, merged.size()));
+            return applyThreshold(merged.subList(0, Math.min(topK, merged.size())), plan);
         }
         List<SearchResultItem> rerankHits = rerankService.rerank(req.getQuery(), merged, topK);
         logCandidates("RAG/retrieve.rerank", rerankHits, /*rerankPhase*/ true);
-        return rerankHits;
+        return applyThreshold(rerankHits, plan);
+    }
+
+    /**
+     * 相似度阈值过滤：丢掉分值低于阈值的片段。
+     *
+     * <p>阈值是 0~1 的「相似度」，只有 <b>rerank 精排分（rerankScore∈[0,1]）</b>量纲与之匹配；
+     * 未开 rerank 时命中分是 RRF 融合分（量级极小 ~0.0x），用同一阈值会误杀全部，故此时跳过过滤并记日志。
+     * 阈值来自 Agent「知识库绑定」，显式 kbId 调试路径无阈值（threshold=null 即不过滤）。
+     */
+    private List<SearchResultItem> applyThreshold(List<SearchResultItem> items, RagPlan plan) {
+        Double threshold = plan.threshold();
+        if (threshold == null || threshold <= 0 || items.isEmpty()) {
+            return items;
+        }
+        if (!plan.rerank()) {
+            log.info("RAG/retrieve.threshold 跳过：未启用 rerank，RRF 融合分与相似度阈值量纲不一致 threshold={}", threshold);
+            return items;
+        }
+        List<SearchResultItem> kept = items.stream()
+                .filter(c -> c.getScore() != null && c.getScore() >= threshold)
+                .collect(java.util.stream.Collectors.toList());
+        log.info("RAG/retrieve.threshold threshold={} 过滤前={} 过滤后={}", threshold, items.size(), kept.size());
+        return kept;
     }
 
     public void streamAnswer(AnswerRequest req, String connectionId, String traceId) {
         try {
             // 检索范围：① 显式 kbId 优先；② 否则取 Agent 绑定的知识库；③ 都没有则纯对话。
             // 即「配了知识库才走 RAG」，绝不强制检索。
-            List<Long> kbIds = resolveKbIds(req);
-            boolean useRag = !kbIds.isEmpty();
-            List<SearchResultItem> citations = useRag ? retrieveForKbs(req, kbIds) : List.of();
+            RagPlan plan = resolveRagPlan(req);
+            boolean useRag = !plan.kbIds().isEmpty();
+            List<SearchResultItem> hits = useRag ? retrieveForKbs(req, plan) : List.of();
             // 始终前置发一个 citations 事件（无 KB 时为空数组），保证前端协议一致。
-            sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(citations));
+            // 富化为带 index / docTitle / score 的引用项，前端据此按文档聚合成「参考来源」。
+            sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(toCitations(hits)));
 
-            Map<String, Object> body = buildClaudeBody(req, citations, useRag);
+            Map<String, Object> body = buildClaudeBody(req, hits, useRag);
 
             // 带 agentId 时加载 Agent 人设/模型/插件上下文：
             // prepareAgentContext 会把 systemPrompt 前置注入、补默认 model/params，
@@ -157,7 +217,7 @@ public class RagAnswerService {
             }
 
             log.info("RAG/answer.prompt useRag={} agentId={} citations={} totalChunkChars={} historyTurns={}",
-                    useRag, req.getAgentId(), citations.size(), totalContentChars(citations),
+                    useRag, req.getAgentId(), hits.size(), totalContentChars(hits),
                     req.getHistory() == null ? 0 : req.getHistory().size());
 
             claudeService.messagesStream(body, connectionId, traceId);
@@ -189,8 +249,10 @@ public class RagAnswerService {
         if (useRag) {
             StringBuilder ctx = new StringBuilder();
             ctx.append("【知识片段】\n");
+            // 片段只编内部序号供模型组织答案，不再外露 chunk_id；系统提示已禁止模型把任何编号写进正文。
+            int idx = 1;
             for (SearchResultItem c : citations) {
-                ctx.append("\n[chunk_id=").append(c.getChunkId()).append(']');
+                ctx.append("\n【资料").append(idx++).append('】');
                 if (c.getHeadingPath() != null) ctx.append(" 章节: ").append(c.getHeadingPath());
                 if (c.getPageNum() != null) ctx.append(" 页码: ").append(c.getPageNum());
                 ctx.append('\n').append(c.getContent() == null ? "" : c.getContent()).append('\n');
@@ -209,6 +271,44 @@ public class RagAnswerService {
 
         body.put("messages", messages);
         return body;
+    }
+
+    /**
+     * 把检索命中富化成前端可直接展示的引用项：补 1-based index、文档标题、统一分值（精排分优先，否则 RRF 分）。
+     * kb_document 不在多租户白名单、但 docId 来自已鉴权的知识库检索，按 id 批量取标题即可。
+     */
+    private List<CitationItem> toCitations(List<SearchResultItem> hits) {
+        if (hits == null || hits.isEmpty()) return List.of();
+        List<Long> docIds = hits.stream()
+                .map(SearchResultItem::getDocId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        Map<Long, String> titles = new HashMap<>();
+        if (!docIds.isEmpty()) {
+            try {
+                for (KbDocument d : kbDocumentMapper.selectBatchIds(docIds)) {
+                    titles.put(d.getId(), d.getTitle());
+                }
+            } catch (Exception e) {
+                log.warn("加载引用文档标题失败 docIds={}: {}", docIds, e.getMessage());
+            }
+        }
+        List<CitationItem> out = new ArrayList<>(hits.size());
+        int index = 1;
+        for (SearchResultItem c : hits) {
+            out.add(CitationItem.builder()
+                    .index(index++)
+                    .docId(c.getDocId())
+                    .docTitle(c.getDocId() == null ? null : titles.get(c.getDocId()))
+                    .chunkId(c.getChunkId())
+                    .content(c.getContent())
+                    .headingPath(c.getHeadingPath())
+                    .pageNum(c.getPageNum())
+                    .score(c.getScore())
+                    .build());
+        }
+        return out;
     }
 
     private void logCandidates(String tag, List<SearchResultItem> items, boolean rerankPhase) {

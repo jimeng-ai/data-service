@@ -61,7 +61,7 @@ public class Agent extends BaseEntity {
     @TableField("owner_id")
     private String ownerId;
 
-    @Schema(description = "知识库绑定配置 JSON：{kbIds:[...], topK, scoreThreshold}")
+    @Schema(description = "知识库绑定配置 JSON：{kbIds:[...], topK, scoreThreshold, rerank}")
     @TableField("kb_config")
     private String kbConfig;
 }

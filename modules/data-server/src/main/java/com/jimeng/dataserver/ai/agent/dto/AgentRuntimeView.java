@@ -37,4 +37,7 @@ public class AgentRuntimeView {
 
     /** 知识库相似度阈值（可空，预留用于过滤/展示） */
     private final Double kbScoreThreshold;
+
+    /** 知识库是否启用 rerank 精排（可空；为空时回落到请求/全局默认 true） */
+    private final Boolean kbRerank;
 }

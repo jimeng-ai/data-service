@@ -82,6 +82,7 @@ public class AgentRuntimeService {
                 .kbIds(kb.kbIds())
                 .kbTopK(kb.topK())
                 .kbScoreThreshold(kb.scoreThreshold())
+                .kbRerank(kb.rerank())
                 .build();
     }
 
@@ -96,13 +97,13 @@ public class AgentRuntimeService {
         }
     }
 
-    /** 解析 agent.kb_config（{kbIds:[...], topK, scoreThreshold}）。 */
-    private record KbBinding(Set<Long> kbIds, Integer topK, Double scoreThreshold) {}
+    /** 解析 agent.kb_config（{kbIds:[...], topK, scoreThreshold, rerank}）。 */
+    private record KbBinding(Set<Long> kbIds, Integer topK, Double scoreThreshold, Boolean rerank) {}
 
     @SuppressWarnings("unchecked")
     private KbBinding parseKbConfig(String json) {
         if (!StringUtils.hasText(json)) {
-            return new KbBinding(Collections.emptySet(), null, null);
+            return new KbBinding(Collections.emptySet(), null, null, null);
         }
         try {
             Map<String, Object> m = CommonUtil.getObjectMapper().readValue(json, Map.class);
@@ -114,10 +115,11 @@ public class AgentRuntimeService {
                     if (id != null) ids.add(id);
                 }
             }
-            return new KbBinding(ids, toInteger(m.get("topK")), toDouble(m.get("scoreThreshold")));
+            return new KbBinding(ids, toInteger(m.get("topK")), toDouble(m.get("scoreThreshold")),
+                    toBoolean(m.get("rerank")));
         } catch (Exception e) {
             log.warn("解析 agent.kb_config 失败, json={}, error={}", json, e.getMessage());
-            return new KbBinding(Collections.emptySet(), null, null);
+            return new KbBinding(Collections.emptySet(), null, null, null);
         }
     }
 
@@ -138,6 +140,12 @@ public class AgentRuntimeService {
 
     private Double toDouble(Object o) {
         if (o instanceof Number n) return n.doubleValue();
+        return null;
+    }
+
+    private Boolean toBoolean(Object o) {
+        if (o instanceof Boolean b) return b;
+        if (o != null) return Boolean.parseBoolean(String.valueOf(o).trim());
         return null;
     }
 }
