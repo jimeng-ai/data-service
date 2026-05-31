@@ -28,8 +28,19 @@ public class GlobalResponseHandler implements ResponseBodyAdvice<Object> {
 
     @Override
     public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        Class<?> t = returnType.getParameterType();
         // 如果返回类型已经是 CommonResponse.Resp，则不需要包装
-        return !returnType.getParameterType().equals(CommonResponse.Resp.class);
+        if (CommonResponse.Resp.class.equals(t)) {
+            return false;
+        }
+        // 二进制 / 流式返回（文件下载等）不可被 JSON 包装，否则会破坏字节流。
+        // 注意：SseEmitter 走 ResponseBodyEmitterReturnValueHandler，本就不经过此 advice。
+        if (byte[].class.equals(t)
+                || org.springframework.core.io.Resource.class.isAssignableFrom(t)
+                || org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody.class.isAssignableFrom(t)) {
+            return false;
+        }
+        return true;
     }
 
     @Override

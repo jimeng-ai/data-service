@@ -155,4 +155,22 @@ public class AdminAuthService {
         payload.put("user_type", user.getUserType());
         return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
     }
+
+    /**
+     * 为内部服务（代码执行 Agent 沙箱边车）签发一枚短时效 JWT，使其能"以该用户身份"回调
+     * 走网关的接口（如 /data/rag/search）。复用同一密钥，gateway 据 tenant_id claim 注入 X-Tenant-Id。
+     * ttl 应只覆盖一次运行（分钟级），缩小被盗用窗口。
+     */
+    public String mintInternalToken(String userId, String tenantId, long ttlMs) {
+        Date now = new Date();
+        Date exp = new Date(now.getTime() + ttlMs);
+        Map<String, Object> payload = new HashMap<>();
+        payload.put(JWTPayload.ISSUED_AT, now);
+        payload.put(JWTPayload.EXPIRES_AT, exp);
+        payload.put(JWTPayload.NOT_BEFORE, now);
+        payload.put("id", userId);
+        payload.put("tenant_id", tenantId);
+        payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
+    }
 }
