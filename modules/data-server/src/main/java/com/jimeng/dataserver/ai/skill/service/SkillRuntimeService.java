@@ -20,6 +20,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -60,20 +61,46 @@ public class SkillRuntimeService {
         Map<String, ToolPackage> skillMap = aggregateToolPackages();
         if (skillMap.isEmpty()) return SkillApplyResult.disabled();
 
-        List<String> explicitNames = extractExplicitSkillNamesAndStrip(messages);
-        if (!explicitNames.isEmpty()) {
-            List<ToolPackage> selected = resolveSelectedSkills(skillMap, explicitNames);
-            if (selected.isEmpty()) return SkillApplyResult.disabled();
-            injectFullSkillContext(body, selected, adapter);
-            return SkillApplyResult.activated(toNames(selected));
+        // 拆分：Agent 显式绑定的插件(tenantId != null) 直接作为 tool_use 工具注入——绑了就能用，不必先 activate_skills；
+        // 平台级 Skill(tenantId == null) 数量多，仍走「发现 → activate_skills 激活」以免铺满上下文。
+        List<ToolPackage> boundPlugins = new ArrayList<>();
+        Map<String, ToolPackage> skillOnly = new LinkedHashMap<>();
+        for (Map.Entry<String, ToolPackage> e : skillMap.entrySet()) {
+            if (e.getValue().getTenantId() != null) {
+                boundPlugins.add(e.getValue());
+            } else {
+                skillOnly.put(e.getKey(), e.getValue());
+            }
+        }
+        if (!boundPlugins.isEmpty()) {
+            injectFullSkillContext(body, boundPlugins, adapter);
+            log.info("插件工具直接注入(tool_use): {}", toNames(boundPlugins));
         }
 
-        // Discovery Phase
-        List<ToolPackage> allSkills = selectForDiscovery(skillMap);
-        if (allSkills.isEmpty()) return SkillApplyResult.disabled();
-        log.info("Discovery Phase skills: {}", toNames(allSkills));
-        injectDiscoveryContext(body, allSkills, adapter);
-        return SkillApplyResult.discovery(toNames(allSkills));
+        List<String> explicitNames = extractExplicitSkillNamesAndStrip(messages);
+        if (!explicitNames.isEmpty()) {
+            List<ToolPackage> selected = resolveSelectedSkills(skillOnly, explicitNames);
+            if (!selected.isEmpty()) {
+                injectFullSkillContext(body, selected, adapter);
+                List<String> names = new ArrayList<>(toNames(selected));
+                names.addAll(toNames(boundPlugins));
+                return SkillApplyResult.activated(names);
+            }
+        }
+
+        // Skill 发现阶段
+        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly);
+        if (!discoverySkills.isEmpty()) {
+            log.info("Discovery Phase skills: {}", toNames(discoverySkills));
+            injectDiscoveryContext(body, discoverySkills, adapter);
+            return SkillApplyResult.discovery(toNames(discoverySkills));
+        }
+
+        // 没有需要发现的 Skill；若已直接注入插件工具，按 activated 让对话循环执行其 tool 调用
+        if (!boundPlugins.isEmpty()) {
+            return SkillApplyResult.activated(toNames(boundPlugins));
+        }
+        return SkillApplyResult.disabled();
     }
 
     public ActivationResult handleActivateSkills(Map<String, Object> body,
@@ -185,6 +212,10 @@ public class SkillRuntimeService {
                 sb.append(skill.getBody()).append("\n");
             }
         }
+        // 调用工具前先用一句自然语言说明意图，提升可观测性（这是给用户看的说明，不是思维链/分析过程）
+        sb.append("\n\n【调用工具的礼貌约定】在发起任何工具调用之前，先用一句简短、自然的话告诉用户")
+          .append("你接下来要做什么、为什么需要这个工具（例如“好的，我来帮你查询泉港的实时天气”），")
+          .append("然后再发起工具调用。这句话是面向用户的说明，不要输出分析、推理或思维链内容。");
         return sb.toString().trim();
     }
 

@@ -195,7 +195,7 @@ public class AiConversationLoop {
                         return;
                     }
 
-                    sendProgress(connectionId, toolRound + 1, toolCalls);
+                    sendProgress(connectionId, toolRound + 1, toolCalls, body, adapter);
                     List<ToolExecutionResult> results = skillRuntimeService.executeToolCalls(toolCalls);
                     sendToolResults(connectionId, toolRound + 1, results);
 
@@ -296,7 +296,10 @@ public class AiConversationLoop {
         sseServiceUtil.sendEvent(connectionId, "summary", JSONUtil.toJsonStr(summary));
     }
 
-    private void sendProgress(String connectionId, int round, List<ToolUseCall> toolCalls) {
+    private void sendProgress(String connectionId, int round, List<ToolUseCall> toolCalls,
+                              Map<String, Object> body, AiProtocolAdapter adapter) {
+        // 工具描述就在请求体的 tools 里，按名取出一并下发，前端可显示「正在调用 X（描述）」
+        Map<String, String> descMap = toolDescriptions(body, adapter);
         List<String> toolNames = new ArrayList<>();
         List<Map<String, Object>> calls = new ArrayList<>();
         for (ToolUseCall call : toolCalls) {
@@ -304,6 +307,8 @@ public class AiConversationLoop {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", call.getToolUseId());
             item.put("name", call.getToolName());
+            String desc = descMap.get(call.getToolName());
+            if (StrUtil.isNotBlank(desc)) item.put("desc", desc);
             item.put("input", call.getInput());
             item.put("status", "running");
             calls.add(item);
@@ -313,6 +318,33 @@ public class AiConversationLoop {
         progress.put("tools", toolNames);
         progress.put("calls", calls);
         sseServiceUtil.sendEvent(connectionId, "progress", JSONUtil.toJsonStr(progress));
+    }
+
+    /** 从请求体 tools 里提取「工具名 → 描述」，兼容 Claude({name,description}) 与 OpenAI({function:{name,description}})。 */
+    private Map<String, String> toolDescriptions(Map<String, Object> body, AiProtocolAdapter adapter) {
+        Map<String, String> map = new LinkedHashMap<>();
+        try {
+            for (Object def : adapter.getToolsList(body)) {
+                String name = adapter.getToolName(def);
+                if (StrUtil.isBlank(name)) continue;
+                String desc = extractToolDesc(def);
+                if (StrUtil.isNotBlank(desc)) map.put(name, desc);
+            }
+        } catch (Exception ignore) {
+            // 取不到描述不影响主流程
+        }
+        return map;
+    }
+
+    private String extractToolDesc(Object def) {
+        if (!(def instanceof Map<?, ?> m)) return null;
+        Object d = m.get("description");
+        if (d instanceof String s && StrUtil.isNotBlank(s)) return s;
+        Object fn = m.get("function");
+        if (fn instanceof Map<?, ?> fm && fm.get("description") instanceof String s && StrUtil.isNotBlank(s)) {
+            return s;
+        }
+        return null;
     }
 
     private void sendToolResults(String connectionId, int round, List<ToolExecutionResult> results) {
