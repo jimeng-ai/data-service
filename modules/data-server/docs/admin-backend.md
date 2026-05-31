@@ -17,10 +17,11 @@
 
 ## 部署清单
 
-1. **建表 / 迁移** —— 在 data-service 库执行
-   `modules/data-server/src/main/resources/db/migration/V20260601__rbac_multitenant.sql`
-   （新建 `sys_operator` / `sys_enterprise` / `sys_user` / `sys_role` / `sys_role_resource` / `sys_user_role`，并给 `knowledge_base` 补 `tenant_id`）。
-   ⚠ 迁移内含历史 `knowledge_base` 回填 `'default'` 租户，须在启动新代码前完成（新代码已把 `knowledge_base` 纳入租户隔离）。
+1. **建表 / 迁移** —— 在 data-service 库**按版本号顺序**执行 `db/migration/` 下的所有 SQL。
+   ⚠ **本项目没有 Flyway / Liquibase，迁移不会随启动自动跑**——每条都得手工执行，且**必须先于启动新代码**（实体已映射新列，列缺失会让相关查询全部 `Unknown column ...` 报 500）。当前清单（按序）：
+   - `V20260601__rbac_multitenant.sql` —— 新建 `sys_operator` / `sys_enterprise` / `sys_user` / `sys_role` / `sys_role_resource` / `sys_user_role`，并给 `knowledge_base` 补 `tenant_id`。内含历史 `knowledge_base` 回填 `'default'` 租户。
+   - `V20260602__fix_rbac_unique_keys.sql` —— 修正 RBAC 唯一键。
+   - `V20260603__chat_message_meta.sql` —— 给 `chat_message` 加 `segments`（工具调用过程片段）/ `elapsed_ms`（回答总耗时）列。**漏跑会导致进入会话详情 / 发消息时 500、前端显示「未找到该会话」。**
 2. **首次启动** —— `OperatorAuthInitializer` 自动创建默认运营账号 `admin / admin123`（BCrypt 当场算）。**生产务必登录后立即改密。**
 3. **更新 Nacos `gateway.yml`** —— 把**两个登录端点**加入白名单（其余 `/data/admin/**` 继续走鉴权）：
    ```yaml

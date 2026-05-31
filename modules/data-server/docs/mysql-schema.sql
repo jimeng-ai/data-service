@@ -403,6 +403,8 @@ CREATE TABLE IF NOT EXISTS `chat_message` (
     `role`            VARCHAR(16)  NOT NULL                COMMENT '角色：user / assistant',
     `content`         LONGTEXT                             COMMENT '消息正文',
     `citations`       JSON         DEFAULT NULL            COMMENT '引用列表（JSON，可空）',
+    `segments`        JSON         DEFAULT NULL            COMMENT '助手消息有序片段（文本/工具调用交错，JSON，可空）',
+    `elapsed_ms`      BIGINT       DEFAULT NULL            COMMENT '助手生成总耗时（毫秒，可空）',
     `deleted`         TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '逻辑删除',
     `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `create_user`     VARCHAR(64)  DEFAULT NULL            COMMENT '创建人',

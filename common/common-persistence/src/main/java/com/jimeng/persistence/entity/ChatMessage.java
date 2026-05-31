@@ -39,4 +39,12 @@ public class ChatMessage extends BaseEntity {
     @Schema(description = "引用列表（JSON 字符串，可空）")
     @TableField("citations")
     private String citations;
+
+    @Schema(description = "助手消息有序片段（文本/工具调用交错，JSON 字符串，可空）")
+    @TableField("segments")
+    private String segments;
+
+    @Schema(description = "助手生成总耗时（毫秒，可空）")
+    @TableField("elapsed_ms")
+    private Long elapsedMs;
 }

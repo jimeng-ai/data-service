@@ -118,6 +118,10 @@ public class ChatConversationService {
         if (req.getCitations() != null) {
             m.setCitations(JSONUtil.toJsonStr(req.getCitations()));
         }
+        if (req.getSegments() != null) {
+            m.setSegments(JSONUtil.toJsonStr(req.getSegments()));
+        }
+        m.setElapsedMs(req.getElapsedMs());
         messageMapper.insert(m);
 
         // 更新会话：刷新 last_message_at；若标题仍是默认值且这是用户消息，用其作为标题。
@@ -181,6 +185,8 @@ public class ChatConversationService {
         v.setRole(m.getRole());
         v.setContent(m.getContent());
         v.setCitations(StrUtil.isBlank(m.getCitations()) ? null : JSONUtil.parse(m.getCitations()));
+        v.setSegments(StrUtil.isBlank(m.getSegments()) ? null : JSONUtil.parse(m.getSegments()));
+        v.setElapsedMs(m.getElapsedMs());
         v.setCreateTime(m.getCreateTime());
         return v;
     }
