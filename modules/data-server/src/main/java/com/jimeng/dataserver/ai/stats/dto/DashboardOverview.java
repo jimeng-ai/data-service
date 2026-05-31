@@ -34,6 +34,9 @@ public class DashboardOverview {
     @Schema(description = "模型用量 Top")
     private List<ModelUsage> topModels;
 
+    @Schema(description = "全量模型用量（不截断，用于「查看全部」饼图）")
+    private List<ModelUsage> allModels;
+
     @Schema(description = "最近调用记录")
     private List<RecentCall> recentCalls;
 
@@ -75,6 +78,10 @@ public class DashboardOverview {
     @Data
     public static class RecentCall {
         private Long id;
+        @Schema(description = "发起调用的 Agent ID（可空，历史数据为空）")
+        private Long agentId;
+        @Schema(description = "发起调用的 Agent 名称（按 agentId JOIN agent 表得到，可空）")
+        private String agentName;
         private String model;
         private String provider;
         private Long totalTokens;

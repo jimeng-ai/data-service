@@ -11,6 +11,7 @@
         <result column="scene_code" property="sceneCode"/>
         <result column="tenant_id" property="tenantId"/>
         <result column="user_id" property="userId"/>
+        <result column="agent_id" property="agentId"/>
         <result column="provider" property="provider"/>
         <result column="model" property="model"/>
         <result column="endpoint" property="endpoint"/>
@@ -42,7 +43,7 @@
     </resultMap>
 
     <sql id="Base_Column_List">
-        id, trace_id, request_id, biz_type, biz_id, scene_code, tenant_id, user_id, provider, model, endpoint,
+        id, trace_id, request_id, biz_type, biz_id, scene_code, tenant_id, user_id, agent_id, provider, model, endpoint,
         stream, has_text, has_image, has_document, has_tool, tool_names, max_tokens, temperature, top_p,
         input_tokens, output_tokens, total_tokens, latency_ms, first_token_ms, retry_count, http_status,
         call_status, error_code, error_msg, cost_usd, deleted, create_time, create_user, update_time, update_user

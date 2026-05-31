@@ -5,6 +5,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
+import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
 import com.jimeng.persistence.entity.AiModelCallContent;
 import com.jimeng.persistence.entity.AiModelCallLog;
 import com.jimeng.persistence.mapper.AiModelCallContentMapper;
@@ -59,6 +60,19 @@ public class AiModelCallRecordService {
         logEntity.setBizType(getString(requestBody, "biz_type", null));
         logEntity.setBizId(getString(requestBody, "biz_id", null));
         logEntity.setSceneCode(getString(requestBody, "scene_code", null));
+        // Agent 维度：agent_id 在转发前会被 ClaudeService.applyAgentContext 从 body 移除，
+        // 所以优先读 body、再回退到 AgentIdContext（由 MdcAsyncSupport 透传到流式异步线程）。
+        // 落库以便仪表盘「最近使用」按 Agent 统计；非数字或缺失时忽略。
+        String agentIdStr = firstNonBlank(
+                getString(requestBody, "agent_id", null),
+                AgentIdContext.get());
+        if (agentIdStr != null && !agentIdStr.isBlank()) {
+            try {
+                logEntity.setAgentId(Long.valueOf(agentIdStr.trim()));
+            } catch (NumberFormatException ignored) {
+                // ignore non-numeric agent_id
+            }
+        }
 
         // 从请求头/上下文提取链路和用户信息
         HttpServletRequest request = currentRequest();

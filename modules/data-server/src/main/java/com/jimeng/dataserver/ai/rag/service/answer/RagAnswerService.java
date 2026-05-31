@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
 import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
@@ -149,6 +150,9 @@ public class RagAnswerService {
             // 并把 AgentContext 设到当前线程（下游工具据此决定可用插件——配了插件才会走）。
             if (StrUtil.isNotBlank(req.getAgentId())) {
                 body.put("agent_id", req.getAgentId());
+                // agent_id 会被 ClaudeService.applyAgentContext 从 body 移除，导致日志层读不到；
+                // 这里同时记到 ThreadLocal，供 AiModelCallRecordService 落库时兜底（含本异步流式线程）。
+                AgentIdContext.set(req.getAgentId());
                 claudeService.prepareAgentContext(body);
             }
 

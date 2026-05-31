@@ -2,7 +2,9 @@ package com.jimeng.dataserver.ai.stats.service;
 
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.stats.dto.DashboardOverview;
+import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AiModelCallLog;
+import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.AiModelCallLogMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -11,9 +13,12 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 仪表盘统计：基于 {@code ai_model_call_log} 的真实聚合，全部按当前租户隔离。
@@ -29,8 +34,11 @@ public class DashboardStatsService {
     private static final int MAX_DAYS = 365;
     private static final int TOP_MODELS_LIMIT = 6;
     private static final int RECENT_CALLS_LIMIT = 8;
+    /** 「查看全部」饼图需要全量模型，给一个足够大的上限即可（单租户模型数远小于此）。 */
+    private static final int ALL_MODELS_LIMIT = 100;
 
     private final AiModelCallLogMapper callLogMapper;
+    private final AgentMapper agentMapper;
 
     public DashboardOverview overview(int days) {
         int window = Math.max(1, Math.min(days, MAX_DAYS));
@@ -58,6 +66,7 @@ public class DashboardStatsService {
             result.setPrevious(emptyTotals());
             result.setTrend(fillTrend(List.of(), startDate, today));
             result.setTopModels(List.of());
+            result.setAllModels(List.of());
             result.setRecentCalls(List.of());
             return result;
         }
@@ -65,7 +74,13 @@ public class DashboardStatsService {
         result.setTotals(toTotals(callLogMapper.selectOverview(tenantId, start, end)));
         result.setPrevious(toTotals(callLogMapper.selectOverview(tenantId, prevStart, start)));
         result.setTrend(fillTrend(callLogMapper.selectDailyTrend(tenantId, start, end), startDate, today));
-        result.setTopModels(toModelUsage(callLogMapper.selectTopModels(tenantId, start, end, TOP_MODELS_LIMIT)));
+        // 全量模型用量（按调用次数倒序）：allModels 给「查看全部」饼图，topModels 取前 N。
+        List<DashboardOverview.ModelUsage> allModels =
+                toModelUsage(callLogMapper.selectTopModels(tenantId, start, end, ALL_MODELS_LIMIT));
+        result.setAllModels(allModels);
+        result.setTopModels(allModels.size() > TOP_MODELS_LIMIT
+                ? new ArrayList<>(allModels.subList(0, TOP_MODELS_LIMIT))
+                : allModels);
         result.setRecentCalls(toRecentCalls(callLogMapper.selectRecentCalls(tenantId, RECENT_CALLS_LIMIT)));
         return result;
     }
@@ -139,9 +154,13 @@ public class DashboardStatsService {
         if (logs == null) {
             return out;
         }
+        // 先收集本批次出现的 agentId，批量查 agent 名称，避免 N+1。
+        Map<Long, String> agentNames = resolveAgentNames(logs);
         for (AiModelCallLog log : logs) {
             DashboardOverview.RecentCall c = new DashboardOverview.RecentCall();
             c.setId(log.getId());
+            c.setAgentId(log.getAgentId());
+            c.setAgentName(log.getAgentId() == null ? null : agentNames.get(log.getAgentId()));
             c.setModel(log.getModel());
             c.setProvider(log.getProvider());
             c.setTotalTokens(log.getTotalTokens() == null ? null : log.getTotalTokens().longValue());
@@ -154,6 +173,24 @@ public class DashboardStatsService {
             out.add(c);
         }
         return out;
+    }
+
+    /** 批量把 agentId 解析成 Agent 名称；agent 已删除或查不到时该 id 不在返回 map 中。 */
+    private Map<Long, String> resolveAgentNames(List<AiModelCallLog> logs) {
+        Set<Long> agentIds = new HashSet<>();
+        for (AiModelCallLog log : logs) {
+            if (log.getAgentId() != null) {
+                agentIds.add(log.getAgentId());
+            }
+        }
+        if (agentIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, String> names = new HashMap<>();
+        for (Agent agent : agentMapper.selectBatchIds(agentIds)) {
+            names.put(agent.getId(), agent.getName());
+        }
+        return names;
     }
 
     private long asLong(Object v) {

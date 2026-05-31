@@ -37,6 +37,9 @@ public class AiModelCallLog extends BaseEntity {
     @TableField("user_id")
     private String userId;
 
+    @TableField("agent_id")
+    private Long agentId;
+
     @TableField("provider")
     private String provider;
 
