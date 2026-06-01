@@ -81,7 +81,8 @@ jobs:
 
       # 重建两个应用容器。接入基础设施网络，用服务名互访；Nacos 指向 prod 命名空间。
       # --add-host 让 data-server 能经 host.docker.internal:8088 回连 sandbox 宿主进程。
-      # data-server 先起（gateway 经发现依赖它），gateway 发布 10011 对外。
+      # data-server 先起（gateway 经发现依赖它）。gateway 容器内仍听 10011，但对外发布到宿主
+      # 20011——10011 留给你本地 IDE 调试用（部署版与本地隔离）。生产验证走 http://<host>:20011/data。
       - name: Redeploy containers
         run: |
           set -euo pipefail
@@ -97,18 +98,20 @@ jobs:
             --add-host host.docker.internal:host-gateway \
             -e NACOS_SERVER_ADDR=nacos:8848 \
             -e NACOS_NAMESPACE="$NACOS_NS" \
-            -p 10011:10011 \
+            -p 20011:10011 \
             ds-gateway:latest
 
-      # gateway 监听 10011（/data 前缀）。给 Spring Boot 拉 Nacos 配置 + 建连一点时间再探活；
-      # 探活失败不判部署失败，但会把两个容器日志尾部打出来便于排查。
+      # gateway 对外发布在宿主 20011（容器内 10011）。给 Spring Boot 拉 Nacos 配置 + 建连一点时间
+      # 再探活；探活失败不判部署失败，但会把两个容器日志尾部打出来便于排查。
+      # 注：/data/** 经网关路由到 data-server 后会被租户鉴权拦截，未带凭据时返回 401/403 属正常，
+      # 只要不是连接拒绝即说明链路通。
       - name: Health check (best-effort)
         continue-on-error: true
         run: |
           for i in $(seq 1 45); do
-            if curl -fsS "http://127.0.0.1:10011/data/actuator/health" >/dev/null 2>&1 \
-               || curl -fsS -o /dev/null "http://127.0.0.1:10011/" 2>/dev/null; then
-              echo "gateway 已响应 (10011)"; exit 0
+            code=$(curl -s -m5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:20011/data/actuator/health" 2>/dev/null || echo 000)
+            if [ "$code" != "000" ]; then
+              echo "gateway 已响应 (20011, HTTP $code)"; exit 0
             fi
             sleep 2
           done
