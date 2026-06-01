@@ -128,6 +128,9 @@
         FROM ai_model_call_log
         WHERE deleted = 0
           AND tenant_id = #{tenantId}
+          <!-- 仅取真正的 Agent 调用：RAG 子调用(embedding/rerank/contextualization)
+               不带 agent_id,排除掉以免污染仪表盘「最近使用 · 按 Agent」信息流。 -->
+          AND agent_id IS NOT NULL
         ORDER BY create_time DESC
         LIMIT #{limit}
     </select>

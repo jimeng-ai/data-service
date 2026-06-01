@@ -39,7 +39,11 @@ public interface AiModelCallLogMapper extends BaseMapper<AiModelCallLog> {
                                               @Param("end") Date end,
                                               @Param("limit") int limit);
 
-    /** 最近 N 条调用记录（用于"最近调用"信息流）。 */
+    /**
+     * 最近 N 条调用记录（用于仪表盘「最近使用 · 按 Agent」信息流）。
+     * 仅含 {@code agent_id} 非空的调用——RAG 子调用（embedding/rerank/contextualization）
+     * 不带 agent_id，会被排除，避免淹没真正的 Agent 活动。
+     */
     List<AiModelCallLog> selectRecentCalls(@Param("tenantId") String tenantId,
                                            @Param("limit") int limit);
 

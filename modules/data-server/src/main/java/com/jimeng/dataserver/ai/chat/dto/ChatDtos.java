@@ -43,6 +43,8 @@ public final class ChatDtos {
         private Object citations;
         @Schema(description = "助手消息有序片段（文本/工具调用交错，任意 JSON，可空）")
         private Object segments;
+        @Schema(description = "消息附件列表（fileId/filename/contentType，任意 JSON，可空）")
+        private Object attachments;
         @Schema(description = "助手生成总耗时（毫秒，可空）")
         private Long elapsedMs;
     }
@@ -71,6 +73,8 @@ public final class ChatDtos {
         private Object citations;
         @Schema(description = "助手消息有序片段（已解析为 JSON，可空）")
         private Object segments;
+        @Schema(description = "消息附件列表（已解析为 JSON，可空）")
+        private Object attachments;
         @Schema(description = "助手生成总耗时（毫秒，可空）")
         private Long elapsedMs;
         private Date createTime;

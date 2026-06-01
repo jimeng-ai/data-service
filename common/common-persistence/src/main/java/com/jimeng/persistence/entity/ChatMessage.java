@@ -44,6 +44,10 @@ public class ChatMessage extends BaseEntity {
     @TableField("segments")
     private String segments;
 
+    @Schema(description = "消息附件列表（fileId/filename/contentType，JSON 字符串，可空）")
+    @TableField("attachments")
+    private String attachments;
+
     @Schema(description = "助手生成总耗时（毫秒，可空）")
     @TableField("elapsed_ms")
     private Long elapsedMs;

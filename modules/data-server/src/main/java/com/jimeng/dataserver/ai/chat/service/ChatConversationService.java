@@ -121,6 +121,9 @@ public class ChatConversationService {
         if (req.getSegments() != null) {
             m.setSegments(JSONUtil.toJsonStr(req.getSegments()));
         }
+        if (req.getAttachments() != null) {
+            m.setAttachments(JSONUtil.toJsonStr(req.getAttachments()));
+        }
         m.setElapsedMs(req.getElapsedMs());
         messageMapper.insert(m);
 
@@ -186,6 +189,7 @@ public class ChatConversationService {
         v.setContent(m.getContent());
         v.setCitations(StrUtil.isBlank(m.getCitations()) ? null : JSONUtil.parse(m.getCitations()));
         v.setSegments(StrUtil.isBlank(m.getSegments()) ? null : JSONUtil.parse(m.getSegments()));
+        v.setAttachments(StrUtil.isBlank(m.getAttachments()) ? null : JSONUtil.parse(m.getAttachments()));
         v.setElapsedMs(m.getElapsedMs());
         v.setCreateTime(m.getCreateTime());
         return v;

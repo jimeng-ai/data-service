@@ -58,6 +58,23 @@ public class AgentFileController {
                 f.getFilename(), file.getContentType(), file.getSize());
     }
 
+    @Operation(summary = "预览输入文件", description = "按 fileId（租户隔离）从 MinIO 流式回传输入文件，Content-Disposition: inline 供前端缩略图/预览。")
+    @GetMapping("/files/{fileId}")
+    public Resource previewInputFile(@PathVariable Long fileId, HttpServletResponse response) throws Exception {
+        AgentInputFile f = inputFileMapper.selectById(fileId);
+        if (f == null) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在");
+        }
+        response.setContentType(f.getContentType() == null
+                ? MediaType.APPLICATION_OCTET_STREAM_VALUE : f.getContentType());
+        String fn = URLEncoder.encode(f.getFilename() == null ? "file" : f.getFilename(),
+                StandardCharsets.UTF_8).replace("+", "%20");
+        // inline：图片/PDF/文本浏览器可内联预览；前端也可 fetch 取 blob 自行渲染（xlsx/docx）。
+        response.setHeader("Content-Disposition", "inline; filename*=UTF-8''" + fn);
+        InputStream is = storage.download(f.getObjectName());
+        return new InputStreamResource(is);
+    }
+
     @Operation(summary = "下载产物文件", description = "按 artifactId（租户隔离）从 MinIO 流式回传产物。")
     @GetMapping("/artifacts/{artifactId}/download")
     public Resource download(@PathVariable Long artifactId, HttpServletResponse response) throws Exception {
