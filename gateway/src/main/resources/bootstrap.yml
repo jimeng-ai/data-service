@@ -30,17 +30,18 @@ spring:
             - Path=/v3/api-docs/**,/swagger-resources/**,/webjars/**
           order: 9999
     nacos:
-      server-addr: localhost:8848
+      # 默认 localhost（本地 IDE 直跑）；容器部署时由 NACOS_SERVER_ADDR 覆盖
+      server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
 #      username: nacos
 #      password: nacos
       discovery:
-        namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
+        namespace: ${NACOS_NAMESPACE:fe9e39ae-06af-49c3-9c5b-6060df2cf93e}
       config:
         shared-configs:
           - data-id: gateway.yml
             refresh: true
           - data-id: default-mysql.yml
             refresh: true
-        namespace: fe9e39ae-06af-49c3-9c5b-6060df2cf93e
+        namespace: ${NACOS_NAMESPACE:fe9e39ae-06af-49c3-9c5b-6060df2cf93e}
         file-extension: yml
         group: DEFAULT_GROUP

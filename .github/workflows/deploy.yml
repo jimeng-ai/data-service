@@ -1,0 +1,119 @@
+name: Deploy
+
+# push 到 master 即自动部署。也支持在 Actions 页面手动触发。
+#
+# data-service 容器化部署（与本地 IDE 隔离）：
+#   • 两个 Spring Boot 应用（gateway / data-server）打成镜像，跑在基础设施所在的
+#     docker 网络 data-service-infra_default 上，用服务名互访（gateway 经 Nacos 发现 data-server）。
+#   • 配置走 Nacos 的独立命名空间 data-service-prod（地址用服务名：mysql/redis/rabbitmq/nacos/
+#     minio/elasticsearch；sandbox 用 host.docker.internal:8088）。本地 IDE 仍用 fe9e39ae 命名空间
+#     （localhost），两套互不影响。
+#   • 基础设施（Nacos/MySQL/...）由 docker/docker-compose.yml 常驻；这里幂等确保其在线。
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-data-service
+  cancel-in-progress: true
+
+env:
+  NET: data-service-infra_default
+  NACOS_NS: data-service-prod
+
+jobs:
+  deploy:
+    # 跑在本机（Mac）上的自托管 Runner，与其它仓库共用同一台机器
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # JDK 17 + Maven 来自宿主（deploy.sh 已装）。launchd 后台会话 PATH 较干净，显式补上
+      # Homebrew 路径，并把 JAVA_HOME 固定到 17。
+      - name: Resolve toolchain
+        run: |
+          echo "/opt/homebrew/bin:/usr/local/bin" >> "$GITHUB_PATH"
+          JH="$(/usr/libexec/java_home -v 17)"
+          echo "JAVA_HOME=$JH" >> "$GITHUB_ENV"
+          echo "$JH/bin" >> "$GITHUB_PATH"
+
+      # macOS 自托管 Runner 跑在 launchd 后台会话里，默认 ~/.docker/config.json 的
+      # credsStore=desktop 会去访问登录钥匙串；无人交互时报 "keychain cannot be accessed"，
+      # 连 docker build/pull 公共基础镜像都会失败。指向一个干净的 DOCKER_CONFIG（config.json={}，
+      # 无 credsStore），让后续 docker 命令都不走钥匙串助手——公共镜像匿名拉取即可。
+      - name: Prepare clean docker config (bypass macOS keychain)
+        run: |
+          DC="$RUNNER_TEMP/docker-ci"
+          mkdir -p "$DC"
+          printf '{}' > "$DC/config.json"
+          echo "DOCKER_CONFIG=$DC" >> "$GITHUB_ENV"
+
+      - name: Build (mvn clean install -DskipTests)
+        run: mvn -B -DskipTests clean install
+
+      # 幂等确保基础设施在线（在则不动，不在则拉起），从而保证 data-service-infra_default 网络存在。
+      - name: Ensure infra up
+        run: docker compose -f docker/docker-compose.yml up -d
+
+      - name: Build app images
+        run: |
+          set -euo pipefail
+          pick_jar() {
+            ls "$1"/*.jar 2>/dev/null \
+              | grep -vE '\.original$|-sources\.jar$|-javadoc\.jar$' | head -1
+          }
+          GATEWAY_JAR="$(pick_jar gateway/target)"
+          DS_JAR="$(pick_jar modules/data-server/target)"
+          [ -n "$GATEWAY_JAR" ] || { echo "找不到 gateway jar"; exit 1; }
+          [ -n "$DS_JAR" ] || { echo "找不到 data-server jar"; exit 1; }
+          echo "gateway jar : $GATEWAY_JAR"
+          echo "data-server : $DS_JAR"
+          docker build -f docker/Dockerfile.app --build-arg JAR="$GATEWAY_JAR" -t ds-gateway:latest .
+          docker build -f docker/Dockerfile.app --build-arg JAR="$DS_JAR"      -t ds-data-server:latest .
+
+      # 重建两个应用容器。接入基础设施网络，用服务名互访；Nacos 指向 prod 命名空间。
+      # --add-host 让 data-server 能经 host.docker.internal:8088 回连 sandbox 宿主进程。
+      # data-server 先起（gateway 经发现依赖它），gateway 发布 10011 对外。
+      - name: Redeploy containers
+        run: |
+          set -euo pipefail
+          docker rm -f ds-data-server ds-gateway 2>/dev/null || true
+          docker run -d --name ds-data-server --restart unless-stopped \
+            --network "$NET" \
+            --add-host host.docker.internal:host-gateway \
+            -e NACOS_SERVER_ADDR=nacos:8848 \
+            -e NACOS_NAMESPACE="$NACOS_NS" \
+            ds-data-server:latest
+          docker run -d --name ds-gateway --restart unless-stopped \
+            --network "$NET" \
+            --add-host host.docker.internal:host-gateway \
+            -e NACOS_SERVER_ADDR=nacos:8848 \
+            -e NACOS_NAMESPACE="$NACOS_NS" \
+            -p 10011:10011 \
+            ds-gateway:latest
+
+      # gateway 监听 10011（/data 前缀）。给 Spring Boot 拉 Nacos 配置 + 建连一点时间再探活；
+      # 探活失败不判部署失败，但会把两个容器日志尾部打出来便于排查。
+      - name: Health check (best-effort)
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 45); do
+            if curl -fsS "http://127.0.0.1:10011/data/actuator/health" >/dev/null 2>&1 \
+               || curl -fsS -o /dev/null "http://127.0.0.1:10011/" 2>/dev/null; then
+              echo "gateway 已响应 (10011)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning::gateway 90s 内未就绪，打印容器日志尾部"
+          echo "----- ds-data-server -----"; docker logs --tail 60 ds-data-server 2>&1 || true
+          echo "----- ds-gateway -----";     docker logs --tail 60 ds-gateway 2>&1 || true
+
+      - name: Cleanup old images
+        if: always()
+        continue-on-error: true
+        run: docker image prune -f

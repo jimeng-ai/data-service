@@ -1,0 +1,5 @@
+.git
+.idea
+*.md
+export
+docker/docker-compose*.yml
