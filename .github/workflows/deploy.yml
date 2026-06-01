@@ -56,9 +56,12 @@ jobs:
       - name: Build (mvn clean install -DskipTests)
         run: mvn -B -DskipTests clean install
 
-      # 幂等确保基础设施在线（在则不动，不在则拉起），从而保证 data-service-infra_default 网络存在。
-      - name: Ensure infra up
-        run: docker compose -f docker/docker-compose.yml up -d
+      # 基础设施（Nacos/MySQL/...）由宿主 docker/docker-compose.yml 常驻，这里只校验其网络在线
+      # （不用 docker compose——本机 docker CLI 未装 compose v2 插件）。不在则提示先跑 ./deploy.sh infra。
+      - name: Ensure infra network exists
+        run: |
+          docker network inspect "$NET" >/dev/null 2>&1 \
+            || { echo "::error::基础设施网络 $NET 不存在，请先在宿主跑 ./deploy.sh infra 起 Nacos/MySQL 等"; exit 1; }
 
       - name: Build app images
         run: |
