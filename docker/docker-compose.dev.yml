@@ -1,0 +1,171 @@
+# 本地开发专用基础设施 —— 与生产(data-service-infra / ds-*)完全隔离。
+# 独立 project 名 data-service-dev → 独立 network；容器名 dev-*；卷 dev_*;端口全部错开。
+# 生产那套(8848/3306/6379/5672/9200/9000/5601)一概不碰。
+#
+# 启停：
+#   docker compose -f docker/docker-compose.dev.yml up -d
+#   docker compose -f docker/docker-compose.dev.yml down            # 停容器,保留卷
+#   docker compose -f docker/docker-compose.dev.yml down -v         # 连数据卷一起删(彻底重置)
+#
+# 本地 IDE 跑 data-server / gateway 时,只需加环境变量:NACOS_SERVER_ADDR=localhost:8849
+name: data-service-dev
+
+services:
+  nacos:
+    image: nacos/nacos-server:v2.4.3
+    container_name: dev-nacos
+    restart: unless-stopped
+    environment:
+      MODE: standalone
+      PREFER_HOST_MODE: hostname
+      JVM_XMS: 512m
+      JVM_XMX: 512m
+      NACOS_AUTH_ENABLE: "false"
+    ports:
+      - "8849:8848"   # 控制台/HTTP API：本地连 localhost:8849
+      - "9849:9848"   # gRPC：客户端按 8849+1000=9849 推导,需映射到容器 9848
+    volumes:
+      - dev_nacos_data:/home/nacos/data
+      - dev_nacos_logs:/home/nacos/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8848/nacos/v1/console/health/readiness || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mysql:
+    image: mysql:8.0
+    container_name: dev-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - dev_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p123456"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: dev-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - dev_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: dev-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_LOOPBACK_USERS: "none"
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    volumes:
+      - dev_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: dev-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9002:9000"   # S3 API：本地连 localhost:9002
+      - "9003:9001"   # 控制台 UI
+    volumes:
+      - dev_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: dev-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9201:9200"
+      - "9301:9300"
+    volumes:
+      - dev_es_data:/usr/share/elasticsearch/data
+    # 与生产一致：首次启动自动装 analysis-ik 插件(data-server 启动会强校验)
+    command: >
+      bash -c "
+        if ! ./bin/elasticsearch-plugin list | grep -q analysis-ik; then
+          ./bin/elasticsearch-plugin install --batch https://release.infinilabs.com/analysis-ik/stable/elasticsearch-analysis-ik-8.13.4.zip;
+        fi &&
+        /usr/local/bin/docker-entrypoint.sh elasticsearch
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: dev-kibana
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_HOST: "0.0.0.0"
+      I18N_LOCALE: zh-CN
+    ports:
+      - "5602:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  dev_nacos_data:
+  dev_nacos_logs:
+  dev_mysql_data:
+  dev_redis_data:
+  dev_rabbitmq_data:
+  dev_es_data:
+  dev_minio_data:
