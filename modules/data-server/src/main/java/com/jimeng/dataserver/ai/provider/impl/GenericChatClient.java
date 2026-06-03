@@ -121,6 +121,7 @@ public class GenericChatClient implements ChatClient {
     private Map<String, Object> prepareAnthropicBody(Map<String, Object> requestBody) {
         Map<String, Object> body = new LinkedHashMap<>(requestBody);
         normalizeAnthropicMaxTokens(body);
+        clampAnthropicTemperature(body);
         String sp = systemPrompt();
         if (StrUtil.isNotBlank(sp)) body.putIfAbsent("system", sp);
         body.putIfAbsent("model", config.getChat().getModel());
@@ -180,6 +181,17 @@ public class GenericChatClient implements ChatClient {
         if (body.containsKey("max_tokens")) return;
         Object camelValue = body.remove("maxTokens");
         if (camelValue != null) body.put("max_tokens", camelValue);
+    }
+
+    /**
+     * Anthropic 的 temperature 合法区间是 [0,1]，超出会被 API 直接拒绝（400）。
+     * 前端历史上把温度滑块上限误设为 2，这里兜底夹紧，避免给 Claude 设 >1 时整条请求失败。
+     */
+    private void clampAnthropicTemperature(Map<String, Object> body) {
+        if (!(body.get("temperature") instanceof Number num)) return;
+        double v = num.doubleValue();
+        if (v < 0) body.put("temperature", 0);
+        else if (v > 1) body.put("temperature", 1);
     }
 
     private void normalizeOpenAiMaxTokens(Map<String, Object> body) {
