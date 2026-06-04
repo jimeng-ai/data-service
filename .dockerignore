@@ -5,5 +5,5 @@ docker/docker-compose*.yml
 # 注:不要排除 export/ —— 它是根 pom 声明的 Maven 模块(data-server 依赖的 Feign 接口),
 # deploy/Dockerfile.app 在容器内 mvn 构建时需要全部源码模块,排除 export 会导致
 # "Child module /src/export does not exist" 构建失败。
-target/
-**/target/
+# 也不要排除 target/ —— 现有 CI(docker/Dockerfile.app)是 COPY 宿主预编译的
+# gateway/target/*.jar 进镜像,排除 target/ 会让 COPY 找不到 jar 而构建失败。
