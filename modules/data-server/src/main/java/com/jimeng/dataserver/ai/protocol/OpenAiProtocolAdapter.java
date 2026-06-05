@@ -31,14 +31,15 @@ public class OpenAiProtocolAdapter implements AiProtocolAdapter {
         if (!(messagesObj instanceof List<?> rawMessages)) return;
         List<Object> messages = (List<Object>) rawMessages;
 
-        for (Object messageObj : messages) {
-            if (!(messageObj instanceof Map<?, ?> rawMessage)) continue;
+        for (int i = 0; i < messages.size(); i++) {
+            if (!(messages.get(i) instanceof Map<?, ?> rawMessage)) continue;
             Map<String, Object> message = castMap(rawMessage);
             String role = str(message.get("role"));
             if (!"system".equals(role) && !"developer".equals(role)) continue;
-            Object contentObj = message.get("content");
-            String existing = str(contentObj);
+            String existing = str(message.get("content"));
             message.put("content", StrUtil.isBlank(existing) ? text : existing + "\n\n" + text);
+            // 必须写回列表：castMap 复制出的是副本，只改 message 不会落到原 messages 上（修复前的 BUG）。
+            messages.set(i, message);
             return;
         }
 

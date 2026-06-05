@@ -72,11 +72,9 @@ class OpenAiProtocolAdapterTest {
     }
 
     @Test
-    void appendSystemContent_existingSystemMessage_currentlyNoOps() {
-        // 特征化测试（characterization）：锁住当前真实行为，非「期望行为」。
-        // ⚠️ 已发现的隐性 BUG：appendSystemContent 命中已有 system 消息时，先 castMap() 复制了一份再
-        // put content，改的是副本而非 messages 列表里的原对象 —— 追加被静默丢弃（应改为就地改原 map）。
-        // 协议适配器在计划「⛔ 明确不碰」清单内，本阶段只用测试钉住现状并上报，不改生产行为。
+    void appendSystemContent_appendsToExistingSystemMessage() {
+        // 回归：appendSystemContent 命中已有 system 消息时，追加必须落到 messages 列表里的那条消息上。
+        // 修复前 castMap() 复制后只改副本、未写回，追加被静默丢弃。
         Map<String, Object> body = new LinkedHashMap<>();
         List<Object> messages = new ArrayList<>();
         messages.add(new LinkedHashMap<>(Map.of("role", "system", "content", "base")));
@@ -86,7 +84,7 @@ class OpenAiProtocolAdapterTest {
         adapter.appendSystemContent(body, "more");
 
         Map<?, ?> systemMsg = (Map<?, ?>) messages.get(0);
-        assertEquals("base", systemMsg.get("content"));  // BUG: 期望应为 "base\n\nmore"
+        assertEquals("base\n\nmore", systemMsg.get("content"));
         assertEquals(2, messages.size());
     }
 
