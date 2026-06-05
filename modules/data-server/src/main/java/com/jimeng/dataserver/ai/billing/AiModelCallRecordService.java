@@ -239,6 +239,16 @@ public class AiModelCallRecordService {
     public Long recordComputedCall(String provider, String endpoint, String model, String bizType,
                                    NormalizedUsage usage, Integer httpStatus, Integer latencyMs,
                                    Map<String, Object> note) {
+        return recordComputedCall(provider, endpoint, model, bizType, usage, httpStatus, latencyMs, note, null);
+    }
+
+    /**
+     * 同上，额外落 agent_id。Agent 沙箱 exec 链路用，使「最近使用·按 Agent」能统计到工具型 Agent 的调用
+     * （该信息流过滤 agent_id IS NULL，不带 agent_id 的合成调用会被排除）。agentId 为 null 时行为同无 agent 版本。
+     */
+    public Long recordComputedCall(String provider, String endpoint, String model, String bizType,
+                                   NormalizedUsage usage, Integer httpStatus, Integer latencyMs,
+                                   Map<String, Object> note, Long agentId) {
         AiModelCallLog logEntity = new AiModelCallLog();
         logEntity.setProvider(provider);
         logEntity.setEndpoint(endpoint);
@@ -246,6 +256,7 @@ public class AiModelCallRecordService {
         logEntity.setStream(false);
         logEntity.setRetryCount(0);
         logEntity.setBizType(bizType);
+        logEntity.setAgentId(agentId);
         logEntity.setHttpStatus(httpStatus);
         logEntity.setLatencyMs(latencyMs);
         logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
@@ -288,7 +299,13 @@ public class AiModelCallRecordService {
     private void applyUsage(AiModelCallLog logEntity, NormalizedUsage usage, String model) {
         logEntity.setInputTokens(usage.getInputTokens());
         logEntity.setOutputTokens(usage.getOutputTokens());
-        logEntity.setTotalTokens(usage.getTotalTokens());
+        // Anthropic 的 usage 不含 total，沙箱 exec / 非流式等链路会拿到 total=null；
+        // 与 recordStreamResponse 同口径回退为 input+output，避免「最近使用」token 列空着。
+        Integer total = usage.getTotalTokens();
+        if (total == null && (usage.getInputTokens() != null || usage.getOutputTokens() != null)) {
+            total = nz(usage.getInputTokens()) + nz(usage.getOutputTokens());
+        }
+        logEntity.setTotalTokens(total);
         logEntity.setCacheReadTokens(usage.getCacheReadTokens());
         logEntity.setCacheWriteTokens(usage.getCacheWriteTokens());
         logEntity.setReasoningTokens(usage.getReasoningTokens());

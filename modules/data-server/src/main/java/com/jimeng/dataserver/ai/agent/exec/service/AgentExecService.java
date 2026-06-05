@@ -301,8 +301,13 @@ public class AgentExecService {
                     usage = usageExtractor.extract(usageJson);
                     run.setInputTokens(toLong(usage.getInputTokens()));
                     run.setOutputTokens(toLong(usage.getOutputTokens()));
+                    // Anthropic usage 无 total，回退为 input+output，保持与 ai_model_call_log 同口径。
                     if (usage.getTotalTokens() != null) {
                         run.setTotalTokens(usage.getTotalTokens().longValue());
+                    } else if (usage.getInputTokens() != null || usage.getOutputTokens() != null) {
+                        int in = usage.getInputTokens() == null ? 0 : usage.getInputTokens();
+                        int out = usage.getOutputTokens() == null ? 0 : usage.getOutputTokens();
+                        run.setTotalTokens((long) (in + out));
                     }
                 }
                 run.setToolRounds(s.getInt("toolRounds", null));
@@ -342,7 +347,8 @@ public class AgentExecService {
                         usage,
                         streamError == null ? 200 : 500,
                         (int) Math.min(latencyMs, Integer.MAX_VALUE),
-                        note);
+                        note,
+                        parseAgentId(run.getAgentId()));
             } catch (Exception e) {
                 log.warn("用量记账失败 runId={} err={}", run.getId(), e.getMessage());
             }
