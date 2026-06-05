@@ -4,7 +4,6 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.tenant.TenantContext;
-import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
@@ -14,7 +13,9 @@ import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
+import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
+import com.jimeng.dataserver.ai.support.SseEventBridge;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.persistence.entity.AgentArtifact;
 import com.jimeng.persistence.entity.AgentExecRun;
@@ -51,7 +52,7 @@ import java.util.concurrent.TimeUnit;
 public class AgentExecService {
 
     private final SidecarClient sidecarClient;
-    private final SseServiceUtil sseServiceUtil;
+    private final SseEventBridge sseBridge;
     private final AgentSandboxProperties props;
     private final AgentExecRunMapper runMapper;
     private final AgentInputFileMapper inputFileMapper;
@@ -60,6 +61,7 @@ public class AgentExecService {
     private final AgentRuntimeService agentRuntimeService;
     private final AdminAuthService adminAuthService;
     private final AiModelCallRecordService recordService;
+    private final UsageExtractor usageExtractor;
     private final ProviderRegistry providerRegistry;
 
     public void streamExec(AgentExecRequest req, String connectionId, String traceId) {
@@ -75,8 +77,8 @@ public class AgentExecService {
             try {
                 agentRuntimeService.byId(agentIdForCheck, req.isPreview());
             } catch (Exception e) {
-                safeSend(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
-                sseServiceUtil.complete(connectionId);
+                sseBridge.send(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
+                sseBridge.complete(connectionId);
                 return;
             }
         }
@@ -166,14 +168,14 @@ public class AgentExecService {
                 if ("artifact".equals(type)) {
                     // 产物落库（临时设置租户上下文）并改写 downloadUrl 后再转发给前端
                     String enriched = registerArtifactAndEnrich(tenantId, runId, data);
-                    safeSend(connectionId, "artifact", enriched);
+                    sseBridge.send(connectionId, "artifact", enriched);
                     artifactEvents.add(data);
                     return;
                 }
                 if ("summary".equals(type)) {
                     summaryHolder[0] = data;
                 }
-                safeSend(connectionId, type, data);
+                sseBridge.send(connectionId, type, data);
             }
 
             @Override
@@ -187,7 +189,7 @@ public class AgentExecService {
                         : ("sidecar http " + (response != null ? response.code() : "?"));
                 streamError[0] = msg;
                 log.error("sidecar 流式失败 runId={} err={}", runId, msg);
-                safeSend(connectionId, "error", new JSONObject().set("message", msg).toString());
+                sseBridge.send(connectionId, "error", new JSONObject().set("message", msg).toString());
                 latch.countDown();
             }
         };
@@ -197,17 +199,17 @@ public class AgentExecService {
             boolean done = latch.await(props.getWallClockSec() + 30L, TimeUnit.SECONDS);
             if (!done) {
                 streamError[0] = "timeout";
-                safeSend(connectionId, "error", new JSONObject().set("message", "timeout").toString());
+                sseBridge.send(connectionId, "error", new JSONObject().set("message", "timeout").toString());
             }
         } catch (Exception e) {
             streamError[0] = e.getMessage();
             log.error("调用边车异常 runId={}", runId, e);
-            safeSend(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
+            sseBridge.send(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
         } finally {
             // 仍在 streamExecutor 线程，TenantContext 还在，可安全回填
             persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
                     System.currentTimeMillis() - startMs);
-            sseServiceUtil.complete(connectionId);
+            sseBridge.complete(connectionId);
         }
     }
 
@@ -250,14 +252,6 @@ public class AgentExecService {
         }
     }
 
-    private void safeSend(String connectionId, String event, String data) {
-        try {
-            sseServiceUtil.sendEvent(connectionId, event, data);
-        } catch (Exception e) {
-            log.warn("SSE 转发失败 event={} err={}", event, e.getMessage());
-        }
-    }
-
     /** 在 OkHttp 回调线程把产物落库（临时设置租户上下文），返回改写了 downloadUrl 的事件 JSON。 */
     private String registerArtifactAndEnrich(String tenantId, Long runId, String data) {
         try {
@@ -297,25 +291,18 @@ public class AgentExecService {
 
     private void persistRunResult(AgentExecRun run, String summaryJson, String streamError,
                                   int artifactCount, long latencyMs) {
-        Long inTok = null;
-        Long outTok = null;
-        Long cacheRead = null;
-        Long cacheWrite = null;
-        String usageRaw = null;
+        NormalizedUsage usage = null;
         try {
             if (summaryJson != null) {
                 JSONObject s = JSONUtil.parseObj(summaryJson);
-                JSONObject usage = s.getJSONObject("usage");
-                if (usage != null) {
-                    usageRaw = usage.toString();
-                    inTok = usage.getLong("input_tokens", null);
-                    outTok = usage.getLong("output_tokens", null);
-                    cacheRead = usage.getLong("cache_read_input_tokens", null);
-                    cacheWrite = usage.getLong("cache_creation_input_tokens", null);
-                    run.setInputTokens(inTok);
-                    run.setOutputTokens(outTok);
-                    if (inTok != null || outTok != null) {
-                        run.setTotalTokens((inTok == null ? 0 : inTok) + (outTok == null ? 0 : outTok));
+                JSONObject usageJson = s.getJSONObject("usage");
+                if (usageJson != null) {
+                    // 与对话/RAG 链路同一套归一化（UsageExtractor 兼容 OpenAI / Anthropic 两套 usage 命名）。
+                    usage = usageExtractor.extract(usageJson);
+                    run.setInputTokens(toLong(usage.getInputTokens()));
+                    run.setOutputTokens(toLong(usage.getOutputTokens()));
+                    if (usage.getTotalTokens() != null) {
+                        run.setTotalTokens(usage.getTotalTokens().longValue());
                     }
                 }
                 run.setToolRounds(s.getInt("toolRounds", null));
@@ -341,15 +328,8 @@ public class AgentExecService {
 
         // 用量记账：写进 ai_model_call_log（与 RAG rerank 等同一套，接入用量统计）。
         // tenant/user 由 recordComputedCall 从 TenantContext / 异步 userId 自动带出。
-        if (inTok != null || outTok != null) {
+        if (usage != null && (usage.getInputTokens() != null || usage.getOutputTokens() != null)) {
             try {
-                NormalizedUsage usage = new NormalizedUsage();
-                usage.setInputTokens(inTok == null ? null : inTok.intValue());
-                usage.setOutputTokens(outTok == null ? null : outTok.intValue());
-                usage.setCacheReadTokens(cacheRead == null ? null : cacheRead.intValue());
-                usage.setCacheWriteTokens(cacheWrite == null ? null : cacheWrite.intValue());
-                usage.setCacheReadInInput(false); // Anthropic 语义：缓存读不含在 input 内
-                usage.setRawJson(usageRaw);
                 Map<String, Object> note = new LinkedHashMap<>();
                 note.put("biz_type", "agent_exec");
                 note.put("run_id", String.valueOf(run.getId()));
@@ -367,5 +347,9 @@ public class AgentExecService {
                 log.warn("用量记账失败 runId={} err={}", run.getId(), e.getMessage());
             }
         }
+    }
+
+    private static Long toLong(Integer v) {
+        return v == null ? null : v.longValue();
     }
 }

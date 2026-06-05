@@ -6,10 +6,10 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
-import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
+import com.jimeng.dataserver.ai.support.SseEventBridge;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
@@ -41,7 +41,7 @@ public class AiConversationLoop {
     private final RequestService requestService;
     private final SkillRuntimeService skillRuntimeService;
     private final AiModelCallRecordService aiModelCallRecordService;
-    private final SseServiceUtil sseServiceUtil;
+    private final SseEventBridge sseBridge;
     private final LlmCallGuard llmCallGuard;
 
     @Value("${skill.max-tool-rounds:10}")
@@ -168,7 +168,7 @@ public class AiConversationLoop {
                         RuntimeException timeout = new RuntimeException("流式请求超时");
                         safeRecordException(logId, timeout, latency);
                         sendError(connectionId, "timeout", "流式请求超时（5分钟）");
-                        sseServiceUtil.complete(connectionId);
+                        sseBridge.complete(connectionId);
                         return;
                     }
 
@@ -192,7 +192,7 @@ public class AiConversationLoop {
                         logFinalAnswer(connectionId, rc, adapter, responseMap, totalIn, totalOut, elapsed);
                         sendSummary(connectionId, totalIn, totalOut,
                                 toolRound > 0 ? toolRound + 1 : 0, traceId, elapsed);
-                        sseServiceUtil.complete(connectionId);
+                        sseBridge.complete(connectionId);
                         return;
                     }
 
@@ -211,7 +211,7 @@ public class AiConversationLoop {
                     if (toolRound >= maxToolRounds) {
                         sendError(connectionId, "max_tool_rounds_exceeded",
                                 "tool调用轮次超过限制: " + maxToolRounds);
-                        sseServiceUtil.complete(connectionId);
+                        sseBridge.complete(connectionId);
                         return;
                     }
 
@@ -222,7 +222,7 @@ public class AiConversationLoop {
                     if (results.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
                         sendSummary(connectionId, totalIn, totalOut, toolRound + 1, traceId, elapsed);
-                        sseServiceUtil.complete(connectionId);
+                        sseBridge.complete(connectionId);
                         return;
                     }
                     adapter.appendToolResultTurn(body, responseMap, results);
@@ -240,7 +240,7 @@ public class AiConversationLoop {
         } catch (Exception e) {
             log.error("流式处理异常, connectionId={}", connectionId, e);
             sendError(connectionId, e.getClass().getSimpleName(), e.getMessage());
-            sseServiceUtil.complete(connectionId);
+            sseBridge.complete(connectionId);
         }
     }
 
@@ -275,7 +275,7 @@ public class AiConversationLoop {
         if (toolRounds > 0) summary.put("tool_rounds", toolRounds);
         summary.put("elapsed_seconds", elapsedSeconds);
         if (StrUtil.isNotBlank(traceId)) summary.put("x-trace-id", traceId);
-        sseServiceUtil.sendEvent(connectionId, "summary", JSONUtil.toJsonStr(summary));
+        sseBridge.sendJson(connectionId, "summary", summary);
     }
 
     private void sendProgress(String connectionId, int round, List<ToolUseCall> toolCalls,
@@ -299,7 +299,7 @@ public class AiConversationLoop {
         progress.put("round", round);
         progress.put("tools", toolNames);
         progress.put("calls", calls);
-        sseServiceUtil.sendEvent(connectionId, "progress", JSONUtil.toJsonStr(progress));
+        sseBridge.sendJson(connectionId, "progress", progress);
     }
 
     /** 从请求体 tools 里提取「工具名 → 描述」，兼容 Claude({name,description}) 与 OpenAI({function:{name,description}})。 */
@@ -343,18 +343,14 @@ public class AiConversationLoop {
         Map<String, Object> event = new LinkedHashMap<>();
         event.put("round", round);
         event.put("results", items);
-        sseServiceUtil.sendEvent(connectionId, "tool_result", JSONUtil.toJsonStr(event));
+        sseBridge.sendJson(connectionId, "tool_result", event);
     }
 
     private void sendError(String connectionId, String error, String message) {
-        try {
-            Map<String, Object> errorData = new LinkedHashMap<>();
-            errorData.put("error", error);
-            errorData.put("message", message);
-            sseServiceUtil.sendEvent(connectionId, "error", JSONUtil.toJsonStr(errorData));
-        } catch (Exception e) {
-            log.warn("发送错误事件失败: {}", e.getMessage());
-        }
+        Map<String, Object> errorData = new LinkedHashMap<>();
+        errorData.put("error", error);
+        errorData.put("message", message);
+        sseBridge.sendJson(connectionId, "error", errorData);
     }
 
     // ------------------------------------------------------------------ stream listener
@@ -370,11 +366,7 @@ public class AiConversationLoop {
 
             @Override
             public void onEvent(EventSource eventSource, String id, String type, String data) {
-                try {
-                    sseServiceUtil.sendEvent(connectionId, adapter.getDeltaEventType(), data);
-                } catch (Exception e) {
-                    log.warn("SSE转发失败, connectionId={}, error={}", connectionId, e.getMessage());
-                }
+                sseBridge.send(connectionId, adapter.getDeltaEventType(), data);
                 accumulator.accumulateEvent(type, data);
                 if (adapter.isDoneSignal(data)) latch.countDown();
             }
