@@ -105,7 +105,7 @@ public class RagAnswerService {
             Long agentId = parseAgentId(req.getAgentId());
             if (agentId != null) {
                 try {
-                    AgentRuntimeView view = agentRuntimeService.byId(agentId);
+                    AgentRuntimeView view = agentRuntimeService.byId(agentId, req.isPreview());
                     if (view.getKbIds() != null && !view.getKbIds().isEmpty()) {
                         return new RagPlan(new ArrayList<>(view.getKbIds()),
                                 effectiveTopK(req.getTopK(), view.getKbTopK()),
@@ -210,6 +210,8 @@ public class RagAnswerService {
             // 并把 AgentContext 设到当前线程（下游工具据此决定可用插件——配了插件才会走）。
             if (StrUtil.isNotBlank(req.getAgentId())) {
                 body.put("agent_id", req.getAgentId());
+                // preview=调试台读实时草稿；缺省=对话端只读已发布快照（未发布时 prepareAgentContext 抛错 → 走外层 catch 发 error 事件）。
+                body.put("agent_preview", req.isPreview());
                 // agent_id 会被 ClaudeService.applyAgentContext 从 body 移除，导致日志层读不到；
                 // 这里同时记到 ThreadLocal，供 AiModelCallRecordService 落库时兜底（含本异步流式线程）。
                 AgentIdContext.set(req.getAgentId());

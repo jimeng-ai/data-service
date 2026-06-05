@@ -53,14 +53,19 @@ public class AgentAdminController {
     @Operation(summary = "列出当前租户的 Agent（成员仅见被授权的）")
     @GetMapping("/agents")
     public List<Agent> list(@RequestParam(required = false) String status) {
-        return permissionResolver.filterCurrent(agentService.list(status), ResourceType.AGENT, Agent::getId);
+        List<Agent> agents = permissionResolver.filterCurrent(
+                agentService.list(status), ResourceType.AGENT, Agent::getId);
+        agentService.attachDirtyFlag(agents); // 回填 hasUnpublishedChanges（已发布但有未发布草稿）
+        return agents;
     }
 
     @Operation(summary = "Agent 详情")
     @GetMapping("/agents/{id}")
     public Agent get(@PathVariable Long id) {
         permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
-        return agentService.getById(id);
+        Agent agent = agentService.getById(id);
+        agentService.attachDirtyFlag(agent);
+        return agent;
     }
 
     @Operation(summary = "删除 Agent")

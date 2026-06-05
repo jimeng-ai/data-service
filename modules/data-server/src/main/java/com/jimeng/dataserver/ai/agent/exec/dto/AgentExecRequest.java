@@ -24,6 +24,9 @@ public class AgentExecRequest {
     @Schema(description = "多轮历史")
     private List<History> history;
 
+    @Schema(description = "是否为调试台预览：true=读 Agent 实时草稿配置；false/缺省=对话端，只读已发布快照（未发布则拒绝）")
+    private boolean preview;
+
     @Data
     public static class History {
         private String role;

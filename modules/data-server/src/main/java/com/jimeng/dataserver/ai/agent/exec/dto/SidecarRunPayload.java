@@ -24,6 +24,8 @@ public class SidecarRunPayload {
     /** 非空时边车获得 search_knowledge_base MCP 工具（A+B 统一：同一 agent 既跑代码又查知识库）。 */
     private RagContext ragContext;
     private Llm llm;
+    /** 非空且 baseUrl/authToken/model 齐全时，边车注册 generate_image MCP 工具（OpenAI 兼容 /v1/images/generations）。 */
+    private ImageGen imageGen;
     private Limits limits;
 
     @Data
@@ -52,6 +54,15 @@ public class SidecarRunPayload {
 
     @Data
     public static class Llm {
+        private String baseUrl;
+        private String authToken;
+        private String model;
+        private String authScheme;
+    }
+
+    /** 字段名须与边车 TS 的 ImageGenConfig 一致（camelCase）。 */
+    @Data
+    public static class ImageGen {
         private String baseUrl;
         private String authToken;
         private String model;

@@ -64,4 +64,26 @@ public class Agent extends BaseEntity {
     @Schema(description = "知识库绑定配置 JSON：{kbIds:[...], topK, scoreThreshold, rerank}")
     @TableField("kb_config")
     private String kbConfig;
+
+    /**
+     * 发布快照（JSON）：发布那一刻冻结的完整运行配置。
+     *
+     * <p>调试台读 Agent 实时字段（草稿），对话端只读这份快照——保证"保存草稿"只在调试台生效，
+     * 必须"发布"后改动才对终端用户可见。结构见
+     * {@code AgentService#buildPublishSnapshot}：{code,name,systemPrompt,model,modelParams,kbConfig,pluginIds}。
+     * 为空 = 从未发布过。
+     */
+    @Schema(description = "发布快照 JSON：发布时冻结的运行配置；为空表示从未发布")
+    @TableField("published_snapshot")
+    private String publishedSnapshot;
+
+    /**
+     * 是否「已发布但存在未发布的草稿改动」——非持久化，由 {@code AgentService} 即时计算后回填。
+     *
+     * <p>true = status=PUBLISHED 且当前实时配置/插件绑定与发布快照不一致（编辑器/对话端可据此提示「有草稿未发布」）。
+     * 非 PUBLISHED 时恒为 false（它本就是草稿，另行展示）。
+     */
+    @Schema(description = "是否存在未发布的草稿改动（已发布且实时配置与快照不一致）")
+    @TableField(exist = false)
+    private Boolean hasUnpublishedChanges;
 }

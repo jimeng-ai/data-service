@@ -34,4 +34,7 @@ public class AnswerRequest {
 
     @Schema(description = "可选：多轮会话历史（OpenAI/Claude messages 数组）。当前轮的 user message 由本服务自动拼装，无需在 history 中重复传入。")
     private List<java.util.Map<String, Object>> history;
+
+    @Schema(description = "是否为调试台预览：true=读 Agent 实时草稿配置；false/缺省=对话端，只读已发布快照（未发布则拒绝）", example = "false")
+    private boolean preview;
 }

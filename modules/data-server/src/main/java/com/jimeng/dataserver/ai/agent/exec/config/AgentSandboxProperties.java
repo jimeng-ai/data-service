@@ -31,8 +31,19 @@ public class AgentSandboxProperties {
     /** 转发给边车的 LLM 目标 */
     private Llm llm = new Llm();
 
+    /** 转发给边车的生图目标（OpenAI 兼容 images/generations）；base-url/auth-token/model 任一为空则不启用生图工具 */
+    private ImageGen imageGen = new ImageGen();
+
     @Data
     public static class Llm {
+        private String baseUrl;
+        private String authToken;
+        private String model;
+        private String authScheme = "bearer";
+    }
+
+    @Data
+    public static class ImageGen {
         private String baseUrl;
         private String authToken;
         private String model;

@@ -67,11 +67,14 @@ public class ClaudeService {
     private void applyAgentContext(Map<String, Object> body) {
         if (body == null) return;
         Object agentIdObj = body.remove("agent_id");
+        // preview=调试台读实时草稿；缺省/false=对话端只读已发布快照。两者都从 body 取出后移除，避免透传给上游。
+        Object previewObj = body.remove("agent_preview");
         if (agentIdObj == null) return;
         Long agentId = parseLong(agentIdObj);
         if (agentId == null) return;
 
-        AgentRuntimeView agent = agentRuntimeService.byId(agentId);
+        boolean preview = previewObj instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(previewObj));
+        AgentRuntimeView agent = agentRuntimeService.byId(agentId, preview);
         AgentContext.set(agent);
         log.info("Agent 上下文已加载: id={}, code={}, allowedPlugins={}",
                 agent.getAgentId(), agent.getCode(), agent.getAllowedPluginCodes());

@@ -68,6 +68,19 @@ public class AgentExecService {
         String userId = userIdL == null ? null : String.valueOf(userIdL);
         long startMs = System.currentTimeMillis();
 
+        // 0. 校验 Agent 可用性：对话端(preview=false)未发布 / 已下架直接拒绝；调试台(preview=true)读实时草稿。
+        //    在落运行记录前校验，避免留下永远 RUNNING 的孤儿记录。
+        Long agentIdForCheck = parseAgentId(req.getAgentId());
+        if (agentIdForCheck != null) {
+            try {
+                agentRuntimeService.byId(agentIdForCheck, req.isPreview());
+            } catch (Exception e) {
+                safeSend(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
+                sseServiceUtil.complete(connectionId);
+                return;
+            }
+        }
+
         // 1. 落运行记录（RUNNING）
         AgentExecRun run = new AgentExecRun();
         run.setTenantId(tenantId);
@@ -115,13 +128,23 @@ public class AgentExecService {
         payload.setInputFiles(inputs);
         payload.setArtifactBucket(storage.getBucket());
         // A+B 统一：若 agent 绑定了知识库，给边车一个短时效 token + ragContext，让它能查知识库
-        payload.setRagContext(buildRagContext(req.getAgentId(), userId, tenantId));
+        payload.setRagContext(buildRagContext(req.getAgentId(), userId, tenantId, req.isPreview()));
         SidecarRunPayload.Llm llm = new SidecarRunPayload.Llm();
         llm.setBaseUrl(props.getLlm().getBaseUrl());
         llm.setAuthToken(props.getLlm().getAuthToken());
         llm.setModel(props.getLlm().getModel());
         llm.setAuthScheme(props.getLlm().getAuthScheme());
         payload.setLlm(llm);
+        // 生图：仅当配置齐全时下发，边车据此注册 generate_image 工具（缺任一项则不启用，沿用原"无生图"行为）。
+        AgentSandboxProperties.ImageGen igCfg = props.getImageGen();
+        if (igCfg != null && StrUtil.isAllNotBlank(igCfg.getBaseUrl(), igCfg.getAuthToken(), igCfg.getModel())) {
+            SidecarRunPayload.ImageGen ig = new SidecarRunPayload.ImageGen();
+            ig.setBaseUrl(igCfg.getBaseUrl());
+            ig.setAuthToken(igCfg.getAuthToken());
+            ig.setModel(igCfg.getModel());
+            ig.setAuthScheme(igCfg.getAuthScheme());
+            payload.setImageGen(ig);
+        }
         SidecarRunPayload.Limits limits = new SidecarRunPayload.Limits();
         limits.setWallClockSec(props.getWallClockSec());
         limits.setMaxTurns(props.getMaxTurns());
@@ -188,19 +211,29 @@ public class AgentExecService {
         }
     }
 
-    /** 解析 agent 绑定的知识库 + 铸短时效回调 token；无绑定 / 无用户 / 解析失败则返回 null（边车不带 RAG 工具）。 */
-    private SidecarRunPayload.RagContext buildRagContext(String agentIdStr, String userId, String tenantId) {
-        if (StrUtil.isBlank(agentIdStr) || userId == null) {
+    /** 解析 "123" 形式的 agentId，非法 / 空返回 null。 */
+    private Long parseAgentId(String agentIdStr) {
+        if (StrUtil.isBlank(agentIdStr)) {
             return null;
         }
-        Long agentId;
         try {
-            agentId = Long.parseLong(agentIdStr.trim());
+            return Long.parseLong(agentIdStr.trim());
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /** 解析 agent 绑定的知识库 + 铸短时效回调 token；无绑定 / 无用户 / 解析失败则返回 null（边车不带 RAG 工具）。 */
+    private SidecarRunPayload.RagContext buildRagContext(String agentIdStr, String userId, String tenantId, boolean preview) {
+        if (userId == null) {
+            return null;
+        }
+        Long agentId = parseAgentId(agentIdStr);
+        if (agentId == null) {
+            return null;
+        }
         try {
-            AgentRuntimeView view = agentRuntimeService.byId(agentId);
+            AgentRuntimeView view = agentRuntimeService.byId(agentId, preview);
             if (view == null || view.getKbIds() == null || view.getKbIds().isEmpty()) {
                 return null;
             }
