@@ -17,14 +17,21 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.web.context.request.RequestContextHolder;
-import org.springframework.web.context.request.ServletRequestAttributes;
 
-import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+
+import static com.jimeng.dataserver.ai.billing.support.MapValues.firstNonBlank;
+import static com.jimeng.dataserver.ai.billing.support.MapValues.firstNonNull;
+import static com.jimeng.dataserver.ai.billing.support.MapValues.getBoolean;
+import static com.jimeng.dataserver.ai.billing.support.MapValues.getDecimal;
+import static com.jimeng.dataserver.ai.billing.support.MapValues.getInteger;
+import static com.jimeng.dataserver.ai.billing.support.MapValues.getString;
+import static com.jimeng.dataserver.ai.billing.support.RequestContextUtil.currentRequest;
+import static com.jimeng.dataserver.ai.billing.support.RequestContextUtil.getHeader;
+import static com.jimeng.dataserver.ai.billing.support.RequestContextUtil.maskSensitiveHeaders;
 
 @Service
 @RequiredArgsConstructor
@@ -379,35 +386,6 @@ public class AiModelCallRecordService {
         return httpStatus != null && httpStatus >= 200 && httpStatus < 300;
     }
 
-    private String getHeader(HttpServletRequest request, String key) {
-        if (request == null || StrUtil.isBlank(key)) {
-            return null;
-        }
-        return request.getHeader(key);
-    }
-
-    private HttpServletRequest currentRequest() {
-        try {
-            ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-            return attributes == null ? null : attributes.getRequest();
-        } catch (Exception e) {
-            log.warn("读取当前请求上下文失败: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    private String firstNonBlank(String... values) {
-        if (values == null) {
-            return null;
-        }
-        for (String value : values) {
-            if (StrUtil.isNotBlank(value)) {
-                return value;
-            }
-        }
-        return null;
-    }
-
     private String limit(String value, int maxLen) {
         if (value == null) {
             return null;
@@ -416,113 +394,6 @@ public class AiModelCallRecordService {
             return value;
         }
         return value.substring(0, maxLen);
-    }
-
-    private String getString(Map<String, ?> map, String key, String defaultValue) {
-        if (map == null || StrUtil.isBlank(key)) {
-            return defaultValue;
-        }
-        Object value = map.get(key);
-        if (value == null) {
-            return defaultValue;
-        }
-        String text = String.valueOf(value);
-        return StrUtil.isBlank(text) ? defaultValue : text;
-    }
-
-    private Integer getInteger(Map<String, ?> map, String key) {
-        if (map == null || StrUtil.isBlank(key)) {
-            return null;
-        }
-        Object value = map.get(key);
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Number number) {
-            return number.intValue();
-        }
-        if (StrUtil.isNotBlank(String.valueOf(value))) {
-            try {
-                return Integer.parseInt(String.valueOf(value));
-            } catch (Exception e) {
-                log.warn("整数解析失败, key={}, value={}", key, value);
-            }
-        }
-        return null;
-    }
-
-    private BigDecimal getDecimal(Map<String, ?> map, String key) {
-        if (map == null || StrUtil.isBlank(key)) {
-            return null;
-        }
-        Object value = map.get(key);
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Number number) {
-            return BigDecimal.valueOf(number.doubleValue());
-        }
-        if (StrUtil.isNotBlank(String.valueOf(value))) {
-            try {
-                return new BigDecimal(String.valueOf(value));
-            } catch (Exception e) {
-                log.warn("小数解析失败, key={}, value={}", key, value);
-            }
-        }
-        return null;
-    }
-
-    private Boolean getBoolean(Map<String, ?> map, String key) {
-        if (map == null || StrUtil.isBlank(key)) {
-            return false;
-        }
-        Object value = map.get(key);
-        if (value instanceof Boolean b) {
-            return b;
-        }
-        if (value == null) {
-            return false;
-        }
-        return Boolean.parseBoolean(String.valueOf(value));
-    }
-
-    @SafeVarargs
-    private <T> T firstNonNull(T... values) {
-        if (values == null) {
-            return null;
-        }
-        for (T value : values) {
-            if (value != null) {
-                return value;
-            }
-        }
-        return null;
-    }
-
-    private Map<String, String> maskSensitiveHeaders(Map<String, String> headers) {
-        if (headers == null || headers.isEmpty()) {
-            return Map.of();
-        }
-        Map<String, String> sanitized = new LinkedHashMap<>();
-        headers.forEach((k, v) -> {
-            if (k == null) {
-                return;
-            }
-            String key = k.toLowerCase();
-            if ("authorization".equals(key) || "x-api-key".equals(key)) {
-                sanitized.put(k, maskValue(v));
-            } else {
-                sanitized.put(k, v);
-            }
-        });
-        return sanitized;
-    }
-
-    private String maskValue(String value) {
-        if (StrUtil.isBlank(value) || value.length() <= 10) {
-            return "****";
-        }
-        return value.substring(0, 6) + "****" + value.substring(value.length() - 4);
     }
 
     private static class ContentFlags {
