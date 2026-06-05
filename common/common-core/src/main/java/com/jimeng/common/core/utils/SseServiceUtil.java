@@ -8,8 +8,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * @Author Moonlight
@@ -22,7 +22,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class SseServiceUtil {
 
-    private final Map<String, SseEmitter> sseManagerMap = new HashMap<>();
+    private final Map<String, SseEmitter> sseManagerMap = new ConcurrentHashMap<>();
 
     private SseEmitter initSseEmitter(String key, SseEmitter sseEmitter) {
         sseEmitter.onCompletion(() -> {
@@ -41,14 +41,9 @@ public class SseServiceUtil {
     }
 
     public SseEmitter getConnection(String key, Long timeout) {
-        if (sseManagerMap.get(key) == null) {
-            if (timeout == null) {
-                sseManagerMap.put(key, new SseEmitter(-1L));
-            } else {
-                sseManagerMap.put(key, new SseEmitter(timeout));
-            }
-        }
-        return initSseEmitter(key, sseManagerMap.get(key));
+        SseEmitter sseEmitter = sseManagerMap.computeIfAbsent(key,
+                k -> timeout == null ? new SseEmitter(-1L) : new SseEmitter(timeout));
+        return initSseEmitter(key, sseEmitter);
     }
 
     public void send(String key, String msg) {

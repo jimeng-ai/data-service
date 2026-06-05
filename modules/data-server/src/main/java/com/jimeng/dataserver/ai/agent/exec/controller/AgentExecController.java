@@ -16,11 +16,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * 代码执行 / 文件处理 Agent 入口。镜像 RagAnswerController 的 SSE 模式：
@@ -37,7 +36,7 @@ public class AgentExecController {
     private final PermissionResolver permissionResolver;
     private final AgentSandboxProperties props;
 
-    private final ExecutorService streamExecutor = Executors.newCachedThreadPool();
+    private final ThreadPoolTaskExecutor streamExecutor;
 
     @Operation(summary = "代码执行 / 文件处理流式",
             description = "把用户输入与已上传文件交给沙箱 Agent 处理，SSE 推送 "

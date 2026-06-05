@@ -9,10 +9,12 @@ import com.jimeng.dataserver.ai.rag.model.Chunk;
 import com.jimeng.persistence.entity.KbChunk;
 import com.jimeng.persistence.mapper.KbChunkMapper;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -23,7 +25,11 @@ import java.util.stream.Collectors;
 
 /**
  * Chunk 双写：MySQL（kb_chunk 元数据）+ Elasticsearch（kb_chunks 索引含 embedding）。
- * MySQL 出现故障 → 整批回滚；ES 出现故障 → 抛 IOException 让上游标记 doc FAILED。
+ *
+ * <p>MySQL 写在事务内（提交后才动 ES）；ES 写在事务外。原因：ES 非事务性，把 {@code esClient} 的
+ * 网络调用放进 {@code @Transactional} 既无法回滚 ES、又会在 ES 调用期间一直占着一条 DB 连接（长事务 +
+ * 连接池压力）。ES 失败仍抛 {@link IOException} 让上游把 doc 标记 FAILED 重试——本类对同一 docId 的写
+ * 是幂等的（先删后插 / 先删后 upsert），重试可自愈短暂的 MySQL 已写、ES 未写不一致。
  */
 @Slf4j
 @Service
@@ -33,40 +39,78 @@ public class ChunkIndexService {
     private final ElasticsearchClient esClient;
     private final RagProperties ragProperties;
     private final KbChunkMapper kbChunkMapper;
+    private final PlatformTransactionManager transactionManager;
 
-    @Transactional(rollbackFor = Exception.class)
+    private TransactionTemplate txTemplate;
+
+    @PostConstruct
+    void initTx() {
+        this.txTemplate = new TransactionTemplate(transactionManager);
+    }
+
     public void indexChunks(Long kbId, Long docId, List<Chunk> chunks) throws IOException {
         if (chunks == null || chunks.isEmpty()) return;
 
-        // 0) 幂等预清理：覆盖以下两类场景的"半成品残留"
-        //   a) 同一 doc 上次 ingest 失败（retry 重跑前）
-        //   b) 同一 doc 重新切片导致 chunk 数变化（旧的高 index chunk 会变孤儿）
-        // MySQL DELETE 跟下面的 INSERT 共享 @Transactional，原子。
-        // ES 那边 bulk index 虽然按 chunk_id upsert 已经能覆盖同 id，
-        // 但若新 chunk 数 < 旧 chunk 数，旧的 doc_id_{N+1...} 不会被覆盖到，需主动删。
-        cleanupExistingChunks(docId);
-
-        // 1) MySQL 元数据
-        for (Chunk c : chunks) {
-            if (c.getChunkId() == null) {
-                c.setChunkId(docId + "_" + c.getChunkIndex());
+        // 1) MySQL（事务内）：幂等预清理（覆盖 retry 重跑 / 重新切片导致旧高 index chunk 变孤儿）后插入新 chunk。
+        txTemplate.executeWithoutResult(status -> {
+            deleteChunksFromDb(docId);
+            for (Chunk c : chunks) {
+                if (c.getChunkId() == null) {
+                    c.setChunkId(docId + "_" + c.getChunkIndex());
+                }
+                KbChunk entity = new KbChunk();
+                entity.setChunkId(c.getChunkId());
+                entity.setDocId(docId);
+                entity.setKbId(kbId);
+                entity.setChunkIndex(c.getChunkIndex());
+                entity.setChunkType(c.getType() != null ? c.getType().name() : "TEXT");
+                entity.setHeadingPath(c.getHeadingPath() == null ? null : String.join(" > ", c.getHeadingPath()));
+                entity.setPageNum(c.getPageNum());
+                entity.setContent(c.getContent());
+                entity.setContextualizedContent(c.getContextualizedContent());
+                entity.setImageUrl(c.getImageUrl());
+                entity.setTokenCount(c.getTokenCount());
+                kbChunkMapper.insert(entity);
             }
-            KbChunk entity = new KbChunk();
-            entity.setChunkId(c.getChunkId());
-            entity.setDocId(docId);
-            entity.setKbId(kbId);
-            entity.setChunkIndex(c.getChunkIndex());
-            entity.setChunkType(c.getType() != null ? c.getType().name() : "TEXT");
-            entity.setHeadingPath(c.getHeadingPath() == null ? null : String.join(" > ", c.getHeadingPath()));
-            entity.setPageNum(c.getPageNum());
-            entity.setContent(c.getContent());
-            entity.setContextualizedContent(c.getContextualizedContent());
-            entity.setImageUrl(c.getImageUrl());
-            entity.setTokenCount(c.getTokenCount());
-            kbChunkMapper.insert(entity);
-        }
+        });
 
-        // 2) ES bulk
+        // 2) ES（事务外）：先 deleteByQuery 清孤儿（bulk 按 chunk_id upsert 覆盖不到新 chunk 数 < 旧的情况），再 bulk index。
+        deleteChunksFromEs(docId);
+        bulkIndexToEs(kbId, docId, chunks);
+        log.info("索引完成 kbId={} docId={} chunks={}", kbId, docId, chunks.size());
+    }
+
+    public void deleteByDoc(Long docId) throws IOException {
+        txTemplate.executeWithoutResult(status -> deleteChunksFromDb(docId));
+        deleteChunksFromEs(docId);
+    }
+
+    public void deleteByKb(Long kbId) throws IOException {
+        txTemplate.executeWithoutResult(status -> {
+            LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
+            w.eq(KbChunk::getKbId, kbId);
+            kbChunkMapper.delete(w);
+        });
+        String index = ragProperties.getElasticsearch().getIndexName();
+        esClient.deleteByQuery(d -> d
+                .index(index)
+                .query(Query.of(q -> q.term(t -> t.field("kb_id").value(String.valueOf(kbId))))));
+    }
+
+    private void deleteChunksFromDb(Long docId) {
+        LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
+        w.eq(KbChunk::getDocId, docId);
+        kbChunkMapper.delete(w);
+    }
+
+    private void deleteChunksFromEs(Long docId) throws IOException {
+        String index = ragProperties.getElasticsearch().getIndexName();
+        esClient.deleteByQuery(d -> d
+                .index(index)
+                .query(Query.of(q -> q.term(t -> t.field("doc_id").value(String.valueOf(docId))))));
+    }
+
+    private void bulkIndexToEs(Long kbId, Long docId, List<Chunk> chunks) throws IOException {
         String index = ragProperties.getElasticsearch().getIndexName();
         BulkRequest.Builder br = new BulkRequest.Builder();
         for (Chunk c : chunks) {
@@ -85,34 +129,6 @@ public class ChunkIndexService {
                     .collect(Collectors.joining(" | "));
             throw new IOException("ES bulk 索引失败: " + err);
         }
-        log.info("索引完成 kbId={} docId={} chunks={}", kbId, docId, chunks.size());
-    }
-
-    @Transactional(rollbackFor = Exception.class)
-    public void deleteByDoc(Long docId) throws IOException {
-        cleanupExistingChunks(docId);
-    }
-
-    /** 清掉 doc 下所有 chunk 的 ES + MySQL 两端记录，供 deleteByDoc 与 indexChunks 复用。 */
-    private void cleanupExistingChunks(Long docId) throws IOException {
-        String index = ragProperties.getElasticsearch().getIndexName();
-        esClient.deleteByQuery(d -> d
-                .index(index)
-                .query(Query.of(q -> q.term(t -> t.field("doc_id").value(String.valueOf(docId))))));
-        LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
-        w.eq(KbChunk::getDocId, docId);
-        kbChunkMapper.delete(w);
-    }
-
-    @Transactional(rollbackFor = Exception.class)
-    public void deleteByKb(Long kbId) throws IOException {
-        String index = ragProperties.getElasticsearch().getIndexName();
-        esClient.deleteByQuery(d -> d
-                .index(index)
-                .query(Query.of(q -> q.term(t -> t.field("kb_id").value(String.valueOf(kbId))))));
-        LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
-        w.eq(KbChunk::getKbId, kbId);
-        kbChunkMapper.delete(w);
     }
 
     private Map<String, Object> toEsDoc(Long kbId, Long docId, Chunk c) {

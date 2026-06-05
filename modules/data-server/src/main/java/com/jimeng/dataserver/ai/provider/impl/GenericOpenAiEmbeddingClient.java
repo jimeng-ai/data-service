@@ -5,7 +5,7 @@ import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
-import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.spi.EmbeddingClient;
 import lombok.extern.slf4j.Slf4j;

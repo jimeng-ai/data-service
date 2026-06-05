@@ -11,24 +11,6 @@ spring:
           uri: lb://data-server
           predicates:
             - Path=/data/**
-        # sys-server 业务路由
-        - id: sys-server
-          uri: lb://sys-server
-          predicates:
-            - Path=/admin/sys/**
-        # sys-server 文档路由
-        - id: sys-server-doc
-          uri: lb://sys-server
-          predicates:
-            - Path=/sys-server/doc.html,/sys-server/v3/api-docs/**,/sys-server/swagger-resources/**,/sys-server/webjars/**
-          filters:
-            - StripPrefix=1
-        # 通用文档路由（兜底）- 将根路径的文档请求转发到 sys-server
-        - id: gateway-doc-fallback
-          uri: lb://sys-server
-          predicates:
-            - Path=/v3/api-docs/**,/swagger-resources/**,/webjars/**
-          order: 9999
     nacos:
       # 默认 localhost（本地 IDE 直跑）；容器部署时由 NACOS_SERVER_ADDR 覆盖
       server-addr: ${NACOS_SERVER_ADDR:localhost:8848}

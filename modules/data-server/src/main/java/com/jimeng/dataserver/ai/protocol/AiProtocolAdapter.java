@@ -38,6 +38,9 @@ public interface AiProtocolAdapter {
     /** Returns [inputTokens, outputTokens] */
     int[] extractUsage(Map<String, Object> responseMap);
 
+    /** 抽出本轮 assistant 的纯文本回复（协议相关：Anthropic content[]、OpenAI choices[]）；无可抽取时返回 null。 */
+    String extractAssistantText(Map<String, Object> responseMap);
+
     // ---- multi-turn message building ----
 
     void appendToolResultTurn(Map<String, Object> body, Map<String, Object> responseMap,

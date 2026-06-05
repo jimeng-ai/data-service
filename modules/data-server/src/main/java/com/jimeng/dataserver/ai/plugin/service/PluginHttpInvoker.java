@@ -16,6 +16,7 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.RequestContextHolder;
@@ -57,7 +58,7 @@ public class PluginHttpInvoker {
     private final Map<String, PluginAuthApplier> appliersByType;
 
     @Autowired
-    public PluginHttpInvoker(OkHttpClient defaultHttpClient,
+    public PluginHttpInvoker(@Qualifier("pluginHttpClient") OkHttpClient defaultHttpClient,
                               PluginCredentialService credentialService,
                               PluginTemplateRenderer templateRenderer,
                               PluginResponseExtractor responseExtractor,
@@ -320,11 +321,17 @@ public class PluginHttpInvoker {
         return sb.toString();
     }
 
+    /**
+     * 插件未显式配置超时时的默认值（毫秒）。避免回落到全局 OkHttp 的 180s read-timeout——
+     * 挂死的插件后端不该占住线程/连接长达 3 分钟。阶段 1.2 拆出独立 pluginHttpClient 后可下沉到配置。
+     */
+    private static final int DEFAULT_PLUGIN_TIMEOUT_MS = 30_000;
+
     private OkHttpClient clientFor(Integer timeoutMs) {
-        if (timeoutMs == null || timeoutMs <= 0) return defaultHttpClient;
+        int effective = (timeoutMs == null || timeoutMs <= 0) ? DEFAULT_PLUGIN_TIMEOUT_MS : timeoutMs;
         return defaultHttpClient.newBuilder()
-                .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .callTimeout(effective, TimeUnit.MILLISECONDS)
+                .readTimeout(effective, TimeUnit.MILLISECONDS)
                 .build();
     }
 

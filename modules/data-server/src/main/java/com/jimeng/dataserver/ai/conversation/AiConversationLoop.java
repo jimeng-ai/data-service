@@ -7,8 +7,9 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
-import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
+import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
@@ -30,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 @RequiredArgsConstructor
@@ -40,6 +42,7 @@ public class AiConversationLoop {
     private final SkillRuntimeService skillRuntimeService;
     private final AiModelCallRecordService aiModelCallRecordService;
     private final SseServiceUtil sseServiceUtil;
+    private final LlmCallGuard llmCallGuard;
 
     @Value("${skill.max-tool-rounds:10}")
     private int maxToolRounds;
@@ -61,12 +64,20 @@ public class AiConversationLoop {
         int toolRound = 0, totalIn = 0, totalOut = 0;
 
         while (true) {
+            llmCallGuard.acquirePermission();
             long start = System.currentTimeMillis();
             Long logId = safeRecordRequest(body, headers, rc);
             try {
-                RequestService.HttpResp resp = requestService.post(url, headers, Collections.emptyMap(), body);
+                RequestService.HttpResp resp;
+                try {
+                    resp = requestService.post(url, headers, Collections.emptyMap(), body);
+                } catch (RuntimeException callEx) {
+                    llmCallGuard.recordFailure();
+                    throw callEx;
+                }
                 int latency = elapsed(start);
                 safeRecordResponse(logId, resp.getStatusCode(), resp.getBody(), latency);
+                recordGuardOutcome(resp.getStatusCode());
                 log.info("{} 接口返回: {}", rc.provider(), resp.getBody());
 
                 Object parsed = tryParseJson(resp.getBody());
@@ -138,24 +149,33 @@ public class AiConversationLoop {
 
         try {
             while (true) {
+                llmCallGuard.acquirePermission();
                 long start = System.currentTimeMillis();
                 Long logId = safeRecordRequest(body, headers, rc);
                 AiStreamAccumulator accumulator = adapter.createStreamAccumulator();
                 CountDownLatch latch = new CountDownLatch(1);
+                AtomicBoolean streamFailed = new AtomicBoolean(false);
 
                 try {
-                    EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch);
+                    EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch, streamFailed);
                     requestService.postStream(url, headers, JSONUtil.toJsonStr(body), listener);
 
                     boolean completed = latch.await(5, TimeUnit.MINUTES);
                     int latency = elapsed(start);
 
                     if (!completed) {
+                        llmCallGuard.recordFailure();
                         RuntimeException timeout = new RuntimeException("流式请求超时");
                         safeRecordException(logId, timeout, latency);
                         sendError(connectionId, "timeout", "流式请求超时（5分钟）");
                         sseServiceUtil.complete(connectionId);
                         return;
+                    }
+
+                    if (streamFailed.get()) {
+                        llmCallGuard.recordFailure();
+                    } else {
+                        llmCallGuard.recordSuccess();
                     }
 
                     safeRecordStreamResponse(logId, 200,
@@ -169,7 +189,7 @@ public class AiConversationLoop {
 
                     if (!skillApplyResult.isEnabled() || toolCalls.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
-                        logFinalAnswer(connectionId, rc, responseMap, totalIn, totalOut, elapsed);
+                        logFinalAnswer(connectionId, rc, adapter, responseMap, totalIn, totalOut, elapsed);
                         sendSummary(connectionId, totalIn, totalOut,
                                 toolRound > 0 ? toolRound + 1 : 0, traceId, elapsed);
                         sseServiceUtil.complete(connectionId);
@@ -230,10 +250,10 @@ public class AiConversationLoop {
      * 流结束时打印 LLM 最终答复全文，便于 Kibana 按 connectionId 复盘整条 RAG 链路。
      * elapsedSeconds 传 -1 表示尚未到收尾阶段（中间轮 tool_use 之间也可调用）。
      */
-    private void logFinalAnswer(String connectionId, CallRecordConfig rc,
+    private void logFinalAnswer(String connectionId, CallRecordConfig rc, AiProtocolAdapter adapter,
                                  Map<String, Object> responseMap,
                                  int totalIn, int totalOut, double elapsedSeconds) {
-        String text = extractAssistantText(responseMap);
+        String text = adapter.extractAssistantText(responseMap);
         if (text == null) return;
         if (elapsedSeconds >= 0) {
             log.info("LLM/answer connectionId={} provider={} model={} input_tokens={} output_tokens={} elapsed={}s\n{}",
@@ -242,44 +262,6 @@ public class AiConversationLoop {
             log.info("LLM/answer.intermediate connectionId={} provider={} input_tokens={} output_tokens={}\n{}",
                     connectionId, rc.provider(), totalIn, totalOut, text);
         }
-    }
-
-    /**
-     * 协议兼容地从 responseMap 抽出 assistant 文本：
-     * - Anthropic 风格：content: [{type: "text", text: "..."}]
-     * - OpenAI 风格：choices: [{message: {content: "..."}}]
-     */
-    @SuppressWarnings("unchecked")
-    private static String extractAssistantText(Map<String, Object> responseMap) {
-        if (responseMap == null || responseMap.isEmpty()) return null;
-
-        // Anthropic
-        Object content = responseMap.get("content");
-        if (content instanceof List<?> blocks) {
-            StringBuilder sb = new StringBuilder();
-            for (Object block : blocks) {
-                if (!(block instanceof Map<?, ?> m)) continue;
-                if ("text".equals(m.get("type"))) {
-                    Object t = m.get("text");
-                    if (t != null) sb.append(t);
-                }
-            }
-            if (sb.length() > 0) return sb.toString().trim();
-        }
-
-        // OpenAI
-        Object choices = responseMap.get("choices");
-        if (choices instanceof List<?> list && !list.isEmpty()) {
-            Object first = list.get(0);
-            if (first instanceof Map<?, ?> choice) {
-                Object msg = choice.get("message");
-                if (msg instanceof Map<?, ?> m) {
-                    Object c = m.get("content");
-                    if (c != null) return String.valueOf(c).trim();
-                }
-            }
-        }
-        return null;
     }
 
     // ------------------------------------------------------------------ SSE event helpers
@@ -378,7 +360,8 @@ public class AiConversationLoop {
     // ------------------------------------------------------------------ stream listener
 
     private EventSourceListener buildListener(String connectionId, AiProtocolAdapter adapter,
-                                               AiStreamAccumulator accumulator, CountDownLatch latch) {
+                                               AiStreamAccumulator accumulator, CountDownLatch latch,
+                                               AtomicBoolean streamFailed) {
         return new EventSourceListener() {
             @Override
             public void onOpen(EventSource eventSource, Response response) {
@@ -404,6 +387,7 @@ public class AiConversationLoop {
 
             @Override
             public void onFailure(EventSource eventSource, Throwable t, Response response) {
+                streamFailed.set(true);
                 String errorMsg = buildStreamErrorMsg(t, response);
                 log.error("流式连接失败, connectionId={}, error={}", connectionId, errorMsg);
                 sendError(connectionId, "stream_failure", errorMsg);
@@ -485,6 +469,18 @@ public class AiConversationLoop {
 
     private boolean isSuccess(Integer httpStatus) {
         return httpStatus != null && httpStatus >= 200 && httpStatus < 300;
+    }
+
+    /** 熔断计数：2xx 记成功；429/5xx 记失败；其它 4xx（客户端错误）不计入。连接级异常在调用处单独记。 */
+    private void recordGuardOutcome(Integer httpStatus) {
+        if (httpStatus == null) {
+            return;
+        }
+        if (httpStatus >= 200 && httpStatus < 300) {
+            llmCallGuard.recordSuccess();
+        } else if (httpStatus == 429 || httpStatus >= 500) {
+            llmCallGuard.recordFailure();
+        }
     }
 
     private Object tryParseJson(Object response) {

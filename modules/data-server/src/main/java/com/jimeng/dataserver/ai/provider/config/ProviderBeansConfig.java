@@ -2,22 +2,23 @@ package com.jimeng.dataserver.ai.provider.config;
 
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.SseServiceUtil;
-import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.conversation.AiConversationLoop;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
-import com.jimeng.dataserver.ai.provider.impl.CohereRerankClient;
 import com.jimeng.dataserver.ai.provider.impl.DefaultContextualizationClient;
 import com.jimeng.dataserver.ai.provider.impl.GenericChatClient;
 import com.jimeng.dataserver.ai.provider.impl.GenericOpenAiEmbeddingClient;
-import com.jimeng.dataserver.ai.provider.impl.Qwen3RerankClient;
 import com.jimeng.dataserver.ai.provider.spi.ChatClient;
 import com.jimeng.dataserver.ai.provider.spi.ContextualizationClient;
 import com.jimeng.dataserver.ai.provider.spi.EmbeddingClient;
 import com.jimeng.dataserver.ai.provider.spi.RerankClient;
+import com.jimeng.dataserver.ai.provider.spi.RerankClientFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import java.util.List;
 
 /**
  * 注册各 provider 的 client bean。
@@ -30,7 +31,7 @@ import org.springframework.context.annotation.Configuration;
  * <ol>
  *   <li>在 yml 加 <code>providers.&lt;name&gt;</code> 配置块；</li>
  *   <li>在本类加四个 @Bean 方法（chat/embedding/rerank/contextualization），调用对应工厂；
- *       rerank 按响应结构选 cohere 还是 qwen3；</li>
+ *       rerank 由 {@link RerankClientFactory} 按 protocol 自动分发，新增 rerank 协议加一个 factory bean 即可、不必改本类；</li>
  *   <li><code>ai.provider</code> 切到新名字 → 重启生效。</li>
  * </ol>
  */
@@ -58,15 +59,18 @@ public class ProviderBeansConfig {
 
     @Bean(name = "openrouter-rerank")
     public RerankClient openrouterRerankClient(AiProviderProperties props,
-                                               RequestService requestService) {
-        return newRerankByProtocol("openrouter", props, requestService);
+                                               RequestService requestService,
+                                               List<RerankClientFactory> rerankFactories) {
+        return newRerankByProtocol("openrouter", props, requestService, rerankFactories);
     }
 
     @Bean(name = "openrouter-contextualization")
     public ContextualizationClient openrouterContextualizationClient(AiProviderProperties props,
                                                                      RequestService requestService,
-                                                                     AiModelCallRecordService recordService) {
-        return newContextualization("openrouter", props, requestService, recordService);
+                                                                     AiModelCallRecordService recordService,
+                                                                     ClaudeProtocolAdapter anthropic,
+                                                                     OpenAiProtocolAdapter openai) {
+        return newContextualization("openrouter", props, requestService, recordService, anthropic, openai);
     }
 
     // ============================================================ 302ai
@@ -90,15 +94,18 @@ public class ProviderBeansConfig {
 
     @Bean(name = "302ai-rerank")
     public RerankClient ai302RerankClient(AiProviderProperties props,
-                                          RequestService requestService) {
-        return newRerankByProtocol("302ai", props, requestService);
+                                          RequestService requestService,
+                                          List<RerankClientFactory> rerankFactories) {
+        return newRerankByProtocol("302ai", props, requestService, rerankFactories);
     }
 
     @Bean(name = "302ai-contextualization")
     public ContextualizationClient ai302ContextualizationClient(AiProviderProperties props,
                                                                 RequestService requestService,
-                                                                AiModelCallRecordService recordService) {
-        return newContextualization("302ai", props, requestService, recordService);
+                                                                AiModelCallRecordService recordService,
+                                                                ClaudeProtocolAdapter anthropic,
+                                                                OpenAiProtocolAdapter openai) {
+        return newContextualization("302ai", props, requestService, recordService, anthropic, openai);
     }
 
     // ============================================================ factories
@@ -133,27 +140,32 @@ public class ProviderBeansConfig {
 
     private static RerankClient newRerankByProtocol(String providerName,
                                                     AiProviderProperties props,
-                                                    RequestService requestService) {
+                                                    RequestService requestService,
+                                                    List<RerankClientFactory> factories) {
         ProviderConfig cfg = configOf(providerName, props);
         String protocol = cfg.getRerank().getProtocol();
         if (protocol == null) {
             throw new IllegalStateException("providers." + providerName
                     + ".rerank.protocol 未配置（cohere / qwen3 / ...）");
         }
-        return switch (protocol.toLowerCase()) {
-            case "cohere" -> new CohereRerankClient(providerName, cfg, requestService);
-            case "qwen3" -> new Qwen3RerankClient(providerName, cfg, requestService);
-            default -> throw new IllegalStateException("不支持的 rerank.protocol: " + protocol
-                    + "（provider=" + providerName + "）。"
-                    + "已知支持: cohere, qwen3。新增需实现 RerankClient 并在此分支添加。");
-        };
+        for (RerankClientFactory f : factories) {
+            if (f.protocol().equalsIgnoreCase(protocol)) {
+                return f.create(providerName, cfg, requestService);
+            }
+        }
+        throw new IllegalStateException("不支持的 rerank.protocol: " + protocol
+                + "（provider=" + providerName + "）。已知: "
+                + factories.stream().map(RerankClientFactory::protocol).toList()
+                + "。新增请实现 RerankClientFactory 并注册为 bean。");
     }
 
     private static ContextualizationClient newContextualization(String providerName,
                                                                 AiProviderProperties props,
                                                                 RequestService requestService,
-                                                                AiModelCallRecordService recordService) {
+                                                                AiModelCallRecordService recordService,
+                                                                ClaudeProtocolAdapter anthropic,
+                                                                OpenAiProtocolAdapter openai) {
         return new DefaultContextualizationClient(providerName, configOf(providerName, props),
-                requestService, recordService);
+                requestService, recordService, anthropic, openai);
     }
 }

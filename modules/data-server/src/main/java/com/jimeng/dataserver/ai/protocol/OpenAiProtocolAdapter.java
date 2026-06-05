@@ -162,6 +162,18 @@ public class OpenAiProtocolAdapter implements AiProtocolAdapter {
     }
 
     @Override
+    public String extractAssistantText(Map<String, Object> responseMap) {
+        Object choices = responseMap == null ? null : responseMap.get("choices");
+        if (!(choices instanceof List<?> list) || list.isEmpty()) return null;
+        Object first = list.get(0);
+        if (!(first instanceof Map<?, ?> choice)) return null;
+        Object msg = choice.get("message");
+        if (!(msg instanceof Map<?, ?> message)) return null;
+        Object content = message.get("content");
+        return content == null ? null : String.valueOf(content).trim();
+    }
+
+    @Override
     @SuppressWarnings("unchecked")
     public void appendToolResultTurn(Map<String, Object> body, Map<String, Object> responseMap,
                                       List<ToolExecutionResult> results) {

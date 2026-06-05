@@ -15,11 +15,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 @Tag(name = "RAG-知识问答", description = "基于知识库 chunk 检索 + LLM 流式生成答案")
 @RestController
@@ -31,7 +30,7 @@ public class RagAnswerController {
     private final SseServiceUtil sseServiceUtil;
     private final PermissionResolver permissionResolver;
 
-    private final ExecutorService streamExecutor = Executors.newCachedThreadPool();
+    private final ThreadPoolTaskExecutor streamExecutor;
 
     @Operation(summary = "RAG 流式问答",
             description = "在指定知识库内检索相关 chunk，并基于命中片段让 LLM 流式生成答案。" +

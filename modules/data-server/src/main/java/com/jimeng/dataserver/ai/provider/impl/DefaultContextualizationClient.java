@@ -3,7 +3,10 @@ package com.jimeng.dataserver.ai.provider.impl;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.service.RequestService;
-import com.jimeng.dataserver.ai.claude.service.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
+import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
+import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.spi.ContextualizationClient;
 import com.jimeng.dataserver.ai.provider.spi.ContextualizationClientException;
@@ -32,15 +35,21 @@ public class DefaultContextualizationClient implements ContextualizationClient {
     private final RequestService requestService;
     /** 计费记录；可能为 null（极端情况下不影响 contextualization 主流程）。 */
     private final AiModelCallRecordService recordService;
+    private final ClaudeProtocolAdapter anthropicAdapter;
+    private final OpenAiProtocolAdapter openAiAdapter;
 
     public DefaultContextualizationClient(String providerName,
                                           ProviderConfig config,
                                           RequestService requestService,
-                                          AiModelCallRecordService recordService) {
+                                          AiModelCallRecordService recordService,
+                                          ClaudeProtocolAdapter anthropicAdapter,
+                                          OpenAiProtocolAdapter openAiAdapter) {
         this.providerName = providerName;
         this.config = config;
         this.requestService = requestService;
         this.recordService = recordService;
+        this.anthropicAdapter = anthropicAdapter;
+        this.openAiAdapter = openAiAdapter;
     }
 
     @Override
@@ -348,43 +357,24 @@ public class DefaultContextualizationClient implements ContextualizationClient {
         return h;
     }
 
-    @SuppressWarnings("unchecked")
     private String extractAnthropicText(String json) {
-        if (StrUtil.isBlank(json)) return "";
-        try {
-            Map<String, Object> root = JSONUtil.parseObj(json).toBean(Map.class);
-            Object contentObj = root.get("content");
-            if (!(contentObj instanceof List<?> list)) return "";
-            StringBuilder sb = new StringBuilder();
-            for (Object block : list) {
-                if (!(block instanceof Map<?, ?> m)) continue;
-                if ("text".equals(m.get("type"))) {
-                    Object t = m.get("text");
-                    if (t != null) sb.append(t);
-                }
-            }
-            return sb.toString().trim();
-        } catch (Exception e) {
-            log.warn("解析 anthropic 响应失败 provider={} err={}", providerName, e.getMessage());
-            return "";
-        }
+        return extractTextVia(anthropicAdapter, json);
     }
 
-    @SuppressWarnings("unchecked")
     private String extractOpenAiText(String json) {
+        return extractTextVia(openAiAdapter, json);
+    }
+
+    /** 解析响应 JSON 并委托对应协议 adapter 抽 assistant 文本；空/解析失败/无文本统一返回 ""（保持原 contextualization 语义）。 */
+    @SuppressWarnings("unchecked")
+    private String extractTextVia(AiProtocolAdapter adapter, String json) {
         if (StrUtil.isBlank(json)) return "";
         try {
             Map<String, Object> root = JSONUtil.parseObj(json).toBean(Map.class);
-            Object choicesObj = root.get("choices");
-            if (!(choicesObj instanceof List<?> list) || list.isEmpty()) return "";
-            Object first = list.get(0);
-            if (!(first instanceof Map<?, ?> choice)) return "";
-            Object msg = choice.get("message");
-            if (!(msg instanceof Map<?, ?> message)) return "";
-            Object content = message.get("content");
-            return content == null ? "" : String.valueOf(content).trim();
+            String text = adapter.extractAssistantText(root);
+            return text == null ? "" : text;
         } catch (Exception e) {
-            log.warn("解析 openai 响应失败 provider={} err={}", providerName, e.getMessage());
+            log.warn("解析响应失败 provider={} err={}", providerName, e.getMessage());
             return "";
         }
     }

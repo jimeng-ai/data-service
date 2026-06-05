@@ -13,12 +13,11 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 @Tag(name = "Claude消息管理", description = "Claude统一消息接口（文本、图片、文档、工具）")
 @RestController
@@ -30,8 +29,7 @@ public class ClaudeController {
     private final ClaudeService claudeService;
     private final SseServiceUtil sseServiceUtil;
 
-    private final ExecutorService streamExecutor =
-            Executors.newCachedThreadPool();
+    private final ThreadPoolTaskExecutor streamExecutor;
 
     @Operation(summary = "Claude统一消息接口", description = "同一个接口支持文本、图片、文档和tools")
     @PostMapping("/messages")

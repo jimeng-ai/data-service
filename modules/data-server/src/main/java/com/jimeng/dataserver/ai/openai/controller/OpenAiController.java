@@ -13,12 +13,11 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 @Tag(name = "OpenAI消息管理", description = "OpenAI Chat Completions接口")
 @RestController
@@ -30,8 +29,7 @@ public class OpenAiController {
     private final OpenAiService openAiService;
     private final SseServiceUtil sseServiceUtil;
 
-    private final ExecutorService streamExecutor =
-            Executors.newCachedThreadPool();
+    private final ThreadPoolTaskExecutor streamExecutor;
 
     @Operation(summary = "OpenAI聊天对话", description = "对接OpenAI /v1/chat/completions")
     @PostMapping("/chat/completions")

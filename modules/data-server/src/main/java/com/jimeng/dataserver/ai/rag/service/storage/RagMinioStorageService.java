@@ -24,8 +24,8 @@ import java.time.format.DateTimeFormatter;
 
 /**
  * RAG 专用 MinIO 存储服务。
- * 由于 {@code MinIOUtil} 在 {@code DataServerApplication} 的 ComponentScan 里被排除（避免无 MinIO 时启动失败），
- * RAG 在此自管 MinioClient，仅在被注入时才生效。bucket 由 rag.ingestion.minio-bucket 控制。
+ * RAG 在此自管 MinioClient（仅在被注入时才生效），不依赖任何全局 MinIO 工具类；
+ * bucket 由 rag.ingestion.minio-bucket 控制。
  */
 @Slf4j
 @Service

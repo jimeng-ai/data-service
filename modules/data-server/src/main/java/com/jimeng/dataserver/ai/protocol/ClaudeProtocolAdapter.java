@@ -132,6 +132,22 @@ public class ClaudeProtocolAdapter implements AiProtocolAdapter {
     }
 
     @Override
+    public String extractAssistantText(Map<String, Object> responseMap) {
+        if (responseMap == null) return null;
+        Object content = responseMap.get("content");
+        if (!(content instanceof List<?> blocks)) return null;
+        StringBuilder sb = new StringBuilder();
+        for (Object block : blocks) {
+            if (!(block instanceof Map<?, ?> m)) continue;
+            if ("text".equals(m.get("type"))) {
+                Object t = m.get("text");
+                if (t != null) sb.append(t);
+            }
+        }
+        return sb.length() > 0 ? sb.toString().trim() : null;
+    }
+
+    @Override
     @SuppressWarnings("unchecked")
     public void appendToolResultTurn(Map<String, Object> body, Map<String, Object> responseMap,
                                       List<ToolExecutionResult> results) {

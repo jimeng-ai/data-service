@@ -6,7 +6,6 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
 import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
-import org.springframework.context.annotation.FilterType;
 
 @SpringBootApplication(exclude = {
         org.springframework.boot.autoconfigure.elasticsearch.ElasticsearchClientAutoConfiguration.class
@@ -17,11 +16,7 @@ import org.springframework.context.annotation.FilterType;
         "com.jimeng.common.core",
         "com.jimeng.persistence",
         "com.jimeng.dataserver"
-},
-        excludeFilters = @ComponentScan.Filter(
-                type = FilterType.ASSIGNABLE_TYPE,
-                classes = {com.jimeng.common.core.utils.MinIOUtil.class}
-        ))
+})
 @Slf4j
 public class DataServerApplication {
 
