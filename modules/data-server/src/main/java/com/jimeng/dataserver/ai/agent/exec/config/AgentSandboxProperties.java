@@ -48,5 +48,9 @@ public class AgentSandboxProperties {
         private String authToken;
         private String model;
         private String authScheme = "bearer";
+        /** 生图上游形态：openai（默认，gpt-image-2 同步）/ kling-o3（可灵 o3 异步任务）。改这里即可切换生图模型。 */
+        private String provider = "openai";
+        /** 批量生图并发上限（一次多张时最多几张同时生成）；空/<=0 时边车用内置默认 5。302 限流就调小。 */
+        private Integer batchConcurrency;
     }
 }

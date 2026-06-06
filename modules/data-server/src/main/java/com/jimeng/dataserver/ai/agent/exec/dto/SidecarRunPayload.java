@@ -67,6 +67,10 @@ public class SidecarRunPayload {
         private String authToken;
         private String model;
         private String authScheme;
+        /** 上游图像 API 形态：openai（默认，gpt-image-2）/ kling-o3（可灵 o3 异步任务）。 */
+        private String provider;
+        /** 批量生图并发上限；空时边车用内置默认。字段名须与边车 TS 的 batchConcurrency 一致。 */
+        private Integer batchConcurrency;
     }
 
     @Data

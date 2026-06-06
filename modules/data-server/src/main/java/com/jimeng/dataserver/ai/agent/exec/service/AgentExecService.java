@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.agent.exec.service;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
@@ -93,20 +94,42 @@ public class AgentExecService {
         runMapper.insert(run);
         final Long runId = run.getId();
 
-        // 2. 解析输入文件（租户过滤自动生效，跨租户引用拿不到）
-        List<SidecarRunPayload.InputFile> inputs = new ArrayList<>();
+        // 2. 解析输入文件（租户过滤自动生效，跨租户引用拿不到）。
+        //    多轮记忆：除本轮显式 fileIds 外，还把【本会话此前上传过的文件】一并铺进 /work，
+        //    否则后续轮次（前端不再带 fileIds）沙箱看不到早先发的图片。按文件 id 去重、保持上传顺序。
+        Long conversationId = req.getConversationId();
+        Map<Long, AgentInputFile> fileById = new LinkedHashMap<>();
+        // 2a. 本轮显式带的文件；顺手把它们登记到当前会话，便于后续轮次按会话回捞。
         if (req.getFileIds() != null) {
             for (Long fid : req.getFileIds()) {
                 AgentInputFile f = inputFileMapper.selectById(fid);
                 if (f != null) {
-                    SidecarRunPayload.InputFile in = new SidecarRunPayload.InputFile();
-                    in.setObjectName(f.getObjectName());
-                    in.setFilename(f.getFilename());
-                    in.setBucket(f.getBucket());
-                    in.setSizeBytes(f.getSizeBytes());
-                    inputs.add(in);
+                    if (conversationId != null && f.getConversationId() == null) {
+                        f.setConversationId(conversationId);
+                        inputFileMapper.updateById(f);
+                    }
+                    fileById.put(f.getId(), f);
                 }
             }
+        }
+        // 2b. 本会话历史上传过的文件（多轮记忆的关键）。
+        if (conversationId != null) {
+            List<AgentInputFile> prior = inputFileMapper.selectList(
+                    new LambdaQueryWrapper<AgentInputFile>()
+                            .eq(AgentInputFile::getConversationId, conversationId)
+                            .orderByAsc(AgentInputFile::getId));
+            for (AgentInputFile f : prior) {
+                fileById.putIfAbsent(f.getId(), f);
+            }
+        }
+        List<SidecarRunPayload.InputFile> inputs = new ArrayList<>();
+        for (AgentInputFile f : fileById.values()) {
+            SidecarRunPayload.InputFile in = new SidecarRunPayload.InputFile();
+            in.setObjectName(f.getObjectName());
+            in.setFilename(f.getFilename());
+            in.setBucket(f.getBucket());
+            in.setSizeBytes(f.getSizeBytes());
+            inputs.add(in);
         }
 
         // 3. 组 dispatch payload
@@ -145,6 +168,8 @@ public class AgentExecService {
             ig.setAuthToken(igCfg.getAuthToken());
             ig.setModel(igCfg.getModel());
             ig.setAuthScheme(igCfg.getAuthScheme());
+            ig.setProvider(igCfg.getProvider());
+            ig.setBatchConcurrency(igCfg.getBatchConcurrency());
             payload.setImageGen(ig);
         }
         SidecarRunPayload.Limits limits = new SidecarRunPayload.Limits();
