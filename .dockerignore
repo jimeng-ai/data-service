@@ -7,3 +7,7 @@ docker/docker-compose*.yml
 # "Child module /src/export does not exist" 构建失败。
 # 也不要排除 target/ —— 现有 CI(docker/Dockerfile.app)是 COPY 宿主预编译的
 # gateway/target/*.jar 进镜像,排除 target/ 会让 COPY 找不到 jar 而构建失败。
+# 上面 *.md 排除了所有 markdown，但 data-server 的 skill 依赖 SKILL.md(frontmatter 提供
+# name/description)，且 skills 目录要随镜像分发。显式恢复 skills 全目录进入构建上下文，
+# 否则 Dockerfile.app 里的 COPY modules/data-server/skills 拿不到 SKILL.md → skill 加载不到。
+!modules/data-server/skills/**
