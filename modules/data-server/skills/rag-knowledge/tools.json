@@ -1,13 +1,13 @@
 [
   {
-    "name": "rag.search",
+    "name": "rag_search",
     "description": "在企业知识库中检索与 query 最相关的 top-K 文档片段。底层走 BM25 + 向量混合检索 + Reranker 精排。仅在用户问题明显需要企业内部资料时使用。",
     "input_schema": {
       "type": "object",
       "properties": {
         "kb_id": {
           "type": "integer",
-          "description": "知识库 ID（可选）。若系统提示已给定 kb_id 或当前 Agent 已绑定知识库，则无需传此参数（系统会自动使用绑定库）；仅当未给定且需指定具体库时，先调用 rag.kb.list 拿到列表再填入"
+          "description": "知识库 ID（可选）。若系统提示已给定 kb_id 或当前 Agent 已绑定知识库，则无需传此参数（系统会自动使用绑定库）；仅当未给定且需指定具体库时，先调用 rag_kb_list 拿到列表再填入"
         },
         "query": {
           "type": "string",
@@ -28,7 +28,7 @@
     }
   },
   {
-    "name": "rag.kb.list",
+    "name": "rag_kb_list",
     "description": "列出当前可用的所有企业知识库，返回 id / name / description。在不知道 kb_id 时先调用此工具。",
     "input_schema": {
       "type": "object",

@@ -32,24 +32,33 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class RagSkillToolExecutor implements SkillToolExecutor {
 
-    private static final String TOOL_SEARCH = "rag.search";
-    private static final String TOOL_KB_LIST = "rag.kb.list";
+    // 注意：Anthropic 工具名不允许点号，SkillRuntimeService.normalizeToolName 会把 tools.json 里的
+    // 名字归一成下划线后再暴露给模型（rag.search → rag_search），模型回传的 tool_use 名亦是下划线。
+    // 故此处用下划线名匹配；supports/execute 再做一次点→下划线归一，点号/下划线两种写法都认，避免再踩坑。
+    private static final String TOOL_SEARCH = "rag_search";
+    private static final String TOOL_KB_LIST = "rag_kb_list";
 
     private final HybridSearchService hybridSearchService;
     private final RerankService rerankService;
     private final KnowledgeBaseService knowledgeBaseService;
     private final CitationAssembler citationAssembler;
 
+    private static String norm(String toolName) {
+        return toolName == null ? "" : toolName.replace('.', '_');
+    }
+
     @Override
     public boolean supports(String toolName) {
-        return TOOL_SEARCH.equals(toolName) || TOOL_KB_LIST.equals(toolName);
+        String n = norm(toolName);
+        return TOOL_SEARCH.equals(n) || TOOL_KB_LIST.equals(n);
     }
 
     @Override
     public Object execute(String toolName, Map<String, Object> input) {
+        String n = norm(toolName);
         try {
-            if (TOOL_SEARCH.equals(toolName)) return doSearch(input);
-            if (TOOL_KB_LIST.equals(toolName)) return doListKb();
+            if (TOOL_SEARCH.equals(n)) return doSearch(input);
+            if (TOOL_KB_LIST.equals(n)) return doListKb();
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "未知 RAG 工具: " + toolName);
         } catch (ServiceException e) {
             throw e;
