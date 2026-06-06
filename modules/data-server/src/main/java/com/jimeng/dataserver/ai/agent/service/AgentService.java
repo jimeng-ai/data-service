@@ -11,6 +11,7 @@ import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.AgentPluginMapper;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -50,7 +51,18 @@ public class AgentService {
         if (!StringUtils.hasText(agent.getStatus())) {
             agent.setStatus("DRAFT");
         }
-        agentMapper.insert(agent);
+        // 先释放被【软删行】占用的同代号唯一键：逻辑删除(deleted=1)后死行仍占着
+        // uk_agent_tenant_code(tenant_id, code)，不释放就无法重建删过的代号（且列表看不到死行）。
+        // 无死行时返回 0、无副作用。
+        agentMapper.releaseDeletedCode(agent.getCode());
+        try {
+            agentMapper.insert(agent);
+        } catch (DuplicateKeyException e) {
+            // 释放后仍冲突 → 占用者是【活跃】Agent（可能是同租户其他成员的、当前用户无权见）。
+            // 转成业务错误，前端会直接弹出该文案，而不是吞掉 SQL 原始异常。
+            throw new ServiceException(
+                    ExceptionCode.INVALID_REQUEST, "Agent 代号「" + agent.getCode() + "」已存在，请换一个");
+        }
         // 成员自授权：否则建完 Agent 后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
         creatorGrantService.grantNewResourceToCreator(ResourceType.AGENT, agent.getId());
         return agent;

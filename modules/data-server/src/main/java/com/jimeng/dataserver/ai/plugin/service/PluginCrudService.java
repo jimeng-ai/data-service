@@ -13,6 +13,7 @@ import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.PluginToolMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -61,7 +62,15 @@ public class PluginCrudService {
             plugin.setAuthType("NONE");
         }
         validateAuthType(plugin.getAuthType());
-        pluginMapper.insert(plugin);
+        // 先释放被【软删行】占用的同代号唯一键，让删过的插件代号能重新使用；无死行返回0、无副作用。
+        pluginMapper.releaseDeletedCode(plugin.getCode());
+        try {
+            pluginMapper.insert(plugin);
+        } catch (DuplicateKeyException e) {
+            // 释放后仍冲突 → 占用者是【活跃】插件。uk_plugin_tenant_code(tenant_id, code)。
+            throw new ServiceException(
+                    ExceptionCode.INVALID_REQUEST, "插件代号「" + plugin.getCode() + "」已存在，请换一个");
+        }
         // 成员自授权：否则建完插件后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
         creatorGrantService.grantNewResourceToCreator(ResourceType.PLUGIN, plugin.getId());
         registryService.reload();
@@ -147,7 +156,15 @@ public class PluginCrudService {
         }
         tool.setPluginId(pluginId);
         if (tool.getEnabled() == null) tool.setEnabled(Boolean.TRUE);
-        pluginToolMapper.insert(tool);
+        // 先释放被【软删行】占用的同工具名唯一键，让删过的工具名能重新使用；无死行返回0、无副作用。
+        pluginToolMapper.releaseDeletedName(tool.getName());
+        try {
+            pluginToolMapper.insert(tool);
+        } catch (DuplicateKeyException e) {
+            // 释放后仍冲突 → 占用者是【活跃】工具。uk_plugin_tool_tenant_name(tenant_id, name)。
+            throw new ServiceException(
+                    ExceptionCode.INVALID_REQUEST, "工具名「" + tool.getName() + "」已存在，请换一个");
+        }
 
         mapping.setPluginToolId(tool.getId());
         pluginHttpMappingMapper.insert(mapping);
