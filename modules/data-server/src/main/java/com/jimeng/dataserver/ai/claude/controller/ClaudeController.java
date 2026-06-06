@@ -2,6 +2,8 @@ package com.jimeng.dataserver.ai.claude.controller;
 
 import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
+import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
+import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.web.MdcAsyncSupport;
 import io.swagger.v3.oas.annotations.Operation;
@@ -35,10 +37,19 @@ public class ClaudeController {
     @PostMapping("/messages")
     public Object messages(@RequestBody Map<String, Object> requestBody,
                            HttpServletRequest request) {
-        if (Boolean.TRUE.equals(requestBody.get("stream"))) {
-            return startStream(requestBody, request);
+        try {
+            if (Boolean.TRUE.equals(requestBody.get("stream"))) {
+                return startStream(requestBody, request);
+            }
+            return claudeService.messages(requestBody);
+        } finally {
+            // 本接口在【请求线程】上通过 prepareAgentContext / messages()→applyAgentContext 设置了 AgentContext。
+            // 流式分支已由 MdcAsyncSupport.wrap 把上下文「拓印」给异步任务（其捕获发生在 startStream 内、本 finally 之前），
+            // 故无论流式/非流式，方法返回前都必须清掉【请求线程】的 Agent ThreadLocal——否则 Tomcat 线程被线程池复用时，
+            // 会把本次请求的 Agent 绑定残留给下一个请求（尤其无 agent 的请求），造成跨请求 / 跨租户串绑定。
+            AgentContext.clear();
+            AgentIdContext.clear();
         }
-        return claudeService.messages(requestBody);
     }
 
     private SseEmitter startStream(Map<String, Object> requestBody, HttpServletRequest request) {

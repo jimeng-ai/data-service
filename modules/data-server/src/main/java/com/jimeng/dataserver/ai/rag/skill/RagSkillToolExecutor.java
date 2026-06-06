@@ -2,10 +2,14 @@ package com.jimeng.dataserver.ai.rag.skill;
 
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.rag.model.SearchResultItem;
+import com.jimeng.dataserver.ai.rag.service.CitationAssembler;
 import com.jimeng.dataserver.ai.rag.service.KnowledgeBaseService;
 import com.jimeng.dataserver.ai.rag.service.search.HybridSearchService;
 import com.jimeng.dataserver.ai.rag.service.search.RerankService;
+import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.service.SkillToolExecutor;
 import com.jimeng.persistence.entity.KnowledgeBase;
 import lombok.RequiredArgsConstructor;
@@ -34,6 +38,7 @@ public class RagSkillToolExecutor implements SkillToolExecutor {
     private final HybridSearchService hybridSearchService;
     private final RerankService rerankService;
     private final KnowledgeBaseService knowledgeBaseService;
+    private final CitationAssembler citationAssembler;
 
     @Override
     public boolean supports(String toolName) {
@@ -57,10 +62,16 @@ public class RagSkillToolExecutor implements SkillToolExecutor {
     private Map<String, Object> doSearch(Map<String, Object> input) throws Exception {
         Object kbIdObj = input == null ? null : input.get("kb_id");
         Object queryObj = input == null ? null : input.get("query");
-        if (!(kbIdObj instanceof Number) || !(queryObj instanceof String) || ((String) queryObj).isBlank()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "rag.search 需要 kb_id(int) + query(string)");
+        if (!(queryObj instanceof String) || ((String) queryObj).isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "rag.search 需要 query(string)");
         }
-        Long kbId = ((Number) kbIdObj).longValue();
+        // kb_id 优先取模型显式入参；缺省时回落到当前 Agent 绑定的知识库——绑定型 Agent 的 system 提示已给定
+        // kb_id，此处是兜底，避免模型偶发漏传导致检索失败。两者都没有才报错。
+        Long kbId = resolveKbId(kbIdObj);
+        if (kbId == null) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "rag.search 需要 kb_id(int)：未显式提供且当前 Agent 未绑定知识库");
+        }
         String query = (String) queryObj;
         int topK = input.get("top_k") instanceof Number n ? n.intValue() : 10;
         boolean rerank = !(input.get("rerank") instanceof Boolean b) || b;
@@ -88,7 +99,20 @@ public class RagSkillToolExecutor implements SkillToolExecutor {
         out.put("query", query);
         out.put("count", items.size());
         out.put("results", items);
+        // 富化的「参考来源」走 __citations__ 旁路：AiConversationLoop 会抽出来单独发 citations 事件、
+        // 并在回传给模型前剥离（不进模型上下文、不计入 token），仅供前端展示。
+        out.put(ToolExecutionResult.CITATIONS_SIDECAR_KEY, citationAssembler.assemble(hits));
         return out;
+    }
+
+    /** kb_id 解析：模型显式入参优先；否则回落到当前 Agent 绑定的首个知识库；都没有返回 null。 */
+    private Long resolveKbId(Object kbIdObj) {
+        if (kbIdObj instanceof Number n) return n.longValue();
+        AgentRuntimeView agent = AgentContext.get();
+        if (agent != null && agent.getKbIds() != null && !agent.getKbIds().isEmpty()) {
+            return agent.getKbIds().iterator().next();
+        }
+        return null;
     }
 
     private Map<String, Object> doListKb() {

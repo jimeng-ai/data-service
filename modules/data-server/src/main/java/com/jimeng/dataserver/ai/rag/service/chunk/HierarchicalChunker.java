@@ -59,7 +59,7 @@ public class HierarchicalChunker {
                 }
                 case TABLE, CODE, IMAGE -> {
                     flush(buffer, result, cfg, sentencePattern);
-                    result.add(buildStandaloneChunk(block, result.size()));
+                    addStandaloneChunks(block, result, cfg);
                 }
             }
         }
@@ -106,6 +106,18 @@ public class HierarchicalChunker {
         for (String s : sentences) {
             if (StrUtil.isBlank(s)) continue;
             int t = tokenCounter.count(s);
+            // 单句本身就超窗口（如电子表格/无句读长文：整片是一个「句子」）：
+            // 不能原样塞进 window，否则该 chunk 会超过 embedding 模型上限导致整批向量化失败。
+            // 先 flush 当前 window，再把这一句按 token 上限硬切成多片。
+            if (t > cfg.getTargetSizeTokens()) {
+                if (current.length() > 0) {
+                    windows.add(current.toString().trim());
+                    current.setLength(0);
+                    currentTokens = 0;
+                }
+                windows.addAll(hardSplitByTokens(s, cfg.getTargetSizeTokens()));
+                continue;
+            }
             if (currentTokens + t > cfg.getTargetSizeTokens() && current.length() > 0) {
                 windows.add(current.toString().trim());
                 current.setLength(0);
@@ -116,6 +128,102 @@ public class HierarchicalChunker {
         }
         if (current.length() > 0) windows.add(current.toString().trim());
         return windows;
+    }
+
+    /**
+     * 把一段超过 maxTokens 的文本硬切成若干 ≤ maxTokens 的片段：先按行（电子表格行 / 代码行 /
+     * 表格行天然以换行分隔）凑窗口；遇到单行仍超限再按字符近似切。保证返回的每片都不超上限，
+     * 从源头杜绝「单个 chunk 超过 embedding 模型 token 上限」。
+     */
+    private List<String> hardSplitByTokens(String text, int maxTokens) {
+        maxTokens = Math.max(1, maxTokens); // 防御误配置（0/负）导致下游死循环
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        int curTokens = 0;
+        for (String line : text.split("\n", -1)) {
+            int lt = tokenCounter.count(line);
+            if (lt > maxTokens) {
+                if (cur.length() > 0) {
+                    out.add(cur.toString().trim());
+                    cur.setLength(0);
+                    curTokens = 0;
+                }
+                out.addAll(splitLongLine(line, maxTokens));
+                continue;
+            }
+            if (curTokens + lt > maxTokens && cur.length() > 0) {
+                out.add(cur.toString().trim());
+                cur.setLength(0);
+                curTokens = 0;
+            }
+            cur.append(line).append('\n');
+            curTokens += lt;
+        }
+        if (cur.length() > 0) {
+            String last = cur.toString().trim();
+            if (!last.isEmpty()) out.add(last);
+        }
+        return out;
+    }
+
+    /**
+     * 切一行超限文本：表格行渲染成「表头: 值 | 表头: 值」，优先按「 | 」边界切，尽量不把一对 header:value
+     * 拦腰斩断（保住检索语义）；只有单个字段本身仍超限时才退化为按字符硬切。非表格行直接按字符切。
+     */
+    private List<String> splitLongLine(String line, int maxTokens) {
+        if (!line.contains(" | ")) {
+            return splitByChars(line, maxTokens);
+        }
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        int curTokens = 0;
+        for (String seg : line.split(" \\| ", -1)) {
+            int t = tokenCounter.count(seg);
+            if (t > maxTokens) { // 单个字段就超限（巨型单元格）：flush 后按字符兜底
+                if (cur.length() > 0) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                    curTokens = 0;
+                }
+                out.addAll(splitByChars(seg, maxTokens));
+                continue;
+            }
+            if (curTokens + t > maxTokens && cur.length() > 0) {
+                out.add(cur.toString());
+                cur.setLength(0);
+                curTokens = 0;
+            }
+            if (cur.length() > 0) {
+                cur.append(" | ");
+            }
+            cur.append(seg);
+            curTokens += t;
+        }
+        if (cur.length() > 0) out.add(cur.toString());
+        return out;
+    }
+
+    /** 按字符近似切到 token 上限以内（用 tokenCounter 收敛，确保每片真实 token ≤ maxTokens）。 */
+    private List<String> splitByChars(String text, int maxTokens) {
+        maxTokens = Math.max(1, maxTokens); // 防御误配置（0/负）导致死循环
+        List<String> out = new ArrayList<>();
+        int i = 0;
+        while (i < text.length()) {
+            // 起步按 maxTokens 个字符（中文最坏约 1 token/字符），再向下收敛到不超上限
+            int end = Math.min(text.length(), i + maxTokens);
+            while (end > i + 1 && tokenCounter.count(text.substring(i, end)) > maxTokens) {
+                end -= Math.max(1, (end - i) / 8);
+            }
+            // 不要把 UTF-16 代理对（emoji 等 BMP 外字符）从中间劈开，否则产生孤立代理 → 乱码
+            if (end < text.length() && end > i + 1
+                    && Character.isHighSurrogate(text.charAt(end - 1))
+                    && Character.isLowSurrogate(text.charAt(end))) {
+                end--;
+            }
+            out.add(text.substring(i, end));
+            i = end;
+        }
+        return out;
     }
 
     /** 取 text 末尾约 N 个 token 的子串作为下一窗口前缀 */
@@ -139,8 +247,23 @@ public class HierarchicalChunker {
                 .build();
     }
 
-    private Chunk buildStandaloneChunk(DocumentBlock block, int index) {
-        String content = block.getText() != null ? block.getText() : "";
+    /**
+     * 输出独立 chunk（TABLE/CODE/IMAGE）。内容超 max-size-tokens 时按 token 上限硬切成多片，
+     * 每片保留原 block 类型与定位信息——否则一张大表 / 大代码块会成为一个超限 chunk，向量化失败。
+     */
+    private void addStandaloneChunks(DocumentBlock block, List<Chunk> out, RagProperties.Chunk cfg) {
+        String content = block.getText() != null ? block.getText().trim() : "";
+        if (content.isEmpty()) return;
+        if (tokenCounter.count(content) <= cfg.getMaxSizeTokens()) {
+            out.add(buildStandaloneChunk(block, content));
+            return;
+        }
+        for (String piece : hardSplitByTokens(content, cfg.getTargetSizeTokens())) {
+            if (!StrUtil.isBlank(piece)) out.add(buildStandaloneChunk(block, piece));
+        }
+    }
+
+    private Chunk buildStandaloneChunk(DocumentBlock block, String content) {
         return Chunk.builder()
                 .type(block.getType())
                 .content(content)

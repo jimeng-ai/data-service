@@ -118,6 +118,8 @@ public class DocumentService {
         if (lower.endsWith(".pdf")) return "pdf";
         if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "docx";
         if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "md";
+        if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".xlsm")) return "xlsx";
+        if (lower.endsWith(".csv") || lower.endsWith(".tsv")) return "csv";
         if (lower.endsWith(".html") || lower.endsWith(".htm")) return "html";
         if (lower.endsWith(".txt")) return "txt";
         return "unknown";

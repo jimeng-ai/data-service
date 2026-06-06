@@ -69,6 +69,8 @@ public class ClaudeService {
         Object agentIdObj = body.remove("agent_id");
         // preview=调试台读实时草稿；缺省/false=对话端只读已发布快照。两者都从 body 取出后移除，避免透传给上游。
         Object previewObj = body.remove("agent_preview");
+        // 调试台显式 kbId 已前置强制检索时，由 RagAnswerService 置位：抑制绑定 KB 的检索护栏，避免双套检索指令冲突。
+        boolean suppressKbGrounding = Boolean.TRUE.equals(body.remove("__suppress_kb_grounding__"));
         if (agentIdObj == null) return;
         Long agentId = parseLong(agentIdObj);
         if (agentId == null) return;
@@ -84,6 +86,13 @@ public class ClaudeService {
             prependSystemPrompt(body, agent.getSystemPrompt());
         }
 
+        // 绑定了知识库的 Agent：注入「检索护栏」。这是把原强制检索路（RagAnswerService）专属的 grounding 约束
+        // 搬到工具式按需检索路上——使「该检索时必检索 + 检索不到就明说 + 不污染正文 + kb_id 已给定免 rag.kb.list」
+        // 对所有绑定 KB 的 Agent 一致生效，取代「绑定即每轮无条件前置检索」。
+        if (agent.getKbIds() != null && !agent.getKbIds().isEmpty() && !suppressKbGrounding) {
+            prependSystemPrompt(body, buildKbGroundingPrompt(agent.getKbIds()));
+        }
+
         // 默认 model / model_params（请求体显式给的优先）
         if (!body.containsKey("model") && StringUtils.hasText(agent.getDefaultModel())) {
             body.put("model", agent.getDefaultModel());
@@ -93,6 +102,20 @@ public class ClaudeService {
                 body.putIfAbsent(e.getKey(), e.getValue());
             }
         }
+    }
+
+    /** 绑定知识库的 Agent 的「检索护栏」系统提示：把 kb_id 钉进提示，约束必检索 / 零编造 / 正文不外露引用标号。 */
+    private String buildKbGroundingPrompt(java.util.Set<Long> kbIds) {
+        StringBuilder ids = new StringBuilder();
+        for (Long id : kbIds) {
+            if (ids.length() > 0) ids.append(", ");
+            ids.append(id);
+        }
+        return "你已绑定企业知识库（kb_id = " + ids + "）。回答用户的实质性问题前，"
+                + "必须先调用 rag.search 工具检索知识库（kb_id 用上面给定的值，无需调用 rag.kb.list）；"
+                + "仅当用户是纯寒暄、明显与知识库无关的闲聊时才可不检索。"
+                + "若检索结果不足以回答，明确告知「未在知识库中找到相关信息」，不要编造知识库以外的内容。"
+                + "不要在回答正文里输出 chunk_id、片段编号或方括号引用标签——来源会由系统在回答下方单独展示。";
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

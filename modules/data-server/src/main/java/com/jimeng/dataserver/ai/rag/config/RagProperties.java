@@ -43,6 +43,12 @@ public class RagProperties {
     public static class Contextualization {
         private boolean enabled = true;
         private int promptCacheTtlSeconds = 300;
+        /**
+         * 上下文化并发度：每篇文档对各 chunk 调 LLM 生成定位描述时的最大并行请求数。
+         * 1 = 串行（最大化 prompt cache 命中、最省成本，但大文档慢）；
+         * &gt;1 = 有界并发（大文档入库提速数倍，首波并发会少量重复写缓存、成本略增）。
+         */
+        private int concurrency = 5;
     }
 
     @Data

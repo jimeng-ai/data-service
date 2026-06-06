@@ -331,6 +331,9 @@ public class AiConversationLoop {
 
     private void sendToolResults(String connectionId, int round, List<ToolExecutionResult> results) {
         if (results == null || results.isEmpty()) return;
+        // 先把携带 __citations__ 旁路的工具结果（如 rag.search）抽出来单独发 citations 事件，并从 payload 剥离，
+        // 避免富化引用既泄漏进模型上下文（随后 appendToolResultTurn 回传）又重复出现在 tool_result.output。
+        surfaceCitations(connectionId, results);
         List<Map<String, Object>> items = new ArrayList<>();
         for (ToolExecutionResult r : results) {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -344,6 +347,26 @@ public class AiConversationLoop {
         event.put("round", round);
         event.put("results", items);
         sseBridge.sendJson(connectionId, "tool_result", event);
+    }
+
+    /**
+     * 把工具结果里 {@link ToolExecutionResult#CITATIONS_SIDECAR_KEY} 旁路的引用抽出来单独下发 citations 事件，
+     * 并从 payload 剥离（使其不进模型上下文、也不重复出现在 tool_result.output）。
+     * 前端 useSSE 对 citations 不假设到达时序——存下、流结束时随消息落库，故工具轮后再发完全兼容。
+     */
+    private void surfaceCitations(String connectionId, List<ToolExecutionResult> results) {
+        for (ToolExecutionResult r : results) {
+            if (!(r.getPayload() instanceof Map<?, ?> raw)) continue;
+            Object citations = raw.get(ToolExecutionResult.CITATIONS_SIDECAR_KEY);
+            if (citations == null) continue;
+            try {
+                ((Map<?, ?>) raw).remove(ToolExecutionResult.CITATIONS_SIDECAR_KEY);
+            } catch (UnsupportedOperationException e) {
+                // payload 不可变时剥离失败：放弃剥离（模型会多看到这段引用），但不丢 citations 事件；打日志以便及早发现。
+                log.warn("citations 旁路剥离失败（payload 不可变）tool={} connectionId={}", r.getToolName(), connectionId);
+            }
+            sseBridge.sendJson(connectionId, "citations", citations);
+        }
     }
 
     private void sendError(String connectionId, String error, String message) {

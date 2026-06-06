@@ -20,6 +20,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -72,6 +73,10 @@ public class SkillRuntimeService {
                 skillOnly.put(e.getKey(), e.getValue());
             }
         }
+        // 绑定了知识库的 Agent：把平台级 Skill「rag-knowledge」提升为「直接注入工具」，免去
+        // discovery→activate_skills 一轮，模型可立即调用 rag.search（kb_id 已由 system 提示给定 + 执行器兜底）。
+        promoteRagSkillIfKbBound(skillOnly, boundPlugins);
+
         if (!boundPlugins.isEmpty()) {
             injectFullSkillContext(body, boundPlugins, adapter);
             log.info("插件工具直接注入(tool_use): {}", toNames(boundPlugins));
@@ -153,6 +158,28 @@ public class SkillRuntimeService {
     }
 
     // ------------------------------------------------------------------ internals
+
+    /** 平台级知识检索 Skill 的名称（SKILL.md frontmatter name）。 */
+    private static final String RAG_SKILL_NAME = "rag-knowledge";
+
+    /**
+     * 当前 Agent 绑定了知识库时，把平台级 Skill「rag-knowledge」从「待发现」集合移到「直接注入」集合：
+     * 让 rag.search 像绑定插件一样立即可调，省去 discovery→activate_skills 往返；其它平台 Skill 仍走发现。
+     */
+    private void promoteRagSkillIfKbBound(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
+        AgentRuntimeView agent = AgentContext.get();
+        boolean kbBound = agent != null && agent.getKbIds() != null && !agent.getKbIds().isEmpty();
+        if (!kbBound) return;
+        for (Iterator<Map.Entry<String, ToolPackage>> it = skillOnly.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, ToolPackage> e = it.next();
+            if (RAG_SKILL_NAME.equals(e.getValue().getName())) {
+                boundPlugins.add(e.getValue());
+                it.remove();
+                log.info("Agent 绑定知识库，rag-knowledge 提升为直接注入工具 kbIds={}", agent.getKbIds());
+                break;
+            }
+        }
+    }
 
     private void injectFullSkillContext(Map<String, Object> body,
                                          List<ToolPackage> skills,

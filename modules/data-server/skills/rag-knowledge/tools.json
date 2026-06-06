@@ -7,7 +7,7 @@
       "properties": {
         "kb_id": {
           "type": "integer",
-          "description": "知识库 ID（必填）。可以先调用 rag.kb.list 拿到列表"
+          "description": "知识库 ID（可选）。若系统提示已给定 kb_id 或当前 Agent 已绑定知识库，则无需传此参数（系统会自动使用绑定库）；仅当未给定且需指定具体库时，先调用 rag.kb.list 拿到列表再填入"
         },
         "query": {
           "type": "string",
@@ -24,7 +24,7 @@
           "default": true
         }
       },
-      "required": ["kb_id", "query"]
+      "required": ["query"]
     }
   },
   {

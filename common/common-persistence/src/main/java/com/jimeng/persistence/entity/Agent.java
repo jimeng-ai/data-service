@@ -41,6 +41,10 @@ public class Agent extends BaseEntity {
     @TableField("avatar_url")
     private String avatarUrl;
 
+    @Schema(description = "对话空状态的预设引导问题（JSON 数组字符串，如 [\"问题1\",\"问题2\"]）")
+    @TableField("preset_questions")
+    private String presetQuestions;
+
     @Schema(description = "人设 / 系统提示词")
     @TableField("system_prompt")
     private String systemPrompt;

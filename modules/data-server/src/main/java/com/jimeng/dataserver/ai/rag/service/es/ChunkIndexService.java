@@ -8,7 +8,6 @@ import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import com.jimeng.dataserver.ai.rag.model.Chunk;
 import com.jimeng.persistence.entity.KbChunk;
 import com.jimeng.persistence.mapper.KbChunkMapper;
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -86,11 +85,7 @@ public class ChunkIndexService {
     }
 
     public void deleteByKb(Long kbId) throws IOException {
-        txTemplate.executeWithoutResult(status -> {
-            LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
-            w.eq(KbChunk::getKbId, kbId);
-            kbChunkMapper.delete(w);
-        });
+        txTemplate.executeWithoutResult(status -> kbChunkMapper.physicalDeleteByKbId(kbId));
         String index = ragProperties.getElasticsearch().getIndexName();
         esClient.deleteByQuery(d -> d
                 .index(index)
@@ -98,9 +93,9 @@ public class ChunkIndexService {
     }
 
     private void deleteChunksFromDb(Long docId) {
-        LambdaQueryWrapper<KbChunk> w = new LambdaQueryWrapper<>();
-        w.eq(KbChunk::getDocId, docId);
-        kbChunkMapper.delete(w);
+        // 物理删除：kb_chunk 有唯一键 uk_chunk_id，逻辑删除会留着旧 chunk_id 占位，
+        // 重新索引插入同名 chunk_id 会撞 Duplicate entry → 整批回滚 → 入库失败重试死循环。
+        kbChunkMapper.physicalDeleteByDocId(docId);
     }
 
     private void deleteChunksFromEs(Long docId) throws IOException {

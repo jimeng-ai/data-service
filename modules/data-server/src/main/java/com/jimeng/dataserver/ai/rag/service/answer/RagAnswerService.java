@@ -4,28 +4,25 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
 import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import com.jimeng.dataserver.ai.rag.model.AnswerRequest;
-import com.jimeng.dataserver.ai.rag.model.CitationItem;
 import com.jimeng.dataserver.ai.rag.model.SearchResultItem;
+import com.jimeng.dataserver.ai.rag.service.CitationAssembler;
 import com.jimeng.dataserver.ai.rag.service.search.HybridSearchService;
 import com.jimeng.dataserver.ai.rag.service.search.RerankService;
-import com.jimeng.persistence.entity.KbDocument;
-import com.jimeng.persistence.mapper.KbDocumentMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * RAG 问答：检索 → 拼上下文 → 复用 ClaudeService 流式输出。
@@ -63,7 +60,7 @@ public class RagAnswerService {
     private final RagProperties ragProperties;
     private final SseServiceUtil sseServiceUtil;
     private final AgentRuntimeService agentRuntimeService;
-    private final KbDocumentMapper kbDocumentMapper;
+    private final CitationAssembler citationAssembler;
 
     public List<SearchResultItem> retrieve(AnswerRequest req) throws Exception {
         int topK = req.getTopK() != null ? req.getTopK() : ragProperties.getRetrieval().getRerankTopK();
@@ -194,32 +191,45 @@ public class RagAnswerService {
 
     public void streamAnswer(AnswerRequest req, String connectionId, String traceId) {
         try {
-            // 检索范围：① 显式 kbId 优先；② 否则取 Agent 绑定的知识库；③ 都没有则纯对话。
-            // 即「配了知识库才走 RAG」，绝不强制检索。
-            RagPlan plan = resolveRagPlan(req);
-            boolean useRag = !plan.kbIds().isEmpty();
-            List<SearchResultItem> hits = useRag ? retrieveForKbs(req, plan) : List.of();
-            // 始终前置发一个 citations 事件（无 KB 时为空数组），保证前端协议一致。
-            // 富化为带 index / docTitle / score 的引用项，前端据此按文档聚合成「参考来源」。
-            sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(toCitations(hits)));
+            // RAG 检索策略（按入参区分两条路）：
+            //  · 显式 kbId（调试台 Playground「挂载知识库测试」直连）→ 保留「前置强制检索」语义：就针对该库检索并前置发 citations。
+            //  · 仅 Agent 绑定知识库（普通对话，无显式 kbId）→ 不再前置强制检索，改由模型在对话循环里按需调用 rag.search（工具式 B）：
+            //    ClaudeService.applyAgentContext 给绑定 KB 的 Agent 注入检索护栏（必检索/零编造/kb_id 已给定），
+            //    SkillRuntimeService 把 rag-knowledge 直注成可立即调用的工具，
+            //    citations 由工具结果经 ToolExecutionResult.CITATIONS_SIDECAR_KEY 旁路在工具轮后上抛（AiConversationLoop）。
+            boolean forcedKbRetrieve = req.getKbId() != null;
+            List<SearchResultItem> hits = List.of();
+            if (forcedKbRetrieve) {
+                hits = retrieveForKbs(req, resolveRagPlan(req));
+                sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(citationAssembler.assemble(hits)));
+            }
 
-            Map<String, Object> body = buildClaudeBody(req, hits, useRag);
+            Map<String, Object> body = buildClaudeBody(req, hits, forcedKbRetrieve);
 
-            // 带 agentId 时加载 Agent 人设/模型/插件上下文：
-            // prepareAgentContext 会把 systemPrompt 前置注入、补默认 model/params，
-            // 并把 AgentContext 设到当前线程（下游工具据此决定可用插件——配了插件才会走）。
+            // 带 agentId 时加载 Agent 人设/模型/插件/知识库上下文：
+            // prepareAgentContext 前置注入 systemPrompt（含绑定 KB 的检索护栏）、补默认 model/params，
+            // 并把 AgentContext 设到当前线程（下游 rag.search 据此兜底 kb_id、插件据此判断可见工具）。
             if (StrUtil.isNotBlank(req.getAgentId())) {
                 body.put("agent_id", req.getAgentId());
                 // preview=调试台读实时草稿；缺省=对话端只读已发布快照（未发布时 prepareAgentContext 抛错 → 走外层 catch 发 error 事件）。
                 body.put("agent_preview", req.isPreview());
+                // 调试台同时传了显式 kbId（已前置强制检索该库）时，抑制 Agent 自身绑定 KB 的检索护栏，
+                // 避免「针对显式库的前置检索」与「指示模型再去检索 Agent 绑定库」两套指令在 Playground 场景打架。
+                if (forcedKbRetrieve) body.put("__suppress_kb_grounding__", Boolean.TRUE);
                 // agent_id 会被 ClaudeService.applyAgentContext 从 body 移除，导致日志层读不到；
                 // 这里同时记到 ThreadLocal，供 AiModelCallRecordService 落库时兜底（含本异步流式线程）。
                 AgentIdContext.set(req.getAgentId());
                 claudeService.prepareAgentContext(body);
+            } else {
+                // 无 agentId：清掉可能由 MdcAsyncSupport 从（被线程池复用的）请求线程继承来的 Agent 上下文，
+                // 否则下游 applySkillContext / RagSkillToolExecutor.resolveKbId 会误读上一个请求残留的 Agent
+                // 绑定（跨请求、甚至跨租户串知识库/插件可见性）；AgentIdContext 同理清掉，避免落库日志记成上个 agent。
+                AgentContext.clear();
+                AgentIdContext.clear();
             }
 
-            log.info("RAG/answer.prompt useRag={} agentId={} citations={} totalChunkChars={} historyTurns={}",
-                    useRag, req.getAgentId(), hits.size(), totalContentChars(hits),
+            log.info("RAG/answer.prompt forcedKbRetrieve={} agentId={} citations={} totalChunkChars={} historyTurns={}",
+                    forcedKbRetrieve, req.getAgentId(), hits.size(), totalContentChars(hits),
                     req.getHistory() == null ? 0 : req.getHistory().size());
 
             claudeService.messagesStream(body, connectionId, traceId);
@@ -273,44 +283,6 @@ public class RagAnswerService {
 
         body.put("messages", messages);
         return body;
-    }
-
-    /**
-     * 把检索命中富化成前端可直接展示的引用项：补 1-based index、文档标题、统一分值（精排分优先，否则 RRF 分）。
-     * kb_document 不在多租户白名单、但 docId 来自已鉴权的知识库检索，按 id 批量取标题即可。
-     */
-    private List<CitationItem> toCitations(List<SearchResultItem> hits) {
-        if (hits == null || hits.isEmpty()) return List.of();
-        List<Long> docIds = hits.stream()
-                .map(SearchResultItem::getDocId)
-                .filter(Objects::nonNull)
-                .distinct()
-                .toList();
-        Map<Long, String> titles = new HashMap<>();
-        if (!docIds.isEmpty()) {
-            try {
-                for (KbDocument d : kbDocumentMapper.selectBatchIds(docIds)) {
-                    titles.put(d.getId(), d.getTitle());
-                }
-            } catch (Exception e) {
-                log.warn("加载引用文档标题失败 docIds={}: {}", docIds, e.getMessage());
-            }
-        }
-        List<CitationItem> out = new ArrayList<>(hits.size());
-        int index = 1;
-        for (SearchResultItem c : hits) {
-            out.add(CitationItem.builder()
-                    .index(index++)
-                    .docId(c.getDocId())
-                    .docTitle(c.getDocId() == null ? null : titles.get(c.getDocId()))
-                    .chunkId(c.getChunkId())
-                    .content(c.getContent())
-                    .headingPath(c.getHeadingPath())
-                    .pageNum(c.getPageNum())
-                    .score(c.getScore())
-                    .build());
-        }
-        return out;
     }
 
     private void logCandidates(String tag, List<SearchResultItem> items, boolean rerankPhase) {
