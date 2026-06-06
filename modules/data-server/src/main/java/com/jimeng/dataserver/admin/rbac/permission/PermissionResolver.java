@@ -32,6 +32,13 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PermissionResolver {
 
+    /**
+     * "全公司可见"哨兵角色 id：{@code sys_role_resource.role_id = 0} 的授权表示该实例对【整个租户】可见，
+     * 不绑定具体角色（部门）。解析任意成员权限时都会并入这些授权，故新建的部门也自动能看到。
+     * 写入方见 {@code ResourceShareService}。
+     */
+    public static final long TENANT_WIDE_ROLE_ID = 0L;
+
     private final SysUserMapper sysUserMapper;
     private final SysUserRoleMapper sysUserRoleMapper;
     private final SysRoleResourceMapper sysRoleResourceMapper;
@@ -70,17 +77,16 @@ public class PermissionResolver {
                     new HashSet<>(PlatformConstant.ALL_MODULES), null, null, null);
         }
 
-        // 成员：取角色 → 取角色的资源授权
+        // 成员：取角色 → 取「角色授权」+「全公司共享授权(哨兵 role_id=0)」的并集。
+        // 哨兵授权不绑部门，对全租户成员可见；即使成员一个角色都没有，也能看到全公司共享的实例。
         List<SysUserRole> userRoles = sysUserRoleMapper.selectList(Wrappers.<SysUserRole>lambdaQuery()
                 .eq(SysUserRole::getTenantId, tenantId)
                 .eq(SysUserRole::getUserId, userId));
-        Set<Long> roleIds = userRoles.stream().map(SysUserRole::getRoleId).collect(Collectors.toSet());
-        if (roleIds.isEmpty()) {
-            return new ResolvedPermissions(false, u.getUserType(), Set.of(), Set.of(), Set.of(), Set.of());
-        }
+        Set<Long> queryRoleIds = userRoles.stream().map(SysUserRole::getRoleId).collect(Collectors.toSet());
+        queryRoleIds.add(TENANT_WIDE_ROLE_ID); // 并入全公司共享
         List<SysRoleResource> grants = sysRoleResourceMapper.selectList(Wrappers.<SysRoleResource>lambdaQuery()
                 .eq(SysRoleResource::getTenantId, tenantId)
-                .in(SysRoleResource::getRoleId, roleIds));
+                .in(SysRoleResource::getRoleId, queryRoleIds));
 
         Set<String> modules = new HashSet<>();
         Set<Long> agentIds = new HashSet<>();

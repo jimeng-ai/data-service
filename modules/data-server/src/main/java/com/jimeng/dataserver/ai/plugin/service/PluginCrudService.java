@@ -69,7 +69,8 @@ public class PluginCrudService {
         } catch (DuplicateKeyException e) {
             // 释放后仍冲突 → 占用者是【活跃】插件。uk_plugin_tenant_code(tenant_id, code)。
             throw new ServiceException(
-                    ExceptionCode.INVALID_REQUEST, "插件代号「" + plugin.getCode() + "」已存在，请换一个");
+                    ExceptionCode.INVALID_REQUEST,
+                    "插件代号「" + plugin.getCode() + "」已被占用（可能属于你无权查看的部门），请换一个");
         }
         // 成员自授权：否则建完插件后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
         creatorGrantService.grantNewResourceToCreator(ResourceType.PLUGIN, plugin.getId());
@@ -163,7 +164,8 @@ public class PluginCrudService {
         } catch (DuplicateKeyException e) {
             // 释放后仍冲突 → 占用者是【活跃】工具。uk_plugin_tool_tenant_name(tenant_id, name)。
             throw new ServiceException(
-                    ExceptionCode.INVALID_REQUEST, "工具名「" + tool.getName() + "」已存在，请换一个");
+                    ExceptionCode.INVALID_REQUEST,
+                    "工具名「" + tool.getName() + "」已被占用（可能属于你无权查看的部门），请换一个");
         }
 
         mapping.setPluginToolId(tool.getId());

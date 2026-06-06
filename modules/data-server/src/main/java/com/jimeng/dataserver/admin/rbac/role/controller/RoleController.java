@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.admin.rbac.role.controller;
 
+import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.admin.rbac.role.dto.RoleUpsertRequest;
 import com.jimeng.dataserver.admin.rbac.role.service.RoleService;
@@ -50,6 +51,13 @@ public class RoleController {
     public List<SysRole> list() {
         String tenantId = superAdminGuard.requireSuperAdmin().getTenantId();
         return roleService.list(tenantId);
+    }
+
+    @Operation(summary = "角色选项（成员可见，供分享/选择部门用）")
+    @GetMapping("/options")
+    public List<SysRole> options() {
+        // 不限超管：普通成员分享资源时需要选择部门(角色)。仅返回本租户角色，按租户隔离。
+        return roleService.list(AdminRequestContext.requireTenantId());
     }
 
     @Operation(summary = "角色详情")

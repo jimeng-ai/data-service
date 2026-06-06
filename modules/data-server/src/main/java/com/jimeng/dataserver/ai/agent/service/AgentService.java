@@ -34,6 +34,9 @@ import java.util.Set;
 @RequiredArgsConstructor
 public class AgentService {
 
+    /** 新建 Agent 的默认模型；须与前端 AVAILABLE_MODELS[0].value 一致。 */
+    private static final String DEFAULT_AGENT_MODEL = "claude-opus-4-7";
+
     private final AgentMapper agentMapper;
     private final AgentPluginMapper agentPluginMapper;
     private final CreatorGrantService creatorGrantService;
@@ -51,6 +54,11 @@ public class AgentService {
         if (!StringUtils.hasText(agent.getStatus())) {
             agent.setStatus("DRAFT");
         }
+        if (!StringUtils.hasText(agent.getModel())) {
+            // 默认模型：新建对话框不填模型，这里兜底落库，避免列表/运行时 model 为空。
+            // 取值须与前端可选项 AVAILABLE_MODELS[0] 保持一致，否则编辑器下拉匹配不上。
+            agent.setModel(DEFAULT_AGENT_MODEL);
+        }
         // 先释放被【软删行】占用的同代号唯一键：逻辑删除(deleted=1)后死行仍占着
         // uk_agent_tenant_code(tenant_id, code)，不释放就无法重建删过的代号（且列表看不到死行）。
         // 无死行时返回 0、无副作用。
@@ -61,7 +69,8 @@ public class AgentService {
             // 释放后仍冲突 → 占用者是【活跃】Agent（可能是同租户其他成员的、当前用户无权见）。
             // 转成业务错误，前端会直接弹出该文案，而不是吞掉 SQL 原始异常。
             throw new ServiceException(
-                    ExceptionCode.INVALID_REQUEST, "Agent 代号「" + agent.getCode() + "」已存在，请换一个");
+                    ExceptionCode.INVALID_REQUEST,
+                    "Agent 代号「" + agent.getCode() + "」已被占用（可能属于你无权查看的部门），请换一个");
         }
         // 成员自授权：否则建完 Agent 后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
         creatorGrantService.grantNewResourceToCreator(ResourceType.AGENT, agent.getId());

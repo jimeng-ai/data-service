@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.agent.controller;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.agent.service.AgentService;
+import com.jimeng.dataserver.admin.common.UserNameResolver;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.Agent;
@@ -35,6 +36,7 @@ public class AgentAdminController {
 
     private final AgentService agentService;
     private final PermissionResolver permissionResolver;
+    private final UserNameResolver userNameResolver;
 
     @Operation(summary = "创建 Agent")
     @PostMapping("/agents")
@@ -56,6 +58,7 @@ public class AgentAdminController {
         List<Agent> agents = permissionResolver.filterCurrent(
                 agentService.list(status), ResourceType.AGENT, Agent::getId);
         agentService.attachDirtyFlag(agents); // 回填 hasUnpublishedChanges（已发布但有未发布草稿）
+        userNameResolver.fillCreatorNames(agents); // 回填创建人显示名
         return agents;
     }
 

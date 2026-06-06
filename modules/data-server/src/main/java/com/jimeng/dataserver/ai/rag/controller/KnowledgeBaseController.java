@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.rag.controller;
 
 import com.jimeng.dataserver.ai.rag.service.KnowledgeBaseService;
+import com.jimeng.dataserver.admin.common.UserNameResolver;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.KnowledgeBase;
@@ -30,6 +31,7 @@ public class KnowledgeBaseController {
 
     private final KnowledgeBaseService kbService;
     private final PermissionResolver permissionResolver;
+    private final UserNameResolver userNameResolver;
 
     @Operation(summary = "创建知识库", description = "新建一个知识库；后续可向该知识库下上传文档")
     @PostMapping
@@ -40,7 +42,10 @@ public class KnowledgeBaseController {
     @Operation(summary = "查询知识库列表", description = "返回当前租户的知识库（成员仅见被授权的）")
     @GetMapping
     public List<KnowledgeBase> list() {
-        return permissionResolver.filterCurrent(kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId);
+        List<KnowledgeBase> kbs = permissionResolver.filterCurrent(
+                kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId);
+        userNameResolver.fillCreatorNames(kbs); // 回填创建人显示名
+        return kbs;
     }
 
     @Operation(summary = "获取知识库详情", description = "按 ID 查询单个知识库的元信息")

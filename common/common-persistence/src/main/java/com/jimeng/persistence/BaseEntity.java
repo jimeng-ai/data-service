@@ -46,4 +46,8 @@ public class BaseEntity implements Serializable {
     @TableField(value = "update_user", fill = FieldFill.INSERT_UPDATE)
     private String updateUser;
 
+    // 创建人显示名（非持久化）：由 create_user(用户id) 解析而来，列表接口按需回填，供前端展示。
+    @TableField(exist = false)
+    private String creatorName;
+
 }

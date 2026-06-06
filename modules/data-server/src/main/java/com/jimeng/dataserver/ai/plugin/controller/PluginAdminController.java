@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.plugin.service.PluginCredentialService;
 import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.plugin.service.PluginHttpInvoker;
 import com.jimeng.dataserver.ai.plugin.service.PluginRegistryService;
+import com.jimeng.dataserver.admin.common.UserNameResolver;
 import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
@@ -47,6 +48,7 @@ public class PluginAdminController {
     private final PluginHttpInvoker httpInvoker;
     private final PermissionResolver permissionResolver;
     private final SuperAdminGuard superAdminGuard;
+    private final UserNameResolver userNameResolver;
 
     // 子资源（工具/映射）端点共用：校验当前账号对父插件有访问权，且 toolId 确实属于该插件，
     // 防止「用自己有权的 pluginId 套别人的 toolId」绕过实例级授权。
@@ -77,7 +79,10 @@ public class PluginAdminController {
     @Operation(summary = "列出当前租户的插件（成员仅见被授权的）")
     @GetMapping("/plugins")
     public List<Plugin> listPlugins(@RequestParam(required = false) String status) {
-        return permissionResolver.filterCurrent(crudService.listPlugins(status), ResourceType.PLUGIN, Plugin::getId);
+        List<Plugin> plugins = permissionResolver.filterCurrent(
+                crudService.listPlugins(status), ResourceType.PLUGIN, Plugin::getId);
+        userNameResolver.fillCreatorNames(plugins); // 回填创建人显示名
+        return plugins;
     }
 
     @Operation(summary = "插件详情")
