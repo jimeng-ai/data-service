@@ -32,6 +32,18 @@ public class ChatMessage extends BaseEntity {
     @TableField("role")
     private String role;
 
+    @Schema(description = "生成状态：GENERATING / COMPLETED / FAILED / CANCELLED；用户消息恒为 COMPLETED")
+    @TableField("status")
+    private String status;
+
+    @Schema(description = "生成运行 id（= SSE connectionId），用于重连续播；仅生成态助手消息有值")
+    @TableField("run_id")
+    private String runId;
+
+    @Schema(description = "生成失败/取消原因（可空）")
+    @TableField("error")
+    private String error;
+
     @Schema(description = "消息正文")
     @TableField("content")
     private String content;

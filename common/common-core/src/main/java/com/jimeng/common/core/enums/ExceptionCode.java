@@ -22,6 +22,7 @@ public enum ExceptionCode {
     REQUEST_ERROR("5006","请求异常"),
     SSE_NOT_FOUND("5008","SSE连接不存在"),
     SSE_SEND_ERROR("5009","SSE消息发送异常"),
+    CONVERSATION_GENERATING("5010","该会话正在生成回复，请稍候"),
     INVALID_REQUEST("5007","无效请求");
 
     private final String resultCode;

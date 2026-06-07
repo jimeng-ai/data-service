@@ -16,7 +16,10 @@ import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
 import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
-import com.jimeng.dataserver.ai.support.SseEventBridge;
+import com.jimeng.dataserver.ai.run.RunEventTee;
+import com.jimeng.dataserver.ai.run.RunFinalizer;
+import com.jimeng.dataserver.ai.run.RunHandle;
+import com.jimeng.dataserver.ai.run.RunRegistry;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.persistence.entity.AgentArtifact;
 import com.jimeng.persistence.entity.AgentExecRun;
@@ -53,7 +56,9 @@ import java.util.concurrent.TimeUnit;
 public class AgentExecService {
 
     private final SidecarClient sidecarClient;
-    private final SseEventBridge sseBridge;
+    private final RunEventTee tee;
+    private final RunFinalizer runFinalizer;
+    private final RunRegistry runRegistry;
     private final AgentSandboxProperties props;
     private final AgentExecRunMapper runMapper;
     private final AgentInputFileMapper inputFileMapper;
@@ -78,8 +83,8 @@ public class AgentExecService {
             try {
                 agentRuntimeService.byId(agentIdForCheck, req.isPreview());
             } catch (Exception e) {
-                sseBridge.send(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
-                sseBridge.complete(connectionId);
+                tee.tee(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
+                runFinalizer.complete(connectionId);
                 return;
             }
         }
@@ -193,14 +198,14 @@ public class AgentExecService {
                 if ("artifact".equals(type)) {
                     // 产物落库（临时设置租户上下文）并改写 downloadUrl 后再转发给前端
                     String enriched = registerArtifactAndEnrich(tenantId, runId, data);
-                    sseBridge.send(connectionId, "artifact", enriched);
+                    tee.tee(connectionId, "artifact", enriched);
                     artifactEvents.add(data);
                     return;
                 }
                 if ("summary".equals(type)) {
                     summaryHolder[0] = data;
                 }
-                sseBridge.send(connectionId, type, data);
+                tee.tee(connectionId, type, data);
             }
 
             @Override
@@ -214,27 +219,30 @@ public class AgentExecService {
                         : ("sidecar http " + (response != null ? response.code() : "?"));
                 streamError[0] = msg;
                 log.error("sidecar 流式失败 runId={} err={}", runId, msg);
-                sseBridge.send(connectionId, "error", new JSONObject().set("message", msg).toString());
+                tee.tee(connectionId, "error", new JSONObject().set("message", msg).toString());
                 latch.countDown();
             }
         };
 
         try {
-            sidecarClient.run(payload, listener);
+            EventSource upstream = sidecarClient.run(payload, listener);
+            // 发布上游句柄，使「停止」能关闭到边车的上游请求（边车据此 docker-kill）。无 run 句柄=直连 /agent/exec，忽略。
+            RunHandle handle = runRegistry.get(connectionId);
+            if (handle != null) handle.setUpstream(upstream);
             boolean done = latch.await(props.getWallClockSec() + 30L, TimeUnit.SECONDS);
             if (!done) {
                 streamError[0] = "timeout";
-                sseBridge.send(connectionId, "error", new JSONObject().set("message", "timeout").toString());
+                tee.tee(connectionId, "error", new JSONObject().set("message", "timeout").toString());
             }
         } catch (Exception e) {
             streamError[0] = e.getMessage();
             log.error("调用边车异常 runId={}", runId, e);
-            sseBridge.send(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
+            tee.tee(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
         } finally {
             // 仍在 streamExecutor 线程，TenantContext 还在，可安全回填
             persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
                     System.currentTimeMillis() - startMs);
-            sseBridge.complete(connectionId);
+            runFinalizer.complete(connectionId);
         }
     }
 

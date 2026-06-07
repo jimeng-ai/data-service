@@ -10,7 +10,10 @@ import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
-import com.jimeng.dataserver.ai.support.SseEventBridge;
+import com.jimeng.dataserver.ai.run.RunEventTee;
+import com.jimeng.dataserver.ai.run.RunFinalizer;
+import com.jimeng.dataserver.ai.run.RunHandle;
+import com.jimeng.dataserver.ai.run.RunRegistry;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
@@ -42,7 +45,9 @@ public class AiConversationLoop {
     private final RequestService requestService;
     private final SkillRuntimeService skillRuntimeService;
     private final AiModelCallRecordService aiModelCallRecordService;
-    private final SseEventBridge sseBridge;
+    private final RunEventTee tee;
+    private final RunFinalizer runFinalizer;
+    private final RunRegistry runRegistry;
     private final LlmCallGuard llmCallGuard;
     private final TraceRecorder traceRecorder;
 
@@ -170,7 +175,10 @@ public class AiConversationLoop {
 
                 try {
                     EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch, streamFailed);
-                    requestService.postStream(url, headers, JSONUtil.toJsonStr(body), listener);
+                    EventSource upstream = requestService.postStream(url, headers, JSONUtil.toJsonStr(body), listener);
+                    // 发布上游句柄到 run 注册表，使「停止」能真正中断本次 LLM 调用（无 run 句柄=调试台直连，忽略）。
+                    RunHandle handle = runRegistry.get(connectionId);
+                    if (handle != null) handle.setUpstream(upstream);
 
                     boolean completed = latch.await(5, TimeUnit.MINUTES);
                     int latency = elapsed(start);
@@ -180,7 +188,7 @@ public class AiConversationLoop {
                         RuntimeException timeout = new RuntimeException("流式请求超时");
                         safeRecordException(logId, timeout, latency);
                         sendError(connectionId, "timeout", "流式请求超时（5分钟）");
-                        sseBridge.complete(connectionId);
+                        runFinalizer.complete(connectionId);
                         return;
                     }
 
@@ -208,7 +216,7 @@ public class AiConversationLoop {
                         logFinalAnswer(connectionId, rc, adapter, responseMap, totalIn, totalOut, elapsed);
                         sendSummary(connectionId, totalIn, totalOut,
                                 toolRound > 0 ? toolRound + 1 : 0, traceId, elapsed);
-                        sseBridge.complete(connectionId);
+                        runFinalizer.complete(connectionId);
                         return;
                     }
 
@@ -227,7 +235,7 @@ public class AiConversationLoop {
                     if (toolRound >= maxToolRounds) {
                         sendError(connectionId, "max_tool_rounds_exceeded",
                                 "tool调用轮次超过限制: " + maxToolRounds);
-                        sseBridge.complete(connectionId);
+                        runFinalizer.complete(connectionId);
                         return;
                     }
 
@@ -238,7 +246,7 @@ public class AiConversationLoop {
                     if (results.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
                         sendSummary(connectionId, totalIn, totalOut, toolRound + 1, traceId, elapsed);
-                        sseBridge.complete(connectionId);
+                        runFinalizer.complete(connectionId);
                         return;
                     }
                     adapter.appendToolResultTurn(body, responseMap, results);
@@ -256,7 +264,7 @@ public class AiConversationLoop {
         } catch (Exception e) {
             log.error("流式处理异常, connectionId={}", connectionId, e);
             sendError(connectionId, e.getClass().getSimpleName(), e.getMessage());
-            sseBridge.complete(connectionId);
+            runFinalizer.complete(connectionId);
         }
     }
 
@@ -291,7 +299,7 @@ public class AiConversationLoop {
         if (toolRounds > 0) summary.put("tool_rounds", toolRounds);
         summary.put("elapsed_seconds", elapsedSeconds);
         if (StrUtil.isNotBlank(traceId)) summary.put("x-trace-id", traceId);
-        sseBridge.sendJson(connectionId, "summary", summary);
+        tee.teeJson(connectionId, "summary", summary);
     }
 
     private void sendProgress(String connectionId, int round, List<ToolUseCall> toolCalls,
@@ -315,7 +323,7 @@ public class AiConversationLoop {
         progress.put("round", round);
         progress.put("tools", toolNames);
         progress.put("calls", calls);
-        sseBridge.sendJson(connectionId, "progress", progress);
+        tee.teeJson(connectionId, "progress", progress);
     }
 
     /** 从请求体 tools 里提取「工具名 → 描述」，兼容 Claude({name,description}) 与 OpenAI({function:{name,description}})。 */
@@ -362,7 +370,7 @@ public class AiConversationLoop {
         Map<String, Object> event = new LinkedHashMap<>();
         event.put("round", round);
         event.put("results", items);
-        sseBridge.sendJson(connectionId, "tool_result", event);
+        tee.teeJson(connectionId, "tool_result", event);
     }
 
     /**
@@ -381,7 +389,7 @@ public class AiConversationLoop {
                 // payload 不可变时剥离失败：放弃剥离（模型会多看到这段引用），但不丢 citations 事件；打日志以便及早发现。
                 log.warn("citations 旁路剥离失败（payload 不可变）tool={} connectionId={}", r.getToolName(), connectionId);
             }
-            sseBridge.sendJson(connectionId, "citations", citations);
+            tee.teeJson(connectionId, "citations", citations);
         }
     }
 
@@ -389,7 +397,7 @@ public class AiConversationLoop {
         Map<String, Object> errorData = new LinkedHashMap<>();
         errorData.put("error", error);
         errorData.put("message", message);
-        sseBridge.sendJson(connectionId, "error", errorData);
+        tee.teeJson(connectionId, "error", errorData);
     }
 
     // ------------------------------------------------------------------ stream listener
@@ -405,7 +413,7 @@ public class AiConversationLoop {
 
             @Override
             public void onEvent(EventSource eventSource, String id, String type, String data) {
-                sseBridge.send(connectionId, adapter.getDeltaEventType(), data);
+                tee.tee(connectionId, adapter.getDeltaEventType(), data);
                 accumulator.accumulateEvent(type, data);
                 if (adapter.isDoneSignal(data)) latch.countDown();
             }

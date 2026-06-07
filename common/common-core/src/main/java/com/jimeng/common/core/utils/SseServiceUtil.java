@@ -83,6 +83,26 @@ public class SseServiceUtil {
     }
 
     /**
+     * 发送带 {@code id} 的 SSE 事件。id 用于客户端断线重连时回传 {@code Last-Event-ID}，
+     * 实现可重连续播（见对话生成的 Redis Stream 续播泵）。
+     */
+    public void sendEvent(String key, String id, String eventName, String data) {
+        SseEmitter sseEmitter = sseManagerMap.get(key);
+        if (sseEmitter == null) {
+            throw new ServiceException(ExceptionCode.SSE_NOT_FOUND, "sse连接不存在");
+        }
+        try {
+            SseEmitter.SseEventBuilder event = SseEmitter.event()
+                    .id(id)
+                    .name(eventName)
+                    .data(data);
+            sseEmitter.send(event);
+        } catch (IOException e) {
+            throw new ServiceException(ExceptionCode.SSE_SEND_ERROR, e.getMessage());
+        }
+    }
+
+    /**
      * 完成 SSE 连接并从管理 Map 中移除
      *
      * @param key SSE 连接标识

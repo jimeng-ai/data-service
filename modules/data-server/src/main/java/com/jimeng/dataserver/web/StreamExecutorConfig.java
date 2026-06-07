@@ -39,4 +39,23 @@ public class StreamExecutorConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * 续播泵专用线程池：每个观众（GET /runs/{id}/stream）占一个线程做短超时阻塞读 Redis Stream。
+     * 与 {@code streamExecutor} 隔离——绝不让阻塞读占用生成线程，也避免生成池的 CallerRunsPolicy
+     * 把阻塞泵压回 Tomcat 线程。容量耗尽时同样 CallerRunsPolicy 兜底（仅在并发观众 &gt; max 时退化）。
+     */
+    @Bean("runPumpExecutor")
+    public ThreadPoolTaskExecutor runPumpExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(64);
+        executor.setQueueCapacity(0);
+        executor.setKeepAliveSeconds(30);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setThreadNamePrefix("run-pump-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
 }

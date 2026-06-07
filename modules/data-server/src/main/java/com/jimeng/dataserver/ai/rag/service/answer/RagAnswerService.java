@@ -2,7 +2,8 @@ package com.jimeng.dataserver.ai.rag.service.answer;
 
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
-import com.jimeng.common.core.utils.SseServiceUtil;
+import com.jimeng.dataserver.ai.run.RunEventTee;
+import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
@@ -58,7 +59,8 @@ public class RagAnswerService {
     private final RerankService rerankService;
     private final ClaudeService claudeService;
     private final RagProperties ragProperties;
-    private final SseServiceUtil sseServiceUtil;
+    private final RunEventTee tee;
+    private final RunFinalizer runFinalizer;
     private final AgentRuntimeService agentRuntimeService;
     private final CitationAssembler citationAssembler;
 
@@ -201,7 +203,7 @@ public class RagAnswerService {
             List<SearchResultItem> hits = List.of();
             if (forcedKbRetrieve) {
                 hits = retrieveForKbs(req, resolveRagPlan(req));
-                sseServiceUtil.sendEvent(connectionId, "citations", JSONUtil.toJsonStr(citationAssembler.assemble(hits)));
+                tee.tee(connectionId, "citations", JSONUtil.toJsonStr(citationAssembler.assemble(hits)));
             }
 
             Map<String, Object> body = buildClaudeBody(req, hits, forcedKbRetrieve);
@@ -239,8 +241,8 @@ public class RagAnswerService {
             err.put("error", e.getClass().getSimpleName());
             err.put("message", e.getMessage());
             try {
-                sseServiceUtil.sendEvent(connectionId, "error", JSONUtil.toJsonStr(err));
-                sseServiceUtil.complete(connectionId);
+                tee.teeJson(connectionId, "error", err);
+                runFinalizer.complete(connectionId);
             } catch (Exception ignore) {}
         }
     }

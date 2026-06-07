@@ -22,7 +22,9 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 对话会话 / 消息持久化。
@@ -38,6 +40,12 @@ public class ChatConversationService {
     private static final String ROLE_ASSISTANT = "assistant";
     private static final String DEFAULT_TITLE = "新对话";
     private static final int TITLE_MAX_LEN = 60;
+    private static final String STATUS_GENERATING = "GENERATING";
+    private static final String STATUS_COMPLETED = "COMPLETED";
+
+    /** 一轮对话落库后返回的两条消息 id。 */
+    public record TurnMessageIds(Long userMessageId, Long assistantMessageId) {
+    }
 
     private final ChatConversationMapper conversationMapper;
     private final ChatMessageMapper messageMapper;
@@ -64,9 +72,29 @@ public class ChatConversationService {
         LambdaQueryWrapper<ChatConversation> wrapper = new LambdaQueryWrapper<ChatConversation>()
                 .orderByDesc(ChatConversation::getLastMessageAt)
                 .orderByDesc(ChatConversation::getId);
+        // 一次查出本租户所有「正在生成」的助手消息，给列表项打上「正在回复」标志（驱动左侧转圈/圆点）。
+        Map<Long, String> activeByConv = activeRunByConversation();
         return conversationMapper.selectList(wrapper).stream()
-                .map(c -> toView(c, null))
+                .map(c -> {
+                    ConversationView v = toView(c, null);
+                    String runId = activeByConv.get(c.getId());
+                    v.setGenerating(runId != null);
+                    v.setActiveRunId(runId);
+                    return v;
+                })
                 .toList();
+    }
+
+    /** 会话 id → 当前在跑的 runId（仅含有 GENERATING 助手消息的会话）。 */
+    private Map<Long, String> activeRunByConversation() {
+        List<ChatMessage> active = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getRole, ROLE_ASSISTANT)
+                .eq(ChatMessage::getStatus, STATUS_GENERATING));
+        Map<Long, String> map = new HashMap<>();
+        for (ChatMessage m : active) {
+            map.putIfAbsent(m.getConversationId(), m.getRunId());
+        }
+        return map;
     }
 
     public ConversationDetail detail(Long id) {
@@ -137,6 +165,87 @@ public class ChatConversationService {
         return toMessageView(m);
     }
 
+    // ------------------------------------------------------------------ 服务端自持久化的一轮对话（/turns）
+
+    /**
+     * 落一轮对话的两条消息：用户消息（COMPLETED）+ 助手占位（GENERATING，带 runId）。
+     * 在生成开始前同步落库并提交，使其后续 GET 重连 / 会话刷新都能看到。
+     */
+    @Transactional
+    public TurnMessageIds insertTurnMessages(Long conversationId, String content, Object attachments, String runId) {
+        ChatConversation c = requireConversation(conversationId);
+        assertAgentAccess(c.getAgentId());
+        if (!StringUtils.hasText(content)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "content 不能为空");
+        }
+        ChatMessage user = new ChatMessage();
+        user.setConversationId(conversationId);
+        user.setRole(ROLE_USER);
+        user.setStatus(STATUS_COMPLETED);
+        user.setContent(content);
+        if (attachments != null) {
+            user.setAttachments(JSONUtil.toJsonStr(attachments));
+        }
+        messageMapper.insert(user);
+
+        ChatMessage assistant = new ChatMessage();
+        assistant.setConversationId(conversationId);
+        assistant.setRole(ROLE_ASSISTANT);
+        assistant.setStatus(STATUS_GENERATING);
+        assistant.setRunId(runId);
+        assistant.setContent("");
+        messageMapper.insert(assistant);
+
+        c.setLastMessageAt(new Date());
+        if (StrUtil.isBlank(c.getTitle()) || DEFAULT_TITLE.equals(c.getTitle())) {
+            c.setTitle(normalizeTitle(content, DEFAULT_TITLE));
+        }
+        conversationMapper.updateById(c);
+        return new TurnMessageIds(user.getId(), assistant.getId());
+    }
+
+    /**
+     * 生成收尾：把助手占位消息更新为最终态。
+     * MyBatis-Plus 默认不更新 null 字段——纯文本回复 segmentsJson=null 不会清掉、成功时 error=null 不会写，符合预期。
+     */
+    public void finalizeAssistant(Long messageId, String status, String content,
+                                  String segmentsJson, String citationsJson, Long elapsedMs, String error) {
+        ChatMessage m = new ChatMessage();
+        m.setId(messageId);
+        m.setStatus(status);
+        m.setContent(content == null ? "" : content);
+        m.setSegments(segmentsJson);
+        m.setCitations(citationsJson);
+        m.setElapsedMs(elapsedMs);
+        m.setError(error);
+        messageMapper.updateById(m);
+    }
+
+    /** 该会话当前是否有正在生成的助手回复（单活跃兜底校验）。 */
+    public boolean hasActiveGeneration(Long conversationId) {
+        Long n = messageMapper.selectCount(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getRole, ROLE_ASSISTANT)
+                .eq(ChatMessage::getStatus, STATUS_GENERATING));
+        return n != null && n > 0;
+    }
+
+    /** 校验当前账号对会话所属 Agent 有访问权，返回会话。供 /turns、/runs 重连/取消鉴权复用。 */
+    public ChatConversation requireConversationWithAccess(Long id) {
+        ChatConversation c = requireConversation(id);
+        assertAgentAccess(c.getAgentId());
+        return c;
+    }
+
+    /** 据 runId 反查所属会话 id（即使生成已结束、消息已落终态仍可查到）。 */
+    public Long conversationIdOfRun(String runId) {
+        if (StrUtil.isBlank(runId)) return null;
+        List<ChatMessage> ms = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getRunId, runId)
+                .last("limit 1"));
+        return ms.isEmpty() ? null : ms.get(0).getConversationId();
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /** 校验当前账号对会话所属 Agent 有访问权；超管放行。agentId 非数字（历史脏数据）则跳过，避免误伤。 */
@@ -191,6 +300,9 @@ public class ChatConversationService {
         v.setSegments(StrUtil.isBlank(m.getSegments()) ? null : JSONUtil.parse(m.getSegments()));
         v.setAttachments(StrUtil.isBlank(m.getAttachments()) ? null : JSONUtil.parse(m.getAttachments()));
         v.setElapsedMs(m.getElapsedMs());
+        v.setStatus(m.getStatus());
+        v.setRunId(m.getRunId());
+        v.setError(m.getError());
         v.setCreateTime(m.getCreateTime());
         return v;
     }

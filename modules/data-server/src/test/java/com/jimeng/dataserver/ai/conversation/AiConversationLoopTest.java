@@ -6,7 +6,9 @@ import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
-import com.jimeng.dataserver.ai.support.SseEventBridge;
+import com.jimeng.dataserver.ai.run.RunEventTee;
+import com.jimeng.dataserver.ai.run.RunFinalizer;
+import com.jimeng.dataserver.ai.run.RunRegistry;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.service.SkillRuntimeService;
@@ -38,7 +40,9 @@ class AiConversationLoopTest {
     private RequestService requestService;
     private SkillRuntimeService skillRuntimeService;
     private AiModelCallRecordService recordService;
-    private SseEventBridge sseBridge;
+    private RunEventTee tee;
+    private RunFinalizer runFinalizer;
+    private RunRegistry runRegistry;
     private LlmCallGuard llmCallGuard;
     private TraceRecorder traceRecorder;
     private AiConversationLoop loop;
@@ -57,10 +61,12 @@ class AiConversationLoopTest {
         requestService = mock(RequestService.class);
         skillRuntimeService = mock(SkillRuntimeService.class);
         recordService = mock(AiModelCallRecordService.class);
-        sseBridge = mock(SseEventBridge.class);
+        tee = mock(RunEventTee.class);
+        runFinalizer = mock(RunFinalizer.class);
+        runRegistry = mock(RunRegistry.class);
         llmCallGuard = mock(LlmCallGuard.class);
         traceRecorder = mock(TraceRecorder.class);
-        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, sseBridge, llmCallGuard, traceRecorder);
+        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, tee, runFinalizer, runRegistry, llmCallGuard, traceRecorder);
         ReflectionTestUtils.setField(loop, "maxToolRounds", 3);
         when(recordService.recordRequest(any(), any(), anyString(), anyString(), anyString())).thenReturn(1L);
     }

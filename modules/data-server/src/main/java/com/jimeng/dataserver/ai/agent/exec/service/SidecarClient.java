@@ -6,6 +6,7 @@ import com.jimeng.common.core.service.RequestService;
 import com.jimeng.dataserver.ai.agent.exec.config.AgentSandboxProperties;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import lombok.RequiredArgsConstructor;
+import okhttp3.sse.EventSource;
 import okhttp3.sse.EventSourceListener;
 import org.springframework.stereotype.Service;
 
@@ -20,13 +21,14 @@ public class SidecarClient {
     private final RequestService requestService;
     private final AgentSandboxProperties props;
 
-    public void run(SidecarRunPayload payload, EventSourceListener listener) {
+    /** 返回底层 {@link EventSource}，供取消时关闭到边车的上游请求（边车据此 docker-kill）。 */
+    public EventSource run(SidecarRunPayload payload, EventSourceListener listener) {
         Map<String, String> headers = new HashMap<>();
         headers.put("Content-Type", "application/json");
         if (StrUtil.isNotBlank(props.getServiceToken())) {
             headers.put("x-service-token", props.getServiceToken());
         }
         String url = StrUtil.removeSuffix(props.getBaseUrl(), "/") + "/sandbox/run";
-        requestService.postStream(url, headers, JSONUtil.toJsonStr(payload), listener);
+        return requestService.postStream(url, headers, JSONUtil.toJsonStr(payload), listener);
     }
 }

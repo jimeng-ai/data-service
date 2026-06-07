@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import okhttp3.internal.sse.RealEventSource;
+import okhttp3.sse.EventSource;
 import okhttp3.sse.EventSourceListener;
 import org.springframework.stereotype.Service;
 
@@ -60,7 +61,14 @@ public class RequestService {
         }
     }
 
-    public void postStream(String url, Map<String, String> header, String requestBody, EventSourceListener eventSourceListener) {
+    /**
+     * 发起一条 SSE 流式请求，返回底层 {@link EventSource} 句柄。
+     *
+     * <p>返回句柄供编排层在「用户点停止 / 取消」时 {@link EventSource#cancel()} 真正中断上游
+     * LLM 调用（对话）或关闭到沙箱边车的上游请求（沙箱据此 docker-kill）。历史调用方忽略返回值即可，
+     * 行为不变。
+     */
+    public EventSource postStream(String url, Map<String, String> header, String requestBody, EventSourceListener eventSourceListener) {
         log.info("发送流式http请求: {} -> {}", url, requestBody);
         final Request.Builder requestBuilder = new Request.Builder();
         requestBuilder.url(url);
@@ -70,6 +78,7 @@ public class RequestService {
         Request request = requestBuilder.post(RequestBody.create(MediaType.get("application/json"), requestBody)).build();
         RealEventSource realEventSource = new RealEventSource(request, eventSourceListener);
         realEventSource.connect(okHttpClient);
+        return realEventSource;
     }
 
     private String buildUrl(String url, Map<String, Object> params) {
