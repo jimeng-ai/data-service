@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.rag.service.search;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import com.jimeng.dataserver.ai.rag.model.SearchResultItem;
 import com.jimeng.dataserver.ai.rag.service.embed.EmbeddingService;
@@ -36,9 +37,11 @@ public class HybridSearchService {
     private final RestClient restClient;
     private final RagProperties ragProperties;
     private final EmbeddingService embeddingService;
+    private final TraceRecorder traceRecorder;
 
     public List<SearchResultItem> search(Long kbId, String query, List<Long> docIds, int topK) throws IOException {
         if (query == null || query.isBlank()) return Collections.emptyList();
+        long start = System.currentTimeMillis();
         float[] qVec = embeddingService.embedOne(query);
         RagProperties.Retrieval r = ragProperties.getRetrieval();
         String index = ragProperties.getElasticsearch().getIndexName();
@@ -48,7 +51,9 @@ public class HybridSearchService {
         List<SearchResultItem> bm25Hits = executeSearch(index, buildBm25Body(query, filters, r.getBm25TopK()));
         List<SearchResultItem> knnHits = executeSearch(index, buildKnnBody(qVec, filters, r.getVectorTopK()));
 
-        return rrfMerge(bm25Hits, knnHits, r.getRrfRankConstant(), topK);
+        List<SearchResultItem> merged = rrfMerge(bm25Hits, knnHits, r.getRrfRankConstant(), topK);
+        traceRecorder.recordKbSearch("KB#" + kbId, topK, merged.size(), System.currentTimeMillis() - start);
+        return merged;
     }
 
     // ------------------------------------------------------------------ filters

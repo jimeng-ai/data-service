@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.jimeng.persistence.mapper.AiTraceMapper">
+
+    <!--
+      概览统计。ai_trace 在多租户白名单内：
+        - 租户侧（jm-agent-front）调用时拦截器自动注入 tenant_id 过滤，tenantId 入参传 null 即可；
+        - 运营侧（jm-operator）用 runAsSystem 跨租户，可选传 tenantId 收窄到单个企业。
+    -->
+    <select id="selectOverview" resultType="java.util.Map">
+        SELECT
+            COUNT(*)                                                          AS totalCalls,
+            COALESCE(AVG(total_latency_ms), 0)                                AS avgLatencyMs,
+            COALESCE(SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END), 0)    AS errorCalls
+        FROM ai_trace
+        WHERE deleted = 0
+        <if test="tenantId != null and tenantId != ''">
+            AND tenant_id = #{tenantId}
+        </if>
+        <if test="start != null">
+            AND create_time &gt;= #{start}
+        </if>
+        <if test="end != null">
+            AND create_time &lt; #{end}
+        </if>
+    </select>
+
+</mapper>

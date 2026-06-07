@@ -31,6 +31,10 @@ public class KbDocument extends BaseEntity {
     @TableField("file_hash")
     private String fileHash;
 
+    /** 文件大小（字节） */
+    @TableField("file_size")
+    private Long fileSize;
+
     /** UPLOADED / PARSING / CHUNKING / CONTEXTUALIZING / EMBEDDING / DONE / FAILED */
     @TableField("status")
     private String status;

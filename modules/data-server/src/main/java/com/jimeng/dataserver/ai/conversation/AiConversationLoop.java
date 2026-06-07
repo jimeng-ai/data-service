@@ -7,6 +7,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.support.SseEventBridge;
@@ -43,6 +44,7 @@ public class AiConversationLoop {
     private final AiModelCallRecordService aiModelCallRecordService;
     private final SseEventBridge sseBridge;
     private final LlmCallGuard llmCallGuard;
+    private final TraceRecorder traceRecorder;
 
     @Value("${skill.max-tool-rounds:10}")
     private int maxToolRounds;
@@ -82,6 +84,9 @@ public class AiConversationLoop {
 
                 Object parsed = tryParseJson(resp.getBody());
                 if (!isSuccess(resp.getStatusCode()) || !skillApplyResult.isEnabled()) {
+                    boolean ok = isSuccess(resp.getStatusCode());
+                    traceRecorder.recordLlm(logId, "推理·生成回答", modelOf(body, rc),
+                            null, null, null, latency, ok, ok ? null : resp.getBody());
                     return parsed;
                 }
 
@@ -93,6 +98,9 @@ public class AiConversationLoop {
                 totalOut += usage[1];
 
                 List<ToolUseCall> toolCalls = adapter.extractToolUseCalls(responseMap);
+                traceRecorder.recordLlm(logId,
+                        toolCalls.isEmpty() ? "推理·生成回答" : "推理·决定调用工具",
+                        modelOf(body, rc), usage[0], usage[1], null, latency, true, null);
                 if (toolCalls.isEmpty()) {
                     if (toolRound > 0) {
                         return adapter.buildAggregatedResponse(responseMap, totalIn, totalOut, toolRound + 1, traceId);
@@ -186,6 +194,10 @@ public class AiConversationLoop {
 
                     Map<String, Object> responseMap = accumulator.buildResponseMap();
                     List<ToolUseCall> toolCalls = adapter.extractToolUseCalls(responseMap);
+                    boolean hasTools = skillApplyResult.isEnabled() && !toolCalls.isEmpty();
+                    traceRecorder.recordLlm(logId, hasTools ? "推理·决定调用工具" : "推理·生成回答",
+                            modelOf(body, rc), accumulator.getInputTokens(), accumulator.getOutputTokens(),
+                            null, latency, !streamFailed.get(), null);
 
                     if (!skillApplyResult.isEnabled() || toolCalls.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
@@ -512,5 +524,14 @@ public class AiConversationLoop {
 
     private int elapsed(long startMs) {
         return Math.toIntExact(System.currentTimeMillis() - startMs);
+    }
+
+    /** 取本轮实际使用的模型名：请求体 model 优先，回退调用配置的 defaultModel。 */
+    private String modelOf(Map<String, Object> body, CallRecordConfig rc) {
+        Object m = body == null ? null : body.get("model");
+        if (m != null && StrUtil.isNotBlank(m.toString())) {
+            return m.toString();
+        }
+        return rc == null ? null : rc.defaultModel();
     }
 }

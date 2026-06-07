@@ -520,4 +520,69 @@ CREATE TABLE IF NOT EXISTS `sys_user_role` (
     KEY `idx_user_role_user` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='成员-角色绑定';
 
+-- ============================ 调用链路 Trace（见 V20260610__ai_trace.sql）============================
+CREATE TABLE IF NOT EXISTS `ai_trace` (
+    `id`                  BIGINT NOT NULL COMMENT '主键，MyBatis-Plus 雪花算法生成',
+    `trace_id`            VARCHAR(128) NOT NULL COMMENT '链路追踪 ID（与 ai_model_call_log.trace_id 同源）',
+    `tenant_id`           VARCHAR(64) DEFAULT NULL COMMENT '租户 ID',
+    `user_id`             VARCHAR(64) DEFAULT NULL COMMENT '用户 ID',
+    `agent_id`            BIGINT DEFAULT NULL COMMENT 'Agent ID',
+    `agent_name`          VARCHAR(255) DEFAULT NULL COMMENT 'Agent 名称（落库冗余）',
+    `biz_type`            VARCHAR(64) DEFAULT NULL COMMENT '业务类型',
+    `scene_code`          VARCHAR(64) DEFAULT NULL COMMENT '场景编码',
+    `status`              VARCHAR(16) NOT NULL DEFAULT 'SUCCESS' COMMENT 'SUCCESS / WARN / ERROR',
+    `step_count`          INT NOT NULL DEFAULT 0 COMMENT '步骤数',
+    `total_latency_ms`    BIGINT NOT NULL DEFAULT 0 COMMENT '各步骤耗时累加，毫秒',
+    `total_input_tokens`  BIGINT NOT NULL DEFAULT 0 COMMENT '输入 token 累加',
+    `total_output_tokens` BIGINT NOT NULL DEFAULT 0 COMMENT '输出 token 累加',
+    `total_tokens`        BIGINT NOT NULL DEFAULT 0 COMMENT '总 token 累加',
+    `total_cost_usd`      DECIMAL(18,8) NOT NULL DEFAULT 0 COMMENT '成本累加，美元',
+    `start_time`          DATETIME(3) DEFAULT NULL COMMENT '首个步骤开始时间',
+    `end_time`            DATETIME(3) DEFAULT NULL COMMENT '末个步骤结束时间',
+    `error_msg`           TEXT DEFAULT NULL COMMENT '最后一条错误信息',
+    `deleted`             TINYINT(1) NOT NULL DEFAULT 0 COMMENT '逻辑删除',
+    `create_time`         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`         VARCHAR(64) DEFAULT NULL COMMENT '创建人',
+    `update_time`         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`         VARCHAR(64) DEFAULT NULL COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_ai_trace_trace_id` (`trace_id`),
+    KEY `idx_ai_trace_tenant_time` (`tenant_id`, `create_time`),
+    KEY `idx_ai_trace_agent` (`agent_id`),
+    KEY `idx_ai_trace_status` (`status`),
+    KEY `idx_ai_trace_create_time` (`create_time`),
+    KEY `idx_ai_trace_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='调用链路 Trace 头表';
+
+CREATE TABLE IF NOT EXISTS `ai_trace_step` (
+    `id`            BIGINT NOT NULL COMMENT '主键，MyBatis-Plus 雪花算法生成',
+    `trace_id`      VARCHAR(128) NOT NULL COMMENT '所属 trace',
+    `tenant_id`     VARCHAR(64) DEFAULT NULL COMMENT '租户 ID',
+    `user_id`       VARCHAR(64) DEFAULT NULL COMMENT '用户 ID',
+    `step_index`    INT NOT NULL DEFAULT 0 COMMENT '在 trace 内的有序序号，从 0 开始',
+    `step_type`     VARCHAR(32) NOT NULL COMMENT 'LLM / KB_SEARCH / RERANK / TOOL_CALL / PLUGIN_TRIGGER',
+    `title`         VARCHAR(255) DEFAULT NULL COMMENT '步骤主标题',
+    `sub_title`     VARCHAR(512) DEFAULT NULL COMMENT '步骤副标题',
+    `model`         VARCHAR(128) DEFAULT NULL COMMENT '模型名',
+    `duration_ms`   INT DEFAULT NULL COMMENT '步骤耗时，毫秒',
+    `input_tokens`  INT DEFAULT NULL COMMENT '输入 token',
+    `output_tokens` INT DEFAULT NULL COMMENT '输出 token',
+    `total_tokens`  INT DEFAULT NULL COMMENT '总 token',
+    `cost_usd`      DECIMAL(18,8) DEFAULT NULL COMMENT '成本，美元',
+    `status`        VARCHAR(16) NOT NULL DEFAULT 'SUCCESS' COMMENT 'SUCCESS / WARN / ERROR',
+    `error_msg`     TEXT DEFAULT NULL COMMENT '错误信息',
+    `ref_log_id`    BIGINT DEFAULT NULL COMMENT '关联 ai_model_call_log.id',
+    `metadata`      JSON DEFAULT NULL COMMENT '扩展字段',
+    `step_time`     DATETIME(3) DEFAULT NULL COMMENT '步骤开始时间',
+    `deleted`       TINYINT(1) NOT NULL DEFAULT 0 COMMENT '逻辑删除',
+    `create_time`   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `create_user`   VARCHAR(64) DEFAULT NULL COMMENT '创建人',
+    `update_time`   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    `update_user`   VARCHAR(64) DEFAULT NULL COMMENT '修改人',
+    PRIMARY KEY (`id`),
+    KEY `idx_ai_trace_step_trace` (`trace_id`, `step_index`),
+    KEY `idx_ai_trace_step_type` (`step_type`),
+    KEY `idx_ai_trace_step_deleted` (`deleted`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='调用链路 Trace 步骤明细表';
+
 SET FOREIGN_KEY_CHECKS = 1;

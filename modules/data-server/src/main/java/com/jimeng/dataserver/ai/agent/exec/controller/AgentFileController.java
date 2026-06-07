@@ -13,8 +13,6 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
-import org.springframework.core.io.InputStreamResource;
-import org.springframework.core.io.Resource;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -25,6 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
@@ -60,7 +59,7 @@ public class AgentFileController {
 
     @Operation(summary = "预览输入文件", description = "按 fileId（租户隔离）从 MinIO 流式回传输入文件，Content-Disposition: inline 供前端缩略图/预览。")
     @GetMapping("/files/{fileId}")
-    public Resource previewInputFile(@PathVariable Long fileId, HttpServletResponse response) throws Exception {
+    public void previewInputFile(@PathVariable Long fileId, HttpServletResponse response) throws Exception {
         AgentInputFile f = inputFileMapper.selectById(fileId);
         if (f == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在");
@@ -71,13 +70,15 @@ public class AgentFileController {
                 StandardCharsets.UTF_8).replace("+", "%20");
         // inline：图片/PDF/文本浏览器可内联预览；前端也可 fetch 取 blob 自行渲染（xlsx/docx）。
         response.setHeader("Content-Disposition", "inline; filename*=UTF-8''" + fn);
-        InputStream is = storage.download(f.getObjectName());
-        return new InputStreamResource(is);
+        // 必须 void+OutputStream 写出：非 void 返回会被 GlobalResponseHandler 包成 JSON、Content-Type
+        // 变 application/json，前端 blob 损坏（图片靠 <img> 嗅探侥幸可用，PDF/Excel 直接乱码）。
+        // 详见 jm-binary-download-response-wrapping 记忆。
+        writeStream(storage.download(f.getObjectName()), response);
     }
 
     @Operation(summary = "下载产物文件", description = "按 artifactId（租户隔离）从 MinIO 流式回传产物。")
     @GetMapping("/artifacts/{artifactId}/download")
-    public Resource download(@PathVariable Long artifactId, HttpServletResponse response) throws Exception {
+    public void download(@PathVariable Long artifactId, HttpServletResponse response) throws Exception {
         AgentArtifact a = artifactMapper.selectById(artifactId);
         if (a == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "产物不存在");
@@ -88,8 +89,15 @@ public class AgentFileController {
                 StandardCharsets.UTF_8).replace("+", "%20");
         response.setHeader("Content-Disposition", "attachment; filename*=UTF-8''" + fn);
         // 产物与输入文件统一落在 RagMinioStorageService 的 bucket（data-service 通过 payload
-        // 告诉边车用同一个 bucket），故这里直接用它下载。
-        InputStream is = storage.download(a.getObjectName());
-        return new InputStreamResource(is);
+        // 告诉边车用同一个 bucket），故这里直接用它下载。void+OutputStream 同上避免 JSON 包装。
+        writeStream(storage.download(a.getObjectName()), response);
+    }
+
+    /** 把 MinIO 输入流原样写到响应输出流（自动关闭两端）。 */
+    private static void writeStream(InputStream in, HttpServletResponse response) throws Exception {
+        try (InputStream is = in; OutputStream out = response.getOutputStream()) {
+            is.transferTo(out);
+            out.flush();
+        }
     }
 }

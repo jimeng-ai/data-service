@@ -54,6 +54,13 @@ public class RagSkillToolExecutor implements SkillToolExecutor {
     }
 
     @Override
+    public String traceStepType() {
+        // RAG 检索/精排已在 HybridSearchService / RerankService 内部埋点（KB_SEARCH / RERANK），
+        // 注册中心跳过，避免重复记录。
+        return null;
+    }
+
+    @Override
     public Object execute(String toolName, Map<String, Object> input) {
         String n = norm(toolName);
         try {

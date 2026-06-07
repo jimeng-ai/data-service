@@ -39,6 +39,9 @@ class JimengTenantLineHandlerTest {
         assertFalse(handler.ignoreTable("plugin_credential"));
         assertFalse(handler.ignoreTable("agent"));
         assertFalse(handler.ignoreTable("agent_plugin"));
+        assertFalse(handler.ignoreTable("knowledge_base"));
+        assertFalse(handler.ignoreTable("ai_trace"));
+        assertFalse(handler.ignoreTable("ai_trace_step"));
         // 大小写不敏感
         assertFalse(handler.ignoreTable("Plugin"));
     }
@@ -46,8 +49,8 @@ class JimengTenantLineHandlerTest {
     @Test
     void ignoreTable_otherTablesReturnTrue() {
         assertTrue(handler.ignoreTable("poi_category_dict"));
+        // ai_model_call_log 刻意不在白名单：聚合查询显式带 tenant_id，避免拦截器改写自定义 SQL。
         assertTrue(handler.ignoreTable("ai_model_call_log"));
-        assertTrue(handler.ignoreTable("knowledge_base"));
         assertTrue(handler.ignoreTable("kb_chunk"));
         assertTrue(handler.ignoreTable("random_unknown_table"));
     }

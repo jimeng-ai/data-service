@@ -39,7 +39,9 @@ public class JimengTenantLineHandler implements TenantLineHandler {
             "knowledge_base",
             "agent_exec_run",
             "agent_input_file",
-            "agent_artifact"
+            "agent_artifact",
+            "ai_trace",
+            "ai_trace_step"
     )));
 
     /** 防御性兜底租户 ID：当 TenantContext 缺失但表又是租户隔离表时，用这个值让查询命不中任何真实数据。 */

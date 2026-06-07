@@ -36,6 +36,11 @@ public class HttpPluginToolExecutor implements SkillToolExecutor {
     }
 
     @Override
+    public String traceStepType() {
+        return "PLUGIN_TRIGGER";
+    }
+
+    @Override
     public Object execute(String toolName, Map<String, Object> input) {
         String tenantId = TenantContext.get();
         if (tenantId == null) {

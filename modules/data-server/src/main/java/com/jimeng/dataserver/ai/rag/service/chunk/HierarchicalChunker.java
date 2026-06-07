@@ -10,7 +10,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -91,7 +93,9 @@ public class HierarchicalChunker {
                 String w = windows.get(i);
                 if (i > 0 && cfg.getOverlapTokens() > 0) {
                     String overlap = tailTokens(windows.get(i - 1), cfg.getOverlapTokens());
-                    w = overlap + " " + w;
+                    // 用 \n 拼接 overlap 与本窗口：行结构文本（表格/代码）的 overlap 是整行，
+                    // 换行拼接才能让边界行各自独立、不被空格黏成一行（如 "...BP PetroChina 序号: 10"）。
+                    w = overlap + "\n" + w;
                 }
                 out.add(buildTextChunk(w, buffer, tokenCounter.count(w)));
             }
@@ -226,12 +230,26 @@ public class HierarchicalChunker {
         return out;
     }
 
-    /** 取 text 末尾约 N 个 token 的子串作为下一窗口前缀 */
+    /** 取 text 末尾约 N 个 token 作为下一窗口前缀 */
     private String tailTokens(String text, int approxTokens) {
         if (StrUtil.isBlank(text) || approxTokens <= 0) return "";
         int totalTokens = tokenCounter.count(text);
         if (totalTokens <= approxTokens) return text;
-        // 字符近似：cl100k 中文约 1 token ≈ 1.5 字符，英文 ≈ 4 字符。取保守 3 字符/token 估算
+        // 行结构文本（表格/代码：每行自带表头「列名: 值」）按【整行】取尾——从末尾逐行累加到 ≈approxTokens，
+        // 绝不从行中间截断，否则 overlap 会丢掉行首列名（如只剩 "小类: 东方 | ..."，没了 序号/NEW_TYPE）。
+        if (text.indexOf('\n') >= 0) {
+            String[] lines = text.split("\n", -1);
+            Deque<String> picked = new ArrayDeque<>();
+            int acc = 0;
+            for (int i = lines.length - 1; i >= 0; i--) {
+                int lt = tokenCounter.count(lines[i]);
+                if (acc + lt > approxTokens && !picked.isEmpty()) break;
+                picked.addFirst(lines[i]);
+                acc += lt;
+            }
+            return String.join("\n", picked);
+        }
+        // 纯文本（无行结构）：字符近似取尾。cl100k 中文约 1 token≈1.5 字符、英文≈4，保守按 3 字符/token。
         int approxChars = approxTokens * 3;
         int start = Math.max(0, text.length() - approxChars);
         return text.substring(start);

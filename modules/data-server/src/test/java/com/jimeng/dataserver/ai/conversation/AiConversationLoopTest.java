@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.conversation;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.support.SseEventBridge;
@@ -39,6 +40,7 @@ class AiConversationLoopTest {
     private AiModelCallRecordService recordService;
     private SseEventBridge sseBridge;
     private LlmCallGuard llmCallGuard;
+    private TraceRecorder traceRecorder;
     private AiConversationLoop loop;
     private final ClaudeProtocolAdapter adapter = new ClaudeProtocolAdapter();
 
@@ -57,7 +59,8 @@ class AiConversationLoopTest {
         recordService = mock(AiModelCallRecordService.class);
         sseBridge = mock(SseEventBridge.class);
         llmCallGuard = mock(LlmCallGuard.class);
-        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, sseBridge, llmCallGuard);
+        traceRecorder = mock(TraceRecorder.class);
+        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, sseBridge, llmCallGuard, traceRecorder);
         ReflectionTestUtils.setField(loop, "maxToolRounds", 3);
         when(recordService.recordRequest(any(), any(), anyString(), anyString(), anyString())).thenReturn(1L);
     }

@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
+import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
 import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
@@ -28,17 +29,20 @@ public class RerankService {
     private final AiModelCallRecordService recordService;
     private final UsageExtractor usageExtractor;
     private final TokenCounter tokenCounter;
+    private final TraceRecorder traceRecorder;
 
     // @Lazy 打破循环：ProviderRegistry → ChatClient → AiConversationLoop → SkillRuntimeService
     //   → SkillToolExecutorRegistryService → RagSkillToolExecutor → RerankService → ProviderRegistry
     public RerankService(@Lazy ProviderRegistry providerRegistry,
                          AiModelCallRecordService recordService,
                          UsageExtractor usageExtractor,
-                         TokenCounter tokenCounter) {
+                         TokenCounter tokenCounter,
+                         TraceRecorder traceRecorder) {
         this.providerRegistry = providerRegistry;
         this.recordService = recordService;
         this.usageExtractor = usageExtractor;
         this.tokenCounter = tokenCounter;
+        this.traceRecorder = traceRecorder;
     }
 
     public List<SearchResultItem> rerank(String query, List<SearchResultItem> candidates, int topK) {
@@ -56,7 +60,8 @@ public class RerankService {
         }
         // 计费：rerank 按 token 收费（query + 所有候选文档）。响应带 usage 就用真实值，
         // 不带就用 jtokkit 估算；落一行 rag_rerank。记账失败不影响检索主流程。
-        safeRecord(result, query, docs, (int) (System.currentTimeMillis() - start));
+        int latencyMs = (int) (System.currentTimeMillis() - start);
+        safeRecord(result, query, docs, latencyMs);
 
         List<RerankHit> hits = result.hits();
         List<SearchResultItem> out = new ArrayList<>(hits.size());
@@ -66,6 +71,7 @@ public class RerankService {
             item.setRerankScore(h.getRelevanceScore());
             out.add(item);
         }
+        traceRecorder.recordRerank(result.model(), out.size(), candidates.size(), latencyMs);
         return out;
     }
 

@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.skill.service;
 
 import cn.hutool.core.util.StrUtil;
+import com.jimeng.dataserver.ai.billing.TraceRecorder;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
 import lombok.RequiredArgsConstructor;
@@ -18,6 +19,7 @@ import java.util.Map;
 public class SkillToolExecutorRegistryService {
 
     private final List<SkillToolExecutor> executors;
+    private final TraceRecorder traceRecorder;
 
     public List<ToolExecutionResult> executeAll(List<ToolUseCall> calls) {
         List<ToolExecutionResult> results = new ArrayList<>();
@@ -39,11 +41,14 @@ public class SkillToolExecutorRegistryService {
                 continue;
             }
 
+            long start = System.currentTimeMillis();
             try {
                 Object payload = executor.execute(toolName, call.getInput());
+                recordTraceStep(executor, toolName, true, null, System.currentTimeMillis() - start);
                 results.add(new ToolExecutionResult(call.getToolUseId(), toolName, true, payload));
             } catch (Exception e) {
                 log.warn("tool执行失败, name={}, error={}", toolName, e.getMessage());
+                recordTraceStep(executor, toolName, false, e.getMessage(), System.currentTimeMillis() - start);
                 Map<String, Object> errorPayload = new LinkedHashMap<>();
                 errorPayload.put("error", "tool_execution_failed");
                 errorPayload.put("message", e.getMessage());
@@ -51,6 +56,23 @@ public class SkillToolExecutorRegistryService {
             }
         }
         return results;
+    }
+
+    /**
+     * 把一次工具执行记入调用链路 Trace。步骤类型由执行器声明（{@link SkillToolExecutor#traceStepType()}）：
+     * PLUGIN_TRIGGER → 插件步骤；TOOL_CALL → 普通工具步骤；null → 跳过（RAG 自行埋点）。
+     */
+    private void recordTraceStep(SkillToolExecutor executor, String toolName,
+                                 boolean ok, String errorMsg, long durationMs) {
+        String type = executor.traceStepType();
+        if (type == null) {
+            return;
+        }
+        if ("PLUGIN_TRIGGER".equals(type)) {
+            traceRecorder.recordPlugin(toolName, null, durationMs, ok, errorMsg);
+        } else {
+            traceRecorder.recordTool(toolName, null, null, durationMs, ok, errorMsg);
+        }
     }
 
     private SkillToolExecutor findExecutor(String toolName) {
