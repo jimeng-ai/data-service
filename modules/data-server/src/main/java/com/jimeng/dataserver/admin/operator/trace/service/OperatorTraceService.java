@@ -6,6 +6,8 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.trace.dto.TraceOverview;
+import com.jimeng.dataserver.ai.trace.dto.TraceReplay;
+import com.jimeng.dataserver.ai.trace.service.TraceReplayService;
 import com.jimeng.dataserver.ai.trace.service.TraceSupport;
 import com.jimeng.persistence.entity.AiTrace;
 import com.jimeng.persistence.entity.AiTraceStep;
@@ -38,6 +40,7 @@ public class OperatorTraceService {
     private final AiTraceMapper aiTraceMapper;
     private final AiTraceStepMapper aiTraceStepMapper;
     private final SysEnterpriseMapper sysEnterpriseMapper;
+    private final TraceReplayService traceReplayService;
 
     /** 跨租户分页列表，回填企业名称。 */
     public Page<AiTrace> page(int page, int size, Date start, Date end,
@@ -70,6 +73,11 @@ public class OperatorTraceService {
             trace.setSteps(steps);
             return trace;
         });
+    }
+
+    /** 跨租户可视化回放：runAsSystem 加载 trace（含企业名 + 步骤）后交给共用还原逻辑。 */
+    public TraceReplay replay(String traceId) {
+        return TenantContext.runAsSystem(() -> traceReplayService.buildReplay(detail(traceId)));
     }
 
     /** 全平台（或单企业）概览统计。 */

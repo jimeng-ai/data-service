@@ -33,6 +33,10 @@ public class AiTrace extends BaseEntity {
     @TableField("agent_name")
     private String agentName;
 
+    /** 本次调用用户发送的消息（首步前捕获，仅记录一次）。 */
+    @TableField("user_message")
+    private String userMessage;
+
     @TableField("biz_type")
     private String bizType;
 

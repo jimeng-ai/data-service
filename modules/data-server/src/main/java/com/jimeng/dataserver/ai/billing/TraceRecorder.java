@@ -60,9 +60,39 @@ public class TraceRecorder {
     }
 
     private static final int MAX_ERROR_MSG_LEN = 1000;
+    private static final int MAX_USER_MSG_LEN = 2000;
 
     private final AiTraceMapper aiTraceMapper;
     private final AiTraceStepMapper aiTraceStepMapper;
+
+    // ============================ 用户消息（trace 头表，仅记录一次） ============================
+
+    /**
+     * 记录本次 trace 的用户输入消息。应在首个步骤、且对话循环追加 tool_result 之前调用，
+     * 以拿到真正的用户问题；已写入后不再覆盖。尽力而为：任何异常只记 warn、不影响主流程。
+     */
+    public void recordUserMessage(String message) {
+        try {
+            if (StrUtil.isBlank(message)) {
+                return;
+            }
+            String traceId = currentTraceId();
+            if (StrUtil.isBlank(traceId)) {
+                return;
+            }
+            Date now = new Date();
+            AiTrace header = loadOrInitHeader(traceId, currentTenantId(), currentUserId(), now);
+            if (StrUtil.isNotBlank(header.getUserMessage())) {
+                return; // 已有，不覆盖
+            }
+            AiTrace update = new AiTrace();
+            update.setId(header.getId());
+            update.setUserMessage(truncate(message, MAX_USER_MSG_LEN));
+            aiTraceMapper.updateById(update);
+        } catch (Exception e) {
+            log.warn("记录 trace 用户消息失败（忽略，不影响主流程）: {}", e.getMessage());
+        }
+    }
 
     // ============================ 类型化埋点方法 ============================
 
@@ -85,7 +115,8 @@ public class TraceRecorder {
     /** 知识库检索步骤（ES 混合检索）。 */
     public void recordKbSearch(String kbName, int topK, int hits, long durationMs) {
         AiTraceStep step = newStep(StepType.KB_SEARCH, "知识库检索" + (StrUtil.isBlank(kbName) ? "" : "·" + kbName));
-        step.setSubTitle("top_k=" + topK + " · 命中 " + hits + " 个分片");
+        // topK 是 rerank 前的 RRF 召回候选窗口（非工具入参 top_k）；措辞与之区分，避免混淆。
+        step.setSubTitle("召回候选 " + topK + " · 命中 " + hits + " 个分片");
         step.setMetadata(json("kbName", kbName, "topK", topK, "hits", hits));
         applyResult(step, durationMs, true, null);
         recordStep(step);
@@ -302,10 +333,14 @@ public class TraceRecorder {
     }
 
     private String truncate(String s) {
+        return truncate(s, MAX_ERROR_MSG_LEN);
+    }
+
+    private String truncate(String s, int max) {
         if (s == null) {
             return null;
         }
-        return s.length() <= MAX_ERROR_MSG_LEN ? s : s.substring(0, MAX_ERROR_MSG_LEN);
+        return s.length() <= max ? s : s.substring(0, max);
     }
 
     /** 把若干 key-value 拼成紧凑 JSON 字符串，跳过 null 值。 */

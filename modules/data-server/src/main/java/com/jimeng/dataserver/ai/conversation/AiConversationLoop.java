@@ -56,6 +56,8 @@ public class AiConversationLoop {
     public Object runBlocking(Map<String, Object> body, AiProtocolAdapter adapter,
                                Map<String, String> headers, String url,
                                String traceId, CallRecordConfig rc) {
+        // 在追加 tool_result 轮次前捕获用户原始问题，写入 trace 头表。
+        traceRecorder.recordUserMessage(latestUserMessage(body));
         SkillApplyResult skillApplyResult = skillRuntimeService.applySkillContext(body, adapter);
         if (skillApplyResult.isEnabled()) {
             log.info("启用skills ({}): {}", rc.provider(), skillApplyResult.getSelectedSkillNames());
@@ -145,6 +147,8 @@ public class AiConversationLoop {
     public void runStream(Map<String, Object> body, AiProtocolAdapter adapter,
                           Map<String, String> headers, String url,
                           String connectionId, String traceId, CallRecordConfig rc) {
+        // 在追加 tool_result 轮次前捕获用户原始问题，写入 trace 头表。
+        traceRecorder.recordUserMessage(latestUserMessage(body));
         SkillApplyResult skillApplyResult = skillRuntimeService.applySkillContext(body, adapter);
         if (skillApplyResult.isEnabled()) {
             log.info("流式启用skills ({}): {}", rc.provider(), skillApplyResult.getSelectedSkillNames());
@@ -441,6 +445,57 @@ public class AiConversationLoop {
             sb.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
         }
         return sb.length() > 0 ? sb.toString() : "未知流式错误";
+    }
+
+    // ------------------------------------------------------------------ user message
+
+    /**
+     * 从请求体 messages 里取最后一条 role=user 的文本内容，用于 trace 头表展示「用户发送的消息」。
+     * 兼容 OpenAI（content 为字符串）与 Claude（content 为 text block 数组）。取不到返回 null。
+     */
+    @SuppressWarnings("unchecked")
+    private static String latestUserMessage(Map<String, Object> body) {
+        if (body == null || !(body.get("messages") instanceof List<?> list)) {
+            return null;
+        }
+        for (int i = list.size() - 1; i >= 0; i--) {
+            if (!(list.get(i) instanceof Map<?, ?> m) || !"user".equals(String.valueOf(m.get("role")))) {
+                continue;
+            }
+            String text = stringifyContent(m.get("content"));
+            if (StrUtil.isNotBlank(text)) {
+                return text;
+            }
+        }
+        return null;
+    }
+
+    /** 把消息 content 归一成纯文本：字符串直接用；数组只取 type=text 的 text 块拼接；其余忽略。 */
+    private static String stringifyContent(Object content) {
+        if (content instanceof String s) {
+            return s;
+        }
+        if (!(content instanceof List<?> blocks)) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Object b : blocks) {
+            if (!(b instanceof Map<?, ?> bm)) {
+                continue;
+            }
+            Object type = bm.get("type");
+            if (type != null && !"text".equals(String.valueOf(type))) {
+                continue; // 跳过 tool_result / image 等非文本块
+            }
+            Object t = bm.get("text");
+            if (t != null) {
+                if (sb.length() > 0) {
+                    sb.append('\n');
+                }
+                sb.append(t);
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
     }
 
     // ------------------------------------------------------------------ record helpers

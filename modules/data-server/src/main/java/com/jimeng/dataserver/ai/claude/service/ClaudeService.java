@@ -99,9 +99,22 @@ public class ClaudeService {
         }
         if (agent.getDefaultModelParams() != null) {
             for (Map.Entry<String, Object> e : agent.getDefaultModelParams().entrySet()) {
-                body.putIfAbsent(e.getKey(), e.getValue());
+                // 把前端 modelParams 的驼峰 key 归一为各 API 认的蛇形 key，否则参数会被模型忽略。
+                body.putIfAbsent(normalizeModelParamKey(e.getKey()), e.getValue());
             }
         }
+    }
+
+    /** modelParams key 归一：topP → top_p、maxTokens → max_tokens；其余原样（temperature 等已一致）。 */
+    private String normalizeModelParamKey(String key) {
+        if (key == null) {
+            return null;
+        }
+        return switch (key) {
+            case "topP" -> "top_p";
+            case "maxTokens" -> "max_tokens";
+            default -> key;
+        };
     }
 
     /** 绑定知识库的 Agent 的「检索护栏」系统提示：把 kb_id 钉进提示，约束必检索 / 零编造 / 正文不外露引用标号。 */

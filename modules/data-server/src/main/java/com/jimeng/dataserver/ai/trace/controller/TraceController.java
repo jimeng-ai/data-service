@@ -2,7 +2,9 @@ package com.jimeng.dataserver.ai.trace.controller;
 
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jimeng.dataserver.ai.trace.dto.TraceOverview;
+import com.jimeng.dataserver.ai.trace.dto.TraceReplay;
 import com.jimeng.dataserver.ai.trace.service.TraceQueryService;
+import com.jimeng.dataserver.ai.trace.service.TraceReplayService;
 import com.jimeng.persistence.entity.AiTrace;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -33,6 +35,7 @@ import java.util.Date;
 public class TraceController {
 
     private final TraceQueryService traceQueryService;
+    private final TraceReplayService traceReplayService;
 
     @Operation(summary = "trace 分页列表")
     @GetMapping
@@ -56,6 +59,12 @@ public class TraceController {
     @GetMapping("/{traceId}")
     public AiTrace detail(@PathVariable("traceId") String traceId) {
         return traceQueryService.detail(traceId);
+    }
+
+    @Operation(summary = "trace 可视化回放（只读重现，含每步真实输入/输出）")
+    @GetMapping("/{traceId}/replay")
+    public TraceReplay replay(@PathVariable("traceId") String traceId) {
+        return traceReplayService.replay(traceId);
     }
 
     @Operation(summary = "按当前筛选导出 CSV")

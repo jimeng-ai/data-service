@@ -46,7 +46,10 @@ public final class TraceSupport {
         }
         if (StrUtil.isNotBlank(keyword)) {
             String kw = keyword.trim();
-            w.and(q -> q.like(AiTrace::getTraceId, kw).or().like(AiTrace::getAgentName, kw));
+            // 关键字模糊匹配 trace_id / Agent 名称 / 用户消息。
+            w.and(q -> q.like(AiTrace::getTraceId, kw)
+                    .or().like(AiTrace::getAgentName, kw)
+                    .or().like(AiTrace::getUserMessage, kw));
         }
         w.orderByDesc(AiTrace::getCreateTime);
         return w;
@@ -75,7 +78,7 @@ public final class TraceSupport {
         if (withEnterprise) {
             header.append("企业,");
         }
-        header.append("Agent,状态,步骤数,总耗时(ms),总Token,开始时间");
+        header.append("Agent,用户消息,状态,步骤数,总耗时(ms),总Token,开始时间");
         writer.write(header.toString());
         writer.write("\n");
         if (rows == null) {
@@ -88,6 +91,7 @@ public final class TraceSupport {
                 sb.append(csv(t.getEnterpriseName())).append(',');
             }
             sb.append(csv(t.getAgentName())).append(',');
+            sb.append(csv(t.getUserMessage())).append(',');
             sb.append(csv(t.getStatus())).append(',');
             sb.append(t.getStepCount() == null ? 0 : t.getStepCount()).append(',');
             sb.append(t.getTotalLatencyMs() == null ? 0 : t.getTotalLatencyMs()).append(',');

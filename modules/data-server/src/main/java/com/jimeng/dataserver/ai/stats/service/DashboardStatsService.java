@@ -45,24 +45,48 @@ public class DashboardStatsService {
         return overview(TenantContext.get(), days);
     }
 
+    /** 自定义区间总览（含端点），租户取当前上下文。 */
+    public DashboardOverview overview(LocalDate startDate, LocalDate endDate) {
+        return overview(TenantContext.get(), startDate, endDate);
+    }
+
     /**
-     * 指定租户的总览统计。运营侧下钻复用本方法（传入目标租户 id），
+     * 指定租户、最近 N 天的总览统计。运营侧下钻复用本方法（传入目标租户 id），
      * 调用方需用 {@code TenantContext.runAsSystem} 包裹，使 agent 名称解析不被错误的租户上下文过滤。
      */
     public DashboardOverview overview(String tenantId, int days) {
         int window = Math.max(1, Math.min(days, MAX_DAYS));
+        LocalDate today = LocalDate.now(ZoneId.systemDefault());
+        return overview(tenantId, today.minusDays(window - 1L), today);
+    }
+
+    /**
+     * 指定租户、自定义 [startDate, endDate]（含端点）区间的总览统计。
+     * 会规范化起止顺序并把窗口长度封顶到 {@link #MAX_DAYS}；环比对比上一等长窗口。
+     */
+    public DashboardOverview overview(String tenantId, LocalDate startDate, LocalDate endDate) {
+        ZoneId zone = ZoneId.systemDefault();
+        // 规范化：保证 startDate <= endDate，并把跨度封顶到 MAX_DAYS（从 endDate 往回截）。
+        if (startDate.isAfter(endDate)) {
+            LocalDate tmp = startDate;
+            startDate = endDate;
+            endDate = tmp;
+        }
+        long span = java.time.temporal.ChronoUnit.DAYS.between(startDate, endDate) + 1;
+        if (span > MAX_DAYS) {
+            startDate = endDate.minusDays(MAX_DAYS - 1L);
+            span = MAX_DAYS;
+        }
+        int window = (int) span;
 
         DashboardOverview result = new DashboardOverview();
         result.setDays(window);
 
-        ZoneId zone = ZoneId.systemDefault();
-        LocalDate today = LocalDate.now(zone);
-        // [start, end) 覆盖今天在内的 window 天；prevStart 为上一等长窗口起点。
-        LocalDate startDate = today.minusDays(window - 1L);
+        // [start, end) 覆盖含端点的 window 天；prevStart 为上一等长窗口起点。
         LocalDate prevStartDate = startDate.minusDays(window);
 
         Date start = Date.from(startDate.atStartOfDay(zone).toInstant());
-        Date end = Date.from(today.plusDays(1).atStartOfDay(zone).toInstant());
+        Date end = Date.from(endDate.plusDays(1).atStartOfDay(zone).toInstant());
         Date prevStart = Date.from(prevStartDate.atStartOfDay(zone).toInstant());
 
         result.setStart(start);
@@ -72,7 +96,7 @@ public class DashboardStatsService {
             // 没有租户上下文：返回空壳，避免跨租户聚合。
             result.setTotals(emptyTotals());
             result.setPrevious(emptyTotals());
-            result.setTrend(fillTrend(List.of(), startDate, today));
+            result.setTrend(fillTrend(List.of(), startDate, endDate));
             result.setTopModels(List.of());
             result.setAllModels(List.of());
             result.setTopAgents(List.of());
@@ -82,7 +106,7 @@ public class DashboardStatsService {
 
         result.setTotals(toTotals(callLogMapper.selectOverview(tenantId, start, end)));
         result.setPrevious(toTotals(callLogMapper.selectOverview(tenantId, prevStart, start)));
-        result.setTrend(fillTrend(callLogMapper.selectDailyTrend(tenantId, start, end), startDate, today));
+        result.setTrend(fillTrend(callLogMapper.selectDailyTrend(tenantId, start, end), startDate, endDate));
         // 全量模型用量（按调用次数倒序）：allModels 给「查看全部」饼图，topModels 取前 N。
         List<DashboardOverview.ModelUsage> allModels =
                 toModelUsage(callLogMapper.selectTopModels(tenantId, start, end, ALL_MODELS_LIMIT));
@@ -117,9 +141,9 @@ public class DashboardStatsService {
         return t;
     }
 
-    /** 把按天分组的稀疏结果补成 [startDate, today] 连续序列。 */
+    /** 把按天分组的稀疏结果补成 [startDate, endDate] 连续序列。 */
     private List<DashboardOverview.TrendPoint> fillTrend(List<Map<String, Object>> rows,
-                                                         LocalDate startDate, LocalDate today) {
+                                                         LocalDate startDate, LocalDate endDate) {
         Map<String, Map<String, Object>> byDate = new LinkedHashMap<>();
         if (rows != null) {
             for (Map<String, Object> row : rows) {
@@ -130,7 +154,7 @@ public class DashboardStatsService {
             }
         }
         List<DashboardOverview.TrendPoint> out = new ArrayList<>();
-        for (LocalDate d = startDate; !d.isAfter(today); d = d.plusDays(1)) {
+        for (LocalDate d = startDate; !d.isAfter(endDate); d = d.plusDays(1)) {
             String key = d.toString(); // yyyy-MM-dd
             DashboardOverview.TrendPoint p = new DashboardOverview.TrendPoint();
             p.setDate(key);

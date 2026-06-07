@@ -5,6 +5,7 @@ import com.jimeng.dataserver.admin.operator.common.OperatorGuard;
 import com.jimeng.dataserver.admin.operator.trace.service.OperatorTraceService;
 import com.jimeng.dataserver.ai.trace.controller.TraceController;
 import com.jimeng.dataserver.ai.trace.dto.TraceOverview;
+import com.jimeng.dataserver.ai.trace.dto.TraceReplay;
 import com.jimeng.persistence.entity.AiTrace;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -59,6 +60,13 @@ public class OperatorTraceController {
     public AiTrace detail(@PathVariable("traceId") String traceId) {
         operatorGuard.requireOperatorId();
         return operatorTraceService.detail(traceId);
+    }
+
+    @Operation(summary = "跨租户 trace 可视化回放")
+    @GetMapping("/{traceId}/replay")
+    public TraceReplay replay(@PathVariable("traceId") String traceId) {
+        operatorGuard.requireOperatorId();
+        return operatorTraceService.replay(traceId);
     }
 
     @Operation(summary = "按当前筛选导出 CSV（含企业列）")

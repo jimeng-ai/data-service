@@ -5,10 +5,13 @@ import com.jimeng.dataserver.ai.stats.service.DashboardStatsService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDate;
 
 /**
  * 仪表盘统计接口：数据全部来自 {@code ai_model_call_log} 的真实聚合。
@@ -21,9 +24,19 @@ public class StatsController {
 
     private final DashboardStatsService dashboardStatsService;
 
-    @Operation(summary = "仪表盘总览", description = "返回当前租户在指定天数窗口内的真实用量统计（含环比、趋势、模型用量、最近调用）")
+    @Operation(summary = "仪表盘总览",
+            description = "返回当前租户在指定时间窗口内的真实用量统计（含环比、趋势、模型用量、最近调用）。"
+                    + "传入 start/end（yyyy-MM-dd，含端点）走自定义区间；否则按 days 取最近 N 天。")
     @GetMapping("/overview")
-    public DashboardOverview overview(@RequestParam(name = "days", defaultValue = "30") int days) {
+    public DashboardOverview overview(
+            @RequestParam(name = "days", defaultValue = "30") int days,
+            @RequestParam(name = "start", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
+            @RequestParam(name = "end", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate end) {
+        if (start != null && end != null) {
+            return dashboardStatsService.overview(start, end);
+        }
         return dashboardStatsService.overview(days);
     }
 }
