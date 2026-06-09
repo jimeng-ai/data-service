@@ -64,11 +64,14 @@ public class PluginTemplateRenderer {
         // body —— 先字符串替换占位符再校验 JSON。
         // 原因：模板里 {{input.name}} 这类占位符不是合法 JSON，无法在替换前 parse。
         if (StringUtils.hasText(mapping.getBodyTemplate())) {
-            String rendered = renderString(mapping.getBodyTemplate(), ctx);
             String contentType = req.getContentType() == null ? "" : req.getContentType().toLowerCase();
             if (contentType.contains("json")) {
+                // JSON body 用专用渲染：占位符按解析出的真实类型序列化成 JSON 片段，
+                // 这样 Object / Array / Array<Object> 等复杂入参才能落成合法 JSON（renderString
+                // 会把 List/Map 渲染成 Java toString，不是合法 JSON）。详见 renderJsonBody。
+                String rendered = renderJsonBody(mapping.getBodyTemplate(), ctx);
                 try {
-                    // 渲染后必须是合法 JSON——通过 readTree 验证一遍并归一化输出
+                    // 渲染后再校验一遍并归一化输出，确保是合法 JSON
                     JsonNode parsed = CommonUtil.getObjectMapper().readTree(rendered);
                     req.setBody(CommonUtil.getObjectMapper().writeValueAsString(parsed));
                 } catch (Exception e) {
@@ -77,7 +80,7 @@ public class PluginTemplateRenderer {
                 }
             } else {
                 // 非 JSON content-type（form-urlencoded 等）直接用渲染后的字符串
-                req.setBody(rendered);
+                req.setBody(renderString(mapping.getBodyTemplate(), ctx));
             }
         }
 
@@ -99,6 +102,51 @@ public class PluginTemplateRenderer {
         }
         sb.append(template, last, template.length());
         return sb.toString();
+    }
+
+    /**
+     * JSON body 专用渲染：把每个 {@code {{...}}} 占位符替换成「按真实类型序列化的 JSON 片段」。
+     *
+     * <p>与 {@link #renderString} 的关键区别：renderString 用 {@link String#valueOf} 拼接，
+     * 对 List/Map 会得到 Java toString（{@code [{a=1}]} / {@code {k=v}}），不是合法 JSON；
+     * 这里改用 Jackson 序列化，从而支持 Object / Array / Array&lt;Object&gt; 等复杂入参，
+     * 同时字符串会被正确加引号 + 转义（修掉值里含 {@code "}、换行符时破坏 JSON 的老问题）。
+     *
+     * <p>前端生成的 body 模板里：字符串/枚举占位符被一对引号包裹（{@code "{{input.x}}"}），
+     * 其余类型是裸占位符（{@code {{input.x}}}）。这里在占位符两侧恰好是一对引号时，连引号一起
+     * 替换，统一交给序列化重新加引号，避免出现 {@code ""value""} 这种双引号。
+     *
+     * <p>仅供 JSON body 使用——url / headers / HMAC sign_template 仍走 {@link #renderString}，
+     * 不能改它们的逐字节输出（HMAC 会对渲染后的原文签名）。
+     */
+    private String renderJsonBody(String template, PluginExecutionContext ctx) {
+        if (template == null) return "";
+        Matcher m = PLACEHOLDER.matcher(template);
+        StringBuilder sb = new StringBuilder();
+        int last = 0;
+        while (m.find()) {
+            int start = m.start();
+            int end = m.end();
+            // 占位符恰好被一对引号完整包裹 → 视为字符串位，连引号一起吃掉，由序列化重新加引号
+            boolean quoted = start > 0 && template.charAt(start - 1) == '"'
+                    && end < template.length() && template.charAt(end) == '"';
+            int cutStart = quoted ? start - 1 : start;
+            int cutEnd = quoted ? end + 1 : end;
+            sb.append(template, last, cutStart);
+            sb.append(toJsonLiteral(resolve(m.group(1), ctx)));
+            last = cutEnd;
+        }
+        sb.append(template, last, template.length());
+        return sb.toString();
+    }
+
+    /** 把任意值序列化成合法 JSON 字面量：字符串自动加引号+转义，List/Map → 数组/对象，null → null。 */
+    private String toJsonLiteral(Object value) {
+        try {
+            return CommonUtil.getObjectMapper().writeValueAsString(value);
+        } catch (Exception e) {
+            throw new TemplateRenderException("body 参数序列化为 JSON 失败: " + e.getMessage());
+        }
     }
 
     /** 递归渲染任意值（String/Map/List/Number/Boolean），保留原类型 */

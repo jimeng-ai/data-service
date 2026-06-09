@@ -82,8 +82,9 @@ public class OperatorTraceService {
 
     /** 全平台（或单企业）概览统计。 */
     public TraceOverview overview(Date start, Date end, String tenantId) {
+        // 运营侧跨租户/不限用户：userId 传 null。
         return TenantContext.runAsSystem(() ->
-                TraceSupport.toOverview(aiTraceMapper.selectOverview(tenantId, start, end)));
+                TraceSupport.toOverview(aiTraceMapper.selectOverview(tenantId, null, start, end)));
     }
 
     /** 按当前筛选导出 CSV（含企业列），封顶 {@link TraceSupport#EXPORT_MAX_ROWS} 行。 */

@@ -29,9 +29,13 @@ public class PluginTool extends BaseEntity {
     @TableField("plugin_id")
     private Long pluginId;
 
-    @Schema(description = "工具名，租户内唯一")
+    @Schema(description = "工具名，租户内唯一（函数名：英文，供 LLM 调用）")
     @TableField("name")
     private String name;
+
+    @Schema(description = "中文展示名（给人看；为空时前端回退用 name）")
+    @TableField("title")
+    private String title;
 
     @Schema(description = "工具描述（LLM 判断何时调用）")
     @TableField("description")

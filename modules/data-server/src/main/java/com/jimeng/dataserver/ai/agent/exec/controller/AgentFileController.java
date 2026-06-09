@@ -3,11 +3,14 @@ package com.jimeng.dataserver.ai.agent.exec.controller;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.exec.dto.AgentFileView;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.persistence.entity.AgentArtifact;
+import com.jimeng.persistence.entity.AgentExecRun;
 import com.jimeng.persistence.entity.AgentInputFile;
 import com.jimeng.persistence.mapper.AgentArtifactMapper;
+import com.jimeng.persistence.mapper.AgentExecRunMapper;
 import com.jimeng.persistence.mapper.AgentInputFileMapper;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -40,6 +43,8 @@ public class AgentFileController {
     private final RagMinioStorageService storage;
     private final AgentInputFileMapper inputFileMapper;
     private final AgentArtifactMapper artifactMapper;
+    private final AgentExecRunMapper runMapper;
+    private final PermissionResolver permissionResolver;
 
     @Operation(summary = "上传输入文件", description = "上传文件到 MinIO（不入知识库），返回 fileId 供 /data/agent/exec 引用。")
     @PostMapping(value = "/files", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -64,6 +69,8 @@ public class AgentFileController {
         if (f == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在");
         }
+        // 输入文件「按人私有」：成员只能预览自己上传的（超管放行）。否则同租户可凭 id 越权下载他人文件（IDOR）。
+        permissionResolver.assertOwnerOrSuperAdmin(f.getCreateUser());
         response.setContentType(f.getContentType() == null
                 ? MediaType.APPLICATION_OCTET_STREAM_VALUE : f.getContentType());
         String fn = URLEncoder.encode(f.getFilename() == null ? "file" : f.getFilename(),
@@ -82,6 +89,14 @@ public class AgentFileController {
         AgentArtifact a = artifactMapper.selectById(artifactId);
         if (a == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "产物不存在");
+        }
+        // 产物「按人私有」：artifactId 会随 SSE downloadUrl 暴露，必须挡住同租户凭 id 越权下载他人产物（IDOR）。
+        // 产物 create_user 在 OkHttp 回调线程落库、可能为空/失真，故按父运行记录的 user_id 判属主（超管放行）。
+        if (!permissionResolver.isSuperAdmin()) {
+            AgentExecRun run = a.getRunId() == null ? null : runMapper.selectById(a.getRunId());
+            if (run == null || !permissionResolver.currentOwnerId().equals(run.getUserId())) {
+                throw new ServiceException(ExceptionCode.NOT_FOUND, "产物不存在");
+            }
         }
         response.setContentType(a.getContentType() == null
                 ? MediaType.APPLICATION_OCTET_STREAM_VALUE : a.getContentType());

@@ -20,6 +20,7 @@ import com.jimeng.dataserver.ai.run.RunEventTee;
 import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.run.RunHandle;
 import com.jimeng.dataserver.ai.run.RunRegistry;
+import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.persistence.entity.AgentArtifact;
 import com.jimeng.persistence.entity.AgentExecRun;
@@ -39,6 +40,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -69,6 +71,7 @@ public class AgentExecService {
     private final AiModelCallRecordService recordService;
     private final UsageExtractor usageExtractor;
     private final ProviderRegistry providerRegistry;
+    private final PermissionResolver permissionResolver;
 
     public void streamExec(AgentExecRequest req, String connectionId, String traceId) {
         String tenantId = TenantContext.get();
@@ -103,12 +106,16 @@ public class AgentExecService {
         //    多轮记忆：除本轮显式 fileIds 外，还把【本会话此前上传过的文件】一并铺进 /work，
         //    否则后续轮次（前端不再带 fileIds）沙箱看不到早先发的图片。按文件 id 去重、保持上传顺序。
         Long conversationId = req.getConversationId();
+        // 输入文件「按人私有」：成员只挂载自己上传的文件，超管不限。
+        // 历史遗留：仅靠租户过滤 -> 成员可引用/扒到他人 fileId 挂进自己沙箱，甚至把他人文件改写归属到本会话。
+        boolean canSeeAllFiles = userId != null && permissionResolver.isSuperAdmin();
         Map<Long, AgentInputFile> fileById = new LinkedHashMap<>();
         // 2a. 本轮显式带的文件；顺手把它们登记到当前会话，便于后续轮次按会话回捞。
         if (req.getFileIds() != null) {
             for (Long fid : req.getFileIds()) {
                 AgentInputFile f = inputFileMapper.selectById(fid);
-                if (f != null) {
+                // 跳过非本人上传的文件（超管放行）：不挂载、也不把他人文件改写归属到本会话。
+                if (f != null && (canSeeAllFiles || Objects.equals(userId, f.getCreateUser()))) {
                     if (conversationId != null && f.getConversationId() == null) {
                         f.setConversationId(conversationId);
                         inputFileMapper.updateById(f);
@@ -117,11 +124,12 @@ public class AgentExecService {
                 }
             }
         }
-        // 2b. 本会话历史上传过的文件（多轮记忆的关键）。
+        // 2b. 本会话历史上传过的文件（多轮记忆的关键）。成员只回捞自己上传的。
         if (conversationId != null) {
             List<AgentInputFile> prior = inputFileMapper.selectList(
                     new LambdaQueryWrapper<AgentInputFile>()
                             .eq(AgentInputFile::getConversationId, conversationId)
+                            .eq(!canSeeAllFiles, AgentInputFile::getCreateUser, userId)
                             .orderByAsc(AgentInputFile::getId));
             for (AgentInputFile f : prior) {
                 fileById.putIfAbsent(f.getId(), f);
@@ -197,7 +205,7 @@ public class AgentExecService {
                 }
                 if ("artifact".equals(type)) {
                     // 产物落库（临时设置租户上下文）并改写 downloadUrl 后再转发给前端
-                    String enriched = registerArtifactAndEnrich(tenantId, runId, data);
+                    String enriched = registerArtifactAndEnrich(tenantId, runId, userId, data);
                     tee.tee(connectionId, "artifact", enriched);
                     artifactEvents.add(data);
                     return;
@@ -286,12 +294,15 @@ public class AgentExecService {
     }
 
     /** 在 OkHttp 回调线程把产物落库（临时设置租户上下文），返回改写了 downloadUrl 的事件 JSON。 */
-    private String registerArtifactAndEnrich(String tenantId, Long runId, String data) {
+    private String registerArtifactAndEnrich(String tenantId, Long runId, String userId, String data) {
         try {
             JSONObject j = JSONUtil.parseObj(data);
             AgentArtifact a = new AgentArtifact();
             a.setTenantId(tenantId);
             a.setRunId(runId);
+            // 回调线程无 user-id 头，MyMetaObjectHandler 填不到 create_user，这里显式补上发起人，
+            // 与下载端「按人私有」判属主对齐（下载端以父 run.user_id 为准，这里是双保险）。
+            a.setCreateUser(userId);
             a.setBucket(j.getStr("bucket"));
             a.setObjectName(j.getStr("objectName"));
             a.setFilename(j.getStr("filename"));

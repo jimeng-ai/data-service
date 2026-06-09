@@ -69,11 +69,15 @@ public class ChatConversationService {
     }
 
     public List<ConversationView> list() {
+        // 会话「按人私有」：成员只看自己创建的；超管（owner==null）看本租户全部。
+        // 历史遗留：仅靠租户拦截器隔离，会把全租户会话都列出 -> 同租户互相看到对方会话。
+        String owner = permissionResolver.ownerScopeOrNull();
         LambdaQueryWrapper<ChatConversation> wrapper = new LambdaQueryWrapper<ChatConversation>()
+                .eq(owner != null, ChatConversation::getCreateUser, owner)
                 .orderByDesc(ChatConversation::getLastMessageAt)
                 .orderByDesc(ChatConversation::getId);
-        // 一次查出本租户所有「正在生成」的助手消息，给列表项打上「正在回复」标志（驱动左侧转圈/圆点）。
-        Map<Long, String> activeByConv = activeRunByConversation();
+        // 一次查出（属主范围内）所有「正在生成」的助手消息，给列表项打上「正在回复」标志（驱动左侧转圈/圆点）。
+        Map<Long, String> activeByConv = activeRunByConversation(owner);
         return conversationMapper.selectList(wrapper).stream()
                 .map(c -> {
                     ConversationView v = toView(c, null);
@@ -85,11 +89,12 @@ public class ChatConversationService {
                 .toList();
     }
 
-    /** 会话 id → 当前在跑的 runId（仅含有 GENERATING 助手消息的会话）。 */
-    private Map<Long, String> activeRunByConversation() {
+    /** 会话 id → 当前在跑的 runId（仅含有 GENERATING 助手消息的会话）。owner!=null 时只统计本人消息。 */
+    private Map<Long, String> activeRunByConversation(String owner) {
         List<ChatMessage> active = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
                 .eq(ChatMessage::getRole, ROLE_ASSISTANT)
-                .eq(ChatMessage::getStatus, STATUS_GENERATING));
+                .eq(ChatMessage::getStatus, STATUS_GENERATING)
+                .eq(owner != null, ChatMessage::getCreateUser, owner));
         Map<Long, String> map = new HashMap<>();
         for (ChatMessage m : active) {
             map.putIfAbsent(m.getConversationId(), m.getRunId());
@@ -100,6 +105,7 @@ public class ChatConversationService {
     public ConversationDetail detail(Long id) {
         ChatConversation c = requireConversation(id);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         List<ChatMessage> messages = messageMapper.selectList(
                 new LambdaQueryWrapper<ChatMessage>()
                         .eq(ChatMessage::getConversationId, id)
@@ -114,6 +120,7 @@ public class ChatConversationService {
     public ConversationView rename(Long id, String title) {
         ChatConversation c = requireConversation(id);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         c.setTitle(normalizeTitle(title, c.getTitle()));
         conversationMapper.updateById(c);
         return toView(c, null);
@@ -122,6 +129,7 @@ public class ChatConversationService {
     public void delete(Long id) {
         ChatConversation c = requireConversation(id);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         // 逻辑删除会话与其消息
         conversationMapper.deleteById(id);
         messageMapper.delete(new LambdaQueryWrapper<ChatMessage>()
@@ -134,6 +142,7 @@ public class ChatConversationService {
     public MessageView appendMessage(Long conversationId, AppendMessageRequest req) {
         ChatConversation c = requireConversation(conversationId);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         if (req == null || !StringUtils.hasText(req.getContent())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "content 不能为空");
         }
@@ -175,6 +184,7 @@ public class ChatConversationService {
     public TurnMessageIds insertTurnMessages(Long conversationId, String content, Object attachments, String runId) {
         ChatConversation c = requireConversation(conversationId);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         if (!StringUtils.hasText(content)) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "content 不能为空");
         }
@@ -234,6 +244,7 @@ public class ChatConversationService {
     public ChatConversation requireConversationWithAccess(Long id) {
         ChatConversation c = requireConversation(id);
         assertAgentAccess(c.getAgentId());
+        assertOwner(c);
         return c;
     }
 
@@ -260,6 +271,15 @@ public class ChatConversationService {
             return;
         }
         permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+    }
+
+    /**
+     * 校验当前账号是会话属主（或超管）。会话「按人私有」：成员只能读写自己创建的会话，
+     * 否则即便对会话所属 Agent 有权也不可见（抛 NOT_FOUND，表现与「会话不存在」一致）。
+     * 与 {@link #assertAgentAccess} 叠加：既要对 Agent 有权，又要是会话属主。
+     */
+    private void assertOwner(ChatConversation c) {
+        permissionResolver.assertOwnerOrSuperAdmin(c.getCreateUser());
     }
 
     private ChatConversation requireConversation(Long id) {

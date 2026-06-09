@@ -43,7 +43,7 @@ public class KnowledgeBaseController {
     @GetMapping
     public List<KnowledgeBase> list() {
         List<KnowledgeBase> kbs = permissionResolver.filterCurrent(
-                kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId);
+                kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId, KnowledgeBase::getCreateUser);
         userNameResolver.fillCreatorNames(kbs); // 回填创建人显示名
         return kbs;
     }

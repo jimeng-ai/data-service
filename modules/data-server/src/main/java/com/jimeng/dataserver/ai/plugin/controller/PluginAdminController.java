@@ -80,7 +80,7 @@ public class PluginAdminController {
     @GetMapping("/plugins")
     public List<Plugin> listPlugins(@RequestParam(required = false) String status) {
         List<Plugin> plugins = permissionResolver.filterCurrent(
-                crudService.listPlugins(status), ResourceType.PLUGIN, Plugin::getId);
+                crudService.listPlugins(status), ResourceType.PLUGIN, Plugin::getId, Plugin::getCreateUser);
         userNameResolver.fillCreatorNames(plugins); // 回填创建人显示名
         return plugins;
     }

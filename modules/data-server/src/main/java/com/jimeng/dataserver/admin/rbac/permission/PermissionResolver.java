@@ -7,9 +7,15 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
+import com.jimeng.persistence.entity.Agent;
+import com.jimeng.persistence.entity.KnowledgeBase;
+import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.SysRoleResource;
 import com.jimeng.persistence.entity.SysUser;
 import com.jimeng.persistence.entity.SysUserRole;
+import com.jimeng.persistence.mapper.AgentMapper;
+import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
+import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleResourceMapper;
 import com.jimeng.persistence.mapper.SysUserMapper;
 import com.jimeng.persistence.mapper.SysUserRoleMapper;
@@ -42,6 +48,10 @@ public class PermissionResolver {
     private final SysUserMapper sysUserMapper;
     private final SysUserRoleMapper sysUserRoleMapper;
     private final SysRoleResourceMapper sysRoleResourceMapper;
+    // 仅用于「本人创建放行」兜底查询 create_user（修复无角色创建者孤儿），均在租户拦截器白名单内。
+    private final AgentMapper agentMapper;
+    private final PluginMapper pluginMapper;
+    private final KnowledgeBaseMapper knowledgeBaseMapper;
 
     /** 解析当前请求账号的权限（读 gateway 注入的头）。 */
     public ResolvedPermissions resolveCurrent() {
@@ -60,10 +70,95 @@ public class PermissionResolver {
         return items.stream().filter(it -> allowed.contains(idFn.apply(it))).collect(Collectors.toList());
     }
 
-    /** 断言当前账号可访问某实例（超管恒通过），否则抛 4001。 */
+    /**
+     * 同 {@link #filterCurrent(List, ResourceType, Function)}，但额外放行「当前账号本人创建」的实例
+     * （{@code create_user == 当前 user-id}）。用于修复无角色创建者孤儿：成员无任何角色时
+     * {@code sys_role_resource} 没有授权行，建完资源会被过滤掉，靠属主兜底让其至少能看到自己建的。
+     */
+    public <T> List<T> filterCurrent(List<T> items, ResourceType type, Function<T, Long> idFn,
+                                     Function<T, String> ownerFn) {
+        ResolvedPermissions p = resolveCurrent();
+        if (p.isSuperAdmin()) {
+            return items;
+        }
+        Set<Long> allowed = p.permittedIds(type);
+        String me = currentOwnerId();
+        return items.stream()
+                .filter(it -> allowed.contains(idFn.apply(it)) || me.equals(ownerFn.apply(it)))
+                .collect(Collectors.toList());
+    }
+
+    /** 断言当前账号可访问某实例（超管恒通过，本人创建兜底放行），否则抛 4001。 */
     public void assertCurrentAccess(ResourceType type, Long id) {
-        if (!resolveCurrent().canAccess(type, id)) {
-            throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "无权访问该资源");
+        if (resolveCurrent().canAccess(type, id)) {
+            return;
+        }
+        // 无授权时兜底：本人创建的实例放行（修复无角色创建者孤儿；与 filterCurrent 的属主放行一致）。
+        // 仅在已判定无授权时才多查一次，正常授权路径零额外开销。
+        if (isOwnedByCurrent(type, id)) {
+            return;
+        }
+        throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "无权访问该资源");
+    }
+
+    /** 某实例的 create_user 是否等于当前账号（按类型查对应表；表均在租户白名单内，跨租户查不到）。 */
+    private boolean isOwnedByCurrent(ResourceType type, Long id) {
+        if (id == null) {
+            return false;
+        }
+        String createUser = switch (type) {
+            case AGENT -> {
+                Agent a = agentMapper.selectById(id);
+                yield a == null ? null : a.getCreateUser();
+            }
+            case PLUGIN -> {
+                Plugin pl = pluginMapper.selectById(id);
+                yield pl == null ? null : pl.getCreateUser();
+            }
+            case KNOWLEDGE_BASE -> {
+                KnowledgeBase kb = knowledgeBaseMapper.selectById(id);
+                yield kb == null ? null : kb.getCreateUser();
+            }
+            case MENU -> null;
+        };
+        return createUser != null && currentOwnerId().equals(createUser);
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // 「按人私有」属主轴：与上面的 RBAC 授权轴对称，按 BaseEntity.create_user 做行级隔离。
+    // 适用于会话 / 调用日志 trace / 代码执行 run·文件·产物 等“成员只看自己、超管看全租户”的资源。
+    // ----------------------------------------------------------------------------------------
+
+    /** 当前账号 id 的字符串形态（= create_user 列存的值，由 MyMetaObjectHandler 写入 user-id 头）。 */
+    public String currentOwnerId() {
+        return String.valueOf(AdminRequestContext.requireUserId());
+    }
+
+    /** 当前账号是否超管。 */
+    public boolean isSuperAdmin() {
+        return resolveCurrent().isSuperAdmin();
+    }
+
+    /**
+     * 「按人私有」列表过滤的属主取值：超管返回 {@code null}（调用方据此跳过 {@code .eq} 看全部），
+     * 成员返回自身 id。用法：
+     * <pre>String owner = permissionResolver.ownerScopeOrNull();
+     * wrapper.eq(owner != null, X::getCreateUser, owner);</pre>
+     */
+    public String ownerScopeOrNull() {
+        return isSuperAdmin() ? null : currentOwnerId();
+    }
+
+    /**
+     * 「按人私有」单行属主断言：超管放行；否则要求 {@code ownerUserId == 当前账号}，不等抛
+     * {@code NOT_FOUND}（而非 4001）——避免暴露资源是否存在，并让“点别人的资源”表现得与“不存在”一致。
+     */
+    public void assertOwnerOrSuperAdmin(String ownerUserId) {
+        if (resolveCurrent().isSuperAdmin()) {
+            return;
+        }
+        if (!currentOwnerId().equals(ownerUserId)) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "资源不存在");
         }
     }
 

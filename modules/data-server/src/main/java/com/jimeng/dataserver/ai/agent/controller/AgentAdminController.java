@@ -56,7 +56,7 @@ public class AgentAdminController {
     @GetMapping("/agents")
     public List<Agent> list(@RequestParam(required = false) String status) {
         List<Agent> agents = permissionResolver.filterCurrent(
-                agentService.list(status), ResourceType.AGENT, Agent::getId);
+                agentService.list(status), ResourceType.AGENT, Agent::getId, Agent::getCreateUser);
         agentService.attachDirtyFlag(agents); // 回填 hasUnpublishedChanges（已发布但有未发布草稿）
         userNameResolver.fillCreatorNames(agents); // 回填创建人显示名
         return agents;

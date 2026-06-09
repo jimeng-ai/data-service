@@ -13,7 +13,6 @@ import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.PluginToolMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -62,16 +61,9 @@ public class PluginCrudService {
             plugin.setAuthType("NONE");
         }
         validateAuthType(plugin.getAuthType());
-        // 先释放被【软删行】占用的同代号唯一键，让删过的插件代号能重新使用；无死行返回0、无副作用。
-        pluginMapper.releaseDeletedCode(plugin.getCode());
-        try {
-            pluginMapper.insert(plugin);
-        } catch (DuplicateKeyException e) {
-            // 释放后仍冲突 → 占用者是【活跃】插件。uk_plugin_tenant_code(tenant_id, code)。
-            throw new ServiceException(
-                    ExceptionCode.INVALID_REQUEST,
-                    "插件代号「" + plugin.getCode() + "」已被占用（可能属于你无权查看的部门），请换一个");
-        }
+        // 已去除租户级 code 唯一键（见 ops-20260610-drop-plugin-name-unique）：重名/重码不再 DB 硬拦，
+        // 改由前端创建前提示重复并支持改名。这里直接插入。
+        pluginMapper.insert(plugin);
         // 成员自授权：否则建完插件后列表过滤不到、读详情 assertCurrentAccess 抛 4001。
         creatorGrantService.grantNewResourceToCreator(ResourceType.PLUGIN, plugin.getId());
         registryService.reload();
@@ -94,6 +86,35 @@ public class PluginCrudService {
         if (!VALID_AUTH_TYPES.contains(authType)) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "非法的 auth_type: " + authType + "，允许值: " + VALID_AUTH_TYPES);
+        }
+    }
+
+    // 工具名作为大模型调用的函数名注入（见 SkillToolDefinition.normalizeModelName），
+    // 仅允许 [a-zA-Z0-9_-]。这是写入路径的【权威】校验：直连 API 也挡得住，与前端即时提示对齐。
+    private static final java.util.regex.Pattern TOOL_NAME_PATTERN =
+            java.util.regex.Pattern.compile("^[a-zA-Z0-9_-]+$");
+
+    private void validateToolName(String name) {
+        if (!StringUtils.hasText(name)) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "tool.name 不能为空");
+        }
+        if (!TOOL_NAME_PATTERN.matcher(name).matches()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "工具名「" + name + "」只能用英文字母、数字、_、-（会作为大模型调用的函数名），请修改");
+        }
+    }
+
+    // 同插件内工具名唯一（应用层查重，不用 DB 唯一键）：name 是 LLM 函数名，同插件重名会让模型/执行器路由撞车。
+    // 跨插件同名是允许的，所以按 pluginId 范围查；excludeToolId 用于 update 时排除自身。
+    private void assertToolNameFreeInPlugin(Long pluginId, String name, Long excludeToolId) {
+        LambdaQueryWrapper<PluginTool> q = new LambdaQueryWrapper<PluginTool>()
+                .eq(PluginTool::getPluginId, pluginId)
+                .eq(PluginTool::getName, name);
+        if (excludeToolId != null) q.ne(PluginTool::getId, excludeToolId);
+        Long c = pluginToolMapper.selectCount(q);
+        if (c != null && c > 0) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "本插件已存在同名工具「" + name + "」，请改个工具名，或先删除原工具");
         }
     }
 
@@ -149,24 +170,16 @@ public class PluginCrudService {
 
     @Transactional
     public PluginTool createTool(Long pluginId, PluginTool tool, PluginHttpMapping mapping) {
-        if (!StringUtils.hasText(tool.getName())) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "tool.name 不能为空");
-        }
+        validateToolName(tool.getName());
+        assertToolNameFreeInPlugin(pluginId, tool.getName(), null);
         if (mapping == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "mapping 不能为空");
         }
         tool.setPluginId(pluginId);
         if (tool.getEnabled() == null) tool.setEnabled(Boolean.TRUE);
-        // 先释放被【软删行】占用的同工具名唯一键，让删过的工具名能重新使用；无死行返回0、无副作用。
-        pluginToolMapper.releaseDeletedName(tool.getName());
-        try {
-            pluginToolMapper.insert(tool);
-        } catch (DuplicateKeyException e) {
-            // 释放后仍冲突 → 占用者是【活跃】工具。uk_plugin_tool_tenant_name(tenant_id, name)。
-            throw new ServiceException(
-                    ExceptionCode.INVALID_REQUEST,
-                    "工具名「" + tool.getName() + "」已被占用（可能属于你无权查看的部门），请换一个");
-        }
+        // 已去除租户级 name 唯一键（见 ops-20260610-drop-plugin-name-unique）：重名不再 DB 硬拦，
+        // 改由前端创建前提示「本插件已存在同名」并支持改名/改接口地址。这里直接插入。
+        pluginToolMapper.insert(tool);
 
         mapping.setPluginToolId(tool.getId());
         pluginHttpMappingMapper.insert(mapping);
@@ -177,6 +190,11 @@ public class PluginCrudService {
     @Transactional
     public PluginTool updateTool(Long pluginId, Long toolId, PluginTool tool, PluginHttpMapping mapping) {
         if (tool != null) {
+            // 改了名字才校验格式 + 同插件查重（局部更新可能不带 name；查重排除自身）。
+            if (StringUtils.hasText(tool.getName())) {
+                validateToolName(tool.getName());
+                assertToolNameFreeInPlugin(pluginId, tool.getName(), toolId);
+            }
             tool.setId(toolId);
             tool.setPluginId(pluginId);
             pluginToolMapper.updateById(tool);
