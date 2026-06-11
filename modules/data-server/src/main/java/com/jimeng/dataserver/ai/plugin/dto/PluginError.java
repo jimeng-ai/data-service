@@ -24,6 +24,7 @@ public class PluginError {
     public static final String CODE_TIMEOUT = "TIMEOUT";
     public static final String CODE_NETWORK = "NETWORK_ERROR";
     public static final String CODE_AUTH_FAILED = "AUTH_FAILED";
+    public static final String CODE_TOKEN_FETCH_FAILED = "TOKEN_FETCH_FAILED";
     public static final String CODE_TEMPLATE_ERROR = "TEMPLATE_ERROR";
     public static final String CODE_CREDENTIAL_MISSING = "CREDENTIAL_MISSING";
     public static final String CODE_CONFIG_INVALID = "CONFIG_INVALID";
