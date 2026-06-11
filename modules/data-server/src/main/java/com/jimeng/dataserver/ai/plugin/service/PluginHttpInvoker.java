@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.plugin.service;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.plugin.auth.PluginAuthApplier;
+import com.jimeng.dataserver.ai.plugin.auth.TokenCachingAuthApplier;
 import com.jimeng.dataserver.ai.plugin.dto.PluginError;
 import com.jimeng.dataserver.ai.plugin.dto.PluginExecutionContext;
 import com.jimeng.dataserver.ai.plugin.dto.PluginToolEntry;
@@ -153,23 +154,23 @@ public class PluginHttpInvoker {
         req.setUrl(resolveUrl(entry.getPlugin().getBaseUrl(), req.getUrl()));
         out.request = req;
 
-        // 4. 认证
+        // 4. 认证（applier/authConfig 提到方法作用域，供 401 兜底重试复用）
+        PluginAuthApplier applier = null;
+        Map<String, Object> authConfig = null;
         if (needAuth(entry)) {
             String authType = entry.getPlugin().getAuthType().toUpperCase();
-            PluginAuthApplier applier = appliersByType.get(authType);
+            applier = appliersByType.get(authType);
             if (applier == null) {
                 out.result = PluginError.of(PluginError.CODE_CONFIG_INVALID,
                         "未注册的 auth_type: " + authType).toMap();
                 return out;
             }
-            Map<String, Object> authConfig = parseJsonMapOrEmpty(entry.getPlugin().getAuthConfig());
-            // env 里塞 body_sha256：HMAC 签名时常用，这里懒求值放到 env
-            ctx.getEnv().put("body_sha256", sha256Hex(req.getBody()));
+            authConfig = parseJsonMapOrEmpty(entry.getPlugin().getAuthConfig());
             try {
-                applier.apply(req, secrets, authConfig);
+                applyAuth(applier, req, ctx, secrets, entry.getPlugin().getId(), authConfig);
             } catch (Exception e) {
                 log.warn("认证注入失败: tool={}, type={}, error={}", entry.toolName(), authType, e.getMessage());
-                out.result = PluginError.of(PluginError.CODE_AUTH_FAILED, e.getMessage()).toMap();
+                out.result = authError(e).toMap();
                 return out;
             }
         }
@@ -177,13 +178,29 @@ public class PluginHttpInvoker {
         // 5. 调 HTTP
         Response resp = null;
         try {
-            Request okRequest = buildOkRequest(req);
             OkHttpClient client = clientFor(entry.getMapping().getTimeoutMs());
+            Request okRequest = buildOkRequest(req);
             resp = client.newCall(okRequest).execute();
             int status = resp.code();
             String body = resp.body() == null ? null : resp.body().string();
             out.status = status;
             out.rawBody = body;
+
+            // 业务接口 401 + token-caching 鉴权 → 作废缓存、重渲染、重注入、重试一次（最多一次，无循环）
+            if (status == 401 && applier instanceof TokenCachingAuthApplier tca) {
+                resp.close();
+                tca.invalidate(ctx, entry.getPlugin().getId(), authConfig);
+                req = templateRenderer.render(entry.getMapping(), ctx);
+                req.setUrl(resolveUrl(entry.getPlugin().getBaseUrl(), req.getUrl()));
+                out.request = req;
+                tca.applyWithContext(req, ctx, entry.getPlugin().getId(), authConfig);
+                okRequest = buildOkRequest(req);
+                resp = client.newCall(okRequest).execute();
+                status = resp.code();
+                body = resp.body() == null ? null : resp.body().string();
+                out.status = status;
+                out.rawBody = body;
+            }
 
             if (status >= 400) {
                 Map<String, Object> details = new LinkedHashMap<>();
@@ -241,6 +258,29 @@ public class PluginHttpInvoker {
 
     private String shellQuote(String s) {
         return s == null ? "" : s.replace("'", "'\\''");
+    }
+
+    /** 认证注入：token-caching 走带上下文入口（取/缓存 token），其余 applier 走基类 apply。 */
+    private void applyAuth(PluginAuthApplier applier, RenderedRequest req, PluginExecutionContext ctx,
+                           Map<String, Object> secrets, Long pluginId, Map<String, Object> authConfig) {
+        if (applier instanceof TokenCachingAuthApplier tca) {
+            tca.applyWithContext(req, ctx, pluginId, authConfig);
+        } else {
+            // env 里塞 body_sha256：HMAC 签名时常用，这里懒求值放到 env
+            ctx.getEnv().put("body_sha256", sha256Hex(req.getBody()));
+            applier.apply(req, secrets, authConfig);
+        }
+    }
+
+    /** 认证异常归类：换 token 失败 / 配置非法 / 其余鉴权失败。 */
+    private PluginError authError(Exception e) {
+        if (e instanceof PluginTokenProvider.TokenFetchException) {
+            return PluginError.of(PluginError.CODE_TOKEN_FETCH_FAILED, e.getMessage());
+        }
+        if (e instanceof IllegalArgumentException) {
+            return PluginError.of(PluginError.CODE_CONFIG_INVALID, e.getMessage());
+        }
+        return PluginError.of(PluginError.CODE_AUTH_FAILED, e.getMessage());
     }
 
     // ------------------------------------------------------------------ helpers
