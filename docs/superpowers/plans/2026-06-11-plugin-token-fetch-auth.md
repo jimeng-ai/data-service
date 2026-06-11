@@ -9,7 +9,11 @@
 **Tech Stack:** Java 17 / Spring Boot / OkHttp 4.9.3 / Redisson / Jackson / JUnit5 + Mockito + okhttp MockWebServer（后端）；React 18 + TS + AntD 5（前端 `jm-agent-front`）。
 
 **测试命令约定（后端）：** 在 `/Users/jerry/Desktop/jm/data-service` 下
-`mvn -q -pl modules/data-server -am -Dtest=<ClassName> test`（纯单元测试，不加载 Spring/DB）。
+`mvn -q -pl modules/data-server test -Dtest=<ClassName> -Dsurefire.failIfNoSpecifiedTests=false`
+（纯单元测试，不加载 Spring/DB）。
+⚠️ 不要加 `-am`：会把 `test` 目标也跑到依赖模块（common-identifier 等），它们没有匹配的测试 →
+reactor 在依赖模块就 `No tests matching pattern` 失败、根本到不了 data-server。依赖的 SNAPSHOT
+已在 `.m2`（之前 `mvn clean install` 装过），无需 `-am`。下文各 Task 的 `-am` 命令同此修正。
 
 ---
 
