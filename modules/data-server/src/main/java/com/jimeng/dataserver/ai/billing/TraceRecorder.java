@@ -56,6 +56,8 @@ public class TraceRecorder {
         public static final String SUCCESS = "SUCCESS";
         public static final String WARN = "WARN";
         public static final String ERROR = "ERROR";
+        /** 用户主动停止生成。不是错误，单列一态；升级优先级最高（盖过 ERROR），见 {@link TraceRecorder#rank}。 */
+        public static final String CANCELLED = "CANCELLED";
         private Status() {}
     }
 
@@ -109,6 +111,25 @@ public class TraceRecorder {
         step.setTotalTokens(sum(inputTokens, outputTokens));
         step.setCostUsd(costUsd);
         applyResult(step, durationMs, ok, errorMsg);
+        recordStep(step);
+    }
+
+    /**
+     * 用户主动停止时进行中的 LLM 步骤：记成 {@link Status#CANCELLED}（非错误），不写 errorMsg。
+     * 因 CANCELLED 升级优先级最高，头表会随之落成 CANCELLED（即便此前已有 ERROR 步骤），
+     * 从而不被算进错误率。供 {@code AiConversationLoop} 在 {@code RunHandle.isCancelled()} 时调用。
+     */
+    public void recordLlmCancelled(Long refLogId, String title, String model,
+                                   Integer inputTokens, Integer outputTokens, long durationMs) {
+        AiTraceStep step = newStep(StepType.LLM, title);
+        step.setSubTitle(model);
+        step.setModel(model);
+        step.setRefLogId(refLogId);
+        step.setInputTokens(inputTokens);
+        step.setOutputTokens(outputTokens);
+        step.setTotalTokens(sum(inputTokens, outputTokens));
+        step.setDurationMs((int) Math.max(0, Math.min(durationMs, Integer.MAX_VALUE)));
+        step.setStatus(Status.CANCELLED);
         recordStep(step);
     }
 
@@ -300,7 +321,7 @@ public class TraceRecorder {
         }
     }
 
-    /** 状态升级：ERROR > WARN > SUCCESS。 */
+    /** 状态升级：CANCELLED > ERROR > WARN > SUCCESS。CANCELLED 最高，使「用户主动停止」盖过中途的 ERROR。 */
     private String escalate(String current, String incoming) {
         int c = rank(current);
         int i = rank(incoming);
@@ -308,6 +329,9 @@ public class TraceRecorder {
     }
 
     private int rank(String status) {
+        if (Status.CANCELLED.equals(status)) {
+            return 3;
+        }
         if (Status.ERROR.equals(status)) {
             return 2;
         }

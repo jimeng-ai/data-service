@@ -207,9 +207,17 @@ public class AiConversationLoop {
                     Map<String, Object> responseMap = accumulator.buildResponseMap();
                     List<ToolUseCall> toolCalls = adapter.extractToolUseCalls(responseMap);
                     boolean hasTools = skillApplyResult.isEnabled() && !toolCalls.isEmpty();
-                    traceRecorder.recordLlm(logId, hasTools ? "推理·决定调用工具" : "推理·生成回答",
-                            modelOf(body, rc), accumulator.getInputTokens(), accumulator.getOutputTokens(),
-                            null, latency, !streamFailed.get(), null);
+                    // 用户主动停止：上游流被 EventSource.cancel() 中断（streamFailed=true），但这不是错误。
+                    // 记成 CANCELLED 而非 ERROR，使 trace 头表落成「用户停止」、不计入错误率（详见 TraceRecorder）。
+                    boolean cancelled = handle != null && handle.isCancelled();
+                    if (cancelled) {
+                        traceRecorder.recordLlmCancelled(logId, "推理·已停止", modelOf(body, rc),
+                                accumulator.getInputTokens(), accumulator.getOutputTokens(), latency);
+                    } else {
+                        traceRecorder.recordLlm(logId, hasTools ? "推理·决定调用工具" : "推理·生成回答",
+                                modelOf(body, rc), accumulator.getInputTokens(), accumulator.getOutputTokens(),
+                                null, latency, !streamFailed.get(), null);
+                    }
 
                     if (!skillApplyResult.isEnabled() || toolCalls.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
