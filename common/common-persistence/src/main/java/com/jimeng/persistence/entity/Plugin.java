@@ -60,4 +60,12 @@ public class Plugin extends BaseEntity {
     @Schema(description = "插件所有者用户 ID")
     @TableField("owner_id")
     private String ownerId;
+
+    @Schema(description = "动作（工具）数量；非持久化，列表接口按需回填")
+    @TableField(exist = false)
+    private Integer toolCount;
+
+    @Schema(description = "被多少个 Agent 引用；非持久化，列表接口按需回填")
+    @TableField(exist = false)
+    private Integer refAgentCount;
 }

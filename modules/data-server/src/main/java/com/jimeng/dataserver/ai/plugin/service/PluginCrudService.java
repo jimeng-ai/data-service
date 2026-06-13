@@ -1,13 +1,16 @@
 package com.jimeng.dataserver.ai.plugin.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.grant.service.CreatorGrantService;
+import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.PluginHttpMapping;
 import com.jimeng.persistence.entity.PluginTool;
+import com.jimeng.persistence.mapper.AgentPluginMapper;
 import com.jimeng.persistence.mapper.PluginHttpMappingMapper;
 import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.PluginToolMapper;
@@ -17,7 +20,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -40,6 +45,7 @@ public class PluginCrudService {
     private final PluginMapper pluginMapper;
     private final PluginToolMapper pluginToolMapper;
     private final PluginHttpMappingMapper pluginHttpMappingMapper;
+    private final AgentPluginMapper agentPluginMapper;
     private final PluginRegistryService registryService;
     private final CreatorGrantService creatorGrantService;
 
@@ -145,7 +151,54 @@ public class PluginCrudService {
             wrapper.eq(Plugin::getStatus, status);
         }
         wrapper.orderByDesc(Plugin::getCreateTime);
-        return pluginMapper.selectList(wrapper);
+        List<Plugin> plugins = pluginMapper.selectList(wrapper);
+        fillCounts(plugins);
+        return plugins;
+    }
+
+    /**
+     * 回填列表展示用的两个聚合数（非持久化字段）：动作数 + 被引用 Agent 数。
+     * 各一条 group-by 批量查（按 plugin id IN，不 N+1）；plugin id 已是租户内的，
+     * 加上 MyBatis-Plus 的租户行处理器，计数天然按当前租户隔离。空列表直接跳过。
+     */
+    private void fillCounts(List<Plugin> plugins) {
+        if (plugins == null || plugins.isEmpty()) {
+            return;
+        }
+        List<Long> ids = plugins.stream().map(Plugin::getId).toList();
+
+        // 动作数：plugin_tool 按 plugin_id 计数
+        Map<Long, Integer> toolCounts = new HashMap<>();
+        QueryWrapper<PluginTool> tq = new QueryWrapper<PluginTool>()
+                .select("plugin_id", "COUNT(*) AS cnt")
+                .in("plugin_id", ids)
+                .groupBy("plugin_id");
+        for (Map<String, Object> row : pluginToolMapper.selectMaps(tq)) {
+            toolCounts.put(asLong(row.get("plugin_id")), asInt(row.get("cnt")));
+        }
+
+        // 被引用：agent_plugin 按 plugin_id 统计去重的 agent 数
+        Map<Long, Integer> refCounts = new HashMap<>();
+        QueryWrapper<AgentPlugin> aq = new QueryWrapper<AgentPlugin>()
+                .select("plugin_id", "COUNT(DISTINCT agent_id) AS cnt")
+                .in("plugin_id", ids)
+                .groupBy("plugin_id");
+        for (Map<String, Object> row : agentPluginMapper.selectMaps(aq)) {
+            refCounts.put(asLong(row.get("plugin_id")), asInt(row.get("cnt")));
+        }
+
+        for (Plugin p : plugins) {
+            p.setToolCount(toolCounts.getOrDefault(p.getId(), 0));
+            p.setRefAgentCount(refCounts.getOrDefault(p.getId(), 0));
+        }
+    }
+
+    private static Long asLong(Object v) {
+        return v instanceof Number n ? n.longValue() : null;
+    }
+
+    private static Integer asInt(Object v) {
+        return v instanceof Number n ? n.intValue() : 0;
     }
 
     @Transactional
