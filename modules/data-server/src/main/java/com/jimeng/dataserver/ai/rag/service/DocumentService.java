@@ -1,6 +1,6 @@
 package com.jimeng.dataserver.ai.rag.service;
 
-import cn.hutool.crypto.SecureUtil;
+import cn.hutool.crypto.digest.DigestUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
@@ -45,7 +45,9 @@ public class DocumentService {
         }
         byte[] bytes = file.getBytes();
         long fileSize = file.getSize();
-        String hash = SecureUtil.sha256(new String(bytes));
+        // 直接对原始字节算 sha256（不要先 new String(bytes)：二进制文件经默认字符集解码会把非法字节塌缩成 U+FFFD，
+        // 既增加碰撞风险又依赖 JVM 默认编码、跨环境不稳）。
+        String hash = DigestUtil.sha256Hex(bytes);
 
         // 幂等：相同 kb 内的同 hash 文件
         //  - 已完成入库（DONE）：直接返回旧记录，跳过整条流水线
