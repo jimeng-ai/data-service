@@ -45,6 +45,7 @@ public class KnowledgeBaseController {
         List<KnowledgeBase> kbs = permissionResolver.filterCurrent(
                 kbService.list(), ResourceType.KNOWLEDGE_BASE, KnowledgeBase::getId, KnowledgeBase::getCreateUser);
         userNameResolver.fillCreatorNames(kbs); // 回填创建人显示名
+        kbService.fillStats(kbs); // 回填列表页统计：文档数 / 切片数 / 大小 / 索引状态
         return kbs;
     }
 
