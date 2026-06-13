@@ -160,8 +160,9 @@ public class PluginCrudService {
      * 回填列表展示用的两个聚合数（非持久化字段）：动作数 + 被引用 Agent 数。
      * 各一条 group-by 批量查（按 plugin id IN，不 N+1）；plugin id 已是租户内的，
      * 加上 MyBatis-Plus 的租户行处理器，计数天然按当前租户隔离。空列表直接跳过。
+     * 详情页也复用本方法（传单元素 List）。
      */
-    private void fillCounts(List<Plugin> plugins) {
+    public void fillCounts(List<Plugin> plugins) {
         if (plugins == null || plugins.isEmpty()) {
             return;
         }

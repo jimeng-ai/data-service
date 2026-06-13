@@ -91,7 +91,10 @@ public class PluginAdminController {
     @GetMapping("/plugins/{id}")
     public Plugin getPlugin(@PathVariable Long id) {
         permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, id);
-        return crudService.getPlugin(id);
+        Plugin plugin = crudService.getPlugin(id);
+        crudService.fillCounts(java.util.List.of(plugin)); // 编辑页头部副标题：动作数 / 被引用 Agent 数
+        userNameResolver.fillCreatorNames(java.util.List.of(plugin)); // 回填创建人显示名
+        return plugin;
     }
 
     @Operation(summary = "删除插件（级联删除工具/映射）")
