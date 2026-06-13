@@ -39,9 +39,11 @@ public class DocumentController {
     @Operation(summary = "上传文档到知识库", description = "将文件上传到指定知识库并触发异步入库流程（解析 → 切片 → 上下文化 → 向量化 → 入 ES）")
     @PostMapping(value = "/kb/{kbId}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public KbDocument upload(@Parameter(description = "知识库 ID") @PathVariable Long kbId,
-                             @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file) throws Exception {
+                             @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file,
+                             @Parameter(description = "表格逐行切片：true=Excel/CSV 每数据行独立成 chunk（FAQ 表用），仅对 xlsx/csv 生效")
+                             @RequestParam(value = "rowPerChunk", defaultValue = "false") boolean rowPerChunk) throws Exception {
         permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, kbId);
-        return documentService.upload(kbId, file);
+        return documentService.upload(kbId, file, rowPerChunk);
     }
 
     @Operation(summary = "查询知识库内文档列表", description = "返回指定知识库下所有文档及各自的入库状态")

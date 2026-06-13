@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.rag.service.parse;
 
+import com.jimeng.dataserver.ai.rag.model.BlockType;
 import com.jimeng.dataserver.ai.rag.model.DocumentBlock;
 import com.jimeng.dataserver.ai.rag.model.ParsedDocument;
 import org.junit.jupiter.api.Test;
@@ -27,6 +28,21 @@ class CsvDocumentParserTest {
         assertTrue(parser.supports(null, "a.csv"));
         assertTrue(parser.supports(null, "b.TSV"));
         assertFalse(parser.supports(null, "c.xlsx"));
+    }
+
+    @Test
+    void rowPerChunk_dataRowsBecomeTableBlocks() throws Exception {
+        String csv = "问题,答案\n怎么理赔,拨打客服热线\n保额多少,最高50万\n";
+        ParsedDocument doc = parser.parse(
+                new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)), "faq.csv", true);
+        List<DocumentBlock> b = doc.getBlocks();
+        assertEquals(2, b.size());
+        assertEquals(BlockType.TABLE, b.get(0).getType(), "rowPerChunk=true 数据行应为 TABLE");
+        assertEquals("问题: 怎么理赔 | 答案: 拨打客服热线", b.get(0).getText());
+        assertEquals(BlockType.TABLE, b.get(1).getType());
+        // 默认走 TEXT（合并）
+        ParsedDocument def = parse(csv.getBytes(StandardCharsets.UTF_8), "faq.csv");
+        assertEquals(BlockType.TEXT, def.getBlocks().get(0).getType());
     }
 
     @Test

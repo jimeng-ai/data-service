@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
+import com.jimeng.dataserver.ai.billing.BizTypeContext;
 import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
@@ -192,6 +193,12 @@ public class RagAnswerService {
     }
 
     public void streamAnswer(AnswerRequest req, String connectionId, String traceId) {
+        // 标注本次模型调用的功能（运营平台按功能统计），供 AiModelCallRecordService 落库 biz_type：
+        // 默认 chat（纯对话）；下方若本次对话挂了知识库（显式 kbId 或 Agent 绑定 KB）→ 升级为 rag_answer。
+        // 口径说明：Agent 绑定 KB 时「是否真的检索」由模型在对话循环里临时决定，请求阶段无法得知，
+        // 故以「本次对话是否挂了 KB」为准（挂了即算知识库问答）。本方法跑在 MdcAsyncSupport.wrap 的
+        // executor 线程上，其 finally 会统一 clear BizTypeContext。
+        BizTypeContext.set(BizTypeContext.DEFAULT_CHAT);
         try {
             // RAG 检索策略（按入参区分两条路）：
             //  · 显式 kbId（调试台 Playground「挂载知识库测试」直连）→ 保留「前置强制检索」语义：就针对该库检索并前置发 citations。
@@ -199,10 +206,15 @@ public class RagAnswerService {
             //    ClaudeService.applyAgentContext 给绑定 KB 的 Agent 注入检索护栏（必检索/零编造/kb_id 已给定），
             //    SkillRuntimeService 把 rag-knowledge 直注成可立即调用的工具，
             //    citations 由工具结果经 ToolExecutionResult.CITATIONS_SIDECAR_KEY 旁路在工具轮后上抛（AiConversationLoop）。
+            // 解析检索计划（显式 kbId / Agent 绑定 KB / 都没有=纯对话）；挂了 KB 即把功能改记为知识库问答。
+            RagPlan plan = resolveRagPlan(req);
+            if (!plan.kbIds().isEmpty()) {
+                BizTypeContext.set(BizTypeContext.RAG_ANSWER);
+            }
             boolean forcedKbRetrieve = req.getKbId() != null;
             List<SearchResultItem> hits = List.of();
             if (forcedKbRetrieve) {
-                hits = retrieveForKbs(req, resolveRagPlan(req));
+                hits = retrieveForKbs(req, plan);
                 tee.tee(connectionId, "citations", JSONUtil.toJsonStr(citationAssembler.assemble(hits)));
             }
 

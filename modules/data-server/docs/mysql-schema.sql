@@ -179,6 +179,8 @@ CREATE TABLE IF NOT EXISTS `kb_document` (
     `minio_bucket`       VARCHAR(128) NULL              COMMENT 'MinIO bucket',
     `minio_object`       VARCHAR(512) NULL              COMMENT 'MinIO object key',
     `file_hash`          CHAR(64)     NULL              COMMENT '文件内容 sha256（去重幂等）',
+    `file_size`          BIGINT       NULL              COMMENT '文件大小（字节）',
+    `row_per_chunk`      TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '表格逐行切片：1=xlsx/csv每数据行独立成chunk(FAQ)，0=按token合并',
     `status`             VARCHAR(32)  NOT NULL          COMMENT '状态：UPLOADED/PARSING/.../DONE/FAILED',
     `failure_reason`     TEXT         NULL              COMMENT '失败原因',
     `total_chunks`       INT          NULL              COMMENT '总切片数',

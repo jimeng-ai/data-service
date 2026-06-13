@@ -163,6 +163,46 @@ class XlsxDocumentParserTest {
         assertEquals("名称: 行内 换行 | 说明: 含 制表", text);
     }
 
+    @Test
+    void rowPerChunk_dataRowsBecomeTableBlocks_preambleStaysText() throws Exception {
+        byte[] bytes;
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("FAQ");
+            setRow(sheet, 0, "学生险常见问题");          // 前言（1 个非空）
+            setRow(sheet, 1, "问题", "答案");            // 表头
+            setRow(sheet, 2, "怎么理赔", "拨打客服热线");  // 数据行1
+            setRow(sheet, 3, "保额多少", "最高 50 万");    // 数据行2
+            bytes = toBytes(wb);
+        }
+
+        ParsedDocument doc = parser.parse(new ByteArrayInputStream(bytes), "faq.xlsx", true);
+        List<DocumentBlock> blocks = doc.getBlocks();
+
+        assertEquals(3, blocks.size(), "前言 + 2 条数据行");
+        // 前言行仍是 TEXT
+        assertEquals(BlockType.TEXT, blocks.get(0).getType());
+        assertEquals("学生险常见问题", blocks.get(0).getText());
+        // 数据行变 TABLE（分块阶段一行一 chunk），仍自带表头
+        assertEquals(BlockType.TABLE, blocks.get(1).getType(), "rowPerChunk=true 数据行应为 TABLE");
+        assertEquals("问题: 怎么理赔 | 答案: 拨打客服热线", blocks.get(1).getText());
+        assertEquals(BlockType.TABLE, blocks.get(2).getType());
+        assertEquals("问题: 保额多少 | 答案: 最高 50 万", blocks.get(2).getText());
+    }
+
+    @Test
+    void rowPerChunkFalse_dataRowsStayText() throws Exception {
+        byte[] bytes;
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("FAQ");
+            setRow(sheet, 0, "问题", "答案");
+            setRow(sheet, 1, "怎么理赔", "拨打客服热线");
+            bytes = toBytes(wb);
+        }
+        // 默认（两参 / 三参 false）数据行仍是 TEXT，走合并
+        ParsedDocument doc = parser.parse(new ByteArrayInputStream(bytes), "faq.xlsx");
+        assertEquals(BlockType.TEXT, doc.getBlocks().get(0).getType());
+    }
+
     /* ----------------------------------------------------------- helpers */
 
     private static void setRow(Sheet sheet, int rowIdx, String... values) {

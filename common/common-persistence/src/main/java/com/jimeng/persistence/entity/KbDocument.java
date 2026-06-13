@@ -35,6 +35,10 @@ public class KbDocument extends BaseEntity {
     @TableField("file_size")
     private Long fileSize;
 
+    /** 表格逐行切片：1=表格(xlsx/csv)每个数据行独立成 chunk；0/null=按 token 合并（默认） */
+    @TableField("row_per_chunk")
+    private Boolean rowPerChunk;
+
     /** UPLOADED / PARSING / CHUNKING / CONTEXTUALIZING / EMBEDDING / DONE / FAILED */
     @TableField("status")
     private String status;

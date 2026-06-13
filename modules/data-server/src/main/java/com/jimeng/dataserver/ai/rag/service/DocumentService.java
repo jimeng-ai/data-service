@@ -35,6 +35,10 @@ public class DocumentService {
     private final KnowledgeBaseService knowledgeBaseService;
 
     public KbDocument upload(Long kbId, MultipartFile file) throws Exception {
+        return upload(kbId, file, false);
+    }
+
+    public KbDocument upload(Long kbId, MultipartFile file, boolean rowPerChunk) throws Exception {
         knowledgeBaseService.get(kbId);
         if (file == null || file.isEmpty()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "上传文件不能为空");
@@ -58,6 +62,7 @@ public class DocumentService {
                     existed.getStatus(), kbId, existed.getId());
             existed.setStatus(IngestionStatus.UPLOADED.code());
             existed.setFailureReason(null);
+            existed.setRowPerChunk(rowPerChunk); // 重传同步本次勾选，按新策略重切
             if (existed.getFileSize() == null) {
                 existed.setFileSize(fileSize); // 旧记录缺大小则补上
             }
@@ -76,6 +81,7 @@ public class DocumentService {
         doc.setMinioObject(objectName);
         doc.setFileHash(hash);
         doc.setFileSize(fileSize);
+        doc.setRowPerChunk(rowPerChunk);
         doc.setStatus(IngestionStatus.UPLOADED.code());
         kbDocumentMapper.insert(doc);
 

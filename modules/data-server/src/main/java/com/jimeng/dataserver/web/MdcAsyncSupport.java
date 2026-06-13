@@ -5,6 +5,7 @@ import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
+import com.jimeng.dataserver.ai.billing.BizTypeContext;
 import org.slf4j.MDC;
 
 import java.util.Map;
@@ -29,6 +30,7 @@ public final class MdcAsyncSupport {
         String parentTenant = TenantContext.get();
         AgentRuntimeView parentAgent = AgentContext.get();
         String parentAgentId = AgentIdContext.get();
+        String parentBizType = BizTypeContext.get();
         // 请求级 userId 不随 RequestContextHolder 传递，这里在请求线程显式捕获后捎带到 executor 线程，
         // 让异步流式里的实例级鉴权（PermissionResolver → AdminRequestContext.requireUserId）能正常工作。
         Long parentUserId = AdminRequestContext.findUserIdOrNull();
@@ -39,6 +41,7 @@ public final class MdcAsyncSupport {
                 if (parentTenant != null) TenantContext.set(parentTenant);
                 if (parentAgent != null) AgentContext.set(parentAgent);
                 if (parentAgentId != null) AgentIdContext.set(parentAgentId);
+                if (parentBizType != null) BizTypeContext.set(parentBizType);
                 if (parentUserId != null) AdminRequestContext.setAsyncUserId(parentUserId);
                 task.run();
             } finally {
@@ -46,6 +49,7 @@ public final class MdcAsyncSupport {
                 TenantContext.clear();
                 AgentContext.clear();
                 AgentIdContext.clear();
+                BizTypeContext.clear();
                 AdminRequestContext.clearAsyncUserId();
             }
         };

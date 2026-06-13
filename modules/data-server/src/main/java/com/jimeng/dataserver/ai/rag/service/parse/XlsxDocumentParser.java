@@ -65,6 +65,11 @@ public class XlsxDocumentParser implements DocumentParser {
 
     @Override
     public ParsedDocument parse(InputStream stream, String filename) throws Exception {
+        return parse(stream, filename, false);
+    }
+
+    @Override
+    public ParsedDocument parse(InputStream stream, String filename, boolean rowPerChunk) throws Exception {
         List<DocumentBlock> blocks = new ArrayList<>();
         try (Workbook workbook = WorkbookFactory.create(stream)) {
             DataFormatter formatter = new DataFormatter();
@@ -75,7 +80,7 @@ public class XlsxDocumentParser implements DocumentParser {
                 if (workbook.isSheetHidden(s) || workbook.isSheetVeryHidden(s)) {
                     continue;
                 }
-                parseSheet(workbook.getSheetAt(s), formatter, evaluator, blocks);
+                parseSheet(workbook.getSheetAt(s), formatter, evaluator, blocks, rowPerChunk);
             }
         }
 
@@ -90,7 +95,7 @@ public class XlsxDocumentParser implements DocumentParser {
     /* ------------------------------------------------------------------ per-sheet */
 
     private void parseSheet(Sheet sheet, DataFormatter formatter, FormulaEvaluator evaluator,
-                            List<DocumentBlock> out) {
+                            List<DocumentBlock> out, boolean rowPerChunk) {
         String sheetName = sheet.getSheetName();
         List<String> heading = List.of(sheetName == null ? "Sheet" : sheetName);
 
@@ -119,9 +124,10 @@ public class XlsxDocumentParser implements DocumentParser {
         List<String> headers = readHeaders(sheet.getRow(headerRowIdx), formatter, evaluator);
 
         // 数据行：每行渲染成「表头: 值 | ...」，带上表头语义；取值对合并单元格做填充。
+        // rowPerChunk=true 时产出 TABLE block（分块阶段一行一 chunk，FAQ 表场景）；否则 TEXT（按 token 合并）。
         for (int r = headerRowIdx + 1; r <= last; r++) {
-            addIfNotBlank(out, heading,
-                    renderRowWithHeaders(sheet, merges, r, headers, formatter, evaluator));
+            addDataRow(out, heading,
+                    renderRowWithHeaders(sheet, merges, r, headers, formatter, evaluator), rowPerChunk);
         }
     }
 
@@ -129,6 +135,15 @@ public class XlsxDocumentParser implements DocumentParser {
         if (StrUtil.isNotBlank(text)) {
             out.add(DocumentBlock.text(heading, null, text));
         }
+    }
+
+    /** 数据行落 block：逐行切片开关打开 → TABLE（独立成片）；否则 TEXT（可被合并）。 */
+    private void addDataRow(List<DocumentBlock> out, List<String> heading, String text, boolean rowPerChunk) {
+        if (StrUtil.isBlank(text)) {
+            return;
+        }
+        out.add(rowPerChunk ? DocumentBlock.table(heading, null, text)
+                            : DocumentBlock.text(heading, null, text));
     }
 
     /** 在前 {@value #HEADER_SCAN_LIMIT} 行内找第一行「非空单元格 ≥ {@value #MIN_HEADER_CELLS}」作为表头（看原始值，不做合并填充）。 */

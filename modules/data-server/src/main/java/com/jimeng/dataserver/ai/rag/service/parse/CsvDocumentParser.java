@@ -56,6 +56,11 @@ public class CsvDocumentParser implements DocumentParser {
 
     @Override
     public ParsedDocument parse(InputStream stream, String filename) throws Exception {
+        return parse(stream, filename, false);
+    }
+
+    @Override
+    public ParsedDocument parse(InputStream stream, String filename, boolean rowPerChunk) throws Exception {
         byte[] bytes = stream.readAllBytes();
         String text = decode(bytes);
 
@@ -77,8 +82,9 @@ public class CsvDocumentParser implements DocumentParser {
                 addIfNotBlank(blocks, heading, joinNonBlank(rows.get(r)));
             }
             List<String> headers = readHeaders(rows.get(headerIdx));
+            // rowPerChunk=true 时数据行产出 TABLE block（分块阶段一行一 chunk，FAQ 表场景）；否则 TEXT。
             for (int r = headerIdx + 1; r < rows.size(); r++) {
-                addIfNotBlank(blocks, heading, renderRowWithHeaders(rows.get(r), headers));
+                addDataRow(blocks, heading, renderRowWithHeaders(rows.get(r), headers), rowPerChunk);
             }
         }
 
@@ -331,5 +337,15 @@ public class CsvDocumentParser implements DocumentParser {
         if (StrUtil.isNotBlank(text)) {
             out.add(DocumentBlock.text(new ArrayList<>(heading), null, text));
         }
+    }
+
+    /** 数据行落 block：逐行切片开关打开 → TABLE（独立成片）；否则 TEXT（可被合并）。 */
+    private void addDataRow(List<DocumentBlock> out, List<String> heading, String text, boolean rowPerChunk) {
+        if (StrUtil.isBlank(text)) {
+            return;
+        }
+        List<String> path = new ArrayList<>(heading);
+        out.add(rowPerChunk ? DocumentBlock.table(path, null, text)
+                            : DocumentBlock.text(path, null, text));
     }
 }

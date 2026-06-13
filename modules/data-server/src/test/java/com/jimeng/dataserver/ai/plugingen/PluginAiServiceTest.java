@@ -10,6 +10,7 @@ import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.config.AiSelectionProperties;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.rag.service.parse.DocumentParserRegistry;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -67,7 +68,7 @@ class PluginAiServiceTest {
         props.setProviders(Map.of("test", cfg(protocol)));
         return new PluginAiService(selection, props, rs,
                 new ClaudeProtocolAdapter(), new OpenAiProtocolAdapter(), new PluginDraftToolSchema(),
-                mock(DocumentParserRegistry.class));
+                mock(DocumentParserRegistry.class), mock(AiModelCallRecordService.class));
     }
 
     private ParamSpec param(ToolSpec t, String name) {

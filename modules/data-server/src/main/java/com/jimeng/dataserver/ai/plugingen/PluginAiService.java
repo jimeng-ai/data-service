@@ -12,6 +12,7 @@ import com.jimeng.dataserver.ai.plugingen.dto.PluginDraft;
 import com.jimeng.dataserver.ai.plugingen.dto.RefineRequest;
 import com.jimeng.dataserver.ai.plugingen.dto.RefineResponse;
 import com.jimeng.dataserver.ai.plugingen.dto.ToolSpec;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
@@ -58,6 +59,11 @@ public class PluginAiService {
     private final OpenAiProtocolAdapter openAiAdapter;
     private final PluginDraftToolSchema toolSchema;
     private final DocumentParserRegistry documentParserRegistry;
+    private final AiModelCallRecordService recordService;
+
+    /** 记账 biz_type（功能维度）：插件草稿生成 / 草稿对话式微调。 */
+    private static final String BIZ_GEN = "plugin_gen";
+    private static final String BIZ_REFINE = "plugin_refine";
 
     /** 文档过长时的字符预算（~20k tokens）；超出截断并加 warning。 */
     private static final int MAX_DOC_CHARS = 80_000;
@@ -171,7 +177,7 @@ public class PluginAiService {
         body.put("tools", new ArrayList<>(List.of(toolSchema.buildEmitToolDef(cfg.getChat().getProtocol()))));
         toolSchema.forceTool(body, cfg.getChat().getProtocol());
 
-        PluginDraft updated = sanitize(toDraft(invokeTool(cfg, anthropic, adapter, body)), null);
+        PluginDraft updated = sanitize(toDraft(invokeTool(cfg, anthropic, adapter, body, BIZ_REFINE)), null);
         int n = updated.getTools() == null ? 0 : updated.getTools().size();
         return new RefineResponse(updated, "已根据你的指令更新草稿（" + n + " 个工具），请在右侧核对。");
     }
@@ -196,23 +202,31 @@ public class PluginAiService {
         toolSchema.forceTool(body, cfg.getChat().getProtocol());
 
         log.info("plugin-gen 调用 provider={} model={} traceId={}", selection.getProvider(), cfg.getChat().getModel(), traceId);
-        return sanitize(toDraft(invokeTool(cfg, anthropic, adapter, body)), extraWarnings);
+        return sanitize(toDraft(invokeTool(cfg, anthropic, adapter, body, BIZ_GEN)), extraWarnings);
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> invokeTool(ProviderConfig cfg, boolean anthropic, AiProtocolAdapter adapter,
-                                           Map<String, Object> body) {
+                                           Map<String, Object> body, String bizType) {
         String url = StrUtil.removeSuffix(cfg.getBaseUrl(), "/") + endpointPath(cfg, anthropic);
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Authorization", "Bearer " + cfg.getApiKey());
         headers.put("Content-Type", "application/json");
 
+        // 记账：插件生成/微调是一次性结构化抽取，直接打 provider（不走对话循环），这里自行落 ai_model_call_log。
+        // 仿 DefaultContextualizationClient 用紧凑 meta 体（不含整篇文档/图片的大 body），response 含 usage 由
+        // RecordService 解析算 cost。记账任何异常都不得影响主流程。
+        Long logId = safeRecordRequest(body, headers, url, bizType, cfg.getChat().getModel());
+        long startMs = System.currentTimeMillis();
+
         RequestService.HttpResp resp;
         try {
             resp = requestService.post(url, headers, Map.of(), body);
         } catch (Exception e) {
+            safeRecordException(logId, e, startMs);
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "调用 AI 失败：" + e.getMessage());
         }
+        safeRecordResponse(logId, resp.getStatusCode(), resp.getBody(), startMs);
         Integer status = resp.getStatusCode();
         if (status == null || status < 200 || status >= 300) {
             log.warn("plugin-gen AI 调用失败 status={} body={}", status, resp.getBody());
@@ -229,6 +243,43 @@ public class PluginAiService {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "AI 未返回结构化结果，请重试或更换输入");
         }
         return calls.get(0).getInput();
+    }
+
+    // ------------------------------------------------------------------ 记账（best-effort，绝不影响主流程）
+
+    /** 落紧凑 meta 体（不含大 body）；biz_type=plugin_gen/plugin_refine，scene_code=provider。 */
+    private Long safeRecordRequest(Map<String, Object> body, Map<String, String> headers,
+                                   String url, String bizType, String model) {
+        try {
+            Map<String, Object> meta = new LinkedHashMap<>();
+            meta.put("model", model);
+            meta.put("max_tokens", body.get("max_tokens"));
+            meta.put("max_completion_tokens", body.get("max_completion_tokens"));
+            meta.put("biz_type", bizType);
+            meta.put("scene_code", selection.getProvider());
+            return recordService.recordRequest(meta, headers, selection.getProvider(), url, model);
+        } catch (Exception e) {
+            log.warn("plugin-gen 计费 recordRequest 失败: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private void safeRecordResponse(Long logId, Integer status, String respBody, long startMs) {
+        if (logId == null) return;
+        try {
+            recordService.recordResponse(logId, status, respBody, (int) (System.currentTimeMillis() - startMs));
+        } catch (Exception e) {
+            log.warn("plugin-gen 计费 recordResponse 失败: {}", e.getMessage());
+        }
+    }
+
+    private void safeRecordException(Long logId, Throwable t, long startMs) {
+        if (logId == null) return;
+        try {
+            recordService.recordException(logId, t, (int) (System.currentTimeMillis() - startMs));
+        } catch (Exception e) {
+            log.warn("plugin-gen 计费 recordException 失败: {}", e.getMessage());
+        }
     }
 
     private PluginDraft toDraft(Map<String, Object> input) {

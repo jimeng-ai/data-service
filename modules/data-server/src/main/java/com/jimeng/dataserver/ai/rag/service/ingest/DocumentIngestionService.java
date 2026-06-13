@@ -135,9 +135,10 @@ public class DocumentIngestionService {
     }
 
     private ParsedDocument parse(KbDocument doc) throws Exception {
+        boolean rowPerChunk = Boolean.TRUE.equals(doc.getRowPerChunk());
         try (InputStream is = minioStorage.download(doc.getMinioObject())) {
             DocumentParser parser = parserRegistry.resolve(null, doc.getTitle());
-            return parser.parse(is, doc.getTitle());
+            return parser.parse(is, doc.getTitle(), rowPerChunk);
         }
     }
 

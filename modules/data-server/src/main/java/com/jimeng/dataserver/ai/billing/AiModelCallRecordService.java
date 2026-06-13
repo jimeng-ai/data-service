@@ -68,8 +68,14 @@ public class AiModelCallRecordService {
         logEntity.setRetryCount(0);
         logEntity.setCallStatus(STATUS_PENDING);
 
-        // 业务字段（可选）
-        logEntity.setBizType(getString(requestBody, "biz_type", null));
+        // 业务字段（功能维度，运营平台据此按功能统计）：
+        // 优先取请求体显式 biz_type（embedding/rerank/上下文化/图片描述/插件生成等链路已显式带上）；
+        // 走对话循环的普通对话 / RAG 问答请求体里没有 biz_type，回退到 BizTypeContext（RAG 问答会设
+        // rag_answer），仍为空时兜底为 "chat"——recordRequest 唯一不带 biz_type 的调用方是对话循环，必为对话。
+        logEntity.setBizType(firstNonBlank(
+                getString(requestBody, "biz_type", null),
+                BizTypeContext.get(),
+                BizTypeContext.DEFAULT_CHAT));
         logEntity.setBizId(getString(requestBody, "biz_id", null));
         logEntity.setSceneCode(getString(requestBody, "scene_code", null));
         // Agent 维度：agent_id 在转发前会被 ClaudeService.applyAgentContext 从 body 移除，
