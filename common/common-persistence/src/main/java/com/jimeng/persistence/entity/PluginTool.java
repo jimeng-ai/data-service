@@ -48,4 +48,8 @@ public class PluginTool extends BaseEntity {
     @Schema(description = "是否启用")
     @TableField("enabled")
     private Boolean enabled;
+
+    @Schema(description = "HTTP 方法（来自 http 映射，非持久化）；列表接口回填，供前端区分 READ/WRITE")
+    @TableField(exist = false)
+    private String method;
 }

@@ -291,8 +291,23 @@ public class PluginCrudService {
     }
 
     public List<PluginTool> listTools(Long pluginId) {
-        return pluginToolMapper.selectList(
+        List<PluginTool> tools = pluginToolMapper.selectList(
                 new LambdaQueryWrapper<PluginTool>().eq(PluginTool::getPluginId, pluginId));
+        if (tools.isEmpty()) {
+            return tools;
+        }
+        // 回填每个工具的 HTTP method（来自一对一的 http 映射）：一条 IN 查询，供前端区分 READ/WRITE。
+        List<Long> toolIds = tools.stream().map(PluginTool::getId).toList();
+        Map<Long, String> methodByTool = new HashMap<>();
+        List<PluginHttpMapping> mappings = pluginHttpMappingMapper.selectList(
+                new LambdaQueryWrapper<PluginHttpMapping>().in(PluginHttpMapping::getPluginToolId, toolIds));
+        for (PluginHttpMapping m : mappings) {
+            methodByTool.putIfAbsent(m.getPluginToolId(), m.getMethod());
+        }
+        for (PluginTool t : tools) {
+            t.setMethod(methodByTool.get(t.getId()));
+        }
+        return tools;
     }
 
     /**
