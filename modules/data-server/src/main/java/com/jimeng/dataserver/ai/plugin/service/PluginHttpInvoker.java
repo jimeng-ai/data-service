@@ -83,7 +83,7 @@ public class PluginHttpInvoker {
      * 入口：执行一个工具调用。永不抛异常，结果一律可 JSON 序列化返给 LLM。
      */
     public Object invoke(PluginToolEntry entry, Map<String, Object> input) {
-        return doInvoke(entry, input).result;
+        return doInvoke(entry, input, false).result;
     }
 
     /**
@@ -91,7 +91,8 @@ public class PluginHttpInvoker {
      * 注意：headers 含认证后的真实 token，仅供有权限的插件管理者调试用。
      */
     public Map<String, Object> invokeForTest(PluginToolEntry entry, Map<String, Object> input) {
-        InvokeOutcome o = doInvoke(entry, input);
+        // 试调用走宽松渲染：缺参不抛错，留可见标记，保证「无论是否报错都能看到 curl」
+        InvokeOutcome o = doInvoke(entry, input, true);
         Map<String, Object> envelope = new LinkedHashMap<>();
         if (o.request != null) {
             String finalUrl = appendQuery(o.request.getUrl(), o.request.getQuery());
@@ -113,23 +114,25 @@ public class PluginHttpInvoker {
     }
 
     /** 渲染 + 调用的完整过程，捕获中间产物（请求/状态/原始响应）供试调用回显。 */
-    private InvokeOutcome doInvoke(PluginToolEntry entry, Map<String, Object> input) {
+    private InvokeOutcome doInvoke(PluginToolEntry entry, Map<String, Object> input, boolean lenient) {
         InvokeOutcome out = new InvokeOutcome();
         if (entry == null) {
             out.result = PluginError.of(PluginError.CODE_CONFIG_INVALID, "PluginToolEntry 为空").toMap();
             return out;
         }
 
-        // 1. 解 secrets
+        // 1. 解 secrets（缺失不立即返回：先用空 secrets 把请求渲染出来，让试调用仍能回显 curl，
+        //    再在渲染后带着 out.request 返回凭证缺失错误）
         Map<String, Object> secrets;
+        Map<String, Object> deferredError = null;
         try {
             secrets = needAuth(entry)
                     ? credentialService.resolveSecrets(entry.getPlugin().getId())
                     : new LinkedHashMap<>();
         } catch (PluginCredentialService.CredentialMissingException e) {
             log.warn("凭证解析失败: tool={}, error={}", entry.toolName(), e.getMessage());
-            out.result = PluginError.of(PluginError.CODE_CREDENTIAL_MISSING, e.getMessage()).toMap();
-            return out;
+            secrets = new LinkedHashMap<>();
+            deferredError = PluginError.of(PluginError.CODE_CREDENTIAL_MISSING, e.getMessage()).toMap();
         }
 
         // 2. 构造上下文
@@ -140,6 +143,7 @@ public class PluginHttpInvoker {
                 buildEnv(),
                 buildMeta()
         );
+        ctx.setLenient(lenient);
 
         // 3. 渲染
         RenderedRequest req;
@@ -153,6 +157,12 @@ public class PluginHttpInvoker {
         // 工具 urlTemplate 只写路径时，域名取插件基础信息的 baseUrl；已是绝对地址则原样用
         req.setUrl(resolveUrl(entry.getPlugin().getBaseUrl(), req.getUrl()));
         out.request = req;
+
+        // 凭证缺失：请求已渲染（curl 可回显），到这里再返回错误，不真正发请求
+        if (deferredError != null) {
+            out.result = deferredError;
+            return out;
+        }
 
         // 4. 认证（applier/authConfig 提到方法作用域，供 401 兜底重试复用）
         PluginAuthApplier applier = null;

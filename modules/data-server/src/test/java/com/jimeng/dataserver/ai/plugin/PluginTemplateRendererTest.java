@@ -59,6 +59,22 @@ class PluginTemplateRendererTest {
     }
 
     @Test
+    void lenient_missingKey_returnsMarkerNotThrow() {
+        PluginExecutionContext ctx = ctx(Map.of("city", "Beijing"), null);
+        ctx.setLenient(true);
+        // 缺失 secrets.token 不抛错，替换成可见标记 → 试调用可回显 curl
+        String out = renderer.renderString("Bearer {{secrets.token}}", ctx);
+        assertEquals("Bearer <未配置:secrets.token>", out);
+    }
+
+    @Test
+    void lenient_unknownNamespace_returnsMarker() {
+        PluginExecutionContext ctx = ctx(Map.of(), null);
+        ctx.setLenient(true);
+        assertEquals("<未配置:wat.x>", renderer.renderString("{{wat.x}}", ctx));
+    }
+
+    @Test
     void renderMapping_url_headers_body_query() {
         PluginHttpMapping mapping = new PluginHttpMapping();
         mapping.setMethod("POST");

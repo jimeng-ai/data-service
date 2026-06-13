@@ -31,10 +31,11 @@ public class PluginCrudService {
 
     /**
      * 允许的 auth_type 取值；保持与 {@link com.jimeng.dataserver.ai.plugin.auth.PluginAuthApplier}
-     * 实现类（BEARER / BASIC / API_KEY / HMAC）一致，外加 NONE。
+     * 实现类一致：BEARER / BASIC / API_KEY / HMAC，加换 token 的 OAUTH2 / TOKEN_FETCH
+     * （{@link com.jimeng.dataserver.ai.plugin.auth.TokenCachingAuthApplier}），外加 NONE。
      */
     private static final Set<String> VALID_AUTH_TYPES =
-            Set.of("NONE", "BEARER", "BASIC", "API_KEY", "HMAC");
+            Set.of("NONE", "BEARER", "BASIC", "API_KEY", "HMAC", "OAUTH2", "TOKEN_FETCH");
 
     private final PluginMapper pluginMapper;
     private final PluginToolMapper pluginToolMapper;
@@ -77,6 +78,18 @@ public class PluginCrudService {
         if (StringUtils.hasText(plugin.getAuthType())) {
             validateAuthType(plugin.getAuthType());
         }
+        // 只读/审计/不可变字段一律忽略客户端回传：前端表单 onFinish 会把整份 plugin（含 update_time/
+        // create_time/tenant_id/status 等）原样发回；若直接 updateById，旧 update_time 会被写回（strict
+        // fill 见非空不覆盖）→ 审计字段永不前进，且有篡改 tenant_id/owner 的风险。清空后让 NOT_NULL
+        // 策略跳过这些列，update_time 由 MetaObjectHandler 重新填当前时间。
+        plugin.setTenantId(null);
+        plugin.setCode(null);
+        plugin.setStatus(null);
+        plugin.setOwnerId(null);
+        plugin.setCreateTime(null);
+        plugin.setCreateUser(null);
+        plugin.setUpdateTime(null);
+        plugin.setUpdateUser(null);
         pluginMapper.updateById(plugin);
         registryService.reload();
         return pluginMapper.selectById(plugin.getId());

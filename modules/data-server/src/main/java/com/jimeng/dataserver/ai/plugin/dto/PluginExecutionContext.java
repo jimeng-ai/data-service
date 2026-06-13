@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.plugin.dto;
 
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 
 import java.util.Map;
 
@@ -12,6 +13,14 @@ import java.util.Map;
 @Getter
 @RequiredArgsConstructor
 public class PluginExecutionContext {
+
+    /**
+     * 宽松渲染开关：仅试调用置 true。缺失占位符不抛 {@code TemplateRenderException}，
+     * 而替换成可见标记（如 {@code <未配置:secrets.token>}），让请求仍能渲染出来回显 curl。
+     * 默认 false（生产调用严格，缺参直接报错）。非 final，不进 RequiredArgs 构造器。
+     */
+    @Setter
+    private boolean lenient = false;
 
     /** 租户 ID（来自 {@link com.jimeng.common.core.tenant.TenantContext}） */
     private final String tenantId;

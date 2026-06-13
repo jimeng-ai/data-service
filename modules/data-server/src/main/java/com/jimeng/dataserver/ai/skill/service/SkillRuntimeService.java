@@ -73,9 +73,9 @@ public class SkillRuntimeService {
                 skillOnly.put(e.getKey(), e.getValue());
             }
         }
-        // 绑定了知识库的 Agent：把平台级 Skill「rag-knowledge」提升为「直接注入工具」，免去
-        // discovery→activate_skills 一轮，模型可立即调用 rag.search（kb_id 已由 system 提示给定 + 执行器兜底）。
-        promoteRagSkillIfKbBound(skillOnly, boundPlugins);
+        // 平台级 Skill「rag-knowledge」可见性取决于当前 Agent 是否绑定知识库：绑了→提升为直接注入工具；
+        // 没绑→直接摘除（没有库可检索，暴露只会诱导模型盲调 rag.search 失败）。
+        resolveRagSkillVisibility(skillOnly, boundPlugins);
 
         if (!boundPlugins.isEmpty()) {
             injectFullSkillContext(body, boundPlugins, adapter);
@@ -163,21 +163,31 @@ public class SkillRuntimeService {
     private static final String RAG_SKILL_NAME = "rag-knowledge";
 
     /**
-     * 当前 Agent 绑定了知识库时，把平台级 Skill「rag-knowledge」从「待发现」集合移到「直接注入」集合：
-     * 让 rag.search 像绑定插件一样立即可调，省去 discovery→activate_skills 往返；其它平台 Skill 仍走发现。
+     * 根据当前 Agent 是否绑定知识库，决定平台级 Skill「rag-knowledge」的可见性：
+     * <ul>
+     *   <li><b>绑定了知识库</b>：把它从「待发现」集合移到「直接注入」集合，让 rag.search 像绑定插件一样
+     *       立即可调，省去 discovery→activate_skills 往返；kb_id 已由 system 提示给定 + 执行器兜底。</li>
+     *   <li><b>未绑定知识库</b>：直接从候选里摘除——没有库可检索，暴露 RAG 只会诱导模型盲调一次
+     *       rag.search 失败（执行器无 kb_id 可解析），徒增困惑。</li>
+     *   <li><b>无 Agent 上下文</b>（直接调 Claude 不带 agent_id 的旧用法）：不干预，仍走正常发现流程。</li>
+     * </ul>
+     * 其它平台 Skill 一律保持原样走发现。
      */
-    private void promoteRagSkillIfKbBound(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
+    private void resolveRagSkillVisibility(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
         AgentRuntimeView agent = AgentContext.get();
-        boolean kbBound = agent != null && agent.getKbIds() != null && !agent.getKbIds().isEmpty();
-        if (!kbBound) return;
+        if (agent == null) return;
+        boolean kbBound = agent.getKbIds() != null && !agent.getKbIds().isEmpty();
         for (Iterator<Map.Entry<String, ToolPackage>> it = skillOnly.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, ToolPackage> e = it.next();
-            if (RAG_SKILL_NAME.equals(e.getValue().getName())) {
+            if (!RAG_SKILL_NAME.equals(e.getValue().getName())) continue;
+            if (kbBound) {
                 boundPlugins.add(e.getValue());
-                it.remove();
                 log.info("Agent 绑定知识库，rag-knowledge 提升为直接注入工具 kbIds={}", agent.getKbIds());
-                break;
+            } else {
+                log.info("Agent 未绑定知识库，隐藏 rag-knowledge 技能 agentId={}", agent.getAgentId());
             }
+            it.remove();
+            break;
         }
     }
 

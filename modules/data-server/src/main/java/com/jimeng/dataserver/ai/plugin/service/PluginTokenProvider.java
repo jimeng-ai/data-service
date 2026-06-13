@@ -43,6 +43,10 @@ public class PluginTokenProvider {
         }
     }
 
+    /** 一次 token 请求的原始响应（不解析 token_path）；供正式取 token 与「测试获取」共用。 */
+    public record RawResponse(int status, String body) {
+    }
+
     private static final long LOCK_WAIT_SEC = 10;
     private static final long LOCK_LEASE_SEC = 30;
     private static final long MIN_TTL_SEC = 5;
@@ -102,7 +106,11 @@ public class PluginTokenProvider {
         }
     }
 
-    private String fetchAndCache(TokenFetchSpec spec, PluginExecutionContext ctx, RBucket<String> bucket) {
+    /**
+     * 渲染并执行一次 token 请求，原样返回 HTTP 状态码 + 响应体；不解析 token、不判 4xx、不缓存。
+     * 供正式取 token（{@link #fetchAndCache}）与调试台「测试获取」共用同一份请求逻辑。
+     */
+    public RawResponse fetchRaw(TokenFetchSpec spec, PluginExecutionContext ctx) {
         String url = renderer.renderString(spec.getUrl(), ctx);
         Request.Builder rb = new Request.Builder().url(url);
         for (Map.Entry<String, String> e : spec.getHeaders().entrySet()) {
@@ -115,17 +123,20 @@ public class PluginTokenProvider {
             String body = spec.getBodyTemplate() == null ? "" : renderer.renderString(spec.getBodyTemplate(), ctx);
             rb.method(method, RequestBody.create(body, MediaType.parse(spec.getContentType())));
         }
-
-        String raw;
-        int status;
         try (Response resp = httpClient.newCall(rb.build()).execute()) {
-            status = resp.code();
-            raw = resp.body() == null ? "" : resp.body().string();
+            int status = resp.code();
+            String raw = resp.body() == null ? "" : resp.body().string();
+            return new RawResponse(status, raw);
         } catch (Exception e) {
             throw new TokenFetchException("token 接口请求失败: " + e.getMessage());
         }
-        if (status >= 400) {
-            throw new TokenFetchException("token 接口 HTTP " + status + ": " + truncate(raw, 300));
+    }
+
+    private String fetchAndCache(TokenFetchSpec spec, PluginExecutionContext ctx, RBucket<String> bucket) {
+        RawResponse resp = fetchRaw(spec, ctx);
+        String raw = resp.body();
+        if (resp.status() >= 400) {
+            throw new TokenFetchException("token 接口 HTTP " + resp.status() + ": " + truncate(raw, 300));
         }
 
         JsonNode root;

@@ -118,4 +118,27 @@ class PluginHttpInvokerTokenRetryTest {
         assertEquals(2, server.getRequestCount(), "最多重试一次");
         assertTrue(result.toString().contains("HTTP_4XX"));
     }
+
+    @Test
+    void credentialMissing_stillReturnsCurlAndRequest() {
+        PluginCredentialService credService = mock(PluginCredentialService.class);
+        when(credService.resolveSecrets(anyLong()))
+                .thenThrow(new PluginCredentialService.CredentialMissingException("凭证缺失"));
+
+        TokenCachingAuthApplier applier = new TokenCachingAuthApplier() {
+            public String authType() { return "OAUTH2"; }
+            public void applyWithContext(RenderedRequest req, PluginExecutionContext ctx, Long pluginId, Map<String, Object> ac) {
+                fail("凭证缺失不应走到鉴权注入");
+            }
+            public void invalidate(PluginExecutionContext ctx, Long pluginId, Map<String, Object> ac) {}
+        };
+
+        Object out = invoker(applier, credService).invokeForTest(entry(), Map.of());
+        assertInstanceOf(Map.class, out);
+        Map<?, ?> env = (Map<?, ?>) out;
+        assertNotNull(env.get("curl"), "凭证缺失也应回显 curl");
+        assertNotNull(env.get("request"), "凭证缺失也应回显已渲染请求");
+        assertTrue(env.get("extracted").toString().contains("CREDENTIAL_MISSING"));
+        assertEquals(0, server.getRequestCount(), "凭证缺失不真正发请求");
+    }
 }

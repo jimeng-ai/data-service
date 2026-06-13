@@ -185,6 +185,11 @@ public class PluginTemplateRenderer {
         return value;
     }
 
+    /** 宽松模式下缺失占位符的可见标记（用于试调用回显 curl，让人一眼看出哪个变量没填） */
+    private String missingMark(String path) {
+        return "<未配置:" + path + ">";
+    }
+
     private Object resolve(String path, PluginExecutionContext ctx) {
         if (path == null || path.isEmpty()) {
             throw new TemplateRenderException("empty placeholder path");
@@ -200,6 +205,7 @@ public class PluginTemplateRenderer {
             case "env":     source = ctx.getEnv(); break;
             case "meta":    source = ctx.getMeta(); break;
             default:
+                if (ctx.isLenient()) return missingMark(path);
                 throw new TemplateRenderException("unknown namespace: " + namespace);
         }
         if (rest.isEmpty()) {
@@ -214,6 +220,8 @@ public class PluginTemplateRenderer {
                 current = null;
             }
             if (current == null) {
+                // 宽松模式（试调用）：缺参不报错，留可见标记让请求渲染出来回显 curl
+                if (ctx.isLenient()) return missingMark(namespace + "." + rest);
                 throw new TemplateRenderException("missing " + namespace + "." + rest);
             }
         }

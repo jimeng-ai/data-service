@@ -33,7 +33,7 @@ public class GenericTokenAuthApplier implements TokenCachingAuthApplier {
     @Override
     public void applyWithContext(RenderedRequest req, PluginExecutionContext ctx,
                                  Long pluginId, Map<String, Object> authConfig) {
-        TokenFetchSpec spec = buildSpec(authConfig);
+        TokenFetchSpec spec = buildSpec(authConfig, ctx.getSecrets());
         String cacheKey = provider.cacheKey(ctx.getTenantId(), pluginId, authConfig, ctx.getSecrets());
         String token = provider.resolveToken(spec, ctx, cacheKey);
         inject(req, authConfig, token);
@@ -44,8 +44,10 @@ public class GenericTokenAuthApplier implements TokenCachingAuthApplier {
         provider.invalidate(provider.cacheKey(ctx.getTenantId(), pluginId, authConfig, ctx.getSecrets()));
     }
 
+    /** secrets 在此忽略：body 里以 {@code {{secrets.x}}} 模板引用，由 renderer 在 fetch 时渲染。 */
+    @Override
     @SuppressWarnings("unchecked")
-    private TokenFetchSpec buildSpec(Map<String, Object> authConfig) {
+    public TokenFetchSpec buildSpec(Map<String, Object> authConfig, Map<String, Object> secrets) {
         Object tr = authConfig == null ? null : authConfig.get("token_request");
         if (!(tr instanceof Map)) {
             throw new IllegalArgumentException("TOKEN_FETCH 缺少 token_request 配置");

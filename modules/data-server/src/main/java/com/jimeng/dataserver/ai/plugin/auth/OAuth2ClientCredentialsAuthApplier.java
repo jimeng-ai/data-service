@@ -48,7 +48,8 @@ public class OAuth2ClientCredentialsAuthApplier implements TokenCachingAuthAppli
         provider.invalidate(provider.cacheKey(ctx.getTenantId(), pluginId, authConfig, ctx.getSecrets()));
     }
 
-    private TokenFetchSpec buildSpec(Map<String, Object> authConfig, Map<String, Object> secrets) {
+    @Override
+    public TokenFetchSpec buildSpec(Map<String, Object> authConfig, Map<String, Object> secrets) {
         String tokenUrl = str(authConfig.get("token_url"));
         if (!StringUtils.hasText(tokenUrl)) {
             throw new IllegalArgumentException("OAUTH2 缺少 token_url 配置");

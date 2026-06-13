@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.plugin.controller;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.plugin.dto.PluginToolEntry;
+import com.jimeng.dataserver.ai.plugin.service.PluginAuthTestService;
 import com.jimeng.dataserver.ai.plugin.service.PluginCredentialService;
 import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.plugin.service.PluginHttpInvoker;
@@ -44,6 +45,7 @@ public class PluginAdminController {
 
     private final PluginCrudService crudService;
     private final PluginCredentialService credentialService;
+    private final PluginAuthTestService authTestService;
     private final PluginRegistryService registryService;
     private final PluginHttpInvoker httpInvoker;
     private final PermissionResolver permissionResolver;
@@ -187,6 +189,27 @@ public class PluginAdminController {
     }
 
     // ============================ 调试 / 缓存 ============================
+
+    @Data
+    public static class AuthTestFetchRequest {
+        /** 调试台里正在编辑、尚未保存的 auth_config 草稿；为空则用已存配置 */
+        private String authConfig;
+        /** 调试台里正在编辑、尚未保存的认证方式草稿；为空则用已存 authType */
+        private String authType;
+    }
+
+    @Operation(summary = "测试获取 token：用已存凭证真实调一次换 token 接口，原样回传响应供点选字段（仅 OAUTH2 / TOKEN_FETCH）")
+    @PostMapping("/plugins/{pluginId}/auth/test-fetch")
+    public PluginAuthTestService.TestFetchResult testAuthFetch(@PathVariable Long pluginId,
+                                                               @RequestBody(required = false) AuthTestFetchRequest req) {
+        // 会用插件凭证真实打到第三方鉴权接口：与「获取凭证」同级，做实例级鉴权 + 归属校验。
+        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
+        crudService.getPlugin(pluginId);
+        return authTestService.testFetch(
+                pluginId,
+                req == null ? null : req.getAuthConfig(),
+                req == null ? null : req.getAuthType());
+    }
 
     @Data
     public static class PluginTestRequest {
