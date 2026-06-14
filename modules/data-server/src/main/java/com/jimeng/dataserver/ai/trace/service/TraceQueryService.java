@@ -34,10 +34,11 @@ public class TraceQueryService {
     private final PermissionResolver permissionResolver;
 
     /** 分页列表。trace「按人私有」：成员只看自己（user_id==自身）的调用链路，超管看本租户全部。 */
-    public Page<AiTrace> page(int page, int size, Date start, Date end, String status, String keyword) {
+    public Page<AiTrace> page(int page, int size, Date start, Date end, String status, String keyword,
+                              String sceneCode) {
         Page<AiTrace> p = new Page<>(Math.max(1, page), Math.min(Math.max(1, size), 200));
         String owner = permissionResolver.ownerScopeOrNull();
-        return aiTraceMapper.selectPage(p, TraceSupport.buildWrapper(start, end, status, keyword, null)
+        return aiTraceMapper.selectPage(p, TraceSupport.buildWrapper(start, end, status, keyword, null, sceneCode)
                 .eq(owner != null, AiTrace::getUserId, owner));
     }
 
@@ -66,10 +67,12 @@ public class TraceQueryService {
     }
 
     /** 按当前筛选导出 CSV（不分页，封顶 {@link TraceSupport#EXPORT_MAX_ROWS} 行）。 */
-    public void exportCsv(Date start, Date end, String status, String keyword, Writer writer) throws Exception {
+    public void exportCsv(Date start, Date end, String status, String keyword, String sceneCode, Writer writer)
+            throws Exception {
         Page<AiTrace> p = new Page<>(1, TraceSupport.EXPORT_MAX_ROWS, false);
         String owner = permissionResolver.ownerScopeOrNull();
-        List<AiTrace> rows = aiTraceMapper.selectPage(p, TraceSupport.buildWrapper(start, end, status, keyword, null)
+        List<AiTrace> rows = aiTraceMapper.selectPage(p,
+                        TraceSupport.buildWrapper(start, end, status, keyword, null, sceneCode)
                         .eq(owner != null, AiTrace::getUserId, owner))
                 .getRecords();
         if (rows.size() >= TraceSupport.EXPORT_MAX_ROWS) {

@@ -30,13 +30,16 @@ public final class TraceSupport {
      * @param tenantId 仅运营侧用于收窄到单个企业；租户侧传 null（拦截器自动注入租户过滤）
      */
     public static LambdaQueryWrapper<AiTrace> buildWrapper(Date start, Date end, String status,
-                                                           String keyword, String tenantId) {
+                                                           String keyword, String tenantId, String sceneCode) {
         LambdaQueryWrapper<AiTrace> w = new LambdaQueryWrapper<>();
         if (StrUtil.isNotBlank(tenantId)) {
             w.eq(AiTrace::getTenantId, tenantId);
         }
         if (StrUtil.isNotBlank(status)) {
             w.eq(AiTrace::getStatus, status);
+        }
+        if (StrUtil.isNotBlank(sceneCode)) {
+            w.eq(AiTrace::getSceneCode, sceneCode);
         }
         if (start != null) {
             w.ge(AiTrace::getCreateTime, start);

@@ -40,10 +40,11 @@ public class OperatorTraceController {
                               @RequestParam(name = "end", required = false) Long end,
                               @RequestParam(name = "status", required = false) String status,
                               @RequestParam(name = "keyword", required = false) String keyword,
-                              @RequestParam(name = "tenantId", required = false) String tenantId) {
+                              @RequestParam(name = "tenantId", required = false) String tenantId,
+                              @RequestParam(name = "sceneCode", required = false) String sceneCode) {
         operatorGuard.requireOperatorId();
         return operatorTraceService.page(page, size, TraceController.toDate(start), TraceController.toDate(end),
-                status, keyword, tenantId);
+                status, keyword, tenantId, sceneCode);
     }
 
     @Operation(summary = "跨租户概览统计")
@@ -76,10 +77,11 @@ public class OperatorTraceController {
                        @RequestParam(name = "status", required = false) String status,
                        @RequestParam(name = "keyword", required = false) String keyword,
                        @RequestParam(name = "tenantId", required = false) String tenantId,
+                       @RequestParam(name = "sceneCode", required = false) String sceneCode,
                        HttpServletResponse response) throws Exception {
         operatorGuard.requireOperatorId();
         TraceController.writeCsvResponse(response, "operator-traces",
                 w -> operatorTraceService.exportCsv(TraceController.toDate(start), TraceController.toDate(end),
-                        status, keyword, tenantId, w));
+                        status, keyword, tenantId, sceneCode, w));
     }
 }

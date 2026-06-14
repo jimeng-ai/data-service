@@ -111,7 +111,7 @@ public class GlobalSearchService {
         String owner = permissionResolver.ownerScopeOrNull();
         Page<AiTrace> page = new Page<>(1, top, false);
         List<AiTrace> traces = aiTraceMapper.selectPage(page,
-                TraceSupport.buildWrapper(null, null, null, kw, null)
+                TraceSupport.buildWrapper(null, null, null, kw, null, null)
                         .eq(owner != null, AiTrace::getUserId, owner)).getRecords();
         return traces.stream().map(t -> {
             GlobalSearchResult.TraceHit hit = new GlobalSearchResult.TraceHit();

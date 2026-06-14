@@ -44,11 +44,11 @@ public class OperatorTraceService {
 
     /** 跨租户分页列表，回填企业名称。 */
     public Page<AiTrace> page(int page, int size, Date start, Date end,
-                              String status, String keyword, String tenantId) {
+                              String status, String keyword, String tenantId, String sceneCode) {
         return TenantContext.runAsSystem(() -> {
             Page<AiTrace> p = new Page<>(Math.max(1, page), Math.min(Math.max(1, size), 200));
             Page<AiTrace> result = aiTraceMapper.selectPage(p,
-                    TraceSupport.buildWrapper(start, end, status, keyword, tenantId));
+                    TraceSupport.buildWrapper(start, end, status, keyword, tenantId, sceneCode));
             Map<String, String> names = loadTenantNames();
             for (AiTrace t : result.getRecords()) {
                 t.setEnterpriseName(names.get(t.getTenantId()));
@@ -89,11 +89,11 @@ public class OperatorTraceService {
 
     /** 按当前筛选导出 CSV（含企业列），封顶 {@link TraceSupport#EXPORT_MAX_ROWS} 行。 */
     public void exportCsv(Date start, Date end, String status, String keyword,
-                          String tenantId, Writer writer) throws Exception {
+                          String tenantId, String sceneCode, Writer writer) throws Exception {
         List<AiTrace> rows = TenantContext.runAsSystem(() -> {
             Page<AiTrace> p = new Page<>(1, TraceSupport.EXPORT_MAX_ROWS, false);
             List<AiTrace> list = aiTraceMapper.selectPage(p,
-                    TraceSupport.buildWrapper(start, end, status, keyword, tenantId)).getRecords();
+                    TraceSupport.buildWrapper(start, end, status, keyword, tenantId, sceneCode)).getRecords();
             Map<String, String> names = loadTenantNames();
             for (AiTrace t : list) {
                 t.setEnterpriseName(names.get(t.getTenantId()));

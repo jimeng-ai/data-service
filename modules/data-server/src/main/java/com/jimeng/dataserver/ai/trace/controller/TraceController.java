@@ -44,8 +44,9 @@ public class TraceController {
                               @RequestParam(name = "start", required = false) Long start,
                               @RequestParam(name = "end", required = false) Long end,
                               @RequestParam(name = "status", required = false) String status,
-                              @RequestParam(name = "keyword", required = false) String keyword) {
-        return traceQueryService.page(page, size, toDate(start), toDate(end), status, keyword);
+                              @RequestParam(name = "keyword", required = false) String keyword,
+                              @RequestParam(name = "sceneCode", required = false) String sceneCode) {
+        return traceQueryService.page(page, size, toDate(start), toDate(end), status, keyword, sceneCode);
     }
 
     @Operation(summary = "概览统计（trace 数 / 平均耗时 / 错误率）")
@@ -73,9 +74,11 @@ public class TraceController {
                        @RequestParam(name = "end", required = false) Long end,
                        @RequestParam(name = "status", required = false) String status,
                        @RequestParam(name = "keyword", required = false) String keyword,
+                       @RequestParam(name = "sceneCode", required = false) String sceneCode,
                        HttpServletResponse response) throws Exception {
         // 二进制/文件下载必须直接写出 OutputStream（void 返回），否则被 GlobalResponseHandler 包成 JSON。
-        writeCsvResponse(response, "traces", w -> traceQueryService.exportCsv(toDate(start), toDate(end), status, keyword, w));
+        writeCsvResponse(response, "traces",
+                w -> traceQueryService.exportCsv(toDate(start), toDate(end), status, keyword, sceneCode, w));
     }
 
     // ------------------------------------------------------------------ helpers
