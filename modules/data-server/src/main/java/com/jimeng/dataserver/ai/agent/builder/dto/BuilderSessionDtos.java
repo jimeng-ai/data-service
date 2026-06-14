@@ -21,4 +21,23 @@ public final class BuilderSessionDtos {
         /** 附件元信息（fileId/filename/contentType，任意 JSON，可空）——落到 user 消息，供前端回显气泡。 */
         private Object attachments;
     }
+
+    @Data
+    public static class FinalizeRequest {
+        /** 最终草稿（含用户在预览里的手改）；为空时后端回退读会话快照。 */
+        private BuilderDraft draft;
+        /** 用户确认要绑定的插件 id。 */
+        private java.util.List<Long> pluginIds;
+        /** 用户确认要绑定的知识库 id。 */
+        private java.util.List<Long> kbIds;
+        /** 知识库检索参数（写入 kb_config）。 */
+        private Integer topK;
+        private Double scoreThreshold;
+        private Boolean rerank;
+    }
+
+    @Data
+    public static class FinalizeResponse {
+        private Long agentId;
+    }
 }

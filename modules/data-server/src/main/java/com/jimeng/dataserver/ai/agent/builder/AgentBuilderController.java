@@ -3,6 +3,8 @@ package com.jimeng.dataserver.ai.agent.builder;
 import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.FinalizeRequest;
+import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.FinalizeResponse;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.StartSessionResponse;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.TurnRequest;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.ConversationView;
@@ -29,6 +31,7 @@ public class AgentBuilderController {
 
     private final AgentBuilderService builderService;
     private final AgentBuilderRunService runService;
+    private final AgentBuilderFinalizeService finalizeService;
     private final ChatConversationService conversationService;
     private final ChatRunService chatRunService;
 
@@ -54,6 +57,17 @@ public class AgentBuilderController {
                                   @RequestBody TurnRequest req,
                                   HttpServletRequest request) {
         return runService.startTurn(conversationId, req, extractTraceId(request));
+    }
+
+    @Operation(summary = "草稿落地为 DRAFT Agent")
+    @PostMapping("/sessions/{id}/finalize")
+    public FinalizeResponse finalizeSession(@PathVariable("id") Long conversationId,
+                                            @RequestBody FinalizeRequest req) {
+        conversationService.requireConversationWithAccess(conversationId);
+        Long agentId = finalizeService.finalize(conversationId, req);
+        FinalizeResponse resp = new FinalizeResponse();
+        resp.setAgentId(agentId);
+        return resp;
     }
 
     @Operation(summary = "读当前草稿（重连恢复预览）")
