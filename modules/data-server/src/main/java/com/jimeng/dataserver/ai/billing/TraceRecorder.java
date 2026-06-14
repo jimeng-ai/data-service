@@ -217,6 +217,14 @@ public class TraceRecorder {
         header.setTenantId(tenantId);
         header.setUserId(userId);
         header.setStatus(Status.SUCCESS);
+        // 场景维度：从 BizTypeContext 读当前功能（chat/rag_answer/agent_gen…），兜底 chat。
+        // 之前 trace 头未填这两列；此处统一补，运营/租户 Trace 列表据此按场景筛。
+        String bizType = BizTypeContext.get();
+        if (bizType == null || bizType.isBlank()) {
+            bizType = BizTypeContext.DEFAULT_CHAT;
+        }
+        header.setBizType(bizType);
+        header.setSceneCode(bizType);
         header.setStepCount(0);
         header.setTotalLatencyMs(0L);
         header.setTotalInputTokens(0L);

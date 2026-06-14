@@ -41,7 +41,8 @@ class SkillRuntimeServiceRagVisibilityTest {
         // 真实的 findByName 逻辑用得上（保持非 mock 行为不影响本用例）；aggregate 打桩成「只有 rag-knowledge」。
         when(registry.aggregate()).thenReturn(ragOnlyPackages());
 
-        service = new SkillRuntimeService(registry, mock(SkillToolExecutorRegistryService.class));
+        service = new SkillRuntimeService(registry, mock(SkillToolExecutorRegistryService.class),
+                new com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage());
         ReflectionTestUtils.setField(service, "skillEnabled", true);
         ReflectionTestUtils.setField(service, "explicitPrefix", "@");
         ReflectionTestUtils.setField(service, "maxSelected", 5);

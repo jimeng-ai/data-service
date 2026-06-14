@@ -257,6 +257,20 @@ public class ChatConversationService {
         return ms.isEmpty() ? null : ms.get(0).getConversationId();
     }
 
+    /** 读构建器草稿 JSON（无则 null）。 */
+    public String getBuilderDraft(Long conversationId) {
+        ChatConversation c = conversationMapper.selectById(conversationId);
+        return c == null ? null : c.getBuilderDraft();
+    }
+
+    /** 落构建器草稿快照（仅更新该列）。 */
+    public void saveBuilderDraft(Long conversationId, String draftJson) {
+        ChatConversation c = new ChatConversation();
+        c.setId(conversationId);
+        c.setBuilderDraft(draftJson);
+        conversationMapper.updateById(c);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /** 校验当前账号对会话所属 Agent 有访问权；超管放行。agentId 非数字（历史脏数据）则跳过，避免误伤。 */

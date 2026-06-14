@@ -42,4 +42,8 @@ public class ChatConversation extends BaseEntity {
     @Schema(description = "最近一条消息时间")
     @TableField("last_message_at")
     private Date lastMessageAt;
+
+    @Schema(description = "构建器草稿快照(JSON)，仅 AI 生成 Agent 向导会话使用；普通对话为空")
+    @TableField("builder_draft")
+    private String builderDraft;
 }

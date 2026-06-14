@@ -25,6 +25,9 @@ public final class BizTypeContext {
     /** RAG 知识库问答（{@code /rag/answer}，最终复用 ClaudeService 生成答案）。 */
     public static final String RAG_ANSWER = "rag_answer";
 
+    /** 对话式生成 Agent（构建器向导）。 */
+    public static final String AGENT_GEN = "agent_gen";
+
     private static final ThreadLocal<String> CURRENT_BIZ_TYPE = new ThreadLocal<>();
 
     private BizTypeContext() {

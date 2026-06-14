@@ -48,10 +48,16 @@ public class SkillRuntimeService {
 
     private final ToolPackageRegistry toolPackageRegistry;
     private final SkillToolExecutorRegistryService skillToolExecutorRegistryService;
+    private final com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage draftAgentToolPackage;
 
     // ------------------------------------------------------------------ public API
 
     public SkillApplyResult applySkillContext(Map<String, Object> body, AiProtocolAdapter adapter) {
+        // 构建器会话：只注入 draft_agent，绕开常规插件/技能聚合与发现（无视全局 skill 开关）。
+        if (body != null && Boolean.TRUE.equals(body.remove("__agent_builder_mode__"))) {
+            injectFullSkillContext(body, java.util.List.of(draftAgentToolPackage), adapter);
+            return SkillApplyResult.activated(java.util.List.of(draftAgentToolPackage.getName()));
+        }
         if (!skillEnabled || body == null) return SkillApplyResult.disabled();
 
         Object messagesObj = body.get("messages");
