@@ -53,8 +53,7 @@ public class AgentBuilderController {
     public TurnStartResponse turn(@PathVariable("id") Long conversationId,
                                   @RequestBody TurnRequest req,
                                   HttpServletRequest request) {
-        return runService.startTurn(conversationId, req == null ? null : req.getQuery(),
-                extractTraceId(request));
+        return runService.startTurn(conversationId, req, extractTraceId(request));
     }
 
     @Operation(summary = "读当前草稿（重连恢复预览）")
