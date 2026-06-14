@@ -40,15 +40,25 @@ public class FeedbackService {
     public ProductFeedbackImage uploadImage(MultipartFile file) throws Exception {
         FeedbackValidator.validateImage(file.getContentType(), file.getSize());
         String objectKey = storage.upload(file);
-        ProductFeedbackImage img = new ProductFeedbackImage();
-        img.setFeedbackId(null);
-        img.setTenantId(TenantContext.get());
-        img.setObjectKey(objectKey);
-        img.setContentType(file.getContentType());
-        img.setFileSize(file.getSize());
-        img.setSortOrder(0);
-        imageMapper.insert(img); // create_user/create_time 自动填充
-        return img;
+        try {
+            ProductFeedbackImage img = new ProductFeedbackImage();
+            img.setFeedbackId(null);
+            img.setTenantId(TenantContext.get());
+            img.setObjectKey(objectKey);
+            img.setContentType(file.getContentType());
+            img.setFileSize(file.getSize());
+            img.setSortOrder(0);
+            imageMapper.insert(img); // create_user/create_time 自动填充
+            return img;
+        } catch (RuntimeException e) {
+            // 插库失败则回收已存的 MinIO 对象：清理任务只扫 DB 行，扫不到这种裸对象，必须就地删
+            try {
+                storage.delete(objectKey);
+            } catch (Exception ignore) {
+                // 回收失败仅记日志级别影响，主异常照常抛出
+            }
+            throw e;
+        }
     }
 
     /** 提交反馈：建主记录 + 回填图片 feedback_id/sort_order（校验属主且未被引用）。 */
@@ -107,7 +117,11 @@ public class FeedbackService {
 
     /** 流式回传图片字节：void+OutputStream 绕 GlobalResponseHandler。checkOwner=false 时跳过属主校验（运营端用）。 */
     public void streamImage(Long imageId, HttpServletResponse response, boolean checkOwner) throws Exception {
-        ProductFeedbackImage img = imageMapper.selectById(imageId);
+        // 租户端 checkOwner=true：selectById 走租户隔离 + 下方属主校验；
+        // 运营端 checkOwner=false：已过 OperatorGuard，需跨租户读取，故 runAsSystem 跳过租户过滤（否则按运营自身租户过滤会查不到）。
+        ProductFeedbackImage img = checkOwner
+                ? imageMapper.selectById(imageId)
+                : TenantContext.runAsSystem(() -> imageMapper.selectById(imageId));
         if (img == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "图片不存在");
         }
