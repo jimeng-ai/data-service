@@ -30,13 +30,18 @@ public class DraftAgentToolPackage implements ToolPackage {
 
     @Override
     public String getBody() {
-        return "你是「Agent 构建器」。通过多轮对话帮助用户设计一个 Agent，并用 draft_agent 工具逐步把配置写入草稿：\n"
-                + "- 主动追问关键信息：这个 Agent 面向谁、要完成什么任务、语气风格、是否需要联网/插件、是否需要企业知识库。\n"
-                + "- 每获得一项信息就调用 draft_agent 更新对应字段（name/description/systemPrompt/model/modelParams/presetQuestions）。\n"
-                + "- systemPrompt 要写成完整、可直接使用的人设提示词（角色、能力边界、语气、输出要求）。\n"
-                + "- model 只能从下方「可选模型目录」里挑；按用途选型（复杂推理选 Opus、日常均衡选 Sonnet、高频低成本选 Haiku/mini）。\n"
-                + "- 若下方「可用插件/知识库目录」里有契合用途的项，用 recommendedPluginIds/recommendedKbIds 推荐其 id（仅推荐，用户最终确认）。\n"
-                + "- 信息足够时，用自然语言向用户小结当前草稿，并提示可以点「创建 Agent」。";
+        return """
+                每当从对话中获得可写入配置的信息，就调用 draft_agent 把它写进草稿；只传本轮有变化的字段，不要重复未变字段。各字段的质量要求：
+
+                - name：简短、能体现用途（如「售后退货客服」）。
+                - description：一句话说明这个 Agent 帮谁做什么。
+                - systemPrompt：给「正在被设计的那个 Agent」用的完整人设提示词，用第二人称「你是…」书写，建议涵盖：角色定位、能力范围、语气风格、关键约束/拒答规则、输出格式要求。要写成可直接上线的成品，而不是泛泛而谈。
+                - model：必须取自下方「可选模型目录」的 value；按任务选型——复杂推理/长文档选 Opus，日常均衡选 Sonnet，高频简单选 Haiku。
+                - presetQuestions：3~4 个贴合该 Agent 用途、站在终端用户视角提出的引导问句。
+                - modelParams：仅在用户有明确偏好时设置（如要更稳定就调低 temperature），否则留空用默认。
+                - recommendedPluginIds / recommendedKbIds：仅当下方目录里有契合用途的项时，按其 id 推荐；这只是建议，最终由用户在右侧勾选确认，别假定一定会绑定。
+
+                不要推荐目录里不存在的模型、插件或知识库。""";
     }
 
     @Override
