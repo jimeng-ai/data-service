@@ -2,6 +2,9 @@ package com.jimeng.dataserver.ai.billing.pricing;
 
 import cn.hutool.core.util.StrUtil;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
+import com.jimeng.dataserver.ai.model.ModelRegistry;
+import com.jimeng.persistence.entity.AiModel;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -23,13 +26,16 @@ import java.util.Map;
  * 其中「计费输入」对 OpenAI 形态会先扣掉已含在 prompt 内的 cached_tokens，避免重复计费
  * （见 {@link NormalizedUsage#isCacheReadInInput()}）。
  *
- * <p>当前单价为代码内常量（USD/百万 token，近似值，按模型档位粗分）。
- * TODO 后续迁到 Nacos 配置中心，支持不改代码热更新价格。
+ * <p>取价优先级：先查 {@link ModelRegistry}（DB 模型目录，运营可视化维护单价，按 value 或 upstream_model 命中），
+ * 命中即用该行四档单价；查不到再落回下方代码内前缀表（兜底 embedding/rerank/历史日志/未入目录的模型）。
  * 人民币换算不在此处固化：{@code cost_usd} 永远存 USD，由报表层按可配置汇率换算。
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class ModelPricing {
+
+    private final ModelRegistry modelRegistry;
 
     /** 单价：USD / 百万 token。 */
     private record Price(double input, double output, double cacheRead, double cacheWrite) {}
@@ -117,6 +123,15 @@ public class ModelPricing {
         if (StrUtil.isBlank(model)) {
             return DEFAULT_PRICE;
         }
+        // 优先 DB 模型目录（运营维护的精确价，按 value 或 upstream_model 命中）。
+        AiModel m = modelRegistry.priceOf(model.trim());
+        if (m != null) {
+            return new Price(
+                    asDouble(m.getPriceInput()),
+                    asDouble(m.getPriceOutput()),
+                    asDouble(m.getPriceCacheRead()),
+                    asDouble(m.getPriceCacheWrite()));
+        }
         String key = model.toLowerCase().trim();
         for (Map.Entry<String, Price> e : PRICES.entrySet()) {
             if (key.contains(e.getKey())) {
@@ -148,5 +163,9 @@ public class ModelPricing {
 
     private static int nz(Integer v) {
         return v == null ? 0 : v;
+    }
+
+    private static double asDouble(BigDecimal v) {
+        return v == null ? 0.0 : v.doubleValue();
     }
 }

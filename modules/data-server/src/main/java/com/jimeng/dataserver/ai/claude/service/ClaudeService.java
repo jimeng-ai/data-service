@@ -6,8 +6,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
-import com.jimeng.dataserver.ai.provider.ProviderRegistry;
-import com.jimeng.dataserver.ai.provider.spi.ChatCapabilities;
+import com.jimeng.dataserver.ai.model.ModelResolver;
 import com.jimeng.dataserver.ai.provider.spi.ChatClient;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
@@ -37,19 +36,20 @@ public class ClaudeService {
 
     private static final String EXPECTED_PROTOCOL = "anthropic";
 
-    private final ProviderRegistry providerRegistry;
+    private final ModelResolver modelResolver;
     private final AgentRuntimeService agentRuntimeService;
 
     public Object messages(Map<String, Object> requestBody) {
-        ChatClient client = requireAnthropicChat();
+        // 先应用 Agent 上下文（可能据 agent.defaultModel 补 model），再按最终 model 解析路由。
         applyAgentContext(requestBody);
+        ChatClient client = modelResolver.resolve(requestBody, EXPECTED_PROTOCOL);
         return client.chat(requestBody, extractTraceId());
     }
 
     public void messagesStream(Map<String, Object> requestBody, String connectionId, String traceId) {
-        ChatClient client = requireAnthropicChat();
-        // 注意：对于流式请求，Controller 已在主线程调用 prepareAgentContext 设置好 AgentContext + body。
-        // 这里只兜底（异步线程被 MdcAsyncSupport 继承的情况下 AgentContext 已有值）。
+        // 注意：流式请求 Controller 已在主线程调用 prepareAgentContext 设置好 AgentContext + body(含 model)，
+        // 故此处直接按最终 model 解析路由。
+        ChatClient client = modelResolver.resolve(requestBody, EXPECTED_PROTOCOL);
         requestBody.put("stream", true);
         client.chatStream(requestBody, connectionId, traceId);
     }
@@ -164,18 +164,6 @@ public class ClaudeService {
         } catch (NumberFormatException e) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "agent_id 必须是数字");
         }
-    }
-
-    private ChatClient requireAnthropicChat() {
-        ChatClient client = providerRegistry.chat();
-        ChatCapabilities caps = client.capabilities();
-        if (!EXPECTED_PROTOCOL.equals(caps.protocol())) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "当前 ai.provider=" + caps.providerName()
-                            + " 的 chat.protocol=" + caps.protocol()
-                            + "，与 /data/claude/messages 期望的 anthropic 协议不匹配，请改用 /data/openai/chat/completions");
-        }
-        return client;
     }
 
     private String extractTraceId() {
