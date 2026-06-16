@@ -112,6 +112,14 @@ public class ChatRunService {
             err.put("error", e.getClass().getSimpleName());
             err.put("message", String.valueOf(e.getMessage()));
             tee.teeJson(runId, "error", err);
+            // 把失败记到 RunState，否则 finally 的 finalize 会把这条助手消息落成 COMPLETED(空)，
+            // 前端实时只闪一下 error 事件、刷新后却是空气泡。记为 FAILED+error 才能持久显示原因。
+            // 适用于「主干在写入任何内容前就抛出」的早失败，如模型已下线/解析失败。
+            RunHandle h = runRegistry.get(runId);
+            if (h != null && h.getState().getTerminalStatus() == null) {
+                h.getState().setError(String.valueOf(e.getMessage()));
+                h.getState().markTerminal("FAILED");
+            }
         } finally {
             // 兜底收尾：生成主干正常路径已自行 finalize（幂等），此处覆盖「主干在 complete 前抛出」的情形。
             runFinalizer.complete(runId);

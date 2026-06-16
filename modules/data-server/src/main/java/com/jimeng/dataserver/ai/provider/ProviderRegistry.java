@@ -88,6 +88,17 @@ public class ProviderRegistry {
         return chatClients.get(selection.getProvider());
     }
 
+    /**
+     * 按 provider 名取 chat client（模型级路由用）。每个已配置 provider 的 chat client
+     * 都已由 ProviderBeansConfig 注册为 bean，这里按名索引；缺失返回 null 由调用方处理。
+     */
+    public ChatClient chat(String providerName) {
+        if (StrUtil.isBlank(providerName)) {
+            return null;
+        }
+        return chatClients.get(providerName);
+    }
+
     public EmbeddingClient embedding() {
         return embeddingClients.get(selection.getProvider());
     }
