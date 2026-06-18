@@ -66,7 +66,7 @@ class AiConversationLoopTest {
         runRegistry = mock(RunRegistry.class);
         llmCallGuard = mock(LlmCallGuard.class);
         traceRecorder = mock(TraceRecorder.class);
-        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, tee, runFinalizer, runRegistry, llmCallGuard, traceRecorder);
+        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, tee, runFinalizer, runRegistry, llmCallGuard, traceRecorder, new com.jimeng.dataserver.ai.web.WebSearchProperties());
         ReflectionTestUtils.setField(loop, "maxToolRounds", 3);
         when(recordService.recordRequest(any(), any(), anyString(), anyString(), anyString())).thenReturn(1L);
     }

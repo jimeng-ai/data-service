@@ -26,6 +26,8 @@ public class SidecarRunPayload {
     private Llm llm;
     /** 非空且 baseUrl/authToken/model 齐全时，边车注册 generate_image MCP 工具（OpenAI 兼容 /v1/images/generations）。 */
     private ImageGen imageGen;
+    /** 非空且 baseUrl/authToken 齐全时，边车注册 web search+fetch MCP 工具。字段名须与边车 TS 的 WebSearchConfig 一致。 */
+    private WebSearch webSearch;
     private Limits limits;
 
     @Data
@@ -71,6 +73,16 @@ public class SidecarRunPayload {
         private String provider;
         /** 批量生图并发上限；空时边车用内置默认。字段名须与边车 TS 的 batchConcurrency 一致。 */
         private Integer batchConcurrency;
+    }
+
+    /** 字段名须与边车 TS 的 WebSearchConfig 一致（camelCase）。 */
+    @Data
+    public static class WebSearch {
+        private String baseUrl;
+        private String authToken;
+        private String provider;
+        private Integer maxResults;
+        private String authScheme;
     }
 
     @Data

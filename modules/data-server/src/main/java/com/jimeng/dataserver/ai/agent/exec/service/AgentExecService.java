@@ -185,6 +185,17 @@ public class AgentExecService {
             ig.setBatchConcurrency(igCfg.getBatchConcurrency());
             payload.setImageGen(ig);
         }
+        // 联网检索：仅当配置齐全时下发，边车据此注册 search/fetch 工具（缺则沿用"无联网"行为）。
+        AgentSandboxProperties.WebSearch wsCfg = props.getWebSearch();
+        if (wsCfg != null && StrUtil.isAllNotBlank(wsCfg.getBaseUrl(), wsCfg.getAuthToken())) {
+            SidecarRunPayload.WebSearch ws = new SidecarRunPayload.WebSearch();
+            ws.setBaseUrl(wsCfg.getBaseUrl());
+            ws.setAuthToken(wsCfg.getAuthToken());
+            ws.setProvider(wsCfg.getProvider());
+            ws.setMaxResults(wsCfg.getMaxResults());
+            ws.setAuthScheme(wsCfg.getAuthScheme());
+            payload.setWebSearch(ws);
+        }
         SidecarRunPayload.Limits limits = new SidecarRunPayload.Limits();
         limits.setWallClockSec(props.getWallClockSec());
         limits.setMaxTurns(props.getMaxTurns());

@@ -34,6 +34,9 @@ public class AgentSandboxProperties {
     /** 转发给边车的生图目标（OpenAI 兼容 images/generations）；base-url/auth-token/model 任一为空则不启用生图工具 */
     private ImageGen imageGen = new ImageGen();
 
+    /** 转发给边车的网络检索目标（AnySearch 等）；base-url/auth-token 任一为空则不启用 web 工具 */
+    private WebSearch webSearch = new WebSearch();
+
     @Data
     public static class Llm {
         private String baseUrl;
@@ -52,5 +55,17 @@ public class AgentSandboxProperties {
         private String provider = "openai";
         /** 批量生图并发上限（一次多张时最多几张同时生成）；空/<=0 时边车用内置默认 5。302 限流就调小。 */
         private Integer batchConcurrency;
+    }
+
+    @Data
+    public static class WebSearch {
+        /** 搜索 API 根地址，例如 https://api.anysearch.com */
+        private String baseUrl;
+        private String authToken;
+        /** 上游搜索 API 形态；默认 anysearch。换后端改这里。 */
+        private String provider = "anysearch";
+        /** search 默认返回条数 */
+        private Integer maxResults = 5;
+        private String authScheme = "bearer";
     }
 }
