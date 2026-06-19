@@ -32,6 +32,7 @@ public class GithubTarballFetcher {
         try {
             HttpClient client = HttpClient.newBuilder()
                     .connectTimeout(Duration.ofSeconds(props.getFetchTimeoutSec()))
+                    .proxy(java.net.ProxySelector.getDefault())
                     .followRedirects(HttpClient.Redirect.NORMAL).build();
             HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofSeconds(props.getFetchTimeoutSec())).GET();
