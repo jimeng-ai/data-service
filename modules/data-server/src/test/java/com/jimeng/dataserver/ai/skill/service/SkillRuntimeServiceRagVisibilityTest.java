@@ -42,7 +42,8 @@ class SkillRuntimeServiceRagVisibilityTest {
         when(registry.aggregate()).thenReturn(ragOnlyPackages());
 
         service = new SkillRuntimeService(registry, mock(SkillToolExecutorRegistryService.class),
-                new com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage());
+                new com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage(),
+                new com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage());
         ReflectionTestUtils.setField(service, "skillEnabled", true);
         ReflectionTestUtils.setField(service, "explicitPrefix", "@");
         ReflectionTestUtils.setField(service, "maxSelected", 5);
