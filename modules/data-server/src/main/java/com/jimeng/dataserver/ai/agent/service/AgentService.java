@@ -93,11 +93,21 @@ public class AgentService {
         return agent;
     }
 
+    /** 内置构建器 Agent 的 code（Agent 构建器 / Skill 构建器）：内部专用，不在「选择 Agent」列表与对话历史中展示。 */
+    public static final java.util.Set<String> INTERNAL_AGENT_CODES =
+            java.util.Set.of("__agent_builder__", "__skill_builder__");
+
+    /** 内置构建器 Agent 的展示名快照：用于按会话 agent_name 快照过滤历史会话（含已被硬删的旧构建器 Agent 的会话）。 */
+    public static final java.util.Set<String> INTERNAL_AGENT_NAMES =
+            java.util.Set.of("Agent 构建器", "Skill 构建器");
+
     public List<Agent> list(String status) {
         LambdaQueryWrapper<Agent> wrapper = new LambdaQueryWrapper<>();
         if (StringUtils.hasText(status)) {
             wrapper.eq(Agent::getStatus, status);
         }
+        // 排除内置构建器 Agent——由「AI 生成 Skill/Agent」入口专用，不应出现在普通选择列表。
+        wrapper.notIn(Agent::getCode, INTERNAL_AGENT_CODES);
         wrapper.orderByDesc(Agent::getCreateTime);
         return agentMapper.selectList(wrapper);
     }

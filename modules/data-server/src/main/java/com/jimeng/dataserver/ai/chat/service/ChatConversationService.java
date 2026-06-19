@@ -12,8 +12,11 @@ import com.jimeng.dataserver.ai.chat.dto.ChatDtos.CreateConversationRequest;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.MessageView;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
+import com.jimeng.dataserver.ai.agent.service.AgentService;
+import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.ChatConversation;
 import com.jimeng.persistence.entity.ChatMessage;
+import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.ChatConversationMapper;
 import com.jimeng.persistence.mapper.ChatMessageMapper;
 import lombok.RequiredArgsConstructor;
@@ -50,6 +53,7 @@ public class ChatConversationService {
     private final ChatConversationMapper conversationMapper;
     private final ChatMessageMapper messageMapper;
     private final PermissionResolver permissionResolver;
+    private final AgentMapper agentMapper;
 
     // ------------------------------------------------------------------ 会话
 
@@ -72,8 +76,13 @@ public class ChatConversationService {
         // 会话「按人私有」：成员只看自己创建的；超管（owner==null）看本租户全部。
         // 历史遗留：仅靠租户拦截器隔离，会把全租户会话都列出 -> 同租户互相看到对方会话。
         String owner = permissionResolver.ownerScopeOrNull();
+        // 排除内置构建器（Skill/Agent 构建器）的会话——它们由「AI 生成」入口专用，不进对话历史。
+        List<String> builderAgentIds = builderAgentIds();
         LambdaQueryWrapper<ChatConversation> wrapper = new LambdaQueryWrapper<ChatConversation>()
                 .eq(owner != null, ChatConversation::getCreateUser, owner)
+                // 双重排除内置构建器会话：按当前 builder agentId（现存的）+ 按 agent_name 快照（兜住旧的/已硬删的构建器 Agent 的历史会话）。
+                .notIn(!builderAgentIds.isEmpty(), ChatConversation::getAgentId, builderAgentIds)
+                .notIn(ChatConversation::getAgentName, AgentService.INTERNAL_AGENT_NAMES)
                 .orderByDesc(ChatConversation::getLastMessageAt)
                 .orderByDesc(ChatConversation::getId);
         // 一次查出（属主范围内）所有「正在生成」的助手消息，给列表项打上「正在回复」标志（驱动左侧转圈/圆点）。
@@ -87,6 +96,13 @@ public class ChatConversationService {
                     return v;
                 })
                 .toList();
+    }
+
+    /** 本租户内置构建器 Agent 的 id（字符串，与 chat_conversation.agent_id 同型）；无则空表。 */
+    private List<String> builderAgentIds() {
+        return agentMapper.selectList(new LambdaQueryWrapper<Agent>()
+                        .in(Agent::getCode, AgentService.INTERNAL_AGENT_CODES))
+                .stream().map(a -> String.valueOf(a.getId())).toList();
     }
 
     /** 会话 id → 当前在跑的 runId（仅含有 GENERATING 助手消息的会话）。owner!=null 时只统计本人消息。 */
