@@ -83,6 +83,17 @@ public class SkillTenantService {
         registry.reloadAndBroadcast();
     }
 
+    /** 本次 run 可见的 ACTIVE DOER skill（scope=TENANT 或 owner==当前用户）。每次现读，不走缓存。 */
+    public List<AiSkill> listActiveDoerForRun(String tenantId, Long currentUserId) {
+        LambdaQueryWrapper<AiSkill> q = new LambdaQueryWrapper<AiSkill>()
+                .eq(AiSkill::getTenantId, tenantId)
+                .eq(AiSkill::getStatus, SkillConst.STATUS_ACTIVE)
+                .eq(AiSkill::getSkillType, SkillConst.TYPE_DOER)
+                .and(w -> w.eq(AiSkill::getScope, SkillConst.SCOPE_TENANT)
+                            .or().eq(AiSkill::getOwnerUserId, currentUserId));
+        return aiSkillMapper.selectList(q);
+    }
+
     private AiSkill requireOwned(Long id, Long currentUserId) {
         AiSkill s = aiSkillMapper.selectById(id);
         if (s == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "未找到该 skill");

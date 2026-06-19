@@ -5,12 +5,15 @@ import com.jimeng.common.core.configuration.FileConfiguration;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import io.minio.BucketExistsArgs;
 import io.minio.GetObjectArgs;
+import io.minio.ListObjectsArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
+import io.minio.Result;
 import io.minio.http.Method;
 import io.minio.GetPresignedObjectUrlArgs;
+import io.minio.messages.Item;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,6 +24,8 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * RAG 专用 MinIO 存储服务。
@@ -115,6 +120,16 @@ public class RagMinioStorageService {
                     .bucket(bucket).object(objectName).contentType(contentType)
                     .stream(is, bytes.length, -1).build());
         }
+    }
+
+    /** 列出某前缀下的所有对象 key（递归）。 */
+    public List<String> listObjects(String prefix) throws Exception {
+        ensureReady();
+        List<String> keys = new ArrayList<>();
+        Iterable<Result<Item>> results = client.listObjects(
+                ListObjectsArgs.builder().bucket(bucket).prefix(prefix).recursive(true).build());
+        for (Result<Item> r : results) keys.add(r.get().objectName());
+        return keys;
     }
 
     public String getBucket() {
