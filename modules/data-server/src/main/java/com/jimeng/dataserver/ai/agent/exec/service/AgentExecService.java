@@ -17,6 +17,9 @@ import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
 import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
 import com.jimeng.dataserver.ai.run.RunEventTee;
+import com.jimeng.dataserver.ai.skill.service.SkillBundleResolver;
+import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
+import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.run.RunHandle;
 import com.jimeng.dataserver.ai.run.RunRegistry;
@@ -72,6 +75,8 @@ public class AgentExecService {
     private final UsageExtractor usageExtractor;
     private final ProviderRegistry providerRegistry;
     private final PermissionResolver permissionResolver;
+    private final SkillTenantService skillTenantService;
+    private final SkillBundleResolver skillBundleResolver;
 
     public void streamExec(AgentExecRequest req, String connectionId, String traceId) {
         String tenantId = TenantContext.get();
@@ -201,6 +206,12 @@ public class AgentExecService {
         limits.setMaxTurns(props.getMaxTurns());
         limits.setMaxBudgetUsd(props.getMaxBudgetUsd());
         payload.setLimits(limits);
+        // DOER skills：把租户可见的活跃 DOER skill bundle 列出并下发给边车（边车物化到 .claude/skills）。
+        List<AiSkill> doerSkills = skillTenantService.listActiveDoerForRun(
+                tenantId, AdminRequestContext.findUserIdOrNull());
+        if (!doerSkills.isEmpty()) {
+            payload.setSkills(skillBundleResolver.resolve(doerSkills));
+        }
 
         // 4. 桥接边车 SSE
         final CountDownLatch latch = new CountDownLatch(1);
