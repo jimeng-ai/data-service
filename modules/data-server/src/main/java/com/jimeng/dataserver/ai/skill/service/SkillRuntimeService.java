@@ -68,12 +68,12 @@ public class SkillRuntimeService {
         Map<String, ToolPackage> skillMap = aggregateToolPackages();
         if (skillMap.isEmpty()) return SkillApplyResult.disabled();
 
-        // 拆分：Agent 显式绑定的插件(tenantId != null) 直接作为 tool_use 工具注入——绑了就能用，不必先 activate_skills；
-        // 平台级 Skill(tenantId == null) 数量多，仍走「发现 → activate_skills 激活」以免铺满上下文。
+        // 拆分：kind==PLUGIN 的包（含租户私有插件）直接作为 tool_use 工具注入——绑了就能用，不必先 activate_skills；
+        // kind==SKILL 的包（含未来的租户私有 Skill）走「发现 → activate_skills 激活」以免铺满上下文。
         List<ToolPackage> boundPlugins = new ArrayList<>();
         Map<String, ToolPackage> skillOnly = new LinkedHashMap<>();
         for (Map.Entry<String, ToolPackage> e : skillMap.entrySet()) {
-            if (e.getValue().getTenantId() != null) {
+            if (e.getValue().getKind() == com.jimeng.dataserver.ai.skill.model.ToolPackageKind.PLUGIN) {
                 boundPlugins.add(e.getValue());
             } else {
                 skillOnly.put(e.getKey(), e.getValue());
@@ -382,7 +382,7 @@ public class SkillRuntimeService {
      * 按当前 AgentContext 过滤：
      * <ul>
      *   <li>没有 Agent 上下文 → 不过滤（兼容直接调 Claude 不带 agent_id 的旧用法）</li>
-     *   <li>有 Agent 上下文 → Skill（tenantId=null）全部保留；插件只保留 Agent 绑定的</li>
+     *   <li>有 Agent 上下文 → kind==SKILL 全部保留；kind==PLUGIN 只保留 Agent 绑定的</li>
      * </ul>
      */
     private Map<String, ToolPackage> filterByAgentAllowlist(Map<String, ToolPackage> packages) {
@@ -393,8 +393,8 @@ public class SkillRuntimeService {
         java.util.LinkedHashMap<String, ToolPackage> filtered = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, ToolPackage> e : packages.entrySet()) {
             ToolPackage pkg = e.getValue();
-            if (pkg.getTenantId() == null) {
-                // Skill 全局可见
+            if (pkg.getKind() == com.jimeng.dataserver.ai.skill.model.ToolPackageKind.SKILL) {
+                // Skill（含未来租户私有 Skill）全部保留
                 filtered.put(e.getKey(), pkg);
             } else if (agent.getAllowedPluginCodes().contains(pkg.getName())) {
                 // 插件按 Agent 绑定过滤
