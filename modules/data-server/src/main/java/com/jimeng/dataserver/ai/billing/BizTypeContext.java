@@ -28,6 +28,9 @@ public final class BizTypeContext {
     /** 对话式生成 Agent（构建器向导）。 */
     public static final String AGENT_GEN = "agent_gen";
 
+    /** 对话式生成 Skill（Skill 构建器向导）。 */
+    public static final String SKILL_GEN = "skill_gen";
+
     private static final ThreadLocal<String> CURRENT_BIZ_TYPE = new ThreadLocal<>();
 
     private BizTypeContext() {
