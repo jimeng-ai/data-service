@@ -49,6 +49,7 @@ public class SkillRuntimeService {
     private final ToolPackageRegistry toolPackageRegistry;
     private final SkillToolExecutorRegistryService skillToolExecutorRegistryService;
     private final com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage draftAgentToolPackage;
+    private final com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage draftSkillToolPackage;
 
     // ------------------------------------------------------------------ public API
 
@@ -57,6 +58,10 @@ public class SkillRuntimeService {
         if (body != null && Boolean.TRUE.equals(body.remove("__agent_builder_mode__"))) {
             injectFullSkillContext(body, java.util.List.of(draftAgentToolPackage), adapter);
             return SkillApplyResult.activated(java.util.List.of(draftAgentToolPackage.getName()));
+        }
+        if (body != null && Boolean.TRUE.equals(body.remove("__skill_builder_mode__"))) {
+            injectFullSkillContext(body, java.util.List.of(draftSkillToolPackage), adapter);
+            return SkillApplyResult.activated(java.util.List.of(draftSkillToolPackage.getName()));
         }
         if (!skillEnabled || body == null) return SkillApplyResult.disabled();
 
