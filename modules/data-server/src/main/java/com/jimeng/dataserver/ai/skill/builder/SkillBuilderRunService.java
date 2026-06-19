@@ -49,7 +49,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -94,9 +93,8 @@ public class SkillBuilderRunService {
     private final SidecarClient sidecarClient;
     private final AgentSandboxProperties sandboxProps;
     private final SseServiceUtil sseServiceUtil;
-
-    /** 每会话一份内存草稿（含 files/脚本）。draft_skill 执行器合并增量，试跑/finalize 取用。 */
-    private final ConcurrentHashMap<Long, SkillDraft> draftByConversation = new ConcurrentHashMap<>();
+    /** 每会话内存草稿（含 files/脚本）的共享持有者——独立叶子组件，破构造环。 */
+    private final SkillDraftStore draftStore;
 
     // ------------------------------------------------------------------ turn / stream
 
@@ -226,14 +224,12 @@ public class SkillBuilderRunService {
      * 由 {@link DraftSkillToolExecutor} 在对话循环执行 draft_skill 后回调（runId→conversationId 已解析）。
      */
     public SkillDraft mergeDraft(Long conversationId, Map<String, Object> patch) {
-        SkillDraft draft = draftByConversation.computeIfAbsent(conversationId, k -> new SkillDraft());
-        SkillDraftMerger.merge(draft, patch);
-        return draft;
+        return draftStore.merge(conversationId, patch);
     }
 
     /** 取该会话当前内存草稿（试跑/finalize 用）；无则 null。 */
     public SkillDraft currentDraft(Long conversationId) {
-        return draftByConversation.get(conversationId);
+        return draftStore.current(conversationId);
     }
 
     // ------------------------------------------------------------------ sandbox dry-run

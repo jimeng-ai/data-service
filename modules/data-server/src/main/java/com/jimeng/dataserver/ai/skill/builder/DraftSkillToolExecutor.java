@@ -38,8 +38,8 @@ public class DraftSkillToolExecutor implements SkillToolExecutor {
     private final AiSkillMapper aiSkillMapper;
     private final ChatConversationService conversationService;
     private final RunEventTee tee;
-    // run-service 持每会话内存草稿 map；本执行器据 runId→conversationId 回调合并增量（单向依赖，无环）。
-    private final SkillBuilderRunService runService;
+    // 内存草稿（含 files/脚本）合并进无依赖的 SkillDraftStore——避免 ↔SkillBuilderRunService 构造环。
+    private final SkillDraftStore draftStore;
 
     @Override
     public boolean supports(String toolName) {
@@ -60,7 +60,7 @@ public class DraftSkillToolExecutor implements SkillToolExecutor {
         // 1. 落库 DRAFT ai_skill 行（元数据 + body）。
         applyDraft(conversationId, tenantId, ownerUserId, input);
         // 2. 合并进内存草稿（含 files/脚本），并推 SSE 全量给前端预览。
-        SkillDraft draft = runService.mergeDraft(conversationId, input);
+        SkillDraft draft = draftStore.merge(conversationId, input);
         if (runId != null) {
             tee.teeJson(runId, "draft-update", draft);
         }
