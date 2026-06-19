@@ -2,7 +2,9 @@ package com.jimeng.dataserver.ai.skill.controller;
 
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.skill.SkillConst;
+import com.jimeng.dataserver.ai.skill.controller.dto.SkillImportRequest;
 import com.jimeng.dataserver.ai.skill.controller.dto.SkillView;
+import com.jimeng.dataserver.ai.skill.service.SkillImportService;
 import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
 import com.jimeng.persistence.entity.AiSkill;
 import io.swagger.v3.oas.annotations.Operation;
@@ -22,6 +24,16 @@ import java.util.List;
 public class SkillTenantController {
 
     private final SkillTenantService skillTenantService;
+    private final SkillImportService skillImportService;
+
+    @Operation(summary = "从 GitHub 导入 skill")
+    @PostMapping("/import")
+    public SkillView importFromGithub(@RequestBody SkillImportRequest req) {
+        AiSkill s = skillImportService.importFromGithub(
+                req.getOwner(), req.getRepo(), req.getRef(), req.getPath(),
+                AdminRequestContext.requireTenantId(), AdminRequestContext.requireUserId());
+        return SkillView.of(s);
+    }
 
     @Operation(summary = "上传 SKILL.md 创建私有 skill")
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
