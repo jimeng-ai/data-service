@@ -65,6 +65,7 @@ public class ResolvedPermissions {
             case AGENT -> agentIds;
             case KNOWLEDGE_BASE -> knowledgeBaseIds;
             case PLUGIN -> pluginIds;
+            case SKILL -> Collections.emptySet();
             case MENU -> Collections.emptySet();
         };
     }

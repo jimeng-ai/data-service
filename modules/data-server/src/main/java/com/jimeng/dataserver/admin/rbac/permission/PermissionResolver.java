@@ -8,12 +8,14 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.persistence.entity.Agent;
+import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.KnowledgeBase;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.SysRoleResource;
 import com.jimeng.persistence.entity.SysUser;
 import com.jimeng.persistence.entity.SysUserRole;
 import com.jimeng.persistence.mapper.AgentMapper;
+import com.jimeng.persistence.mapper.AiSkillMapper;
 import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
 import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleResourceMapper;
@@ -52,6 +54,7 @@ public class PermissionResolver {
     private final AgentMapper agentMapper;
     private final PluginMapper pluginMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
+    private final AiSkillMapper aiSkillMapper;
 
     /** 解析当前请求账号的权限（读 gateway 注入的头）。 */
     public ResolvedPermissions resolveCurrent() {
@@ -118,6 +121,10 @@ public class PermissionResolver {
             case KNOWLEDGE_BASE -> {
                 KnowledgeBase kb = knowledgeBaseMapper.selectById(id);
                 yield kb == null ? null : kb.getCreateUser();
+            }
+            case SKILL -> {
+                AiSkill sk = aiSkillMapper.selectById(id);
+                yield sk == null ? null : sk.getCreateUser();
             }
             case MENU -> null;
         };
