@@ -20,6 +20,7 @@ import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.model.ToolPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
 import com.jimeng.dataserver.ai.skill.service.SkillRuntimeService;
+import com.jimeng.dataserver.ai.skill.install.SkillInstallToolDefinitions;
 import com.jimeng.dataserver.ai.web.WebSearchProperties;
 import com.jimeng.dataserver.ai.web.WebToolDefinitions;
 import lombok.RequiredArgsConstructor;
@@ -57,16 +58,26 @@ public class AiConversationLoop {
     @Value("${skill.max-tool-rounds:10}")
     private int maxToolRounds;
 
+    @Value("${skill.install.enabled:true}")
+    private boolean skillInstallEnabled;
+
     public record CallRecordConfig(String provider, String endpoint, String defaultModel) {}
 
     /**
-     * 注入内置 web 工具定义（web_search / web_fetch），对所有 Agent 永远在场（不走 skill 发现流程），
-     * 并确保 tool_choice=auto。仅当 ai.web-search 配齐时由调用方触发。
+     * 注入内置工具定义（web_search/web_fetch 和 skill.search/skill.install），对所有 Agent 永远在场
+     * （不走 skill 发现流程），并确保 tool_choice=auto。各工具组由对应开关独立控制。
      */
-    private void injectWebTools(Map<String, Object> body, AiProtocolAdapter adapter) {
+    private void injectBuiltinTools(Map<String, Object> body, AiProtocolAdapter adapter,
+                                    boolean webTools, boolean skillInstall) {
         List<Object> tools = adapter.getToolsList(body);
-        tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_SEARCH));
-        tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_FETCH));
+        if (webTools) {
+            tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_SEARCH));
+            tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_FETCH));
+        }
+        if (skillInstall) {
+            tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.SEARCH_DEF));
+            tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.INSTALL_DEF));
+        }
         adapter.setToolsList(body, tools);
         adapter.ensureToolChoiceAuto(body);
     }
@@ -85,11 +96,12 @@ public class AiConversationLoop {
         Map<String, ToolPackage> skillMap = skillApplyResult.isDiscoveryPhase()
                 ? skillRuntimeService.aggregateToolPackages() : null;
 
-        // 内置 web 工具：配齐 ai.web-search 即对所有 Agent 注入 web_search/web_fetch，并让工具循环对
-        // 「没绑任何 skill/plugin 的裸 Agent」也保持开启（否则 !isEnabled() 会让其第一轮就短路返回）。
+        // 内置工具：web_search/web_fetch（ai.web-search 配齐时）和 skill.search/skill.install（默认开）
+        // 对所有 Agent 永远在场，并让工具循环对「没绑任何 skill/plugin 的裸 Agent」也保持开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        if (webToolsEnabled) {
-            injectWebTools(body, adapter);
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        if (builtinToolsEnabled) {
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
@@ -112,7 +124,7 @@ public class AiConversationLoop {
                 log.info("{} 接口返回: {}", rc.provider(), resp.getBody());
 
                 Object parsed = tryParseJson(resp.getBody());
-                if (!isSuccess(resp.getStatusCode()) || (!skillApplyResult.isEnabled() && !webToolsEnabled)) {
+                if (!isSuccess(resp.getStatusCode()) || (!skillApplyResult.isEnabled() && !builtinToolsEnabled)) {
                     boolean ok = isSuccess(resp.getStatusCode());
                     traceRecorder.recordLlm(logId, "推理·生成回答", modelOf(body, rc),
                             null, null, null, latency, ok, ok ? null : resp.getBody());
@@ -183,10 +195,11 @@ public class AiConversationLoop {
         Map<String, ToolPackage> skillMap = skillApplyResult.isDiscoveryPhase()
                 ? skillRuntimeService.aggregateToolPackages() : null;
 
-        // 内置 web 工具：见 runBlocking 同段说明。配齐即对所有 Agent（含裸 Agent）开启。
+        // 内置工具：见 runBlocking 同段说明。配齐/默认开即对所有 Agent（含裸 Agent）开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        if (webToolsEnabled) {
-            injectWebTools(body, adapter);
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        if (builtinToolsEnabled) {
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
@@ -234,7 +247,7 @@ public class AiConversationLoop {
 
                     Map<String, Object> responseMap = accumulator.buildResponseMap();
                     List<ToolUseCall> toolCalls = adapter.extractToolUseCalls(responseMap);
-                    boolean hasTools = (skillApplyResult.isEnabled() || webToolsEnabled) && !toolCalls.isEmpty();
+                    boolean hasTools = (skillApplyResult.isEnabled() || builtinToolsEnabled) && !toolCalls.isEmpty();
                     // 用户主动停止：上游流被 EventSource.cancel() 中断（streamFailed=true），但这不是错误。
                     // 记成 CANCELLED 而非 ERROR，使 trace 头表落成「用户停止」、不计入错误率（详见 TraceRecorder）。
                     boolean cancelled = handle != null && handle.isCancelled();
@@ -247,7 +260,7 @@ public class AiConversationLoop {
                                 null, latency, !streamFailed.get(), null);
                     }
 
-                    if ((!skillApplyResult.isEnabled() && !webToolsEnabled) || toolCalls.isEmpty()) {
+                    if ((!skillApplyResult.isEnabled() && !builtinToolsEnabled) || toolCalls.isEmpty()) {
                         double elapsed = (System.currentTimeMillis() - totalStart) / 1000.0;
                         logFinalAnswer(connectionId, rc, adapter, responseMap, totalIn, totalOut, elapsed);
                         sendSummary(connectionId, totalIn, totalOut,
