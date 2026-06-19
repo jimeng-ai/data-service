@@ -36,14 +36,21 @@ public class DocumentController {
     private final DocumentService documentService;
     private final PermissionResolver permissionResolver;
 
-    @Operation(summary = "上传文档到知识库", description = "将文件上传到指定知识库并触发异步入库流程（解析 → 切片 → 上下文化 → 向量化 → 入 ES）")
+    @Operation(summary = "上传文档到知识库", description = "仅将文件上传存储，置为「待确认（STAGED）」状态，不触发入库；需随后调用「确认入库」接口才开始解析/切片/向量化")
     @PostMapping(value = "/kb/{kbId}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public KbDocument upload(@Parameter(description = "知识库 ID") @PathVariable Long kbId,
-                             @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file,
-                             @Parameter(description = "表格逐行切片：true=Excel/CSV 每数据行独立成 chunk（FAQ 表用），仅对 xlsx/csv 生效")
-                             @RequestParam(value = "rowPerChunk", defaultValue = "false") boolean rowPerChunk) throws Exception {
+                             @Parameter(description = "上传的文档文件，支持 pdf/docx/xlsx/md 等") @RequestParam("file") MultipartFile file) throws Exception {
         permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, kbId);
-        return documentService.upload(kbId, file, rowPerChunk);
+        return documentService.upload(kbId, file);
+    }
+
+    @Operation(summary = "确认入库", description = "将该知识库下所有「待确认（STAGED）」文档一并推进到入库流水线（解析 → 切片 → 上下文化 → 向量化 → 入 ES）")
+    @PostMapping("/kb/{kbId}/documents/confirm")
+    public List<KbDocument> confirm(@Parameter(description = "知识库 ID") @PathVariable Long kbId,
+                                    @Parameter(description = "表格逐行切片：true=Excel/CSV 每数据行独立成 chunk（FAQ 表用），仅对 xlsx/csv 生效；本批无表格文件时勾选无影响")
+                                    @RequestParam(value = "rowPerChunk", defaultValue = "false") boolean rowPerChunk) {
+        permissionResolver.assertCurrentAccess(ResourceType.KNOWLEDGE_BASE, kbId);
+        return documentService.confirm(kbId, rowPerChunk);
     }
 
     @Operation(summary = "查询知识库内文档列表", description = "返回指定知识库下所有文档及各自的入库状态")

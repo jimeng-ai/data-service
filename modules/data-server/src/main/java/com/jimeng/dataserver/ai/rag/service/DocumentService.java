@@ -34,11 +34,12 @@ public class DocumentService {
     private final ChunkIndexService chunkIndexService;
     private final KnowledgeBaseService knowledgeBaseService;
 
+    /**
+     * 上传文件到知识库，仅存储（MinIO + kb_document），状态置 STAGED（待确认），
+     * 不发 RabbitMQ 消息、不触发入库流水线。需用户随后调 {@link #confirm} 才进入处理。
+     * 逐行切片（rowPerChunk）在确认时统一决定，故上传不接收该参数。
+     */
     public KbDocument upload(Long kbId, MultipartFile file) throws Exception {
-        return upload(kbId, file, false);
-    }
-
-    public KbDocument upload(Long kbId, MultipartFile file, boolean rowPerChunk) throws Exception {
         knowledgeBaseService.get(kbId);
         if (file == null || file.isEmpty()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "上传文件不能为空");
@@ -51,7 +52,7 @@ public class DocumentService {
 
         // 幂等：相同 kb 内的同 hash 文件
         //  - 已完成入库（DONE）：直接返回旧记录，跳过整条流水线
-        //  - 中间状态（UPLOADED / PARSING / CHUNKING / ... / FAILED）：复用旧记录，但重新入队触发入库
+        //  - 其它状态（STAGED / PARSING / ... / FAILED）：复用旧记录，重置为 STAGED 等待用户再次确认（不入队）
         LambdaQueryWrapper<KbDocument> w = new LambdaQueryWrapper<>();
         w.eq(KbDocument::getKbId, kbId).eq(KbDocument::getFileHash, hash);
         KbDocument existed = kbDocumentMapper.selectOne(w);
@@ -60,16 +61,14 @@ public class DocumentService {
                 log.info("文档幂等命中（已完成）kbId={} hash={} docId={}", kbId, hash, existed.getId());
                 return existed;
             }
-            log.info("文档存在但状态 {} 未完成，重新入队 kbId={} docId={}",
+            log.info("文档存在但状态 {} 未完成，重置为待确认 kbId={} docId={}",
                     existed.getStatus(), kbId, existed.getId());
-            existed.setStatus(IngestionStatus.UPLOADED.code());
+            existed.setStatus(IngestionStatus.STAGED.code());
             existed.setFailureReason(null);
-            existed.setRowPerChunk(rowPerChunk); // 重传同步本次勾选，按新策略重切
             if (existed.getFileSize() == null) {
                 existed.setFileSize(fileSize); // 旧记录缺大小则补上
             }
             kbDocumentMapper.updateById(existed);
-            ingestionQueueProducer.publish(new IngestionMessage(existed.getId(), kbId, null, TenantContext.get()));
             return existed;
         }
 
@@ -83,12 +82,31 @@ public class DocumentService {
         doc.setMinioObject(objectName);
         doc.setFileHash(hash);
         doc.setFileSize(fileSize);
-        doc.setRowPerChunk(rowPerChunk);
-        doc.setStatus(IngestionStatus.UPLOADED.code());
+        doc.setRowPerChunk(false); // 默认值；真正生效的逐行切片在 confirm 时按本批勾选统一写入
+        doc.setStatus(IngestionStatus.STAGED.code());
         kbDocumentMapper.insert(doc);
-
-        ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), kbId, null, TenantContext.get()));
         return doc;
+    }
+
+    /**
+     * 确认入库：把本知识库下所有「待确认（STAGED）」文档推进到入库流水线。
+     * 给每篇写入本次勾选的 rowPerChunk（仅 xlsx/csv 实际生效）、状态置 UPLOADED、各发一条 RabbitMQ 消息。
+     * @return 被确认入队的文档列表（无待确认文件时为空列表）
+     */
+    public List<KbDocument> confirm(Long kbId, boolean rowPerChunk) {
+        knowledgeBaseService.get(kbId);
+        LambdaQueryWrapper<KbDocument> w = new LambdaQueryWrapper<>();
+        w.eq(KbDocument::getKbId, kbId).eq(KbDocument::getStatus, IngestionStatus.STAGED.code());
+        List<KbDocument> staged = kbDocumentMapper.selectList(w);
+        for (KbDocument doc : staged) {
+            doc.setStatus(IngestionStatus.UPLOADED.code());
+            doc.setFailureReason(null);
+            doc.setRowPerChunk(rowPerChunk);
+            kbDocumentMapper.updateById(doc);
+            ingestionQueueProducer.publish(new IngestionMessage(doc.getId(), kbId, null, TenantContext.get()));
+        }
+        log.info("确认入库 kbId={} rowPerChunk={} 入队 {} 篇", kbId, rowPerChunk, staged.size());
+        return staged;
     }
 
     public KbDocument get(Long docId) {
