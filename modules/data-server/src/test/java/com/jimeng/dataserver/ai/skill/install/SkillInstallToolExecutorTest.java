@@ -25,8 +25,8 @@ class SkillInstallToolExecutorTest {
     void supportsBothTools() {
         SkillInstallToolExecutor ex = new SkillInstallToolExecutor(
                 mock(GithubSkillSearchService.class), mock(SkillImportService.class), mock(SkillInstallGuard.class));
-        assertTrue(ex.supports("skill.search"));
-        assertTrue(ex.supports("skill.install"));
+        assertTrue(ex.supports("skill_search"));
+        assertTrue(ex.supports("skill_install"));
         assertFalse(ex.supports("gaode.poi.cluster"));
     }
 
@@ -39,7 +39,7 @@ class SkillInstallToolExecutorTest {
         c.setPath("pdf");
         when(search.search("pdf")).thenReturn(List.of(c));
         SkillInstallToolExecutor ex = new SkillInstallToolExecutor(search, mock(SkillImportService.class), guardAllow());
-        Object payload = ex.execute("skill.search", Map.of("keyword", "pdf"));
+        Object payload = ex.execute("skill_search", Map.of("keyword", "pdf"));
         assertTrue(payload.toString().contains("anthropics"));
     }
 
@@ -50,7 +50,7 @@ class SkillInstallToolExecutorTest {
         SkillImportService importSvc = mock(SkillImportService.class);
         SkillInstallToolExecutor ex = new SkillInstallToolExecutor(
                 mock(GithubSkillSearchService.class), importSvc, guard);
-        Object payload = ex.execute("skill.install",
+        Object payload = ex.execute("skill_install",
                 Map.of("owner", "anthropics", "repo", "skills", "path", "pdf"));
         assertTrue(payload.toString().contains("no_permission"));
         verify(importSvc, never()).importFromGithub(any(), any(), any(), any(), any(), any());
@@ -65,7 +65,7 @@ class SkillInstallToolExecutorTest {
                 .thenReturn(s);
         SkillInstallToolExecutor ex = new SkillInstallToolExecutor(
                 mock(GithubSkillSearchService.class), importSvc, guardAllow());
-        Object payload = ex.execute("skill.install",
+        Object payload = ex.execute("skill_install",
                 Map.of("owner", "anthropics", "repo", "skills", "ref", "main", "path", "pdf"));
         assertTrue(payload.toString().contains("pdf"));
         verify(importSvc).importFromGithub(
