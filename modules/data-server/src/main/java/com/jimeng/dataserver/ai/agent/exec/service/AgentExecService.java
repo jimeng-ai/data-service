@@ -103,6 +103,10 @@ public class AgentExecService {
         run.setAgentId(req.getAgentId());
         run.setConversationId(req.getConversationId());
         run.setUserId(userId);
+        // 显式落属主审计列：本方法跑在 streamExecutor 异步线程，MyMetaObjectHandler 的 create_user 自动填充
+        // 只读 RequestContextHolder（请求线程）→ 异步线程拿不到会落空。与 artifact 同款显式 set（userId 来自
+        // findUserIdOrNull，已含 MdcAsyncSupport 捎带的 async userId）。归属判定仍以 user_id 为准，这里仅补审计列。
+        run.setCreateUser(userId);
         run.setStatus("RUNNING");
         runMapper.insert(run);
         final Long runId = run.getId();
