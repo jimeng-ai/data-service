@@ -29,7 +29,7 @@ public class SkillBundleResolver {
         return out;
     }
 
-    static SidecarRunPayload.SkillRef toSkillRef(String name, String prefix, String bucket, List<String> objects) {
+    public static SidecarRunPayload.SkillRef toSkillRef(String name, String prefix, String bucket, List<String> objects) {
         SidecarRunPayload.SkillRef ref = new SidecarRunPayload.SkillRef();
         ref.setName(name);
         List<SidecarRunPayload.SkillFile> files = new ArrayList<>();
