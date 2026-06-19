@@ -107,6 +107,16 @@ public class RagMinioStorageService {
                 .bucket(bucket).object(objectName).method(Method.GET).expiry(expirySeconds).build());
     }
 
+    /** 按指定 objectName(可含路径前缀) 写入字节，不改写 key（uploadBytes 会改写，故另加此方法）。 */
+    public void putObject(String objectName, byte[] bytes, String contentType) throws Exception {
+        ensureReady();
+        try (InputStream is = new ByteArrayInputStream(bytes)) {
+            client.putObject(PutObjectArgs.builder()
+                    .bucket(bucket).object(objectName).contentType(contentType)
+                    .stream(is, bytes.length, -1).build());
+        }
+    }
+
     public String getBucket() {
         return bucket;
     }
