@@ -30,4 +30,13 @@ public interface ToolPackage {
     default String getTenantId() {
         return null;
     }
+
+    /**
+     * 工具包类型：{@link ToolPackageKind#SKILL} 走 discovery→activate 流程；
+     * {@link ToolPackageKind#PLUGIN} 直接注入 tool_use。
+     * 默认 SKILL，插件实现类覆盖返回 PLUGIN。
+     */
+    default ToolPackageKind getKind() {
+        return ToolPackageKind.SKILL;
+    }
 }

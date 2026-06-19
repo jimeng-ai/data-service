@@ -4,6 +4,7 @@ import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.plugin.dto.PluginToolEntry;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import com.jimeng.dataserver.ai.skill.model.ToolPackage;
+import com.jimeng.dataserver.ai.skill.model.ToolPackageKind;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.PluginTool;
 import lombok.extern.slf4j.Slf4j;
@@ -78,6 +79,11 @@ public class PluginToolPackage implements ToolPackage {
     @Override
     public String getTenantId() {
         return plugin.getTenantId();
+    }
+
+    @Override
+    public ToolPackageKind getKind() {
+        return ToolPackageKind.PLUGIN;
     }
 
     @SuppressWarnings("unchecked")
