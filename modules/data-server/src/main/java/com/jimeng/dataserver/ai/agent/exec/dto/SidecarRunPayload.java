@@ -29,6 +29,21 @@ public class SidecarRunPayload {
     /** 非空且 baseUrl/authToken 齐全时，边车注册 web search+fetch MCP 工具。字段名须与边车 TS 的 WebSearchConfig 一致。 */
     private WebSearch webSearch;
     private Limits limits;
+    /** 本次 run 可用的 DOER skill（编排者从 MinIO 列出文件，边车物化到 .claude/skills）。 */
+    private List<SkillRef> skills;
+
+    @Data
+    public static class SkillRef {
+        private String name;
+        private List<SkillFile> files;
+    }
+
+    @Data
+    public static class SkillFile {
+        private String objectName;
+        private String relPath;
+        private String bucket;
+    }
 
     @Data
     public static class RagContext {
