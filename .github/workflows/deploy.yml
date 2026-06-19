@@ -1,6 +1,6 @@
 name: Deploy
 
-# push 到 master 即自动部署。也支持在 Actions 页面手动触发。
+# push 到 main 即自动部署。也支持在 Actions 页面手动触发。
 #
 # data-service 容器化部署（与本地 IDE 隔离）：
 #   • 两个 Spring Boot 应用（gateway / data-server）打成镜像，跑在基础设施所在的
@@ -11,7 +11,7 @@ name: Deploy
 #   • 基础设施（Nacos/MySQL/...）由 docker/docker-compose.yml 常驻；这里幂等确保其在线。
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
