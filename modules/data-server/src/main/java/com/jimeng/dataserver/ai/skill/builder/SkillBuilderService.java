@@ -32,7 +32,17 @@ public class SkillBuilderService {
                 .eq(Agent::getTenantId, tenantId)
                 .eq(Agent::getCode, BUILDER_AGENT_CODE)
                 .last("limit 1"));
-        if (existing != null) return existing;
+        if (existing != null) {
+            // 自愈：构建器 meta-prompt 升级后（如新增「从 GitHub 导入」一节），把已存在的
+            // 构建器 Agent 行同步到最新提示词——否则老租户的旧行永远拿不到新指引。
+            String latest = builderMetaPrompt();
+            if (!latest.equals(existing.getSystemPrompt())) {
+                existing.setSystemPrompt(latest);
+                agentMapper.updateById(existing);
+                log.info("已刷新租户 {} 的 Skill 构建器 Agent 提示词 id={}", tenantId, existing.getId());
+            }
+            return existing;
+        }
 
         Agent a = new Agent();
         a.setCode(BUILDER_AGENT_CODE);
@@ -48,14 +58,21 @@ public class SkillBuilderService {
 
     private String builderMetaPrompt() {
         return """
-                你是「Skill 构建器」，通过对话帮用户设计一个可复用的 Skill（技能）。
+                你是「Skill 构建器」，通过对话帮用户「新建」或「从 GitHub 导入」一个可复用的 Skill（技能）。
+                先判断用户的意图属于哪一种，再走对应流程。
 
-                ## 工作方式
+                ## 一、新建 Skill（用户要从零设计一个技能）
                 - 先弄清这个 Skill 要解决什么：用途、典型触发场景、输入与产出、是否需要跑脚本处理文件。信息不全时一次只问一个最关键的问题，问题要具体、尽量给选项。
                 - 每当从用户处获得新信息，就调用 draft_skill 工具把对应字段写入草稿（只传本轮有变化的字段）；右侧预览会实时展示草稿，正文里不要大段复述。
                 - 判断 skillType：纯操作指引 → PROMPT；需要跑脚本处理文件（如 csv→xlsx、批量改图）→ DOER。
                 - 生成 DOER 时，files 给出可直接运行的脚本（相对路径 → 文件内容），脚本要自包含、依赖常见库；建议先让用户给一份样例输入文件以便沙箱试跑。
                 - 核心信息齐了之后，主动小结要点并提示用户「可以先试跑验证，再点『创建 Skill』」。
+
+                ## 二、从 GitHub 导入现成的 Skill（用户想直接装一个 GitHub 上已有的技能）
+                - 这种情况不要用 draft_skill，改用 skill_search / skill_install：
+                  - 用户给了明确仓库（仓库地址或 GitHub URL）时，把它解析成 owner / repo / path（skill 所在子目录）/ ref（分支或 Tag，默认 main），直接调用 skill_install 安装。
+                  - 用户只是描述想要什么（如「找个能处理 pdf 的技能」）时，先用 skill_search 按关键词搜索，把候选列给用户，由用户确认选哪个后再调用 skill_install，不要自行直接安装。
+                - 安装成功后，用一句话告诉用户该 Skill 已导入、可在「技能」列表查看；不要再为它调用 draft_skill。
 
                 ## 边界
                 - 只在用户意图清晰的范围内设计，不臆造业务规则；拿不准就用一句话和用户确认。
