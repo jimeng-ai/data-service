@@ -44,8 +44,11 @@ public class SkillBuilderFinalizeService {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST, "DOER skill 缺少脚本文件，请先在构建器里完成并试跑");
             }
             String prefix = "skills/" + s.getId() + "/1/";
+            // 写入带 frontmatter 的规范 SKILL.md（name/description 从列重建），
+            // 否则沙箱拿到的 SKILL.md 缺 frontmatter，SDK 读不到 description（何时调用的信号）。
+            String skillMd = SkillMarkdownParser.render(s.getName(), s.getDescription(), s.getBody());
             try {
-                minio.putObject(prefix + "SKILL.md", s.getBody().getBytes(StandardCharsets.UTF_8), "text/markdown");
+                minio.putObject(prefix + "SKILL.md", skillMd.getBytes(StandardCharsets.UTF_8), "text/markdown");
                 for (Map.Entry<String, String> e : draft.getFiles().entrySet()) {
                     minio.putObject(prefix + e.getKey(), e.getValue().getBytes(StandardCharsets.UTF_8), "application/octet-stream");
                 }

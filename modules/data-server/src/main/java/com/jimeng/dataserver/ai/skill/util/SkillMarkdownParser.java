@@ -36,6 +36,24 @@ public final class SkillMarkdownParser {
         return new ParsedSkill(name, description, body);
     }
 
+    /**
+     * parse 的逆操作：由 name/description/body 重建带 frontmatter 的规范 SKILL.md。
+     * description 用双引号包裹（含冒号也不会被 YAML 解析器截断），换行折叠为空格。
+     * 供 finalize 写入 bundle、详情页展示统一格式，与 parse 往返一致。
+     */
+    public static String render(String name, String description, String body) {
+        String n = name == null ? "" : name.trim();
+        String desc = description == null ? "" : description
+                .replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", " ").replace("\n", " ").trim();
+        String b = body == null ? "" : body.trim();
+        return "---\n"
+                + "name: " + n + "\n"
+                + "description: \"" + desc + "\"\n"
+                + "---\n\n"
+                + b + "\n";
+    }
+
     public static void validate(ParsedSkill p) {
         if (p == null || StrUtil.isBlank(p.name()))
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md frontmatter 必须包含 name");
