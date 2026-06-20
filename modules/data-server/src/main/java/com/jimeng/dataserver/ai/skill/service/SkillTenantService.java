@@ -52,9 +52,15 @@ public class SkillTenantService {
         return aiSkillMapper.selectList(q);
     }
 
-    public AiSkill get(Long id, String tenantId) {
+    public AiSkill get(Long id, String tenantId, Long currentUserId) {
         AiSkill s = aiSkillMapper.selectById(id);
         if (s == null || !Objects.equals(s.getTenantId(), tenantId)) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "未找到该 skill");
+        }
+        // 可见性与列表一致：私有 skill 仅创建者可见（含其正文/脚本），否则当作不存在，避免按 id 越权读他人源码
+        boolean visible = SkillConst.SCOPE_TENANT.equals(s.getScope())
+                || Objects.equals(s.getOwnerUserId(), currentUserId);
+        if (!visible) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "未找到该 skill");
         }
         return s;
