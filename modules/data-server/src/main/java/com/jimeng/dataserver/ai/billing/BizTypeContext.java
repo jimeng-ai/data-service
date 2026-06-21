@@ -31,6 +31,9 @@ public final class BizTypeContext {
     /** 对话式生成 Skill（Skill 构建器向导）。 */
     public static final String SKILL_GEN = "skill_gen";
 
+    /** 对话内 generate_image 文生图。 */
+    public static final String IMAGE_GEN = "image_gen";
+
     private static final ThreadLocal<String> CURRENT_BIZ_TYPE = new ThreadLocal<>();
 
     private BizTypeContext() {
