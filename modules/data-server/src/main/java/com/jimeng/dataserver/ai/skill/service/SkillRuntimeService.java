@@ -20,10 +20,13 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -104,8 +107,8 @@ public class SkillRuntimeService {
             }
         }
 
-        // Skill 发现阶段
-        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly);
+        // Skill 发现阶段：按与用户问题的相关性挑选要展示的 Skill
+        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly, latestUserText(messages));
         if (!discoverySkills.isEmpty()) {
             log.info("Discovery Phase skills: {}", toNames(discoverySkills));
             injectDiscoveryContext(body, discoverySkills, adapter);
@@ -267,10 +270,79 @@ public class SkillRuntimeService {
         return sb.toString().trim();
     }
 
-    private List<ToolPackage> selectForDiscovery(Map<String, ToolPackage> skillMap) {
+    private static final Pattern WORD_TOKEN = Pattern.compile("[a-z0-9]{2,}");
+
+    /**
+     * 发现阶段挑选要展示给模型的 Skill：按与用户问题的词面相关性降序排序，<b>同分时租户自有 Skill 优先于
+     * 平台 Skill</b>（避免用户自己的 Skill 被平台 Skill 挤出 {@code skill.max-selected} 上限——这正是
+     * 之前「租户 Skill 一直不被发现/调用」的根因），最后截断到上限。
+     */
+    private List<ToolPackage> selectForDiscovery(Map<String, ToolPackage> skillMap, String query) {
         List<ToolPackage> all = new ArrayList<>(skillMap.values());
         int limit = Math.max(maxSelected, 1);
-        return all.size() <= limit ? all : new ArrayList<>(all.subList(0, limit));
+        if (all.size() <= limit) return all;
+        return rankForDiscovery(all, tokenize(query), limit);
+    }
+
+    /** 纯函数：按相关性(降序) + 租户优先 稳定排序后取前 limit 个。便于单测。 */
+    static List<ToolPackage> rankForDiscovery(List<ToolPackage> all, Set<String> queryTokens, int limit) {
+        List<ToolPackage> sorted = new ArrayList<>(all);
+        // List.sort 稳定：相关性与租户标记都相同的元素保留原插入顺序。
+        sorted.sort(Comparator
+                .comparingInt((ToolPackage p) -> -relevanceScore(queryTokens, p))   // 相关性高在前
+                .thenComparingInt(p -> p.getTenantId() != null ? 0 : 1));            // 同分租户(0)优先于平台(1)
+        return new ArrayList<>(sorted.subList(0, Math.min(limit, sorted.size())));
+    }
+
+    /** Skill 文本(名称+描述)与用户问题词元的交集大小。 */
+    private static int relevanceScore(Set<String> queryTokens, ToolPackage pkg) {
+        if (queryTokens == null || queryTokens.isEmpty()) return 0;
+        Set<String> skillTokens = tokenize(pkg.getName() + " " + pkg.getDescription());
+        int score = 0;
+        for (String t : skillTokens) {
+            if (queryTokens.contains(t)) score++;
+        }
+        return score;
+    }
+
+    /** 把文本切成可比较词元：英文/数字单词(len≥2) + 中文相邻二字组(bigram) + 孤立汉字，全部小写。 */
+    static Set<String> tokenize(String text) {
+        Set<String> tokens = new HashSet<>();
+        if (text == null || text.isEmpty()) return tokens;
+        String lower = text.toLowerCase(Locale.ROOT);
+        Matcher m = WORD_TOKEN.matcher(lower);
+        while (m.find()) tokens.add(m.group());
+        for (String run : lower.replaceAll("[^\\u4e00-\\u9fa5]+", " ").trim().split("\\s+")) {
+            if (run.isEmpty()) continue;
+            if (run.length() == 1) {
+                tokens.add(run);
+                continue;
+            }
+            for (int i = 0; i + 1 < run.length(); i++) tokens.add(run.substring(i, i + 2));
+        }
+        return tokens;
+    }
+
+    /** 取最后一条 user 消息文本(content 支持 String 或块数组)，用于 Skill 发现相关性打分。 */
+    private static String latestUserText(List<?> messages) {
+        if (messages == null) return "";
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (!(messages.get(i) instanceof Map<?, ?> msg)) continue;
+            if (!"user".equals(String.valueOf(msg.get("role")))) continue;
+            Object content = msg.get("content");
+            if (content instanceof String s) return s;
+            if (content instanceof List<?> blocks) {
+                StringBuilder sb = new StringBuilder();
+                for (Object b : blocks) {
+                    if (b instanceof Map<?, ?> bm && "text".equals(bm.get("type"))) {
+                        sb.append(String.valueOf(bm.get("text"))).append(' ');
+                    }
+                }
+                return sb.toString();
+            }
+            return "";
+        }
+        return "";
     }
 
     private List<ToolPackage> resolveSelectedSkills(Map<String, ToolPackage> skillMap,
