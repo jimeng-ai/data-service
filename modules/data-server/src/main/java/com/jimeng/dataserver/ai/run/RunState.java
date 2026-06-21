@@ -90,7 +90,7 @@ public class RunState {
         call.put("status", status);
     }
 
-    public void setToolOutput(String id, String tool, String output) {
+    public void setToolOutput(String id, String tool, Object output) {
         Map<String, Object> call = findToolCall(id);
         if (call == null) {
             call = ensureToolCall(id, tool);
