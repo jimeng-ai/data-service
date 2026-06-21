@@ -68,6 +68,7 @@ public class GenerateImageToolExecutor implements SkillToolExecutor {
             out.put("count", urls.size());
             return out;
         } catch (IllegalArgumentException e) {
+            // 入参类错误原样抛出，不记 billing(500)、不包成"生图失败"——那是生成/上传失败才该走的路径
             throw e;
         } catch (Exception e) {
             recordBilling(size, 0, 500, (int) (System.currentTimeMillis() - start));
