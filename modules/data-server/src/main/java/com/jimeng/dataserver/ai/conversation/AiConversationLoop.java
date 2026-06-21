@@ -179,7 +179,7 @@ public class AiConversationLoop {
                     }
                     return parsed;
                 }
-                adapter.appendToolResultTurn(body, responseMap, results);
+                adapter.appendToolResultTurn(body, responseMap, stripImageUrlsForModel(results));
                 toolRound++;
             } catch (Exception e) {
                 safeRecordException(logId, e, elapsed(start));
@@ -280,9 +280,15 @@ public class AiConversationLoop {
                     if (skillApplyResult.isDiscoveryPhase()) {
                         ToolUseCall activateCall = findActivateCall(toolCalls);
                         if (activateCall != null) {
+                            // 让前端把「激活技能」作为可见的一步显示：先 progress(运行中)，激活完再 tool_result(已激活的技能名)。
+                            sendProgress(connectionId, toolRound + 1, List.of(activateCall), body, adapter);
                             ActivationResult activation = skillRuntimeService.handleActivateSkills(
                                     body, activateCall, skillMap, adapter);
                             adapter.appendActivationTurn(body, responseMap, activation);
+                            Map<String, Object> actPayload = new LinkedHashMap<>();
+                            actPayload.put("activated", activation.getActivatedSkillNames());
+                            sendToolResults(connectionId, toolRound + 1, List.of(new ToolExecutionResult(
+                                    activateCall.getToolUseId(), activateCall.getToolName(), true, actPayload)));
                             skillApplyResult = SkillApplyResult.activated(activation.getActivatedSkillNames());
                             toolRound++;
                             continue;
@@ -306,7 +312,7 @@ public class AiConversationLoop {
                         runFinalizer.complete(connectionId);
                         return;
                     }
-                    adapter.appendToolResultTurn(body, responseMap, results);
+                    adapter.appendToolResultTurn(body, responseMap, stripImageUrlsForModel(results));
                     toolRound++;
 
                 } catch (InterruptedException e) {
@@ -323,6 +329,29 @@ public class AiConversationLoop {
             sendError(connectionId, e.getClass().getSimpleName(), e.getMessage());
             runFinalizer.complete(connectionId);
         }
+    }
+
+    /**
+     * 给「模型上下文」用的 tool_result：把 generate_image 的图片 URL 剥掉、换成一句说明，避免模型把图片
+     * 用 Markdown 内联进回答（与前端图片卡片重复，选①）。发给前端的 tool_result 事件仍保留完整 urls。
+     */
+    private List<ToolExecutionResult> stripImageUrlsForModel(List<ToolExecutionResult> results) {
+        if (results == null || results.isEmpty()) return results;
+        List<ToolExecutionResult> out = new ArrayList<>(results.size());
+        for (ToolExecutionResult r : results) {
+            if ("generate_image".equals(r.getToolName()) && r.isSuccess()
+                    && r.getPayload() instanceof Map<?, ?> p && p.get("urls") instanceof List<?> urls) {
+                Map<String, Object> slim = new LinkedHashMap<>();
+                slim.put("status", "ok");
+                slim.put("image_count", urls.size());
+                slim.put("note", "已生成 " + urls.size()
+                        + " 张图片并直接展示给用户；请勿在回复中用 Markdown 重复贴出图片或图片链接。");
+                out.add(new ToolExecutionResult(r.getToolUseId(), r.getToolName(), true, slim));
+            } else {
+                out.add(r);
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------ final answer log
