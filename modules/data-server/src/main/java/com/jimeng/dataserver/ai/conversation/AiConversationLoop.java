@@ -8,6 +8,8 @@ import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.TraceRecorder;
+import com.jimeng.dataserver.ai.image.ImageGenClient;
+import com.jimeng.dataserver.ai.image.ImageGenToolDefinitions;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.run.RunEventTee;
@@ -54,6 +56,7 @@ public class AiConversationLoop {
     private final LlmCallGuard llmCallGuard;
     private final TraceRecorder traceRecorder;
     private final WebSearchProperties webSearchProperties;
+    private final ImageGenClient imageGenClient;
 
     @Value("${skill.max-tool-rounds:10}")
     private int maxToolRounds;
@@ -64,11 +67,11 @@ public class AiConversationLoop {
     public record CallRecordConfig(String provider, String endpoint, String defaultModel) {}
 
     /**
-     * 注入内置工具定义（web_search/web_fetch 和 skill.search/skill.install），对所有 Agent 永远在场
-     * （不走 skill 发现流程），并确保 tool_choice=auto。各工具组由对应开关独立控制。
+     * 注入内置工具定义（web_search/web_fetch、skill.search/skill.install、generate_image），对所有 Agent
+     * 永远在场（不走 skill 发现流程），并确保 tool_choice=auto。各工具组由对应开关独立控制。
      */
     private void injectBuiltinTools(Map<String, Object> body, AiProtocolAdapter adapter,
-                                    boolean webTools, boolean skillInstall) {
+                                    boolean webTools, boolean skillInstall, boolean imageGen) {
         List<Object> tools = adapter.getToolsList(body);
         if (webTools) {
             tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_SEARCH));
@@ -77,6 +80,9 @@ public class AiConversationLoop {
         if (skillInstall) {
             tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.SEARCH_DEF));
             tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.INSTALL_DEF));
+        }
+        if (imageGen) {
+            tools.add(adapter.convertToolDef(ImageGenToolDefinitions.GENERATE_IMAGE));
         }
         adapter.setToolsList(body, tools);
         adapter.ensureToolChoiceAuto(body);
@@ -99,9 +105,10 @@ public class AiConversationLoop {
         // 内置工具：web_search/web_fetch（ai.web-search 配齐时）和 skill.search/skill.install（默认开）
         // 对所有 Agent 永远在场，并让工具循环对「没绑任何 skill/plugin 的裸 Agent」也保持开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        boolean imageGenEnabled = imageGenClient.enabled();
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled || imageGenEnabled;
         if (builtinToolsEnabled) {
-            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled, imageGenEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
@@ -197,9 +204,10 @@ public class AiConversationLoop {
 
         // 内置工具：见 runBlocking 同段说明。配齐/默认开即对所有 Agent（含裸 Agent）开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        boolean imageGenEnabled = imageGenClient.enabled();
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled || imageGenEnabled;
         if (builtinToolsEnabled) {
-            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled, imageGenEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
