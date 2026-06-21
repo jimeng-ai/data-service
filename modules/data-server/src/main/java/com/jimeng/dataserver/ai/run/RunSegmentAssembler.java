@@ -85,6 +85,13 @@ public class RunSegmentAssembler {
         for (Object o : results) {
             if (!(o instanceof JSONObject r)) continue;
             s.setToolStatus(r.getStr("id"), r.getStr("name"), r.getStr("status"));
+            // 体积小且历史回看时要展示的工具(生图 urls、激活技能名)持久化其 output；
+            // 其余工具(如 RAG 检索)输出过大，仍只存状态、不进 segments，避免撑爆 chat_message。
+            String toolName = r.getStr("name");
+            if (("generate_image".equals(toolName) || "activate_skills".equals(toolName))
+                    && r.get("output") != null) {
+                s.setToolOutput(r.getStr("id"), toolName, r.get("output"));
+            }
         }
     }
 

@@ -8,6 +8,8 @@ import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.TraceRecorder;
+import com.jimeng.dataserver.ai.image.ImageGenClient;
+import com.jimeng.dataserver.ai.image.ImageGenToolDefinitions;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.run.RunEventTee;
@@ -54,6 +56,7 @@ public class AiConversationLoop {
     private final LlmCallGuard llmCallGuard;
     private final TraceRecorder traceRecorder;
     private final WebSearchProperties webSearchProperties;
+    private final ImageGenClient imageGenClient;
 
     @Value("${skill.max-tool-rounds:10}")
     private int maxToolRounds;
@@ -64,11 +67,11 @@ public class AiConversationLoop {
     public record CallRecordConfig(String provider, String endpoint, String defaultModel) {}
 
     /**
-     * 注入内置工具定义（web_search/web_fetch 和 skill.search/skill.install），对所有 Agent 永远在场
-     * （不走 skill 发现流程），并确保 tool_choice=auto。各工具组由对应开关独立控制。
+     * 注入内置工具定义（web_search/web_fetch、skill.search/skill.install、generate_image），对所有 Agent
+     * 永远在场（不走 skill 发现流程），并确保 tool_choice=auto。各工具组由对应开关独立控制。
      */
     private void injectBuiltinTools(Map<String, Object> body, AiProtocolAdapter adapter,
-                                    boolean webTools, boolean skillInstall) {
+                                    boolean webTools, boolean skillInstall, boolean imageGen) {
         List<Object> tools = adapter.getToolsList(body);
         if (webTools) {
             tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_SEARCH));
@@ -77,6 +80,9 @@ public class AiConversationLoop {
         if (skillInstall) {
             tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.SEARCH_DEF));
             tools.add(adapter.convertToolDef(SkillInstallToolDefinitions.INSTALL_DEF));
+        }
+        if (imageGen) {
+            tools.add(adapter.convertToolDef(ImageGenToolDefinitions.GENERATE_IMAGE));
         }
         adapter.setToolsList(body, tools);
         adapter.ensureToolChoiceAuto(body);
@@ -99,9 +105,10 @@ public class AiConversationLoop {
         // 内置工具：web_search/web_fetch（ai.web-search 配齐时）和 skill.search/skill.install（默认开）
         // 对所有 Agent 永远在场，并让工具循环对「没绑任何 skill/plugin 的裸 Agent」也保持开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        boolean imageGenEnabled = imageGenClient.enabled();
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled || imageGenEnabled;
         if (builtinToolsEnabled) {
-            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled, imageGenEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
@@ -172,7 +179,7 @@ public class AiConversationLoop {
                     }
                     return parsed;
                 }
-                adapter.appendToolResultTurn(body, responseMap, results);
+                adapter.appendToolResultTurn(body, responseMap, stripImageUrlsForModel(results));
                 toolRound++;
             } catch (Exception e) {
                 safeRecordException(logId, e, elapsed(start));
@@ -197,9 +204,10 @@ public class AiConversationLoop {
 
         // 内置工具：见 runBlocking 同段说明。配齐/默认开即对所有 Agent（含裸 Agent）开启。
         boolean webToolsEnabled = webSearchProperties.enabled();
-        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled;
+        boolean imageGenEnabled = imageGenClient.enabled();
+        boolean builtinToolsEnabled = webToolsEnabled || skillInstallEnabled || imageGenEnabled;
         if (builtinToolsEnabled) {
-            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled);
+            injectBuiltinTools(body, adapter, webToolsEnabled, skillInstallEnabled, imageGenEnabled);
         }
 
         int toolRound = 0, totalIn = 0, totalOut = 0;
@@ -272,9 +280,15 @@ public class AiConversationLoop {
                     if (skillApplyResult.isDiscoveryPhase()) {
                         ToolUseCall activateCall = findActivateCall(toolCalls);
                         if (activateCall != null) {
+                            // 让前端把「激活技能」作为可见的一步显示：先 progress(运行中)，激活完再 tool_result(已激活的技能名)。
+                            sendProgress(connectionId, toolRound + 1, List.of(activateCall), body, adapter);
                             ActivationResult activation = skillRuntimeService.handleActivateSkills(
                                     body, activateCall, skillMap, adapter);
                             adapter.appendActivationTurn(body, responseMap, activation);
+                            Map<String, Object> actPayload = new LinkedHashMap<>();
+                            actPayload.put("activated", activation.getActivatedSkillNames());
+                            sendToolResults(connectionId, toolRound + 1, List.of(new ToolExecutionResult(
+                                    activateCall.getToolUseId(), activateCall.getToolName(), true, actPayload)));
                             skillApplyResult = SkillApplyResult.activated(activation.getActivatedSkillNames());
                             toolRound++;
                             continue;
@@ -298,7 +312,7 @@ public class AiConversationLoop {
                         runFinalizer.complete(connectionId);
                         return;
                     }
-                    adapter.appendToolResultTurn(body, responseMap, results);
+                    adapter.appendToolResultTurn(body, responseMap, stripImageUrlsForModel(results));
                     toolRound++;
 
                 } catch (InterruptedException e) {
@@ -315,6 +329,30 @@ public class AiConversationLoop {
             sendError(connectionId, e.getClass().getSimpleName(), e.getMessage());
             runFinalizer.complete(connectionId);
         }
+    }
+
+    /**
+     * 给「模型上下文」用的 tool_result：把 generate_image 的图片 URL 剥掉、换成一句说明，避免模型把图片
+     * 用 Markdown 内联进回答（与前端图片卡片重复，选①）。发给前端的 tool_result 事件仍保留完整 urls。
+     */
+    private List<ToolExecutionResult> stripImageUrlsForModel(List<ToolExecutionResult> results) {
+        if (results == null || results.isEmpty()) return results;
+        List<ToolExecutionResult> out = new ArrayList<>(results.size());
+        for (ToolExecutionResult r : results) {
+            if ("generate_image".equals(r.getToolName()) && r.isSuccess()
+                    && r.getPayload() instanceof Map<?, ?> p && p.get("urls") instanceof List<?> urls) {
+                Map<String, Object> slim = new LinkedHashMap<>();
+                slim.put("status", "ok");
+                slim.put("image_count", urls.size());
+                slim.put("note", "已生成 " + urls.size()
+                        + " 张图片，会展示在你这条回复的下方；请勿在回复中用 Markdown 重复贴出图片或图片链接，"
+                        + "如需指代可说「下方的图」。");
+                out.add(new ToolExecutionResult(r.getToolUseId(), r.getToolName(), true, slim));
+            } else {
+                out.add(r);
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------ final answer log
