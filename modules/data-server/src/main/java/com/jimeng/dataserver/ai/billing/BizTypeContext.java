@@ -15,7 +15,7 @@ package com.jimeng.dataserver.ai.billing;
  * <p>已知取值（biz_type 列，供运营平台「功能」维度统计）：
  * {@code chat}（普通/Agent 对话）、{@code rag_answer}（知识库问答）、
  * {@code rag_embedding} / {@code rag_rerank} / {@code rag_contextualization} / {@code rag_image_desc}、
- * {@code agent_exec}、{@code plugin_gen} / {@code plugin_refine}。
+ * {@code agent_exec}、{@code plugin_gen} / {@code plugin_refine}、{@code image_gen}（对话内文生图）。
  */
 public final class BizTypeContext {
 
