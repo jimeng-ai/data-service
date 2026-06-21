@@ -4,6 +4,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.service.RequestService;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.TraceRecorder;
+import com.jimeng.dataserver.ai.image.ImageGenClient;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
 import com.jimeng.dataserver.ai.resilience.LlmCallGuard;
 import com.jimeng.dataserver.ai.run.RunEventTee;
@@ -45,6 +46,7 @@ class AiConversationLoopTest {
     private RunRegistry runRegistry;
     private LlmCallGuard llmCallGuard;
     private TraceRecorder traceRecorder;
+    private ImageGenClient imageGenClient;
     private AiConversationLoop loop;
     private final ClaudeProtocolAdapter adapter = new ClaudeProtocolAdapter();
 
@@ -66,7 +68,8 @@ class AiConversationLoopTest {
         runRegistry = mock(RunRegistry.class);
         llmCallGuard = mock(LlmCallGuard.class);
         traceRecorder = mock(TraceRecorder.class);
-        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, tee, runFinalizer, runRegistry, llmCallGuard, traceRecorder, new com.jimeng.dataserver.ai.web.WebSearchProperties());
+        imageGenClient = mock(ImageGenClient.class);
+        loop = new AiConversationLoop(requestService, skillRuntimeService, recordService, tee, runFinalizer, runRegistry, llmCallGuard, traceRecorder, new com.jimeng.dataserver.ai.web.WebSearchProperties(), imageGenClient);
         ReflectionTestUtils.setField(loop, "maxToolRounds", 3);
         when(recordService.recordRequest(any(), any(), anyString(), anyString(), anyString())).thenReturn(1L);
     }
