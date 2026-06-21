@@ -345,7 +345,8 @@ public class AiConversationLoop {
                 slim.put("status", "ok");
                 slim.put("image_count", urls.size());
                 slim.put("note", "已生成 " + urls.size()
-                        + " 张图片并直接展示给用户；请勿在回复中用 Markdown 重复贴出图片或图片链接。");
+                        + " 张图片，会展示在你这条回复的下方；请勿在回复中用 Markdown 重复贴出图片或图片链接，"
+                        + "如需指代可说「下方的图」。");
                 out.add(new ToolExecutionResult(r.getToolUseId(), r.getToolName(), true, slim));
             } else {
                 out.add(r);
