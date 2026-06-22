@@ -1,6 +1,8 @@
 package com.jimeng.dataserver.ai.stats.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.jimeng.dataserver.ai.rag.model.IngestionStatus;
+import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.stats.dto.DashboardSummary;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.Agent;
@@ -65,10 +67,10 @@ public class DashboardSummaryService {
 
         DashboardSummary.SkillCounts skills = new DashboardSummary.SkillCounts();
         skills.setTotal(aiSkillMapper.selectCount(new QueryWrapper<>()));
-        skills.setPrivateCount(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("scope", "PRIVATE")));
-        skills.setShared(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("scope", "TENANT")));
-        skills.setEnabled(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("status", "ACTIVE")));
-        skills.setDisabled(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("status", "DISABLED")));
+        skills.setPrivateCount(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("scope", SkillConst.SCOPE_PRIVATE)));
+        skills.setShared(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("scope", SkillConst.SCOPE_TENANT)));
+        skills.setEnabled(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("status", SkillConst.STATUS_ACTIVE)));
+        skills.setDisabled(aiSkillMapper.selectCount(new QueryWrapper<AiSkill>().eq("status", SkillConst.STATUS_DISABLED)));
         s.getAssets().setSkills(skills);
 
         // ---- 知识库 + 文档：kb 自动租户隔离；文档经本租户 kb_id 间接隔离 ----
@@ -79,10 +81,17 @@ public class DashboardSummaryService {
         if (!kbIds.isEmpty()) {
             kb.setDocTotal(kbDocumentMapper.selectCount(new QueryWrapper<KbDocument>().in("kb_id", kbIds)));
             kb.setDocSuccess(kbDocumentMapper.selectCount(
-                    new QueryWrapper<KbDocument>().in("kb_id", kbIds).eq("status", "DONE")));
+                    new QueryWrapper<KbDocument>().in("kb_id", kbIds).eq("status", IngestionStatus.DONE.code())));
             kb.setDocFailed(kbDocumentMapper.selectCount(
-                    new QueryWrapper<KbDocument>().in("kb_id", kbIds).eq("status", "FAILED")));
-            kb.setDocIngesting(kb.getDocTotal() - kb.getDocSuccess() - kb.getDocFailed());
+                    new QueryWrapper<KbDocument>().in("kb_id", kbIds).eq("status", IngestionStatus.FAILED.code())));
+            kb.setDocIngesting(kbDocumentMapper.selectCount(new QueryWrapper<KbDocument>()
+                    .in("kb_id", kbIds)
+                    .in("status",
+                            IngestionStatus.UPLOADED.code(),
+                            IngestionStatus.PARSING.code(),
+                            IngestionStatus.CHUNKING.code(),
+                            IngestionStatus.CONTEXTUALIZING.code(),
+                            IngestionStatus.EMBEDDING.code())));
         }
         s.getAssets().setKb(kb);
 
