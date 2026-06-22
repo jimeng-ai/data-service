@@ -358,9 +358,15 @@ public class AiConversationLoop {
                 Map<String, Object> slim = new LinkedHashMap<>();
                 slim.put("status", "ok");
                 slim.put("image_count", urls.size());
-                slim.put("note", "已生成 " + urls.size()
-                        + " 张图片，会展示在你这条回复的下方；请勿在回复中用 Markdown 重复贴出图片或图片链接，"
-                        + "如需指代可说「下方的图」。");
+                // 说明词同时承担两个职责：①别让模型把图 URL 用 Markdown 重复贴进文字；②防止「只叙述不调工具」
+                // 的幻觉——多轮微调时模型常说「搞定/重新出图了」却没真调 generate_image（实测海边黄昏那轮）。
+                // 故明确：任何新图/改图都必须重新调用本工具，绝不能只用文字声称已生成。
+                slim.put("note", "本次已通过 generate_image 工具成功生成 " + urls.size()
+                        + " 张图片，前端会在你这条回复下方自动展示。"
+                        + "【硬性规则】此后只要用户想要新图或改图（换风格/换场景/调尺寸/重做/再来一张等），"
+                        + "你都必须重新调用 generate_image 工具来真正生成——绝对禁止只用文字声称「已生成/已出图/搞定」"
+                        + "而不实际调用工具，也禁止凭空说「已为你生成 N 张图」。回复里不要用 Markdown 贴图片或图片链接，"
+                        + "指代已生成的图说「下方的图」即可。");
                 out.add(new ToolExecutionResult(r.getToolUseId(), r.getToolName(), true, slim));
             } else {
                 out.add(r);

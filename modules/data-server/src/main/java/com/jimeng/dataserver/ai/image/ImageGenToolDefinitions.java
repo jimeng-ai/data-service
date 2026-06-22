@@ -31,7 +31,9 @@ public final class ImageGenToolDefinitions {
         properties.put("size", size);
         return new SkillToolDefinition(
                 "generate_image",
-                "根据文字描述生成图片。当用户要求画图、生成图片、出图、做插画/头像时调用本工具，返回图片的可访问 URL。",
+                "根据文字描述生成图片。当用户要求画图、生成图片、出图、做插画/头像，或在多轮里要求改图/换风格/换场景/重做/再来一张时，"
+                        + "都必须调用本工具来真正出图——每出一张（含改版/重做）都要单独调用一次；"
+                        + "绝不能只用文字声称「已生成/搞定」而不调用本工具。返回图片的可访问 URL。",
                 objectSchema(properties, List.of("prompt")));
     }
 
