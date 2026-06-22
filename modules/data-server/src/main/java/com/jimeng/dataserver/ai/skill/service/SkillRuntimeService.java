@@ -218,8 +218,15 @@ public class SkillRuntimeService {
                                          List<ToolPackage> skills,
                                          AiProtocolAdapter adapter) {
         StringBuilder sb = new StringBuilder(skillSystemPrompt).append("\n\n");
-        sb.append("以下是可用的 Skill 列表。如果用户的问题需要使用某个 Skill，");
-        sb.append("请调用 activate_skills 工具激活对应的 Skill。\n\n");
+        // 强约束的激活指引：模型常因「内置工具能直接完成」而跳过明显相关的 Skill（例如收到生图请求时
+        // 直接调 generate_image，却不先激活『图像提示词优化』Skill）。这里要求：在调用任何其它工具或直接
+        // 作答之前，先逐一比对下列 Skill 的适用场景，只要明显相关就必须先 activate_skills 激活并遵循其指引。
+        sb.append("下面是当前可用的 Skill 列表（已按与用户请求的相关性挑选）。\n");
+        sb.append("**在直接作答或调用其它任何工具（包括 generate_image 等内置工具）之前**，");
+        sb.append("先逐一对照每个 Skill 的「适用场景/触发场景」判断它是否与用户当前请求相关：\n");
+        sb.append("- 只要某个 Skill 明显相关，你【必须】先调用 activate_skills 激活它，激活后严格遵循该 Skill 的指引再继续后续动作；\n");
+        sb.append("- 不要在存在明显相关 Skill 的情况下跳过激活、直接用其它工具或凭空作答；\n");
+        sb.append("- 若确实没有相关 Skill，可不激活、正常继续。\n\n");
         for (ToolPackage skill : skills) {
             sb.append("- **").append(skill.getName()).append("**: ").append(skill.getDescription()).append("\n");
         }
