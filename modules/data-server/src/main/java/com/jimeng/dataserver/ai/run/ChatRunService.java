@@ -56,6 +56,7 @@ public class ChatRunService {
     private final RunReplayPump pump;
     private final SseServiceUtil sseServiceUtil;
     private final RagAnswerService ragAnswerService;
+    private final ChatHistoryReconstructor chatHistoryReconstructor;
     private final AgentExecService agentExecService;
     private final AgentInputFileMapper inputFileMapper;
     private final ThreadPoolTaskExecutor streamExecutor;
@@ -91,20 +92,22 @@ public class ChatRunService {
                 TenantContext.get(), state));
 
         boolean exec = decideExec(conversationId, req.getFileIds());
+        // cutoff=本轮 user 消息 id：重建历史时排除本轮 user+assistant 占位消息（本轮 query 由 buildClaudeBody 单独追加）。
+        Long cutoffMessageId = ids.userMessageId();
         streamExecutor.execute(MdcAsyncSupport.wrap(runId,
-                () -> dispatchGeneration(runId, conversationId, req, exec, traceId)));
+                () -> dispatchGeneration(runId, conversationId, req, exec, traceId, cutoffMessageId)));
 
         return new TurnStartResponse(runId, ids.userMessageId(), ids.assistantMessageId());
     }
 
     /** 在 executor 线程上跑生成（rag 或 exec）；事件经 tee 进 Redis+RunState，收尾统一走 RunFinalizer。 */
     private void dispatchGeneration(String runId, Long conversationId, TurnStartRequest req,
-                                    boolean exec, String traceId) {
+                                    boolean exec, String traceId, Long cutoffMessageId) {
         try {
             if (exec) {
                 agentExecService.streamExec(toExecRequest(conversationId, req), runId, traceId);
             } else {
-                ragAnswerService.streamAnswer(toAnswerRequest(req), runId, traceId);
+                ragAnswerService.streamAnswer(toAnswerRequest(req, conversationId, cutoffMessageId), runId, traceId);
             }
         } catch (Exception e) {
             log.error("生成派发异常 runId={}", runId, e);
@@ -154,14 +157,18 @@ public class ChatRunService {
         return er;
     }
 
-    private AnswerRequest toAnswerRequest(TurnStartRequest req) {
+    private AnswerRequest toAnswerRequest(TurnStartRequest req, Long conversationId, Long cutoffMessageId) {
+        // 用已落库 segments 重建带 tool_use/tool_result 的真实历史(让模型看见自己调过 generate_image 等工具，
+        // 修多轮「只叙述不真出图」)；重建失败/为空安全回退到前端纯文字 history。
+        List<Map<String, Object>> history = chatHistoryReconstructor.reconstructClaude(
+                conversationId, cutoffMessageId, req.getHistory());
         return AnswerRequest.builder()
                 .agentId(req.getAgentId())
                 .kbId(req.getKbId())
                 .query(req.getQuery())
                 .topK(req.getTopK())
                 .rerank(req.getRerank())
-                .history(req.getHistory())
+                .history(history)
                 .preview(req.isPreview())
                 .build();
     }

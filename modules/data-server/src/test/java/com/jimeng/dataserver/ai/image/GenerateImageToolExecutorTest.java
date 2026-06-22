@@ -4,6 +4,7 @@ import com.jimeng.dataserver.ai.agent.exec.config.AgentSandboxProperties;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
@@ -35,13 +36,11 @@ class GenerateImageToolExecutorTest {
     }
 
     @Test
-    void executeUploadsAndReturnsUrls() throws Exception {
+    void executeUploadsAndReturnsBackendUrls() throws Exception {
         ImageGenClient client = mock(ImageGenClient.class);
         when(client.generate(eq("胖橘猫"), anyString(), eq(1)))
                 .thenReturn(List.of(new byte[]{(byte) 0x89, 'P', 'N', 'G'}));
         RagMinioStorageService minio = mock(RagMinioStorageService.class);
-        when(minio.uploadBytes(any(), anyString(), anyString())).thenReturn("2026/06/21/abc_genimg.png");
-        when(minio.presignedUrl(eq("2026/06/21/abc_genimg.png"), anyInt())).thenReturn("http://minio/genimg.png");
         AiModelCallRecordService rec = mock(AiModelCallRecordService.class);
 
         GenerateImageToolExecutor ex = new GenerateImageToolExecutor(client, minio, rec, props());
@@ -49,8 +48,22 @@ class GenerateImageToolExecutorTest {
 
         @SuppressWarnings("unchecked")
         Map<String, Object> m = (Map<String, Object>) out;
-        assertEquals(List.of("http://minio/genimg.png"), m.get("urls"));
+        @SuppressWarnings("unchecked")
+        List<String> urls = (List<String>) m.get("urls");
+        assertEquals(1, urls.size());
+        // 返回的是后端鉴权回传路径(非裸 presigned)；扁平 genimg- key、png 扩展名。
+        assertTrue(urls.get(0).matches("^/data/ai/image/genimg-[0-9a-f]+\\.png$"),
+                "unexpected url: " + urls.get(0));
         assertEquals(1, m.get("count"));
+
+        // 落库走 putObject(扁平 key、不改写)；不再调用会加日期斜杠前缀的 uploadBytes，也不再 presign。
+        ArgumentCaptor<String> keyCap = ArgumentCaptor.forClass(String.class);
+        verify(minio).putObject(keyCap.capture(), any(), eq("image/png"));
+        assertTrue(keyCap.getValue().matches("^genimg-[0-9a-f]+\\.png$"),
+                "unexpected key: " + keyCap.getValue());
+        verify(minio, never()).uploadBytes(any(), anyString(), anyString());
+        verify(minio, never()).presignedUrl(anyString(), anyInt());
+
         verify(rec).recordComputedCall(any(), eq("image:generate"), any(), eq("image_gen"),
                 any(), eq(200), anyInt(), any());
     }
