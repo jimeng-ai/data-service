@@ -1,7 +1,10 @@
 package com.jimeng.dataserver.ai.stats.controller;
 
+import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.ai.stats.dto.DashboardOverview;
+import com.jimeng.dataserver.ai.stats.dto.DashboardSummary;
 import com.jimeng.dataserver.ai.stats.service.DashboardStatsService;
+import com.jimeng.dataserver.ai.stats.service.DashboardSummaryService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -23,6 +26,8 @@ import java.time.LocalDate;
 public class StatsController {
 
     private final DashboardStatsService dashboardStatsService;
+    private final DashboardSummaryService dashboardSummaryService;
+    private final SuperAdminGuard superAdminGuard;
 
     @Operation(summary = "仪表盘总览",
             description = "返回当前租户在指定时间窗口内的真实用量统计（含环比、趋势、模型用量、最近调用）。"
@@ -34,9 +39,17 @@ public class StatsController {
             @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
             @RequestParam(name = "end", required = false)
             @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate end) {
+        superAdminGuard.requireSuperAdmin();
         if (start != null && end != null) {
             return dashboardStatsService.overview(start, end);
         }
         return dashboardStatsService.overview(days);
+    }
+
+    @Operation(summary = "看板计数快照", description = "当前租户的资产/组织/互动量计数。仅企业超管可访问。")
+    @GetMapping("/summary")
+    public DashboardSummary summary() {
+        String tenantId = superAdminGuard.requireSuperAdmin().getTenantId();
+        return dashboardSummaryService.summary(tenantId);
     }
 }
