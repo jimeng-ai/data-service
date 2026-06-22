@@ -37,6 +37,9 @@ public class DashboardOverview {
     @Schema(description = "Agent 用量 Top（按调用次数倒序）")
     private List<AgentUsage> topAgents;
 
+    @Schema(description = "成员消耗 Top（按成本倒序；user_id 空/查无归「未归属」）")
+    private List<UserUsage> topUsers;
+
     @Schema(description = "全量模型用量（不截断，用于「查看全部」饼图）")
     private List<ModelUsage> allModels;
 
@@ -83,6 +86,18 @@ public class DashboardOverview {
         @Schema(description = "Agent ID（agent 已删除则名称为空）")
         private Long agentId;
         private String agentName;
+        private long calls;
+        private long tokens;
+        @Schema(description = "成本（USD）")
+        private double costUsd;
+    }
+
+    @Data
+    public static class UserUsage {
+        @Schema(description = "成员 ID（ai_model_call_log.user_id，可空）")
+        private String userId;
+        @Schema(description = "成员显示名；user_id 空或查无 → 未归属")
+        private String userName;
         private long calls;
         private long tokens;
         @Schema(description = "成本（USD）")
