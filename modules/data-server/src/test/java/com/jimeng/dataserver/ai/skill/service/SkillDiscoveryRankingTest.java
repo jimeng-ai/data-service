@@ -24,6 +24,15 @@ class SkillDiscoveryRankingTest {
         return new AiSkillToolPackage(s);
     }
 
+    private static ToolPackage skillWithBody(String name, String desc, String tenantId, String body) {
+        AiSkill s = new AiSkill();
+        s.setName(name);
+        s.setDescription(desc);
+        s.setTenantId(tenantId);
+        s.setBody(body);
+        return new AiSkillToolPackage(s);
+    }
+
     private static List<String> names(List<ToolPackage> pkgs) {
         return pkgs.stream().map(ToolPackage::getName).toList();
     }
@@ -61,5 +70,54 @@ class SkillDiscoveryRankingTest {
         List<ToolPackage> top = SkillRuntimeService.rankForDiscovery(all, SkillRuntimeService.tokenize("zzzz"), 3);
         assertTrue(names(top).contains("brand-guidelines"), names(top).toString());
         assertTrue(names(top).contains("ai-image-prompts-lite"), names(top).toString());
+    }
+
+    // ---- 确定性自动激活：pickAutoActivateTenantSkill ----
+
+    @Test
+    void autoActivatePicksRelevantTenantPromptSkill() {
+        List<ToolPackage> discovered = List.of(
+                skillWithBody("design-system", "Audit your design system", null, "platform body"),
+                // 与线上 ai-image-prompts-lite 一致：描述含「生成」，故「生成…图片」请求词面相关。
+                skillWithBody("ai-image-prompts-lite",
+                        "AI 图像提示词推荐助手，按风格场景生成绘图提示词、配图润色", "test", "提示词优化指引正文"));
+        ToolPackage auto = SkillRuntimeService.pickAutoActivateTenantSkill(
+                discovered, "帮我生成一张小猫在奔跑的图片");
+        assertNotNull(auto, "生图请求应确定性自动激活租户图像提示词技能");
+        assertEquals("ai-image-prompts-lite", auto.getName());
+    }
+
+    @Test
+    void autoActivateNeverPicksPlatformSkill() {
+        // 平台技能(tenantId==null)即便相关也不自动激活，避免对所有对话强行注入平台技能正文。
+        List<ToolPackage> discovered = List.of(
+                skillWithBody("design-system", "设计系统 组件 审计 提示词", null, "platform body"));
+        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "设计系统组件审计提示词"));
+    }
+
+    @Test
+    void autoActivateNullWhenNoLexicalOverlap() {
+        List<ToolPackage> discovered = List.of(
+                skillWithBody("ai-image-prompts-lite", "AI 图像提示词 绘图", "test", "正文"));
+        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "今天天气怎么样"));
+    }
+
+    @Test
+    void autoActivateSkipsTenantSkillWithoutBody() {
+        // 无正文的技能没有可注入的指引，不自动激活。
+        List<ToolPackage> discovered = List.of(
+                skill("ai-image-prompts-lite", "AI 图像提示词 绘图 配图", "test"));
+        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "帮我绘图配图"));
+    }
+
+    @Test
+    void autoActivatePicksHighestScoringTenantSkill() {
+        List<ToolPackage> discovered = List.of(
+                skillWithBody("weak-skill", "无关 描述", "test", "正文1"),
+                skillWithBody("image-skill", "图像 绘图 提示词 配图 生成", "test", "正文2"));
+        ToolPackage auto = SkillRuntimeService.pickAutoActivateTenantSkill(
+                discovered, "绘图 提示词 配图 生成图像");
+        assertNotNull(auto);
+        assertEquals("image-skill", auto.getName());
     }
 }

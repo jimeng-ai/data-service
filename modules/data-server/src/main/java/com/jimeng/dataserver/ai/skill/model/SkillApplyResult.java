@@ -13,10 +13,17 @@ public class SkillApplyResult {
 
     private final Phase phase;
     private final List<String> selectedSkillNames;
+    /**
+     * 由服务端「确定性自动激活」（直接注入正文，不依赖模型调 activate_skills）的技能名。
+     * 用于让对话循环补发一条合成「激活技能」步骤，使前端仍能看到技能被使用。
+     */
+    private final List<String> autoActivatedSkillNames;
 
-    private SkillApplyResult(Phase phase, List<String> selectedSkillNames) {
+    private SkillApplyResult(Phase phase, List<String> selectedSkillNames, List<String> autoActivatedSkillNames) {
         this.phase = phase;
         this.selectedSkillNames = selectedSkillNames == null ? Collections.emptyList() : List.copyOf(selectedSkillNames);
+        this.autoActivatedSkillNames =
+                autoActivatedSkillNames == null ? Collections.emptyList() : List.copyOf(autoActivatedSkillNames);
     }
 
     /**
@@ -24,22 +31,32 @@ public class SkillApplyResult {
      */
     @Deprecated
     public SkillApplyResult(boolean enabled, List<String> selectedSkillNames) {
-        this(enabled ? Phase.ACTIVATED : Phase.DISABLED, selectedSkillNames);
+        this(enabled ? Phase.ACTIVATED : Phase.DISABLED, selectedSkillNames, Collections.emptyList());
     }
 
     /** DISABLED 工厂方法 */
     public static SkillApplyResult disabled() {
-        return new SkillApplyResult(Phase.DISABLED, Collections.emptyList());
+        return new SkillApplyResult(Phase.DISABLED, Collections.emptyList(), Collections.emptyList());
     }
 
     /** DISCOVERY 工厂方法 */
     public static SkillApplyResult discovery(List<String> allSkillNames) {
-        return new SkillApplyResult(Phase.DISCOVERY, allSkillNames);
+        return new SkillApplyResult(Phase.DISCOVERY, allSkillNames, Collections.emptyList());
+    }
+
+    /** DISCOVERY 阶段，但其中部分技能已由服务端确定性自动激活（已注入正文）；其余仍待模型按需发现/激活。 */
+    public static SkillApplyResult discoveryWithAutoActivated(List<String> allSkillNames, List<String> autoActivated) {
+        return new SkillApplyResult(Phase.DISCOVERY, allSkillNames, autoActivated);
+    }
+
+    /** 全部由服务端确定性自动激活，无剩余待发现技能。 */
+    public static SkillApplyResult autoActivated(List<String> autoActivated) {
+        return new SkillApplyResult(Phase.ACTIVATED, autoActivated, autoActivated);
     }
 
     /** ACTIVATED 工厂方法 */
     public static SkillApplyResult activated(List<String> selectedSkillNames) {
-        return new SkillApplyResult(Phase.ACTIVATED, selectedSkillNames);
+        return new SkillApplyResult(Phase.ACTIVATED, selectedSkillNames, Collections.emptyList());
     }
 
     /**
@@ -63,5 +80,9 @@ public class SkillApplyResult {
 
     public List<String> getSelectedSkillNames() {
         return selectedSkillNames;
+    }
+
+    public List<String> getAutoActivatedSkillNames() {
+        return autoActivatedSkillNames;
     }
 }

@@ -108,8 +108,23 @@ public class SkillRuntimeService {
         }
 
         // Skill 发现阶段：按与用户问题的相关性挑选要展示的 Skill
-        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly, latestUserText(messages));
+        String userText = latestUserText(messages);
+        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly, userText);
         if (!discoverySkills.isEmpty()) {
+            // 确定性自动激活：挑出「与用户问题词面相关、且最相关的本租户 PROMPT 技能」，直接注入其完整正文，
+            // 不再依赖模型自觉调用 activate_skills——这是 ai-image-prompts 这类「该用就得用」的租户技能此前
+            // 激活不稳定（约 83%）的根因。其余候选仍走发现，模型可按需再激活。
+            ToolPackage auto = pickAutoActivateTenantSkill(discoverySkills, userText);
+            if (auto != null) {
+                List<ToolPackage> remaining = new ArrayList<>(discoverySkills);
+                remaining.remove(auto);
+                injectFullSkillContext(body, List.of(auto), adapter);
+                if (!remaining.isEmpty()) injectDiscoveryContext(body, remaining, adapter);
+                log.info("Auto-activated tenant skill: {}; remaining discovery: {}", auto.getName(), toNames(remaining));
+                return remaining.isEmpty()
+                        ? SkillApplyResult.autoActivated(List.of(auto.getName()))
+                        : SkillApplyResult.discoveryWithAutoActivated(toNames(discoverySkills), List.of(auto.getName()));
+            }
             log.info("Discovery Phase skills: {}", toNames(discoverySkills));
             injectDiscoveryContext(body, discoverySkills, adapter);
             return SkillApplyResult.discovery(toNames(discoverySkills));
@@ -299,6 +314,31 @@ public class SkillRuntimeService {
                 .comparingInt((ToolPackage p) -> -relevanceScore(queryTokens, p))   // 相关性高在前
                 .thenComparingInt(p -> p.getTenantId() != null ? 0 : 1));            // 同分租户(0)优先于平台(1)
         return new ArrayList<>(sorted.subList(0, Math.min(limit, sorted.size())));
+    }
+
+    /**
+     * 从发现候选里挑「确定性自动激活」的本租户 PROMPT 技能：与用户问题有词面相关（relevanceScore&gt;0）、含正文，
+     * 取相关性最高的一个；无则返回 null（回退到普通发现 → 模型自行 activate_skills）。
+     *
+     * <p>仅限<b>本租户技能</b>（tenantId!=null）：平台技能（如 brand-guidelines/design-system）仍走发现，
+     * 避免对所有对话强行注入平台技能正文。租户技能是租户为自己用例显式创建的，「该用就得用」，故确定性激活。
+     * 静态 + 包级可见，便于单测。
+     */
+    static ToolPackage pickAutoActivateTenantSkill(List<ToolPackage> discovered, String query) {
+        Set<String> qTokens = tokenize(query);
+        if (qTokens.isEmpty()) return null;
+        ToolPackage best = null;
+        int bestScore = 0;
+        for (ToolPackage p : discovered) {
+            if (p.getTenantId() == null) continue;          // 仅本租户技能
+            if (StrUtil.isBlank(p.getBody())) continue;     // 需有正文(指引)才值得注入
+            int s = relevanceScore(qTokens, p);
+            if (s > bestScore) {
+                bestScore = s;
+                best = p;
+            }
+        }
+        return bestScore > 0 ? best : null;
     }
 
     /** Skill 文本(名称+描述)与用户问题词元的交集大小。 */

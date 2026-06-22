@@ -213,6 +213,20 @@ public class AiConversationLoop {
         int toolRound = 0, totalIn = 0, totalOut = 0;
         long totalStart = System.currentTimeMillis();
 
+        // 确定性自动激活的可见性：服务端已在 applySkillContext 注入了相关租户技能的完整正文，这里补发一条
+        // 合成「激活技能」步骤(progress + tool_result)，让前端仍渲染「激活技能:X」卡片（与模型自调
+        // activate_skills 同款展示），并随历史持久化。注意：技能正文已注入，无需再经模型调用，确定性 100%。
+        List<String> autoActivatedSkills = skillApplyResult.getAutoActivatedSkillNames();
+        if (!autoActivatedSkills.isEmpty()) {
+            String autoId = "auto-activate-" + connectionId;
+            ToolUseCall syntheticCall = new ToolUseCall(autoId, "activate_skills",
+                    Map.of("skill_names", autoActivatedSkills));
+            sendProgress(connectionId, toolRound + 1, List.of(syntheticCall), body, adapter);
+            sendToolResults(connectionId, toolRound + 1, List.of(new ToolExecutionResult(
+                    autoId, "activate_skills", true, Map.of("activated", autoActivatedSkills))));
+            toolRound++;
+        }
+
         try {
             while (true) {
                 llmCallGuard.acquirePermission();
