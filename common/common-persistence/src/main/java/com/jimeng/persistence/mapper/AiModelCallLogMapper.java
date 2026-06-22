@@ -39,6 +39,12 @@ public interface AiModelCallLogMapper extends BaseMapper<AiModelCallLog> {
                                               @Param("end") Date end,
                                               @Param("limit") int limit);
 
+    /** 按成员（user_id）聚合的调用数 / token / 成本，按成本倒序取前 N。user_id 为空的调用会聚成一组（未归属）。 */
+    List<Map<String, Object>> selectTopUsers(@Param("tenantId") String tenantId,
+                                             @Param("start") Date start,
+                                             @Param("end") Date end,
+                                             @Param("limit") int limit);
+
     /**
      * 最近 N 条调用记录（用于仪表盘「最近使用 · 按 Agent」信息流）。
      * 仅含 {@code agent_id} 非空的调用——RAG 子调用（embedding/rerank/contextualization）
