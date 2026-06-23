@@ -5,14 +5,17 @@ import com.jimeng.dataserver.ai.skill.source.AiSkillToolPackage;
 import com.jimeng.persistence.entity.AiSkill;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 发现阶段 Skill 挑选：相关性排序 + 租户优先 + 上限截断。
- * 复现并守护「租户自有 Skill 被平台 Skill 挤出 max-selected、一直不被发现」的回归。
+ * 发现阶段 Skill 挑选：常规数量下「展示全部、模型自行判断」；仅超出安全上限才退化到相关性排序 + 租户优先 + 截断。
+ * 守护两条回归：①知识库等无关请求不再因关键词命中被强行激活图像技能(改为模型按描述判断)；
+ * ②租户自有 Skill 不被平台 Skill 挤出而漏发现。
  */
 class SkillDiscoveryRankingTest {
 
@@ -24,17 +27,14 @@ class SkillDiscoveryRankingTest {
         return new AiSkillToolPackage(s);
     }
 
-    private static ToolPackage skillWithBody(String name, String desc, String tenantId, String body) {
-        AiSkill s = new AiSkill();
-        s.setName(name);
-        s.setDescription(desc);
-        s.setTenantId(tenantId);
-        s.setBody(body);
-        return new AiSkillToolPackage(s);
-    }
-
     private static List<String> names(List<ToolPackage> pkgs) {
         return pkgs.stream().map(ToolPackage::getName).toList();
+    }
+
+    private static Map<String, ToolPackage> asMap(List<ToolPackage> pkgs) {
+        Map<String, ToolPackage> m = new LinkedHashMap<>();
+        for (ToolPackage p : pkgs) m.put(p.getName(), p);
+        return m;
     }
 
     @Test
@@ -44,6 +44,36 @@ class SkillDiscoveryRankingTest {
         assertTrue(t.contains("提示")); // bigram
         assertTrue(t.contains("示词")); // bigram
     }
+
+    // ---- 发现阶段「展示全部、模型自行判断」：selectForDiscovery ----
+
+    @Test
+    void discoveryShowsEverySkillWhenUnderCap() {
+        // 常规数量下，发现阶段把每一个 Skill 都展示给模型(让模型读到全部描述、自行判断是否激活)，不做关键词预筛。
+        List<ToolPackage> all = List.of(
+                skill("design-system", "Audit your design system", null),
+                skill("gaode-poi", "高德POI查询与商圈聚类分析", null),
+                skill("brand-guidelines", "Anthropic brand colors and typography", "test"),
+                skill("ai-image-prompts-lite", "AI 图像提示词推荐助手，绘图提示词润色配图", "test"));
+        List<ToolPackage> shown = SkillRuntimeService.selectForDiscovery(asMap(all), "帮我把这条内容上传到知识库");
+        assertEquals(4, shown.size(), "候选数未超上限时应原样全部展示");
+        assertTrue(names(shown).containsAll(
+                List.of("design-system", "gaode-poi", "brand-guidelines", "ai-image-prompts-lite")));
+    }
+
+    @Test
+    void discoveryFallsBackToRankingWhenOverCap() {
+        // 仅当 Skill 数量超过安全上限(30)时，才退化为相关性排序 + 截断，防止上下文膨胀。
+        java.util.List<ToolPackage> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 40; i++) many.add(skill("filler-" + i, "无关填充技能", null));
+        many.add(skill("ai-image-prompts-lite", "AI 图像 绘图 提示词 配图", "test"));
+        List<ToolPackage> shown = SkillRuntimeService.selectForDiscovery(asMap(many), "帮我绘图配图生成图像提示词");
+        assertEquals(30, shown.size(), "超上限应截断到 DISCOVERY_MAX");
+        assertTrue(names(shown).contains("ai-image-prompts-lite"),
+                "超量兜底排序应让相关的租户图像技能进入发现列表: " + names(shown));
+    }
+
+    // ---- 超量兜底时仍保留的相关性排序：rankForDiscovery ----
 
     @Test
     void imageQuerySurfacesTenantImageSkillWithinLimit() {
@@ -70,54 +100,5 @@ class SkillDiscoveryRankingTest {
         List<ToolPackage> top = SkillRuntimeService.rankForDiscovery(all, SkillRuntimeService.tokenize("zzzz"), 3);
         assertTrue(names(top).contains("brand-guidelines"), names(top).toString());
         assertTrue(names(top).contains("ai-image-prompts-lite"), names(top).toString());
-    }
-
-    // ---- 确定性自动激活：pickAutoActivateTenantSkill ----
-
-    @Test
-    void autoActivatePicksRelevantTenantPromptSkill() {
-        List<ToolPackage> discovered = List.of(
-                skillWithBody("design-system", "Audit your design system", null, "platform body"),
-                // 与线上 ai-image-prompts-lite 一致：描述含「生成」，故「生成…图片」请求词面相关。
-                skillWithBody("ai-image-prompts-lite",
-                        "AI 图像提示词推荐助手，按风格场景生成绘图提示词、配图润色", "test", "提示词优化指引正文"));
-        ToolPackage auto = SkillRuntimeService.pickAutoActivateTenantSkill(
-                discovered, "帮我生成一张小猫在奔跑的图片");
-        assertNotNull(auto, "生图请求应确定性自动激活租户图像提示词技能");
-        assertEquals("ai-image-prompts-lite", auto.getName());
-    }
-
-    @Test
-    void autoActivateNeverPicksPlatformSkill() {
-        // 平台技能(tenantId==null)即便相关也不自动激活，避免对所有对话强行注入平台技能正文。
-        List<ToolPackage> discovered = List.of(
-                skillWithBody("design-system", "设计系统 组件 审计 提示词", null, "platform body"));
-        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "设计系统组件审计提示词"));
-    }
-
-    @Test
-    void autoActivateNullWhenNoLexicalOverlap() {
-        List<ToolPackage> discovered = List.of(
-                skillWithBody("ai-image-prompts-lite", "AI 图像提示词 绘图", "test", "正文"));
-        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "今天天气怎么样"));
-    }
-
-    @Test
-    void autoActivateSkipsTenantSkillWithoutBody() {
-        // 无正文的技能没有可注入的指引，不自动激活。
-        List<ToolPackage> discovered = List.of(
-                skill("ai-image-prompts-lite", "AI 图像提示词 绘图 配图", "test"));
-        assertNull(SkillRuntimeService.pickAutoActivateTenantSkill(discovered, "帮我绘图配图"));
-    }
-
-    @Test
-    void autoActivatePicksHighestScoringTenantSkill() {
-        List<ToolPackage> discovered = List.of(
-                skillWithBody("weak-skill", "无关 描述", "test", "正文1"),
-                skillWithBody("image-skill", "图像 绘图 提示词 配图 生成", "test", "正文2"));
-        ToolPackage auto = SkillRuntimeService.pickAutoActivateTenantSkill(
-                discovered, "绘图 提示词 配图 生成图像");
-        assertNotNull(auto);
-        assertEquals("image-skill", auto.getName());
     }
 }
