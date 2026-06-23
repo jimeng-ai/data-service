@@ -107,24 +107,11 @@ public class SkillRuntimeService {
             }
         }
 
-        // Skill 发现阶段：按与用户问题的相关性挑选要展示的 Skill
-        String userText = latestUserText(messages);
-        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly, userText);
+        // Skill 发现阶段：把候选 Skill 的「名称 + 描述」全部展示给模型，由模型自行逐一比对、判断是否需要
+        // activate_skills 激活——不做任何关键词命中式的服务端自动激活（关键词匹配会因描述里的通用词
+        // 误命中，例如知识库上传请求里的「内容」撞上图像技能描述，被强行激活；详见 selectForDiscovery）。
+        List<ToolPackage> discoverySkills = selectForDiscovery(skillOnly, latestUserText(messages));
         if (!discoverySkills.isEmpty()) {
-            // 确定性自动激活：挑出「与用户问题词面相关、且最相关的本租户 PROMPT 技能」，直接注入其完整正文，
-            // 不再依赖模型自觉调用 activate_skills——这是 ai-image-prompts 这类「该用就得用」的租户技能此前
-            // 激活不稳定（约 83%）的根因。其余候选仍走发现，模型可按需再激活。
-            ToolPackage auto = pickAutoActivateTenantSkill(discoverySkills, userText);
-            if (auto != null) {
-                List<ToolPackage> remaining = new ArrayList<>(discoverySkills);
-                remaining.remove(auto);
-                injectFullSkillContext(body, List.of(auto), adapter);
-                if (!remaining.isEmpty()) injectDiscoveryContext(body, remaining, adapter);
-                log.info("Auto-activated tenant skill: {}; remaining discovery: {}", auto.getName(), toNames(remaining));
-                return remaining.isEmpty()
-                        ? SkillApplyResult.autoActivated(List.of(auto.getName()))
-                        : SkillApplyResult.discoveryWithAutoActivated(toNames(discoverySkills), List.of(auto.getName()));
-            }
             log.info("Discovery Phase skills: {}", toNames(discoverySkills));
             injectDiscoveryContext(body, discoverySkills, adapter);
             return SkillApplyResult.discovery(toNames(discoverySkills));
@@ -236,9 +223,9 @@ public class SkillRuntimeService {
         // 强约束的激活指引：模型常因「内置工具能直接完成」而跳过明显相关的 Skill（例如收到生图请求时
         // 直接调 generate_image，却不先激活『图像提示词优化』Skill）。这里要求：在调用任何其它工具或直接
         // 作答之前，先逐一比对下列 Skill 的适用场景，只要明显相关就必须先 activate_skills 激活并遵循其指引。
-        sb.append("下面是当前可用的 Skill 列表（已按与用户请求的相关性挑选）。\n");
+        sb.append("下面是当前可用的全部 Skill 列表。\n");
         sb.append("**在直接作答或调用其它任何工具（包括 generate_image 等内置工具）之前**，");
-        sb.append("先逐一对照每个 Skill 的「适用场景/触发场景」判断它是否与用户当前请求相关：\n");
+        sb.append("请你自己逐一阅读每个 Skill 的「适用场景/触发场景」描述，判断它是否与用户当前请求相关：\n");
         sb.append("- 只要某个 Skill 明显相关，你【必须】先调用 activate_skills 激活它，激活后严格遵循该 Skill 的指引再继续后续动作；\n");
         sb.append("- 不要在存在明显相关 Skill 的情况下跳过激活、直接用其它工具或凭空作答；\n");
         sb.append("- 若确实没有相关 Skill，可不激活、正常继续。\n\n");
@@ -295,15 +282,22 @@ public class SkillRuntimeService {
     private static final Pattern WORD_TOKEN = Pattern.compile("[a-z0-9]{2,}");
 
     /**
-     * 发现阶段挑选要展示给模型的 Skill：按与用户问题的词面相关性降序排序，<b>同分时租户自有 Skill 优先于
-     * 平台 Skill</b>（避免用户自己的 Skill 被平台 Skill 挤出 {@code skill.max-selected} 上限——这正是
-     * 之前「租户 Skill 一直不被发现/调用」的根因），最后截断到上限。
+     * 发现阶段安全上限：只有当候选 Skill 数量<b>超过</b>它时，才退化到「关键词相关性排序 + 截断」以免上下文膨胀；
+     * 常规数量下把<b>全部</b> Skill 的「名称 + 描述」都展示给模型，由模型自行判断是否激活——不做关键词预筛。
+     * 注意：这与 {@code skill.max-selected}（单次 activate_skills 可激活的数量上限）无关。
      */
-    private List<ToolPackage> selectForDiscovery(Map<String, ToolPackage> skillMap, String query) {
+    private static final int DISCOVERY_MAX = 30;
+
+    /**
+     * 发现阶段挑选要展示给模型的 Skill：常规情况下<b>展示全部候选</b>（让模型读到每一个 Skill 的描述、自行判断
+     * 是否需要激活），不按关键词预筛——关键词命中式预筛/自动激活会因描述中的通用词误命中而错误激活，是此前
+     * 「知识库等无关请求也激活图像技能」的根因。仅当候选数量超过 {@link #DISCOVERY_MAX} 这一安全上限时，
+     * 才退化为按词面相关性排序（同分租户自有 Skill 优先）并截断，纯粹为防上下文膨胀。
+     */
+    static List<ToolPackage> selectForDiscovery(Map<String, ToolPackage> skillMap, String query) {
         List<ToolPackage> all = new ArrayList<>(skillMap.values());
-        int limit = Math.max(maxSelected, 1);
-        if (all.size() <= limit) return all;
-        return rankForDiscovery(all, tokenize(query), limit);
+        if (all.size() <= DISCOVERY_MAX) return all;
+        return rankForDiscovery(all, tokenize(query), DISCOVERY_MAX);
     }
 
     /** 纯函数：按相关性(降序) + 租户优先 稳定排序后取前 limit 个。便于单测。 */
@@ -316,32 +310,7 @@ public class SkillRuntimeService {
         return new ArrayList<>(sorted.subList(0, Math.min(limit, sorted.size())));
     }
 
-    /**
-     * 从发现候选里挑「确定性自动激活」的本租户 PROMPT 技能：与用户问题有词面相关（relevanceScore&gt;0）、含正文，
-     * 取相关性最高的一个；无则返回 null（回退到普通发现 → 模型自行 activate_skills）。
-     *
-     * <p>仅限<b>本租户技能</b>（tenantId!=null）：平台技能（如 brand-guidelines/design-system）仍走发现，
-     * 避免对所有对话强行注入平台技能正文。租户技能是租户为自己用例显式创建的，「该用就得用」，故确定性激活。
-     * 静态 + 包级可见，便于单测。
-     */
-    static ToolPackage pickAutoActivateTenantSkill(List<ToolPackage> discovered, String query) {
-        Set<String> qTokens = tokenize(query);
-        if (qTokens.isEmpty()) return null;
-        ToolPackage best = null;
-        int bestScore = 0;
-        for (ToolPackage p : discovered) {
-            if (p.getTenantId() == null) continue;          // 仅本租户技能
-            if (StrUtil.isBlank(p.getBody())) continue;     // 需有正文(指引)才值得注入
-            int s = relevanceScore(qTokens, p);
-            if (s > bestScore) {
-                bestScore = s;
-                best = p;
-            }
-        }
-        return bestScore > 0 ? best : null;
-    }
-
-    /** Skill 文本(名称+描述)与用户问题词元的交集大小。 */
+    /** Skill 文本(名称+描述)与用户问题词元的交集大小。仅用于 {@link #rankForDiscovery} 的超量兜底排序。 */
     private static int relevanceScore(Set<String> queryTokens, ToolPackage pkg) {
         if (queryTokens == null || queryTokens.isEmpty()) return 0;
         Set<String> skillTokens = tokenize(pkg.getName() + " " + pkg.getDescription());
