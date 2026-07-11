@@ -37,6 +37,11 @@ public class ChatHistoryReconstructor {
     private static final String ROLE_ASSISTANT = "assistant";
     /** 单条 tool_result 文本上限，避免把巨大工具输出灌回上下文。 */
     private static final int MAX_TOOL_RESULT_CHARS = 1500;
+    /** 只回放已成功完成的消息（user 恒为 COMPLETED；排除 CANCELLED / FAILED / GENERATING 的助手轮，
+     *  否则会把半截取消 / 失败的回答当成真答案回放，甚至伪造出「工具已成功」的 tool_result）。 */
+    private static final String STATUS_COMPLETED = "COMPLETED";
+    /** 回放历史的最近消息条数上限：长会话若把全部历史灌回模型，会撑爆上下文 / 触 maxBudgetUsd。 */
+    private static final int MAX_HISTORY_MESSAGES = 40;
 
     private final ChatMessageMapper messageMapper;
 
@@ -53,12 +58,8 @@ public class ChatHistoryReconstructor {
                                                        Long beforeMessageId,
                                                        List<Map<String, Object>> fallback) {
         try {
-            List<ChatMessage> msgs = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
-                    .eq(ChatMessage::getConversationId, conversationId)
-                    .lt(beforeMessageId != null, ChatMessage::getId, beforeMessageId)
-                    .orderByAsc(ChatMessage::getCreateTime)
-                    .orderByAsc(ChatMessage::getId));
-            if (msgs == null || msgs.isEmpty()) return fallback;
+            List<ChatMessage> msgs = loadHistoryMessages(conversationId, beforeMessageId);
+            if (msgs.isEmpty()) return fallback;
 
             List<Map<String, Object>> out = new ArrayList<>();
             for (ChatMessage m : msgs) {
@@ -77,6 +78,98 @@ public class ChatHistoryReconstructor {
             log.warn("历史重建失败，回退纯文字 history conversationId={} err={}", conversationId, e.getMessage());
             return fallback;
         }
+    }
+
+    /**
+     * 加载会话历史消息（供 Claude 重建 / exec 纯文本重建共用）：
+     *  - 只取 COMPLETED（#7：不回放 CANCELLED / FAILED / GENERATING）；
+     *  - 只保留最近 {@link #MAX_HISTORY_MESSAGES} 条（#6：避免长会话历史无界）；
+     *  - 截断后若开头是 assistant（其配对 user 被切走），丢弃开头非 user 行，保证首条为 user（Claude 要求）。
+     * 空则返回空列表（调用方据此回退 fallback）。
+     */
+    private List<ChatMessage> loadHistoryMessages(Long conversationId, Long beforeMessageId) {
+        List<ChatMessage> msgs = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getStatus, STATUS_COMPLETED)
+                .lt(beforeMessageId != null, ChatMessage::getId, beforeMessageId)
+                .orderByAsc(ChatMessage::getCreateTime)
+                .orderByAsc(ChatMessage::getId));
+        if (msgs == null || msgs.isEmpty()) return List.of();
+        if (msgs.size() > MAX_HISTORY_MESSAGES) {
+            msgs = new ArrayList<>(msgs.subList(msgs.size() - MAX_HISTORY_MESSAGES, msgs.size()));
+            int start = 0;
+            while (start < msgs.size() && !ROLE_USER.equals(msgs.get(start).getRole())) start++;
+            if (start > 0) msgs = new ArrayList<>(msgs.subList(start, msgs.size()));
+        }
+        return msgs;
+    }
+
+    /**
+     * 为 exec（沙箱）路径重建【纯文本】历史。沙箱契约只吃 {@code {role, content}}，无法消费 tool_use/
+     * tool_result 块，故这里不建 Claude 块，而是把 assistant 轮里调过的工具 / 产出的产物折叠成一句可读描述
+     * 附在其回答文字后。否则「只出图 / 只写文件、无收尾文字」的 assistant 轮 content 为空 → 沙箱渲染成裸
+     * {@code assistant:} 行 → 模型看不见自己上一轮出过图 / 写过文件，于是改用文字叙述而不再真调工具
+     * （与 RAG 路径同类退化）。失败 / 为空回退到调用方 fallback（前端纯文字 history）。
+     */
+    public List<Map<String, Object>> reconstructFlatText(Long conversationId,
+                                                         Long beforeMessageId,
+                                                         List<Map<String, Object>> fallback) {
+        try {
+            List<ChatMessage> msgs = loadHistoryMessages(conversationId, beforeMessageId);
+            if (msgs.isEmpty()) return fallback;
+            List<Map<String, Object>> out = new ArrayList<>();
+            boolean anyAssistant = false;
+            for (ChatMessage m : msgs) {
+                if (ROLE_USER.equals(m.getRole())) {
+                    if (StrUtil.isNotBlank(m.getContent())) out.add(textMsg(ROLE_USER, m.getContent()));
+                } else if (ROLE_ASSISTANT.equals(m.getRole())) {
+                    String content = flattenAssistant(m);
+                    if (StrUtil.isNotBlank(content)) {
+                        out.add(textMsg(ROLE_ASSISTANT, content));
+                        anyAssistant = true;
+                    }
+                }
+            }
+            // 无任何 assistant 轮（如此前的助手轮都因取消/失败被状态过滤掉）→ 回退前端 history，否则只剩一串
+            // 没有回答的 user 行（没人应答的问题墙），比带可见回答的前端历史更差、还会误导模型。
+            return (out.isEmpty() || !anyAssistant) ? fallback : out;
+        } catch (Exception e) {
+            log.warn("exec 历史重建失败，回退纯文字 history conversationId={} err={}", conversationId, e.getMessage());
+            return fallback;
+        }
+    }
+
+    /** 把一条 assistant 消息折叠成纯文本：原始回答文字 +（若有）本轮所调工具 / 所产文件的简述。 */
+    String flattenAssistant(ChatMessage m) {
+        String base = StrUtil.nullToEmpty(m.getContent()).trim();
+        List<Object> segs = parseSegments(m.getSegments());
+        List<String> tools = new ArrayList<>();
+        List<String> artifacts = new ArrayList<>();
+        for (Object segObj : segs) {
+            if (!(segObj instanceof JSONObject seg)) continue;
+            String type = seg.getStr("type");
+            // 用 instanceof 取 call/artifact，绝不用 getJSONObject——后者遇到 call 是数组/字符串/数字等
+            // 非对象时会抛 ClassCastException/JSONException，畸形段会连累整段重建回退。
+            if ("tool".equals(type) && seg.get("call") instanceof JSONObject call) {
+                String name = shortName(call.getStr("name"));
+                if (StrUtil.isNotBlank(name) && !tools.contains(name)) tools.add(name);
+            } else if ("artifact".equals(type) && seg.get("artifact") instanceof JSONObject art) {
+                String fn = shortName(art.getStr("filename"));
+                if (StrUtil.isNotBlank(fn) && !artifacts.contains(fn)) artifacts.add(fn);
+            }
+        }
+        if (tools.isEmpty() && artifacts.isEmpty()) return base;
+        StringBuilder note = new StringBuilder();
+        if (!tools.isEmpty()) note.append("（本轮调用了工具：").append(StrUtil.join("、", tools.toArray())).append("）");
+        if (!artifacts.isEmpty()) note.append("（本轮生成了文件：").append(StrUtil.join("、", artifacts.toArray())).append("）");
+        return base.isEmpty() ? note.toString() : base + " " + note;
+    }
+
+    /** 工具名 / 文件名裁到合理长度，防畸形段里的超长或非字符串值（getStr 会转成 JSON 文本）把折叠文本撑爆。 */
+    private static String shortName(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.length() > 80 ? t.substring(0, 80) + "…" : t;
     }
 
     /** 把一条 assistant 消息(可能含工具段)展开成「assistant(text+tool_use) → user(tool_result)」交替序列。 */

@@ -268,8 +268,10 @@ public class RagAnswerService {
             body.put("system", SYSTEM_PROMPT);
         }
 
-        List<Map<String, Object>> messages = new ArrayList<>();
-        if (req.getHistory() != null) messages.addAll(req.getHistory());
+        // 历史可能来自「重建回退」或直连 /rag/answer 端点，未经交替校验。清洗成 Claude 可接受的序列，
+        // 否则畸形历史（结尾是 user、或首条是 assistant、或非 user/assistant 角色）会与下方追加的当前
+        // user 消息一起触发角色不交替 → Claude 400。见对话历史 bug #9。
+        List<Map<String, Object>> messages = sanitizeHistoryForClaude(req.getHistory());
 
         String userContent;
         if (useRag) {
@@ -297,6 +299,29 @@ public class RagAnswerService {
 
         body.put("messages", messages);
         return body;
+    }
+
+    /**
+     * 清洗历史 messages 成 Claude 合法序列：只留 user/assistant 角色、强制相邻不同角色、丢弃开头的
+     * assistant（Claude 要求首条为 user）与结尾的 user（其后要追加当前 user 消息，避免两条 user 相邻）。
+     * 返回可变列表，供调用方继续追加当前轮消息。包级可见，便于单测。
+     */
+    static List<Map<String, Object>> sanitizeHistoryForClaude(List<Map<String, Object>> history) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (history == null) return out;
+        for (Map<String, Object> h : history) {
+            if (h == null) continue;
+            Object role = h.get("role");
+            if (!"user".equals(role) && !"assistant".equals(role)) continue;
+            // Claude 的 content 只接受字符串或 content-block 数组(List)；对象(Map)等其它形状会被上游判 400，剔除。
+            Object content = h.get("content");
+            if (!(content instanceof String) && !(content instanceof List)) continue;
+            if (!out.isEmpty() && String.valueOf(out.get(out.size() - 1).get("role")).equals(role)) continue;
+            out.add(h);
+        }
+        while (!out.isEmpty() && "assistant".equals(String.valueOf(out.get(0).get("role")))) out.remove(0);
+        while (!out.isEmpty() && "user".equals(String.valueOf(out.get(out.size() - 1).get("role")))) out.remove(out.size() - 1);
+        return out;
     }
 
     private void logCandidates(String tag, List<SearchResultItem> items, boolean rerankPhase) {

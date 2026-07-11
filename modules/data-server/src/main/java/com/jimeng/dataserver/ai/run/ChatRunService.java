@@ -105,7 +105,7 @@ public class ChatRunService {
                                     boolean exec, String traceId, Long cutoffMessageId) {
         try {
             if (exec) {
-                agentExecService.streamExec(toExecRequest(conversationId, req), runId, traceId);
+                agentExecService.streamExec(toExecRequest(conversationId, req, cutoffMessageId), runId, traceId);
             } else {
                 ragAnswerService.streamAnswer(toAnswerRequest(req, conversationId, cutoffMessageId), runId, traceId);
             }
@@ -137,19 +137,30 @@ public class ChatRunService {
         return n != null && n > 0;
     }
 
-    private AgentExecRequest toExecRequest(Long conversationId, TurnStartRequest req) {
+    private AgentExecRequest toExecRequest(Long conversationId, TurnStartRequest req, Long cutoffMessageId) {
         AgentExecRequest er = new AgentExecRequest();
         er.setAgentId(req.getAgentId());
         er.setConversationId(conversationId);
         er.setQuery(req.getQuery());
         er.setFileIds(req.getFileIds());
         er.setPreview(req.isPreview());
-        if (req.getHistory() != null) {
+        // 用已落库 segments 重建【纯文本】历史：让模型看见自己上一轮调过工具 / 出过图 / 写过文件（否则空的
+        // assistant 轮 → 沙箱裸 `assistant:` 行，模型改用文字叙述而不再真调工具）。重建失败 / 为空安全回退
+        // 到前端纯文字 history。
+        List<Map<String, Object>> history = chatHistoryReconstructor.reconstructFlatText(
+                conversationId, cutoffMessageId, req.getHistory());
+        if (history != null) {
             List<AgentExecRequest.History> hs = new ArrayList<>();
-            for (Map<String, Object> h : req.getHistory()) {
+            for (Map<String, Object> h : history) {
+                if (h == null) continue;
+                Object role = h.get("role");
+                Object content = h.get("content");
+                // 跳过缺字段项，且绝不用 String.valueOf(null)——它会把缺失渲染成字面量 "null" 污染上下文
+                // （回退的前端 history 可能缺 role/content）。角色也归一到 user/assistant。
+                if (role == null || content == null) continue;
                 AgentExecRequest.History one = new AgentExecRequest.History();
-                one.setRole(String.valueOf(h.get("role")));
-                one.setContent(String.valueOf(h.get("content")));
+                one.setRole("assistant".equals(String.valueOf(role)) ? "assistant" : "user");
+                one.setContent(String.valueOf(content));
                 hs.add(one);
             }
             er.setHistory(hs);

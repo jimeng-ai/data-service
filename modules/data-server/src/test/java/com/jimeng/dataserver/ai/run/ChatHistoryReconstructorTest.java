@@ -102,4 +102,71 @@ class ChatHistoryReconstructorTest {
         assertTrue(ChatHistoryReconstructor.validAlternation(List.of(
                 Map.of("role", "user", "content", "a"), Map.of("role", "assistant", "content", "b"))));
     }
+
+    /** exec 路径：一条「只出图 / 写文件、无收尾文字」的 assistant 轮，其 segments 含 tool + artifact 段。 */
+    private static String execSeg() {
+        return JSONUtil.toJsonStr(List.of(
+                Map.of("type", "tool", "call", Map.of("id", "t1", "name", "generate_image", "status", "success")),
+                Map.of("type", "artifact", "artifact", Map.of("filename", "report.xlsx"))));
+    }
+
+    @Test
+    void flattenAssistantSummarizesToolsAndArtifacts() {
+        ChatHistoryReconstructor r = new ChatHistoryReconstructor(mock(ChatMessageMapper.class));
+        // 空回答文字但调过工具/出过产物：折叠出非空、含工具名与文件名的描述（而非裸空串）。
+        String s = r.flattenAssistant(msg(2, "assistant", "", execSeg()));
+        assertTrue(s.contains("generate_image"), s);
+        assertTrue(s.contains("report.xlsx"), s);
+        // 纯文字回答无工具段：原样返回文字。
+        assertEquals("你好", r.flattenAssistant(msg(3, "assistant", "你好", null)));
+    }
+
+    @Test
+    void reconstructFlatTextSurfacesEmptyAssistantToolTurn() {
+        ChatMessageMapper mapper = mock(ChatMessageMapper.class);
+        when(mapper.selectList(any())).thenReturn(List.of(
+                msg(1, "user", "画一张海边黄昏", null),
+                msg(2, "assistant", "", execSeg())));   // 只出图、无收尾文字
+        List<Map<String, Object>> out =
+                new ChatHistoryReconstructor(mapper).reconstructFlatText(1L, 9L, null);
+        assertEquals(2, out.size(), out.toString());
+        assertEquals("user", out.get(0).get("role"));
+        assertEquals("assistant", out.get(1).get("role"));
+        // 关键：assistant 轮 content 非空且带工具证据（修「裸 assistant: 行」导致模型不再真调工具）。
+        String c = String.valueOf(out.get(1).get("content"));
+        assertFalse(c.isBlank(), "assistant content 不应为空");
+        assertTrue(c.contains("generate_image"), c);
+    }
+
+    @Test
+    void reconstructFlatTextEmptyFallsBack() {
+        ChatMessageMapper mapper = mock(ChatMessageMapper.class);
+        when(mapper.selectList(any())).thenReturn(List.of());
+        List<Map<String, Object>> fb = List.of(Map.of("role", "user", "content", "x"));
+        assertSame(fb, new ChatHistoryReconstructor(mapper).reconstructFlatText(1L, 9L, fb));
+    }
+
+    /** 对抗：segments 里 call/artifact 是数组/字符串/数字等非对象时，flattenAssistant 绝不能抛异常。 */
+    @Test
+    void flattenAssistantToleratesMalformedSegments() {
+        ChatHistoryReconstructor r = new ChatHistoryReconstructor(mock(ChatMessageMapper.class));
+        String malformed = JSONUtil.toJsonStr(List.of(
+                Map.of("type", "tool", "call", List.of(1, 2)),          // call 是数组
+                Map.of("type", "tool", "call", "oops"),                  // call 是字符串
+                Map.of("type", "artifact", "artifact", List.of("x")),    // artifact 是数组
+                Map.of("type", "unknown", "foo", "bar")));               // 未知段
+        assertDoesNotThrow(() -> r.flattenAssistant(msg(2, "assistant", "答复", malformed)));
+        assertEquals("答复", r.flattenAssistant(msg(2, "assistant", "答复", malformed))); // 畸形段被忽略，保留正文
+    }
+
+    /** 对抗：所有历史助手轮都被取消/失败过滤掉 → 只剩 user 行时，回退前端 history（别喂一堵没人应答的问题墙）。 */
+    @Test
+    void reconstructFlatTextFallsBackWhenNoAssistant() {
+        ChatMessageMapper mapper = mock(ChatMessageMapper.class);
+        when(mapper.selectList(any())).thenReturn(List.of(
+                msg(1, "user", "q1", null), msg(3, "user", "q2", null), msg(5, "user", "q3", null)));
+        List<Map<String, Object>> fb = List.of(
+                Map.of("role", "user", "content", "q1"), Map.of("role", "assistant", "content", "a1"));
+        assertSame(fb, new ChatHistoryReconstructor(mapper).reconstructFlatText(1L, 9L, fb));
+    }
 }
