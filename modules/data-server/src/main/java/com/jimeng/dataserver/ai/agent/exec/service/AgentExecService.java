@@ -40,10 +40,13 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -59,6 +62,14 @@ import java.util.concurrent.TimeUnit;
 @Service
 @RequiredArgsConstructor
 public class AgentExecService {
+
+    /**
+     * 一次 run 允许铺进沙箱的输入文件条数上限，必须 <= 边车的 LIMIT_MAX_INPUT_FILES（默认 20）。
+     * 边车超限的处理是【400 拒掉整个 run】，不是截断 —— 表现为「聊着聊着这轮突然全废」。
+     * 自从产物也会登记成会话输入文件（registerArtifactAsInput）后，长会话必然会累积到这个量级，
+     * 所以派发前必须自己先裁剪。两边的数字要一起改。
+     */
+    private static final int MAX_SANDBOX_INPUT_FILES = 20;
 
     private final SidecarClient sidecarClient;
     private final RunEventTee tee;
@@ -144,13 +155,46 @@ public class AgentExecService {
                 fileById.putIfAbsent(f.getId(), f);
             }
         }
+        // 2c. 本会话【历史产物】也铺回 /work，否则"在你刚生成的那份报表上再加一列"永远做不到：
+        //     边车每轮结束会硬删工作区，产物不会自己留下。产物存在 agent_artifact（不与上传混在
+        //     agent_input_file 里），所以这里单独查——好处是"上传 vs 产物"天然可区分，下面的
+        //     去重与裁剪优先级才有依据，也不用给 agent_input_file 加来源列。
+        List<AgentArtifact> priorArtifacts = conversationId == null
+                ? List.of()
+                : recentConversationArtifacts(conversationId, userId, canSeeAllFiles);
+
+        // 2d. 条数封顶 + 优先级。边车对超过 LIMIT_MAX_INPUT_FILES 的处理是【400 拒掉整轮】而不是
+        //     截断，所以必须在派发前自己裁到位。
+        //     优先级：本轮显式带的 > 历史上传 > 历史产物；同层内新的优先。
+        //     产物排在最后被裁是刻意的：源数据几乎总比中间产物重要 —— 若反过来，一个长会话会把
+        //     用户最早上传的源文件挤掉、只留一堆中间图表，"用原始数据重算一遍"就做不到了。
+        Set<Long> explicitIds = req.getFileIds() == null ? Set.of() : new HashSet<>(req.getFileIds());
+        List<AgentInputFile> allUploads = new ArrayList<>(fileById.values());
+        InputSelection selection = selectInputs(allUploads, explicitIds, priorArtifacts, MAX_SANDBOX_INPUT_FILES);
+        List<AgentInputFile> keptUploads = selection.uploads();
+        List<AgentArtifact> keptArtifacts = selection.artifacts();
+        if (keptUploads.size() < allUploads.size() || keptArtifacts.size() < priorArtifacts.size()) {
+            // 显式文件本身就超限时裁不下来，此时仍会被边车拒掉；日志要能看出是哪种情况。
+            log.info("会话 {} 输入超上限 {}：上传 {}->{}（显式 {}），产物 {}->{}",
+                    conversationId, MAX_SANDBOX_INPUT_FILES, allUploads.size(), keptUploads.size(),
+                    explicitIds.size(), priorArtifacts.size(), keptArtifacts.size());
+        }
+
         List<SidecarRunPayload.InputFile> inputs = new ArrayList<>();
-        for (AgentInputFile f : fileById.values()) {
+        for (AgentInputFile f : keptUploads) {
             SidecarRunPayload.InputFile in = new SidecarRunPayload.InputFile();
             in.setObjectName(f.getObjectName());
             in.setFilename(f.getFilename());
             in.setBucket(f.getBucket());
             in.setSizeBytes(f.getSizeBytes());
+            inputs.add(in);
+        }
+        for (AgentArtifact a : keptArtifacts) {
+            SidecarRunPayload.InputFile in = new SidecarRunPayload.InputFile();
+            in.setObjectName(a.getObjectName());
+            in.setFilename(a.getFilename());
+            in.setBucket(a.getBucket());
+            in.setSizeBytes(a.getSizeBytes());
             inputs.add(in);
         }
 
@@ -356,6 +400,100 @@ public class AgentExecService {
         } catch (Exception e) {
             log.warn("产物落库失败 runId={} err={}", runId, e.getMessage());
             return data;
+        }
+    }
+
+    /** 选中的输入：上传与产物分开，调用方各自转成 payload。 */
+    record InputSelection(List<AgentInputFile> uploads, List<AgentArtifact> artifacts) {
+    }
+
+    /**
+     * 在总数上限内挑选本轮要铺进沙箱的输入，纯函数、可单测（AgentExecInputSelectionTest）。
+     *
+     * 边车对超过 LIMIT_MAX_INPUT_FILES 的处理是【400 拒掉整轮】而不是截断，所以必须在派发前裁到位。
+     * 优先级：本轮显式带的上传 > 其它历史上传（新->旧）> 历史产物（新->旧）。
+     *
+     * 产物排在最后被裁是刻意的：源数据几乎总比中间产物重要。若按 id 一刀切"丢最旧的"，产物 id 更大
+     * 会导致用户最早上传的源文件先被挤掉、只剩一堆中间图表，"用原始数据重算一遍"就做不到了。
+     *
+     * @param allUploads    上传候选，按 id 升序（旧->新），显式项已在其中
+     * @param explicitIds   本轮显式带的 fileId，必留
+     * @param artifactsNewestFirst 历史产物，按新->旧且已按文件名去重
+     * @return 两份名单，均已回到"先后顺序"（旧->新），便于模型按时间理解
+     */
+    static InputSelection selectInputs(List<AgentInputFile> allUploads, Set<Long> explicitIds,
+                                       List<AgentArtifact> artifactsNewestFirst, int max) {
+        List<AgentInputFile> keptUploads = new ArrayList<>();
+        List<AgentInputFile> others = new ArrayList<>();
+        for (AgentInputFile f : allUploads) {
+            if (explicitIds.contains(f.getId())) {
+                keptUploads.add(f); // 用户刚点的，必留（哪怕它本身就超限）
+            } else {
+                others.add(f);
+            }
+        }
+        Collections.reverse(others); // 新->旧，填不下时丢的是最旧的
+        for (AgentInputFile f : others) {
+            if (keptUploads.size() >= max) {
+                break;
+            }
+            keptUploads.add(f);
+        }
+        keptUploads.sort(Comparator.comparing(AgentInputFile::getId)); // 回到上传先后顺序
+        int budget = Math.max(0, max - keptUploads.size());
+        List<AgentArtifact> keptArtifacts = new ArrayList<>(
+                artifactsNewestFirst.subList(0, Math.min(budget, artifactsNewestFirst.size())));
+        Collections.reverse(keptArtifacts); // 回到生成先后顺序
+        return new InputSelection(keptUploads, keptArtifacts);
+    }
+
+    /**
+     * 取本会话历史产物，按【新 -> 旧】返回，并按文件名去重只留最新的那份。
+     *
+     * 为什么要查这张表：边车每轮结束会硬删工作区，产物不会自己留下；不铺回去，"在你刚生成的那份
+     * 报表上再加一列"就永远做不到（用户上传的文件有 2b 回捞，产物此前没有对应链路）。
+     *
+     * 为什么按文件名去重：agent 每轮往往生成同名文件（report.xlsx 改一版再存一次）。全带上的话，
+     * 第 5 轮工作区里会同时躺着 report.xlsx / report-2.xlsx / report-3.xlsx（边车侧同名会消歧），
+     * 全是同一份东西的不同版本，模型很可能读到旧的那份并据此作答。只留最新的才符合"那份报表"的语义。
+     *
+     * 「按人私有」与 2b 对齐：产物归属跟随其父 run 的 user_id，成员只回捞自己那些 run 产出的。
+     */
+    private List<AgentArtifact> recentConversationArtifacts(Long conversationId, String userId,
+                                                            boolean canSeeAll) {
+        try {
+            List<AgentExecRun> runs = runMapper.selectList(
+                    new LambdaQueryWrapper<AgentExecRun>()
+                            .select(AgentExecRun::getId)
+                            .eq(AgentExecRun::getConversationId, conversationId)
+                            .eq(!canSeeAll, AgentExecRun::getUserId, userId)
+                            // 只看最近若干轮：长会话里 run 数会很多，IN 列表不能无界增长。
+                            // 取值远大于 MAX_SANDBOX_INPUT_FILES，保证候选集充足。
+                            .orderByDesc(AgentExecRun::getId)
+                            .last("limit " + (MAX_SANDBOX_INPUT_FILES * 3)));
+            if (runs.isEmpty()) {
+                return List.of();
+            }
+            List<Long> runIds = new ArrayList<>();
+            for (AgentExecRun r : runs) {
+                runIds.add(r.getId());
+            }
+            List<AgentArtifact> all = artifactMapper.selectList(
+                    new LambdaQueryWrapper<AgentArtifact>()
+                            .in(AgentArtifact::getRunId, runIds)
+                            .orderByDesc(AgentArtifact::getId));
+            // 已是新->旧，putIfAbsent 天然保留每个文件名最新的那条。
+            Map<String, AgentArtifact> newestByName = new LinkedHashMap<>();
+            for (AgentArtifact a : all) {
+                if (a.getFilename() != null) {
+                    newestByName.putIfAbsent(a.getFilename(), a);
+                }
+            }
+            return new ArrayList<>(newestByName.values());
+        } catch (Exception e) {
+            // 回捞产物是增强能力，查询出问题不该让整轮 run 起不来 —— 退化成"只有上传文件"。
+            log.warn("回捞会话产物失败 conversationId={} err={}", conversationId, e.getMessage());
+            return List.of();
         }
     }
 
