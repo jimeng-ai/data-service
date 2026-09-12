@@ -7,8 +7,8 @@ import cn.hutool.jwt.JWT;
 import cn.hutool.jwt.JWTPayload;
 import cn.hutool.jwt.JWTUtil;
 import com.jimeng.gateway.config.AuthConfiguration;
-import com.jimeng.gateway.constants.JWTConstant;
 import com.jimeng.gateway.entity.GatewayResponse;
+import com.jimeng.gateway.security.JwtSecretProvider;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
@@ -42,6 +42,7 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
 
     // 获取 nacos 配置
     private final AuthConfiguration authConfiguration;
+    private final JwtSecretProvider jwtSecretProvider;
 
     @Override
     public int getOrder() {
@@ -82,8 +83,8 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
         }
 
         try {
-            // 验证token签名
-            boolean verify = JWTUtil.verify(token, JWTConstant.TOKEN_SECRET.getBytes());
+            // 验证token签名。密钥来自配置（jwt.secret），轮转期可另接受 jwt.additional-secrets。
+            boolean verify = jwtSecretProvider.verify(token);
             if (!verify) {
                 log.warn("Invalid JWT signature for path: {}", urlPath);
                 return buildErrorResponse(response, HttpStatus.UNAUTHORIZED, "Invalid token signature");

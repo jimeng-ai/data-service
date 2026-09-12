@@ -3,7 +3,7 @@ package com.jimeng.dataserver.admin.auth.service;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.jwt.JWTPayload;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
-import com.jimeng.common.core.constant.JWTConstant;
+import com.jimeng.common.core.security.JwtSecretProvider;
 import com.jimeng.common.core.constant.PlatformConstant;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
@@ -29,7 +29,7 @@ import java.util.Map;
  * 企业账号（{@code sys_user}：超管 + 成员）登录、改密、查询当前用户。
  * jm-agent-front 与 jm-admin 企业门户共用 {@code /data/admin/auth/**}。
  *
- * <p>JWT 直接用 hutool 签发；共用 {@link JWTConstant#TOKEN_SECRET}，gateway 的 {@code AuthorizeFilter}
+ * <p>JWT 直接用 hutool 签发；密钥来自配置（{@link JwtSecretProvider}），gateway 的 {@code AuthorizeFilter}
  * 用同一密钥校验，并据 {@code tenant_id} claim 注入 {@code X-Tenant-Id}。固定 12 小时。
  *
  * <p>{@code sys_user}/{@code sys_enterprise} 均不在租户白名单内，查询不会被自动注入 {@code tenant_id}；
@@ -46,6 +46,7 @@ public class AdminAuthService {
     private final SysUserMapper sysUserMapper;
     private final SysEnterpriseMapper sysEnterpriseMapper;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final JwtSecretProvider jwtSecretProvider;
 
     @Transactional
     public LoginResponse login(LoginRequest req) {
@@ -153,7 +154,7 @@ public class AdminAuthService {
         payload.put("username", user.getUsername());
         payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
         payload.put("user_type", user.getUserType());
-        return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }
 
     /**
@@ -171,6 +172,6 @@ public class AdminAuthService {
         payload.put("id", userId);
         payload.put("tenant_id", tenantId);
         payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
-        return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }
 }

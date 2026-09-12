@@ -3,7 +3,7 @@ package com.jimeng.dataserver.admin.operator.auth.service;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.jwt.JWTPayload;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
-import com.jimeng.common.core.constant.JWTConstant;
+import com.jimeng.common.core.security.JwtSecretProvider;
 import com.jimeng.common.core.constant.PlatformConstant;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
@@ -37,6 +37,7 @@ public class OperatorAuthService {
 
     private final SysOperatorMapper sysOperatorMapper;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final JwtSecretProvider jwtSecretProvider;
 
     @Transactional
     public LoginResponse login(LoginRequest req) {
@@ -127,6 +128,6 @@ public class OperatorAuthService {
         payload.put("tenant_id", PlatformConstant.PLATFORM_TENANT);
         payload.put("username", op.getUsername());
         payload.put("realm", PlatformConstant.REALM_OPERATOR);
-        return cn.hutool.jwt.JWTUtil.createToken(payload, JWTConstant.TOKEN_SECRET.getBytes());
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }
 }
