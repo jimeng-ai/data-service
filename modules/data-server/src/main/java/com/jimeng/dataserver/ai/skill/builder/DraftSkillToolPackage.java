@@ -23,7 +23,8 @@ public class DraftSkillToolPackage implements ToolPackage {
             - description：一句话说明用途 + 触发场景（写好触发词，利于被发现）。
             - body：SKILL.md 正文，写成可直接用的操作指引（步骤/输入输出/约束）。
             - skillType：纯指引→PROMPT；需要跑脚本处理文件→DOER。
-            - files：仅 DOER 时给出，path→content（如 scripts/run.py 的完整可运行代码）。
+            - files：path→content 文件树。DOER 放脚本（如 scripts/run.py 的完整可运行代码）；
+            　PROMPT 与 DOER 都要放 evals/evals.json（测试用例，格式见系统提示）。
             生成 DOER 时脚本要自包含、可在沙箱用常见依赖运行；建议先让用户给样例输入以便试跑。
             """;
     }
@@ -35,7 +36,7 @@ public class DraftSkillToolPackage implements ToolPackage {
         props.put("skillType", str("PROMPT 或 DOER"));
         Map<String, Object> files = new LinkedHashMap<>();
         files.put("type", "object");
-        files.put("description", "DOER 文件树：相对路径 -> 文件内容");
+        files.put("description", "文件树：相对路径 -> 文件内容。DOER 放 scripts/*；两种类型都要放 evals/evals.json（测试用例）");
         files.put("additionalProperties", Map.of("type", "string"));
         props.put("files", files);
         Map<String, Object> schema = new LinkedHashMap<>();

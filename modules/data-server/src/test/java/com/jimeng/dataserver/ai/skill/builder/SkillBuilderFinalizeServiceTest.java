@@ -7,13 +7,19 @@ import com.jimeng.dataserver.ai.skill.service.AiSkillRegistryService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import org.junit.jupiter.api.Test;
+import com.jimeng.dataserver.ai.skill.eval.SkillEvalGate;
+
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class SkillBuilderFinalizeServiceTest {
     private SkillBuilderFinalizeService svc(AiSkillMapper mapper, AiSkillRegistryService reg) {
-        return new SkillBuilderFinalizeService(mapper, reg, mock(SkillDraftStore.class), mock(RagMinioStorageService.class));
+        // 门槛在这些用例里不是被测对象：用一个永远放行的桩，避免测试隐式依赖评测记录。
+        SkillEvalGate gate = mock(SkillEvalGate.class);
+        when(gate.check(any(), any())).thenReturn(new SkillEvalGate.Verdict(true, null, null, null));
+        return new SkillBuilderFinalizeService(mapper, reg, mock(SkillDraftStore.class),
+                mock(RagMinioStorageService.class), gate);
     }
     @Test void finalizeFlipsDraftToActive() {
         AiSkill draft = new AiSkill();

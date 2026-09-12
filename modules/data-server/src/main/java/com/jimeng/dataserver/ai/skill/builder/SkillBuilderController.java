@@ -12,6 +12,7 @@ import com.jimeng.dataserver.ai.chat.dto.ChatDtos.TurnStartResponse;
 import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
 import com.jimeng.dataserver.ai.run.ChatRunService;
 import com.jimeng.persistence.entity.Agent;
+import com.jimeng.dataserver.ai.skill.eval.SkillEvalGate;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import io.swagger.v3.oas.annotations.Operation;
@@ -171,6 +172,13 @@ public class SkillBuilderController {
         resp.setSkillId(skill.getId());
         resp.setName(skill.getName());
         resp.setStatus(skill.getStatus());
+        // 门槛结论随发布结果一起回去。WARN 模式下 skill 确实发布了，但可能根本不会被触发——
+        // 这条只写日志的话，用户永远不知道。
+        SkillEvalGate.Verdict v = finalizeService.takeVerdict();
+        if (v != null) {
+            resp.setEvalWarning(v.warning());
+            resp.setEvalRunId(v.evalRunId());
+        }
         return resp;
     }
 
@@ -187,5 +195,9 @@ public class SkillBuilderController {
         private Long skillId;
         private String name;
         private String status;
+        /** 发布门槛的提示。非空表示「放行了，但这个 skill 可能不会被触发」——前端必须显示出来。 */
+        private String evalWarning;
+        /** 依据的那轮召回评测（便于前端跳过去看细节）。 */
+        private Long evalRunId;
     }
 }
