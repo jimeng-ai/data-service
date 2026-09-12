@@ -481,19 +481,43 @@ public class SkillRuntimeService {
     private Map<String, ToolPackage> filterByAgentAllowlist(Map<String, ToolPackage> packages) {
         AgentRuntimeView agent = AgentContext.get();
         if (agent == null) return packages;
-        if (agent.getAllowedPluginCodes() == null) return packages;
 
         java.util.LinkedHashMap<String, ToolPackage> filtered = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, ToolPackage> e : packages.entrySet()) {
             ToolPackage pkg = e.getValue();
-            if (pkg.getKind() == com.jimeng.dataserver.ai.skill.model.ToolPackageKind.SKILL) {
-                // Skill（含未来租户私有 Skill）全部保留
-                filtered.put(e.getKey(), pkg);
-            } else if (agent.getAllowedPluginCodes().contains(pkg.getName())) {
-                // 插件按 Agent 绑定过滤
+            if (isVisibleToAgent(pkg, agent)) {
                 filtered.put(e.getKey(), pkg);
             }
         }
         return filtered;
+    }
+
+    /**
+     * 一个工具包对当前 Agent 是否可见。
+     *
+     * <p><b>判别依据是 {@code getTenantId()==null}，不是 {@code getKind()}。</b>
+     * 磁盘上的平台技能（gaode-poi / rag-knowledge / design-system）也是 kind==SKILL，
+     * 但它们没有 ai_skill 行、永远绑不上 agent_skill；按 kind 判会让每个 agent 同时丢掉这三个
+     * （含 RAG 提升），而且不报错。
+     *
+     * <p>{@code allowedSkillIds == null} 表示"无绑定信息"（老发布快照），保持旧的全可见行为；
+     * 空集合表示"明确不绑"。两者含义不同，不能合并。
+     */
+    private boolean isVisibleToAgent(ToolPackage pkg, AgentRuntimeView agent) {
+        // 平台工具包：全局可见，不参与按 Agent 的绑定过滤。
+        if (pkg.getTenantId() == null) return true;
+
+        if (pkg.getKind() == com.jimeng.dataserver.ai.skill.model.ToolPackageKind.PLUGIN) {
+            // 插件按 Agent 绑定的 code 过滤（插件下线后本分支随之消失）。
+            return agent.getAllowedPluginCodes() != null
+                    && agent.getAllowedPluginCodes().contains(pkg.getName());
+        }
+
+        // 租户技能：按 agent_skill 绑定过滤。
+        java.util.Set<Long> allowed = agent.getAllowedSkillIds();
+        if (allowed == null) return true;           // 无绑定信息 → 不过滤（向后兼容）
+        Long sourceId = pkg.getSourceId();
+        if (sourceId == null) return true;          // 拿不到 DB 主键 → 不敢判，放行（fail-open 但仅限此分支）
+        return allowed.contains(sourceId);
     }
 }

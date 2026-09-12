@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
+import java.util.Set;
 import java.util.Objects;
 
 @Service
@@ -90,13 +91,31 @@ public class SkillTenantService {
     }
 
     /** 本次 run 可见的 ACTIVE DOER skill（scope=TENANT 或 owner==当前用户）。每次现读，不走缓存。 */
-    public List<AiSkill> listActiveDoerForRun(String tenantId, Long currentUserId) {
+    /**
+     * 本次 run 要物化进沙箱的 DOER 技能。
+     *
+     * @param allowedSkillIds 该 Agent 绑定的技能 id。<b>三态，与 AgentRuntimeView.allowedSkillIds 一致</b>：
+     *                        {@code null} = 无绑定信息（老发布快照）→ 不按 Agent 过滤，保持旧行为；
+     *                        空集 = 明确不绑 → 一个 DOER 技能都不下发；
+     *                        非空 = 只下发集合内的。
+     *
+     * <p>加这个参数之前，每个 Agent 的每一次 run 都会把该租户【全部】活跃 DOER 技能的完整 bundle
+     * 从 MinIO 拉进工作区——既是作用域漏洞（SDK 明确说 options.skills 只是上下文过滤器，
+     * 未列出的技能文件仍在盘上、Read/Bash 可达），也是无谓的拉取开销。
+     */
+    public List<AiSkill> listActiveDoerForRun(String tenantId, Long currentUserId, Set<Long> allowedSkillIds) {
+        if (allowedSkillIds != null && allowedSkillIds.isEmpty()) {
+            return List.of();
+        }
         LambdaQueryWrapper<AiSkill> q = new LambdaQueryWrapper<AiSkill>()
                 .eq(AiSkill::getTenantId, tenantId)
                 .eq(AiSkill::getStatus, SkillConst.STATUS_ACTIVE)
                 .eq(AiSkill::getSkillType, SkillConst.TYPE_DOER)
                 .and(w -> w.eq(AiSkill::getScope, SkillConst.SCOPE_TENANT)
                             .or().eq(AiSkill::getOwnerUserId, currentUserId));
+        if (allowedSkillIds != null) {
+            q.in(AiSkill::getId, allowedSkillIds);
+        }
         return aiSkillMapper.selectList(q);
     }
 

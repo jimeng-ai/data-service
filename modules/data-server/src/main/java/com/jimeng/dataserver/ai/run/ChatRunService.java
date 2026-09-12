@@ -5,6 +5,10 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
+import com.jimeng.dataserver.admin.common.AdminRequestContext;
+import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
+import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
+import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.agent.exec.dto.AgentExecRequest;
 import com.jimeng.dataserver.ai.agent.exec.service.AgentExecService;
@@ -59,6 +63,8 @@ public class ChatRunService {
     private final ChatHistoryReconstructor chatHistoryReconstructor;
     private final AgentExecService agentExecService;
     private final AgentInputFileMapper inputFileMapper;
+    private final AgentRuntimeService agentRuntimeService;
+    private final SkillTenantService skillTenantService;
     private final ThreadPoolTaskExecutor streamExecutor;
     private final ThreadPoolTaskExecutor runPumpExecutor;
 
@@ -91,7 +97,7 @@ public class ChatRunService {
         runRegistry.register(new RunHandle(runId, conversationId, ids.assistantMessageId(),
                 TenantContext.get(), state));
 
-        boolean exec = decideExec(conversationId, req.getFileIds());
+        boolean exec = decideExec(conversationId, req.getFileIds(), req.getAgentId(), req.isPreview());
         // cutoff=本轮 user 消息 id：重建历史时排除本轮 user+assistant 占位消息（本轮 query 由 buildClaudeBody 单独追加）。
         Long cutoffMessageId = ids.userMessageId();
         streamExecutor.execute(MdcAsyncSupport.wrap(runId,
@@ -129,12 +135,46 @@ public class ChatRunService {
         }
     }
 
-    /** 本轮带文件、或会话历史上传过文件 → 走代码执行 Agent；否则走对话/RAG。与前端原 mode 判定一致，但由服务端裁决。 */
-    private boolean decideExec(Long conversationId, List<Long> fileIds) {
+    /**
+     * 选执行平面：代码执行 Agent（沙箱）还是对话/RAG（JVM 内）。
+     *
+     * <p>原判据只有"有没有文件"。后果是：Agent 自己说了不算——一个绑了 DOER 技能
+     * （带可执行脚本、只能在沙箱里跑）的 Agent，用户不传附件就永远够不到自己的技能，
+     * 而且【不报错】：工具不存在，模型自己编一个答案。
+     *
+     * <p>现在加一条 OR：Agent 绑了任何 DOER 技能 → 也走沙箱。这不是完整的执行平面统一
+     * （payload 仍缺 modelParams、多知识库仍被压成一个），但它让"Agent 的能力决定它在哪跑"
+     * 这件事第一次成立。
+     *
+     * <p>判定顺序是刻意的：先看文件（一次内存判断 + 一次 count），技能查询只在前两者都为假时
+     * 才发生，避免给纯对话路径平添一次查询。
+     */
+    private boolean decideExec(Long conversationId, List<Long> fileIds, String agentId, boolean preview) {
         if (fileIds != null && !fileIds.isEmpty()) return true;
         Long n = inputFileMapper.selectCount(new LambdaQueryWrapper<AgentInputFile>()
                 .eq(AgentInputFile::getConversationId, conversationId));
-        return n != null && n > 0;
+        if (n != null && n > 0) return true;
+        return hasSandboxOnlySkill(agentId, preview);
+    }
+
+    /** 该 Agent 是否绑定了必须在沙箱里执行的技能（DOER）。解析失败一律返回 false：
+     *  路由判定出错时回落到旧行为（走对话平面），而不是把所有对话推进沙箱。 */
+    private boolean hasSandboxOnlySkill(String agentId, boolean preview) {
+        if (agentId == null || agentId.isBlank()) return false;
+        try {
+            Long id = Long.valueOf(agentId.trim());
+            AgentRuntimeView view = agentRuntimeService.byId(id, preview);
+            if (view == null) return false;
+            java.util.Set<Long> allowed = view.getAllowedSkillIds();
+            // allowedSkillIds==null 表示"无绑定信息"（老快照）。此时按旧行为处理：
+            // 不因为无从判断就把会话推进沙箱——那会让所有历史 Agent 突然换平面。
+            if (allowed == null || allowed.isEmpty()) return false;
+            return !skillTenantService.listActiveDoerForRun(
+                    TenantContext.get(), AdminRequestContext.findUserIdOrNull(), allowed).isEmpty();
+        } catch (Exception e) {
+            log.warn("判定 agent={} 是否需要沙箱平面失败，回落到对话平面: {}", agentId, e.getMessage());
+            return false;
+        }
     }
 
     private AgentExecRequest toExecRequest(Long conversationId, TurnStartRequest req, Long cutoffMessageId) {

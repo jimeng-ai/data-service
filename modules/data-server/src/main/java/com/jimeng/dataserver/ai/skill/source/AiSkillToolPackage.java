@@ -14,5 +14,6 @@ public class AiSkillToolPackage implements ToolPackage {
     @Override public String getBody() { return skill.getBody(); }
     @Override public List<SkillToolDefinition> getTools() { return List.of(); }
     @Override public String getTenantId() { return skill.getTenantId(); }
+    @Override public Long getSourceId() { return skill.getId(); }
     @Override public ToolPackageKind getKind() { return ToolPackageKind.SKILL; }
 }

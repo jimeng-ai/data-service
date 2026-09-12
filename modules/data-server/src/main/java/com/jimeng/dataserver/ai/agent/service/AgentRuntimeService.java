@@ -9,9 +9,11 @@ import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AgentPlugin;
+import com.jimeng.persistence.entity.AgentSkill;
 import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.AgentPluginMapper;
+import com.jimeng.persistence.mapper.AgentSkillMapper;
 import com.jimeng.persistence.mapper.PluginMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +21,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -39,6 +42,7 @@ public class AgentRuntimeService {
 
     private final AgentMapper agentMapper;
     private final AgentPluginMapper agentPluginMapper;
+    private final AgentSkillMapper agentSkillMapper;
     private final PluginMapper pluginMapper;
     private final PermissionResolver permissionResolver;
 
@@ -68,7 +72,7 @@ public class AgentRuntimeService {
             // 调试台：用实时字段 + 实时插件绑定。
             List<Long> pluginIds = listBoundPluginIds(agentId);
             return buildView(agent, agent.getSystemPrompt(), agent.getModel(),
-                    agent.getModelParams(), agent.getKbConfig(), pluginIds);
+                    agent.getModelParams(), agent.getKbConfig(), pluginIds, listBoundSkillIds(agentId));
         }
 
         // 对话端：必须已发布并存在快照，否则拒绝。
@@ -97,17 +101,34 @@ public class AgentRuntimeService {
         }
         // modelParams / kbConfig 兼容两种表示：Java 发布写入的是 JSON 字符串，
         // 历史 SQL 回填写入的可能是嵌套 JSON 对象（model_params 为 json 列时）。统一归一化成字符串再交给下游解析。
+        // skillIds 三态：键【不存在】= 老快照，回落实时绑定（否则每个已发布 agent 瞬间丢光租户技能）；
+        // 键存在（哪怕是 []）= 发布时的明确意图，严格执行。
+        Set<Long> skillIds = null;
+        if (snap.containsKey("skillIds")) {
+            skillIds = new HashSet<>();
+            if (snap.get("skillIds") instanceof List<?> sl) {
+                for (Object o : sl) {
+                    Long id = toLong(o);
+                    if (id != null) skillIds.add(id);
+                }
+            }
+        } else {
+            skillIds = new HashSet<>(listBoundSkillIds(agent.getId()));
+            log.debug("agent={} 的发布快照无 skillIds 键（发布于本特性之前），回落实时绑定 {} 条",
+                    agent.getId(), skillIds.size());
+        }
         return buildView(agent,
                 asString(snap.get("systemPrompt")),
                 asString(snap.get("model")),
                 asJsonString(snap.get("modelParams")),
                 asJsonString(snap.get("kbConfig")),
-                pluginIds);
+                pluginIds, skillIds);
     }
 
     /** 用给定的人设/模型/参数/知识库/插件 id 集合拼装运行时视图。插件 id → code 时只放行 PUBLISHED 插件。 */
     private AgentRuntimeView buildView(Agent agent, String systemPrompt, String model,
-                                       String modelParams, String kbConfig, List<Long> pluginIds) {
+                                       String modelParams, String kbConfig, List<Long> pluginIds,
+                                       Collection<Long> skillIds) {
         Set<String> allowedPluginCodes = new HashSet<>();
         if (pluginIds != null && !pluginIds.isEmpty()) {
             LambdaQueryWrapper<Plugin> pluginQuery = new LambdaQueryWrapper<Plugin>()
@@ -128,11 +149,19 @@ public class AgentRuntimeService {
                 .defaultModel(model)
                 .defaultModelParams(parseJsonMap(modelParams))
                 .allowedPluginCodes(Collections.unmodifiableSet(allowedPluginCodes))
+                .allowedSkillIds(skillIds == null ? null : Set.copyOf(skillIds))
                 .kbIds(kb.kbIds())
                 .kbTopK(kb.topK())
                 .kbScoreThreshold(kb.scoreThreshold())
                 .kbRerank(kb.rerank())
                 .build();
+    }
+
+    /** 实时读取该 agent 绑定的技能 id。返回空 list 表示"明确没绑"，不是"无信息"。 */
+    private List<Long> listBoundSkillIds(Long agentId) {
+        return agentSkillMapper.selectList(new LambdaQueryWrapper<AgentSkill>()
+                        .eq(AgentSkill::getAgentId, agentId))
+                .stream().map(AgentSkill::getSkillId).toList();
     }
 
     private List<Long> listBoundPluginIds(Long agentId) {
