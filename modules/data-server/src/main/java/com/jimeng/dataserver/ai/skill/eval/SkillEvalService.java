@@ -329,10 +329,18 @@ public class SkillEvalService {
                 ? graderModel : sandboxProps.getLlm().getModel());
         body.put("max_tokens", 4096);
         body.put("system", EvalPrompts.graderSystem(recall));
-        body.put("messages", List.of(Map.of(
-                "role", "user",
-                "content", EvalPrompts.graderUser(skillName, prompt, c.getExpectedOutput(),
-                        c.getExpectations(), t.text(), t.artifacts()))));
+        // 必须用【可变】集合：下游 ModelResolver / ChatClient 会就地规整 messages 与其中的消息体。
+        // 用 List.of / Map.of 会在那里抛 UnsupportedOperationException——而且它 message 为 null，
+        // 在结果里只表现为一个孤零零的 "null"，极难排查（本条注释即由此而来）。
+        // 正常聊天路径的 body 来自 Jackson 反序列化（ArrayList/LinkedHashMap），天然可变，
+        // 所以只有评委这条自己构造 body 的路会踩到。
+        Map<String, Object> userMsg = new LinkedHashMap<>();
+        userMsg.put("role", "user");
+        userMsg.put("content", EvalPrompts.graderUser(skillName, prompt, c.getExpectedOutput(),
+                c.getExpectations(), t.text(), t.artifacts()));
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(userMsg);
+        body.put("messages", messages);
 
         Object resp = claudeService.messages(body);
         String textOut = extractText(resp);
