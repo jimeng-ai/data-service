@@ -24,10 +24,28 @@ public class SidecarRunPayload {
     /** 非空时边车获得 search_knowledge_base MCP 工具（A+B 统一：同一 agent 既跑代码又查知识库）。 */
     private RagContext ragContext;
     private Llm llm;
+
+    /**
+     * Agent 人格（agent.system_prompt）。边车把它排在平台操作契约【之前】，契约仍是最后一句话。
+     *
+     * <p>补这个字段是因为：跨到沙箱平面时 payload 里原本没有它，于是同一个 agent 一旦带附件
+     * 就换了人格——不报错，只是行为变了。这是执行平面统一的第一块。
+     *
+     * <p>注意 modelParams（temperature / max_tokens 等）【无法】走这条路：Claude Agent SDK 的
+     * Options 不接受这些字段（sdk.d.ts 里 temperature 零命中）。要按 agent 调参只能在
+     * /data/claude/messages 出口侧做。下面组装时对此显式告警，不静默丢。
+     */
+    private String systemPrompt;
     /** 非空且 baseUrl/authToken/model 齐全时，边车注册 generate_image MCP 工具（OpenAI 兼容 /v1/images/generations）。 */
     private ImageGen imageGen;
     /** 非空且 baseUrl/authToken 齐全时，边车注册 web search+fetch MCP 工具。字段名须与边车 TS 的 WebSearchConfig 一致。 */
     private WebSearch webSearch;
+    /**
+     * 本次 run 被授予的外部系统连接。边车转注册给 egress 代理；容器只见 name，
+     * 真实 baseUrl 与 token 只存在于代理内存里，按源 IP 注入。
+     */
+    private List<Conn> connections;
+
     private Limits limits;
     /** 本次 run 可用的 DOER skill（编排者从 MinIO 列出文件，边车物化到 .claude/skills）。 */
     private List<SkillRef> skills;
@@ -98,6 +116,19 @@ public class SidecarRunPayload {
         private String provider;
         private Integer maxResults;
         private String authScheme;
+    }
+
+    @Data
+    public static class Conn {
+        /** 容器可见标识，也是 $JM_CONN_BASE/<name>/ 里的那一段 */
+        private String name;
+        private String baseUrl;
+        private String token;
+        private String scheme;
+        /** 允许的方法；空则边车按默认 ["GET"] 处理（只读） */
+        private List<String> allowMethods;
+        /** 允许的路径 glob；空则边车按默认 ["/**"] 处理 */
+        private List<String> allowPaths;
     }
 
     @Data

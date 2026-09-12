@@ -81,6 +81,7 @@ public class AgentExecService {
     private final AgentArtifactMapper artifactMapper;
     private final RagMinioStorageService storage;
     private final AgentRuntimeService agentRuntimeService;
+    private final com.jimeng.dataserver.ai.connection.ConnectionResolver connectionResolver;
     private final AdminAuthService adminAuthService;
     private final AiModelCallRecordService recordService;
     private final UsageExtractor usageExtractor;
@@ -218,14 +219,34 @@ public class AgentExecService {
         }
         payload.setInputFiles(inputs);
         payload.setArtifactBucket(storage.getBucket());
+        // Agent 运行视图只解析一次，下面的人格 / 模型 / RAG 都用它。原先只有 buildRagContext 里
+        // 取过一次，人格和模型压根没读——这正是「传了附件就换人格、还换模型」的成因。
+        AgentRuntimeView view = resolveViewOrNull(req.getAgentId(), req.isPreview());
         // A+B 统一：若 agent 绑定了知识库，给边车一个短时效 token + ragContext，让它能查知识库
-        payload.setRagContext(buildRagContext(req.getAgentId(), userId, tenantId, req.isPreview()));
+        payload.setRagContext(buildRagContext(view, req.getAgentId(), userId, tenantId));
+        // 人格：不传则边车只有平台契约，agent 的定义在这条通道上等于不存在。
+        if (view != null && StrUtil.isNotBlank(view.getSystemPrompt())) {
+            payload.setSystemPrompt(view.getSystemPrompt());
+        }
         SidecarRunPayload.Llm llm = new SidecarRunPayload.Llm();
         llm.setBaseUrl(props.getLlm().getBaseUrl());
         llm.setAuthToken(props.getLlm().getAuthToken());
-        llm.setModel(props.getLlm().getModel());
+        // 模型优先用 agent 自己的，未指定才回落全局 Nacos 配置。
+        // 原先无条件用全局值，于是同一个 agent 在两个平面上跑的是两个模型。
+        String agentModel = view == null ? null : view.getDefaultModel();
+        llm.setModel(StrUtil.isNotBlank(agentModel) ? agentModel : props.getLlm().getModel());
         llm.setAuthScheme(props.getLlm().getAuthScheme());
         payload.setLlm(llm);
+        // 两处【确实传不过去】的能力，显式告警而不是静默丢——静默丢是这套系统反复踩的坑。
+        if (view != null && view.getDefaultModelParams() != null && !view.getDefaultModelParams().isEmpty()) {
+            log.warn("[sandbox] agent={} 的 modelParams {} 在沙箱平面【无法生效】：Claude Agent SDK 的 Options "
+                            + "不接受 temperature/max_tokens 等字段。要按 agent 调参需在 /data/claude/messages 出口侧实现。",
+                    req.getAgentId(), view.getDefaultModelParams().keySet());
+        }
+        if (view != null && view.getKbIds() != null && view.getKbIds().size() > 1) {
+            log.warn("[sandbox] agent={} 绑定了 {} 个知识库，但边车 RagContext.kbId 是标量，本次只用第一个（{}）。",
+                    req.getAgentId(), view.getKbIds().size(), view.getKbIds().iterator().next());
+        }
         // 生图：仅当配置齐全时下发，边车据此注册 generate_image 工具（缺任一项则不启用，沿用原"无生图"行为）。
         AgentSandboxProperties.ImageGen igCfg = props.getImageGen();
         if (igCfg != null && StrUtil.isAllNotBlank(igCfg.getBaseUrl(), igCfg.getAuthToken(), igCfg.getModel())) {
@@ -255,8 +276,17 @@ public class AgentExecService {
         limits.setMaxBudgetUsd(props.getMaxBudgetUsd());
         payload.setLimits(limits);
         // DOER skills：把租户可见的活跃 DOER skill bundle 列出并下发给边车（边车物化到 .claude/skills）。
+        // 外部连接：按 Agent 授权下发。技能脚本用 $JM_CONN_BASE/<name>/... 调用，
+        // 真实地址与凭据只到边车+egress 代理为止，不进容器。
+        List<SidecarRunPayload.Conn> conns =
+                connectionResolver.resolveForAgent(view == null ? null : view.getAgentId());
+        if (!conns.isEmpty()) {
+            payload.setConnections(conns);
+        }
+        // 按 Agent 绑定收窄：view 为空（无 agentId）时传 null，保持旧的"租户内全量"行为。
         List<AiSkill> doerSkills = skillTenantService.listActiveDoerForRun(
-                tenantId, AdminRequestContext.findUserIdOrNull());
+                tenantId, AdminRequestContext.findUserIdOrNull(),
+                view == null ? null : view.getAllowedSkillIds());
         if (!doerSkills.isEmpty()) {
             payload.setSkills(skillBundleResolver.resolve(doerSkills));
         }
@@ -336,17 +366,26 @@ public class AgentExecService {
         }
     }
 
-    /** 解析 agent 绑定的知识库 + 铸短时效回调 token；无绑定 / 无用户 / 解析失败则返回 null（边车不带 RAG 工具）。 */
-    private SidecarRunPayload.RagContext buildRagContext(String agentIdStr, String userId, String tenantId, boolean preview) {
-        if (userId == null) {
-            return null;
-        }
+    /** 解析 agent 运行视图；agentId 缺失 / 解析失败一律返回 null，调用方各自回落。 */
+    private AgentRuntimeView resolveViewOrNull(String agentIdStr, boolean preview) {
         Long agentId = parseAgentId(agentIdStr);
         if (agentId == null) {
             return null;
         }
         try {
-            AgentRuntimeView view = agentRuntimeService.byId(agentId, preview);
+            return agentRuntimeService.byId(agentId, preview);
+        } catch (Exception e) {
+            log.warn("[sandbox] 解析 agent 运行视图失败 agentId={}: {}", agentIdStr, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 解析 agent 绑定的知识库 + 铸短时效回调 token；无绑定 / 无用户 / 解析失败则返回 null（边车不带 RAG 工具）。 */
+    private SidecarRunPayload.RagContext buildRagContext(AgentRuntimeView view, String agentIdStr, String userId, String tenantId) {
+        if (userId == null) {
+            return null;
+        }
+        try {
             if (view == null || view.getKbIds() == null || view.getKbIds().isEmpty()) {
                 return null;
             }
