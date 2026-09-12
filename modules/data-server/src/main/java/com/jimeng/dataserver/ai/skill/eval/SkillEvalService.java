@@ -152,9 +152,9 @@ public class SkillEvalService {
                         one.put("passed", false);
                     }
                 } catch (Exception e) {
-                    log.warn("评测用例失败 runId={} caseId={}: {}", runId, c.getId(), e.getMessage(), e);
+                    log.warn("评测用例失败 runId={} caseId={}: {}", runId, c.getId(), describe(e), e);
                     one.put("passed", false);
-                    one.put("error", String.valueOf(e.getMessage()));
+                    one.put("error", describe(e));
                 }
                 caseResults.add(one);
                 finished++;
@@ -164,8 +164,15 @@ public class SkillEvalService {
             updateProgress(runId, finished, passed, caseResults, null, STATUS_COMPLETED);
         } catch (Exception e) {
             log.error("评测整轮失败 runId={}", runId, e);
-            updateProgress(runId, finished, passed, caseResults, String.valueOf(e.getMessage()), STATUS_FAILED);
+            updateProgress(runId, finished, passed, caseResults, describe(e), STATUS_FAILED);
         }
+    }
+
+    /** 异常摘要：带上类名。避免 NPE 这类 message 为 null 的异常在评测结果里显示成孤零零的 "null"、无从排查。 */
+    private static String describe(Throwable e) {
+        if (e == null) return "unknown";
+        String m = e.getMessage();
+        return e.getClass().getSimpleName() + (m == null || m.isBlank() ? "" : ": " + m);
     }
 
     /**

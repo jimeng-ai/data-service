@@ -35,6 +35,7 @@ public class SkillEvalController {
     private final SkillEvalService evalService;
     private final SkillDraftStore draftStore;
     private final AiSkillMapper aiSkillMapper;
+    private final SkillMaterializer materializer;
 
     @Data
     public static class StartRequest {
@@ -63,10 +64,11 @@ public class SkillEvalController {
         }
         AiSkill s = aiSkillMapper.selectById(req.getSkillId());
         if (s == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "skill 不存在");
-        // 已入库 skill 的文件在 MinIO bundle 里。当前只支持带 evals 的草稿评测；
-        // 对已发布 skill 的评测需要先把 bundle 拉回来——留待与 SkillBundleResolver 合并时实现。
-        throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                "暂只支持评测构建器草稿；已发布 skill 的评测待接入 bundle 回读");
+        // 已发布 skill：正文在 DB（body）、随包文件在 MinIO bundle。读回文件表拿 evals/evals.json，
+        // 再走与草稿同一套 evalService.start（内部会把 body+files 重新物化进沙箱）。
+        Map<String, String> files = materializer.readBundleFiles(s.getBundleKey());
+        return evalService.start(s.getName(), s.getBody(), files,
+                parseSuite(files.get(EVALS_PATH)), mode, s.getId(), null);
     }
 
     @Operation(summary = "查一轮评测的进度/结果")
@@ -78,7 +80,7 @@ public class SkillEvalController {
     private EvalSuite parseSuite(String json) {
         if (json == null || json.isBlank()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "草稿里没有 " + EVALS_PATH + "：请先让构建器写测试用例");
+                    "没有 " + EVALS_PATH + "：请先为该 skill 写测试用例（构建器可自动生成）");
         }
         try {
             return CommonUtil.getObjectMapper().readValue(json, new TypeReference<EvalSuite>() {});
