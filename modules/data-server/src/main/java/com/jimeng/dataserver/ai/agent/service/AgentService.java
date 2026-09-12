@@ -7,11 +7,9 @@ import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.grant.service.CreatorGrantService;
 import com.jimeng.persistence.entity.Agent;
-import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.AgentSkill;
 import com.jimeng.persistence.mapper.AgentMapper;
-import com.jimeng.persistence.mapper.AgentPluginMapper;
 import com.jimeng.persistence.mapper.AgentConnectionMapper;
 import com.jimeng.persistence.mapper.AgentSkillMapper;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +27,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Agent CRUD + Agent-插件绑定。
+ * Agent CRUD + Agent-技能/连接绑定。
  *
  * <p>所有方法依赖 MyBatis-Plus 多租户拦截器自动注入 {@code WHERE tenant_id = ?}，
  * 业务代码不显式写租户过滤；跨租户访问会自动返回 0 行 / 404。
@@ -42,7 +40,6 @@ public class AgentService {
     private static final String DEFAULT_AGENT_MODEL = "claude-opus-4-7";
 
     private final AgentMapper agentMapper;
-    private final AgentPluginMapper agentPluginMapper;
     private final AgentSkillMapper agentSkillMapper;
     private final AgentConnectionMapper agentConnectionMapper;
     private final CreatorGrantService creatorGrantService;
@@ -147,12 +144,9 @@ public class AgentService {
 
     /**
      * 冻结一份发布快照。modelParams / kbConfig 原样保留为 JSON 字符串
-     * （{@link AgentRuntimeService} 已有按字符串解析的逻辑），pluginIds 取发布那一刻的绑定集合。
+     * （{@link AgentRuntimeService} 已有按字符串解析的逻辑），skillIds 取发布那一刻的绑定集合。
      */
     private String buildPublishSnapshot(Agent agent) {
-        List<AgentPlugin> bindings = agentPluginMapper.selectList(
-                new LambdaQueryWrapper<AgentPlugin>().eq(AgentPlugin::getAgentId, agent.getId()));
-        List<Long> pluginIds = bindings.stream().map(AgentPlugin::getPluginId).toList();
         List<Long> skillIds = agentSkillMapper.selectList(
                         new LambdaQueryWrapper<AgentSkill>().eq(AgentSkill::getAgentId, agent.getId()))
                 .stream().map(AgentSkill::getSkillId).toList();
@@ -164,7 +158,6 @@ public class AgentService {
         snapshot.put("model", agent.getModel());
         snapshot.put("modelParams", agent.getModelParams());
         snapshot.put("kbConfig", agent.getKbConfig());
-        snapshot.put("pluginIds", pluginIds);
         // 从本次发布起，快照里【一定】有 skillIds 键（哪怕是空数组）。
         // AgentRuntimeService 靠"键在不在"区分「老快照，回落实时绑定」与「明确绑定为空」，
         // 所以这里绝不能因为空集合就省略这个键。
@@ -179,19 +172,14 @@ public class AgentService {
     // ------------------------------------------------------------------ 未发布草稿标记
 
     /**
-     * 给一批 Agent 回填 {@code hasUnpublishedChanges}：是否「已发布但实时配置/插件绑定领先于发布快照」。
-     * 批量加载插件绑定，避免逐个查询。
+     * 给一批 Agent 回填 {@code hasUnpublishedChanges}：是否「已发布但实时配置/技能绑定领先于发布快照」。
+     * 批量加载技能绑定，避免逐个查询。
      */
     public void attachDirtyFlag(List<Agent> agents) {
         if (agents == null || agents.isEmpty()) {
             return;
         }
         List<Long> ids = agents.stream().map(Agent::getId).toList();
-        Map<Long, Set<Long>> bindingsByAgent = new HashMap<>();
-        agentPluginMapper.selectList(new LambdaQueryWrapper<AgentPlugin>().in(AgentPlugin::getAgentId, ids))
-                .forEach(b -> bindingsByAgent
-                        .computeIfAbsent(b.getAgentId(), k -> new HashSet<>())
-                        .add(b.getPluginId()));
         Map<Long, Set<Long>> skillsByAgent = new HashMap<>();
         agentSkillMapper.selectList(new LambdaQueryWrapper<AgentSkill>().in(AgentSkill::getAgentId, ids))
                 .forEach(b -> skillsByAgent
@@ -199,7 +187,6 @@ public class AgentService {
                         .add(b.getSkillId()));
         for (Agent a : agents) {
             a.setHasUnpublishedChanges(computeDirty(a,
-                    bindingsByAgent.getOrDefault(a.getId(), Collections.emptySet()),
                     skillsByAgent.getOrDefault(a.getId(), Collections.emptySet())));
         }
     }
@@ -209,20 +196,17 @@ public class AgentService {
         if (agent == null) {
             return;
         }
-        Set<Long> livePluginIds = new HashSet<>(agentPluginMapper
-                .selectList(new LambdaQueryWrapper<AgentPlugin>().eq(AgentPlugin::getAgentId, agent.getId()))
-                .stream().map(AgentPlugin::getPluginId).toList());
         Set<Long> liveSkillIds = new HashSet<>(agentSkillMapper
                 .selectList(new LambdaQueryWrapper<AgentSkill>().eq(AgentSkill::getAgentId, agent.getId()))
                 .stream().map(AgentSkill::getSkillId).toList());
-        agent.setHasUnpublishedChanges(computeDirty(agent, livePluginIds, liveSkillIds));
+        agent.setHasUnpublishedChanges(computeDirty(agent, liveSkillIds));
     }
 
     /**
      * 是否存在未发布的草稿改动：仅对 PUBLISHED 生效；逐字段做语义比较（modelParams/kbConfig 归一成 Map 比，
-     * pluginIds 当集合比），避免 JSON 字符串格式/键序差异造成误判。
+     * skillIds 当集合比），避免 JSON 字符串格式/键序差异造成误判。
      */
-    private boolean computeDirty(Agent agent, Set<Long> livePluginIds, Set<Long> liveSkillIds) {
+    private boolean computeDirty(Agent agent, Set<Long> liveSkillIds) {
         if (!"PUBLISHED".equals(agent.getStatus())) {
             return false;
         }
@@ -241,7 +225,6 @@ public class AgentService {
         if (!strEq(agent.getModel(), snap.get("model"))) return true;
         if (!jsonEq(agent.getModelParams(), snap.get("modelParams"))) return true;
         if (!jsonEq(agent.getKbConfig(), snap.get("kbConfig"))) return true;
-        if (!livePluginIds.equals(toLongSet(snap.get("pluginIds")))) return true;
         // 老快照没有 skillIds 键 —— 此时运行时是「回落实时绑定」，即快照与实时本就一致，
         // 不能因为键缺失就判成 dirty，否则每个历史 agent 都会一直显示「有未发布改动」。
         if (!snap.containsKey("skillIds")) return false;
@@ -349,35 +332,5 @@ public class AgentService {
     public List<AgentConnection> listConnectionGrants(Long agentId) {
         return agentConnectionMapper.selectList(new LambdaQueryWrapper<AgentConnection>()
                 .eq(AgentConnection::getAgentId, agentId));
-    }
-
-    public AgentPlugin bindPlugin(Long agentId, Long pluginId) {
-        // 幂等：已绑定直接返回
-        LambdaQueryWrapper<AgentPlugin> wrapper = new LambdaQueryWrapper<AgentPlugin>()
-                .eq(AgentPlugin::getAgentId, agentId)
-                .eq(AgentPlugin::getPluginId, pluginId);
-        AgentPlugin existing = agentPluginMapper.selectOne(wrapper);
-        if (existing != null) {
-            return existing;
-        }
-        AgentPlugin binding = new AgentPlugin();
-        binding.setAgentId(agentId);
-        binding.setPluginId(pluginId);
-        agentPluginMapper.insert(binding);
-        return binding;
-    }
-
-    @Transactional
-    public int unbindPlugin(Long agentId, Long pluginId) {
-        LambdaQueryWrapper<AgentPlugin> wrapper = new LambdaQueryWrapper<AgentPlugin>()
-                .eq(AgentPlugin::getAgentId, agentId)
-                .eq(AgentPlugin::getPluginId, pluginId);
-        return agentPluginMapper.delete(wrapper);
-    }
-
-    public List<AgentPlugin> listBindings(Long agentId) {
-        LambdaQueryWrapper<AgentPlugin> wrapper = new LambdaQueryWrapper<AgentPlugin>()
-                .eq(AgentPlugin::getAgentId, agentId);
-        return agentPluginMapper.selectList(wrapper);
     }
 }

@@ -8,7 +8,6 @@ import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.persistence.entity.SysRoleResource;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
-import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleResourceMapper;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -20,7 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 资源分享：以【资源】为中心管理 {@code sys_role_resource} 授权——把某个 Agent / 插件 / 知识库
+ * 资源分享：以【资源】为中心管理 {@code sys_role_resource} 授权——把某个 Agent / 知识库
  * 分享给若干角色(部门)，或设为「全公司可见」(哨兵 {@code role_id = 0}，见 {@link PermissionResolver})。
  *
  * <p>与 {@code RoleResourceService}（以角色为中心整体覆盖某角色的授权）互补；二者写的是同一张表，
@@ -33,7 +32,6 @@ public class ResourceShareService {
     private final SysRoleResourceMapper sysRoleResourceMapper;
     private final AgentMapper agentMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
-    private final PluginMapper pluginMapper;
 
     /** 读取某资源当前分享给了哪些角色(部门) + 是否全公司可见。 */
     public ShareView getShares(String tenantId, ResourceType type, Long resourceId) {
@@ -103,7 +101,6 @@ public class ResourceShareService {
         boolean exists = switch (type) {
             case AGENT -> agentMapper.selectById(id) != null;
             case KNOWLEDGE_BASE -> knowledgeBaseMapper.selectById(id) != null;
-            case PLUGIN -> pluginMapper.selectById(id) != null;
             default -> false;
         };
         if (!exists) {

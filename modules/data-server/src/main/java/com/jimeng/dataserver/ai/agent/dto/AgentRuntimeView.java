@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Agent 运行时视图：一次请求需要的 Agent 配置 + 绑定的插件信息。
+ * Agent 运行时视图：一次请求需要的 Agent 配置 + 绑定的技能/知识库信息。
  * ClaudeService 拿到这个对象后把内容注入到 Claude 请求。
  */
 @Getter
@@ -25,9 +25,6 @@ public class AgentRuntimeView {
 
     /** 默认模型参数；请求体 temperature/max_tokens 等字段可覆盖 */
     private final Map<String, Object> defaultModelParams;
-
-    /** Agent 绑定的插件 code 集合——决定该 Agent 能看到哪些 ToolPackage */
-    private final Set<String> allowedPluginCodes;
 
     /**
      * Agent 绑定的技能 ID 集合（ai_skill.id）——决定该 Agent 能看到哪些【租户】技能。

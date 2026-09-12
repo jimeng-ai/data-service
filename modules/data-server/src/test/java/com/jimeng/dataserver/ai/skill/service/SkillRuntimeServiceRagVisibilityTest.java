@@ -88,7 +88,6 @@ class SkillRuntimeServiceRagVisibilityTest {
         return AgentRuntimeView.builder()
                 .agentId(1L)
                 .tenantId("test")
-                .allowedPluginCodes(Collections.emptySet())
                 .kbIds(kbIds)
                 .build();
     }

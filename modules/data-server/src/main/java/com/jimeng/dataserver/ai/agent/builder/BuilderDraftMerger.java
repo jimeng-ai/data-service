@@ -36,7 +36,6 @@ public class BuilderDraftMerger {
             draft.getModelParams().putAll((Map<String, Object>) m);
             updated.add("modelParams");
         }
-        applyLongList(patch, "recommendedPluginIds", draft::setRecommendedPluginIds, updated);
         applyLongList(patch, "recommendedKbIds", draft::setRecommendedKbIds, updated);
         return updated;
     }

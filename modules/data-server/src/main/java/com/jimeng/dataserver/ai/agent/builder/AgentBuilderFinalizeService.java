@@ -4,8 +4,6 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
-import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
-import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderDraft;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.FinalizeRequest;
 import com.jimeng.dataserver.ai.agent.service.AgentService;
@@ -19,7 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** 草稿 → DRAFT Agent + 绑插件 + 写 kb_config。一把事务。 */
+/** 草稿 → DRAFT Agent + 写 kb_config。一把事务。 */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -27,7 +25,6 @@ public class AgentBuilderFinalizeService {
 
     private final AgentService agentService;
     private final ChatConversationService conversationService;
-    private final PermissionResolver permissionResolver;
 
     @Transactional
     public Long finalize(Long conversationId, FinalizeRequest req) {
@@ -53,13 +50,6 @@ public class AgentBuilderFinalizeService {
 
         Agent created = agentService.create(agent);   // 含 code 唯一键兜底 + creator 授权
 
-        // 绑定用户确认的插件（带权限校验，防越权间接调用）。
-        if (req.getPluginIds() != null) {
-            for (Long pluginId : req.getPluginIds()) {
-                permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
-                agentService.bindPlugin(created.getId(), pluginId);
-            }
-        }
         log.info("构建器 finalize: 会话 {} → DRAFT Agent {}（{}）", conversationId, created.getId(), created.getName());
         return created.getId();
     }

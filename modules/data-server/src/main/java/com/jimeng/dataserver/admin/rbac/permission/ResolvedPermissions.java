@@ -18,16 +18,14 @@ public class ResolvedPermissions {
     private final Set<String> modules;
     private final Set<Long> agentIds;
     private final Set<Long> knowledgeBaseIds;
-    private final Set<Long> pluginIds;
 
     public ResolvedPermissions(boolean superAdmin, String userType, Set<String> modules,
-                               Set<Long> agentIds, Set<Long> knowledgeBaseIds, Set<Long> pluginIds) {
+                               Set<Long> agentIds, Set<Long> knowledgeBaseIds) {
         this.superAdmin = superAdmin;
         this.userType = userType;
         this.modules = modules == null ? Collections.emptySet() : modules;
         this.agentIds = agentIds == null ? Collections.emptySet() : agentIds;
         this.knowledgeBaseIds = knowledgeBaseIds == null ? Collections.emptySet() : knowledgeBaseIds;
-        this.pluginIds = pluginIds == null ? Collections.emptySet() : pluginIds;
     }
 
     public boolean isSuperAdmin() {
@@ -50,10 +48,6 @@ public class ResolvedPermissions {
         return knowledgeBaseIds;
     }
 
-    public Set<Long> getPluginIds() {
-        return pluginIds;
-    }
-
     /** 是否可进入某模块（超管恒 true）。 */
     public boolean canEnter(String moduleCode) {
         return superAdmin || modules.contains(moduleCode);
@@ -64,7 +58,6 @@ public class ResolvedPermissions {
         return switch (type) {
             case AGENT -> agentIds;
             case KNOWLEDGE_BASE -> knowledgeBaseIds;
-            case PLUGIN -> pluginIds;
             case SKILL -> Collections.emptySet();
             case MENU -> Collections.emptySet();
         };

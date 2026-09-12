@@ -10,7 +10,6 @@ import com.jimeng.persistence.entity.Agent;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
-import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.AgentSkill;
 import com.jimeng.dataserver.ai.connection.ConnectionService;
@@ -33,9 +32,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Agent 管理后台接口：Agent CRUD + Agent-Plugin 绑定。
+ * Agent 管理后台接口：Agent CRUD + Agent-技能/连接绑定。
  */
-@Tag(name = "Agent 管理", description = "ToB Agent 平台 - Agent CRUD + 插件绑定")
+@Tag(name = "Agent 管理", description = "ToB Agent 平台 - Agent CRUD + 技能/连接绑定")
 @RestController
 @RequestMapping("/data/admin/agent")
 @RequiredArgsConstructor
@@ -103,40 +102,7 @@ public class AgentAdminController {
         return agentService.unpublish(id);
     }
 
-    // ============================ Agent-Plugin 绑定 ============================
-
-    @Data
-    public static class BindPluginRequest {
-        private Long pluginId;
-    }
-
-    @Operation(summary = "绑定插件（幂等：重复绑定直接返回已存在的绑定）")
-    @PostMapping("/agents/{id}/plugins")
-    public AgentPlugin bindPlugin(@PathVariable Long id, @RequestBody BindPluginRequest req) {
-        if (req == null || req.getPluginId() == null) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "plugin_id 不能为空");
-        }
-        // 双校验：成员只能把【自己有权的插件】绑到【自己有权的 Agent】上，否则可借 Agent 运行时间接调用未授权插件。
-        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
-        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, req.getPluginId());
-        return agentService.bindPlugin(id, req.getPluginId());
-    }
-
-    @Operation(summary = "解绑插件")
-    @DeleteMapping("/agents/{id}/plugins/{pluginId}")
-    public Map<String, Object> unbindPlugin(@PathVariable Long id, @PathVariable Long pluginId) {
-        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
-        permissionResolver.assertCurrentAccess(ResourceType.PLUGIN, pluginId);
-        int affected = agentService.unbindPlugin(id, pluginId);
-        return Map.of("unbound", affected);
-    }
-
-    @Operation(summary = "列出 Agent 已绑定的插件")
-    @GetMapping("/agents/{id}/plugins")
-    public List<AgentPlugin> listBindings(@PathVariable Long id) {
-        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
-        return agentService.listBindings(id);
-    }
+    // ============================ Agent-Skill 绑定 ============================
 
     @Data
     public static class BindSkillRequest {

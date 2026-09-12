@@ -78,8 +78,8 @@ public class ClaudeService {
         boolean preview = previewObj instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(previewObj));
         AgentRuntimeView agent = agentRuntimeService.byId(agentId, preview);
         AgentContext.set(agent);
-        log.info("Agent 上下文已加载: id={}, code={}, allowedPlugins={}",
-                agent.getAgentId(), agent.getCode(), agent.getAllowedPluginCodes());
+        log.info("Agent 上下文已加载: id={}, code={}, allowedSkillIds={}",
+                agent.getAgentId(), agent.getCode(), agent.getAllowedSkillIds());
 
         // 注入 system_prompt（追加到现有 system 之前）
         if (StringUtils.hasText(agent.getSystemPrompt())) {

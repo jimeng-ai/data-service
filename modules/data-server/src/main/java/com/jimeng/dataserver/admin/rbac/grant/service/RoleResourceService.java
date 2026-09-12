@@ -11,7 +11,6 @@ import com.jimeng.dataserver.admin.rbac.role.service.RoleService;
 import com.jimeng.persistence.entity.SysRoleResource;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
-import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleResourceMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -23,8 +22,8 @@ import java.util.List;
 /**
  * 角色资源授权：读取 / 整体覆盖某角色的模块与实例授权。
  *
- * <p>实例 id 校验走租户过滤的 {@code AgentMapper}/{@code KnowledgeBaseMapper}/{@code PluginMapper}
- * （这三表在白名单内，当前超管请求上下文已注入 {@code WHERE tenant_id=?}），跨租户 id 查不到即拒绝。
+ * <p>实例 id 校验走租户过滤的 {@code AgentMapper}/{@code KnowledgeBaseMapper}
+ * （这两表在白名单内，当前超管请求上下文已注入 {@code WHERE tenant_id=?}），跨租户 id 查不到即拒绝。
  */
 @Service
 @RequiredArgsConstructor
@@ -34,7 +33,6 @@ public class RoleResourceService {
     private final RoleService roleService;
     private final AgentMapper agentMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
-    private final PluginMapper pluginMapper;
 
     public GrantView getGrants(String tenantId, Long roleId) {
         roleService.requireRoleForGrant(tenantId, roleId);
@@ -44,17 +42,15 @@ public class RoleResourceService {
         List<String> modules = new ArrayList<>();
         List<Long> agents = new ArrayList<>();
         List<Long> kbs = new ArrayList<>();
-        List<Long> plugins = new ArrayList<>();
         for (SysRoleResource r : rows) {
             switch (r.getResourceType()) {
                 case "MENU" -> { if (r.getResourceCode() != null) modules.add(r.getResourceCode()); }
                 case "AGENT" -> agents.add(r.getResourceId());
                 case "KNOWLEDGE_BASE" -> kbs.add(r.getResourceId());
-                case "PLUGIN" -> plugins.add(r.getResourceId());
-                default -> { /* ignore unknown */ }
+                default -> { /* ignore unknown（含历史 PLUGIN 授权行，插件下线后忽略） */ }
             }
         }
-        return GrantView.builder().modules(modules).agents(agents).knowledgeBases(kbs).plugins(plugins).build();
+        return GrantView.builder().modules(modules).agents(agents).knowledgeBases(kbs).build();
     }
 
     @Transactional
@@ -73,7 +69,6 @@ public class RoleResourceService {
         // 校验实例 id 属本租户
         validateInstances(nullToEmpty(req.getAgents()), id -> agentMapper.selectById(id) != null, "智能体");
         validateInstances(nullToEmpty(req.getKnowledgeBases()), id -> knowledgeBaseMapper.selectById(id) != null, "知识库");
-        validateInstances(nullToEmpty(req.getPlugins()), id -> pluginMapper.selectById(id) != null, "插件");
 
         // 整体覆盖：先软删旧授权，再插新授权
         sysRoleResourceMapper.delete(Wrappers.<SysRoleResource>lambdaQuery()
@@ -88,9 +83,6 @@ public class RoleResourceService {
         }
         for (Long id : nullToEmpty(req.getKnowledgeBases())) {
             insertGrant(tenantId, roleId, ResourceType.KNOWLEDGE_BASE, id, null);
-        }
-        for (Long id : nullToEmpty(req.getPlugins())) {
-            insertGrant(tenantId, roleId, ResourceType.PLUGIN, id, null);
         }
     }
 

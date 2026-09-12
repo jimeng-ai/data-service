@@ -507,12 +507,6 @@ public class SkillRuntimeService {
         // 平台工具包：全局可见，不参与按 Agent 的绑定过滤。
         if (pkg.getTenantId() == null) return true;
 
-        if (pkg.getKind() == com.jimeng.dataserver.ai.skill.model.ToolPackageKind.PLUGIN) {
-            // 插件按 Agent 绑定的 code 过滤（插件下线后本分支随之消失）。
-            return agent.getAllowedPluginCodes() != null
-                    && agent.getAllowedPluginCodes().contains(pkg.getName());
-        }
-
         // 租户技能：按 agent_skill 绑定过滤。
         java.util.Set<Long> allowed = agent.getAllowedSkillIds();
         if (allowed == null) return true;           // 无绑定信息 → 不过滤（向后兼容）

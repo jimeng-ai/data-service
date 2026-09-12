@@ -33,17 +33,15 @@ class JimengTenantLineHandlerTest {
 
     @Test
     void ignoreTable_tenantAwareTablesReturnFalse() {
-        assertFalse(handler.ignoreTable("plugin"));
-        assertFalse(handler.ignoreTable("plugin_tool"));
-        assertFalse(handler.ignoreTable("plugin_http_mapping"));
-        assertFalse(handler.ignoreTable("plugin_credential"));
         assertFalse(handler.ignoreTable("agent"));
-        assertFalse(handler.ignoreTable("agent_plugin"));
+        assertFalse(handler.ignoreTable("agent_skill"));
+        assertFalse(handler.ignoreTable("connection"));
+        assertFalse(handler.ignoreTable("agent_connection"));
         assertFalse(handler.ignoreTable("knowledge_base"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));
         // 大小写不敏感
-        assertFalse(handler.ignoreTable("Plugin"));
+        assertFalse(handler.ignoreTable("Agent"));
     }
 
     @Test
@@ -58,7 +56,7 @@ class JimengTenantLineHandlerTest {
     @Test
     void ignoreTable_systemModeAlwaysTrue() {
         TenantContext.runAsSystem(() -> {
-            assertTrue(handler.ignoreTable("plugin"));
+            assertTrue(handler.ignoreTable("agent_skill"));
             assertTrue(handler.ignoreTable("agent"));
         });
     }

@@ -26,9 +26,6 @@ public class MePermissionsView {
     @Schema(description = "被授权的知识库 id 列表")
     private List<Long> knowledgeBaseIds;
 
-    @Schema(description = "被授权的插件 id 列表")
-    private List<Long> pluginIds;
-
     public static MePermissionsView from(ResolvedPermissions p) {
         return MePermissionsView.builder()
                 .superAdmin(p.isSuperAdmin())
@@ -36,7 +33,6 @@ public class MePermissionsView {
                 .modules(List.copyOf(p.getModules()))
                 .agentIds(List.copyOf(p.getAgentIds()))
                 .knowledgeBaseIds(List.copyOf(p.getKnowledgeBaseIds()))
-                .pluginIds(List.copyOf(p.getPluginIds()))
                 .build();
     }
 }

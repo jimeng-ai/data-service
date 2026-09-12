@@ -37,15 +37,13 @@ class BuilderDraftMergerTest {
         Map<String, Object> patch = Map.of(
                 "presetQuestions", List.of("你能做什么", "怎么退货"),
                 "modelParams", Map.of("temperature", 0.7, "maxTokens", 2048),
-                "recommendedPluginIds", List.of(11, 12),
                 "recommendedKbIds", List.of(5));
 
         merger.apply(base, patch);
 
         assertEquals(List.of("你能做什么", "怎么退货"), base.getPresetQuestions());
         assertEquals(0.7, base.getModelParams().get("temperature"));
-        assertEquals(List.of(11L, 12L), base.getRecommendedPluginIds());   // 数字归一为 Long
-        assertEquals(List.of(5L), base.getRecommendedKbIds());
+        assertEquals(List.of(5L), base.getRecommendedKbIds());   // 数字归一为 Long
     }
 
     @Test

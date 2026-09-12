@@ -6,7 +6,6 @@ import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.service.AgentService;
-import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.rag.service.KnowledgeBaseService;
 import com.jimeng.dataserver.ai.search.dto.GlobalSearchResult;
 import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
@@ -16,7 +15,6 @@ import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.AiTrace;
 import com.jimeng.persistence.entity.KbDocument;
 import com.jimeng.persistence.entity.KnowledgeBase;
-import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.mapper.AiTraceMapper;
 import com.jimeng.persistence.mapper.KbDocumentMapper;
 import lombok.RequiredArgsConstructor;
@@ -48,7 +46,6 @@ public class GlobalSearchService {
     private final KbDocumentMapper kbDocumentMapper;
     private final AiTraceMapper aiTraceMapper;
     private final PermissionResolver permissionResolver;
-    private final PluginCrudService pluginCrudService;
     private final SkillTenantService skillTenantService;
 
     public GlobalSearchResult search(String q, int limit) {
@@ -61,7 +58,6 @@ public class GlobalSearchService {
         int top = Math.min(Math.max(1, limit), MAX_LIMIT);
         result.setAgents(searchAgents(kw, top));
         result.setDocuments(searchDocuments(kw, top));
-        result.setPlugins(searchPlugins(kw, top));
         result.setSkills(searchSkills(kw, top));
         result.setTraces(searchTraces(kw, top));
         return result;
@@ -75,25 +71,6 @@ public class GlobalSearchService {
             }
         }
         return false;
-    }
-
-    /** 插件：复用 PLUGIN RBAC 可见性（与 PluginAdminController.listPlugins 一致），内存按 name/description 模糊。 */
-    private List<GlobalSearchResult.PluginHit> searchPlugins(String kw, int top) {
-        String lower = kw.toLowerCase(Locale.ROOT);
-        List<Plugin> visible = permissionResolver.filterCurrent(
-                pluginCrudService.listPlugins(null), ResourceType.PLUGIN, Plugin::getId, Plugin::getCreateUser);
-        return visible.stream()
-                .filter(p -> matches(lower, p.getName(), p.getDescription()))
-                .limit(top)
-                .map(p -> {
-                    GlobalSearchResult.PluginHit hit = new GlobalSearchResult.PluginHit();
-                    hit.setId(p.getId());
-                    hit.setName(p.getName());
-                    hit.setDescription(p.getDescription());
-                    hit.setStatus(p.getStatus());
-                    return hit;
-                })
-                .collect(Collectors.toList());
     }
 
     /** 技能：复用 SkillTenantService.list（scope=TENANT 或 owner==当前用户），内存按 name/description 模糊。 */

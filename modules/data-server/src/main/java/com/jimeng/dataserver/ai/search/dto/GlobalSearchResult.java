@@ -18,9 +18,6 @@ public class GlobalSearchResult {
     /** 文档命中（按标题模糊，限当前用户可见的知识库下）。 */
     private List<DocumentHit> documents = new ArrayList<>();
 
-    /** 插件命中（按 name/description 模糊，复用 PLUGIN RBAC 可见性）。 */
-    private List<PluginHit> plugins = new ArrayList<>();
-
     /** 技能命中（按 name/description 模糊，scope=TENANT 或 owner==当前用户）。 */
     private List<SkillHit> skills = new ArrayList<>();
 
@@ -41,14 +38,6 @@ public class GlobalSearchResult {
         private Long kbId;
         private String kbName;
         private String sourceType;
-    }
-
-    @Data
-    public static class PluginHit {
-        private Long id;
-        private String name;
-        private String description;
-        private String status;
     }
 
     @Data

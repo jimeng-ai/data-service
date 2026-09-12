@@ -54,11 +54,10 @@ class AgentSkillVisibilityTest {
         };
     }
 
-    private static AgentRuntimeView agent(Set<Long> skillIds, Set<String> pluginCodes) {
+    private static AgentRuntimeView agent(Set<Long> skillIds) {
         return AgentRuntimeView.builder()
                 .agentId(1L).tenantId("t1").code("c").name("n")
                 .allowedSkillIds(skillIds)
-                .allowedPluginCodes(pluginCodes)
                 .build();
     }
 
@@ -66,23 +65,23 @@ class AgentSkillVisibilityTest {
     @DisplayName("平台技能（tenantId==null）恒可见，不受绑定约束")
     void platformSkillAlwaysVisible() {
         ToolPackage rag = pkg("rag-knowledge", null, null, ToolPackageKind.SKILL);
-        assertThat(visible(rag, agent(Set.of(), Set.of()))).isTrue();          // 明确不绑任何技能
-        assertThat(visible(rag, agent(Set.of(999L), Set.of()))).isTrue();      // 绑了别的
-        assertThat(visible(rag, agent(null, null))).isTrue();                  // 无绑定信息
+        assertThat(visible(rag, agent(Set.of()))).isTrue();          // 明确不绑任何技能
+        assertThat(visible(rag, agent(Set.of(999L)))).isTrue();      // 绑了别的
+        assertThat(visible(rag, agent(null))).isTrue();              // 无绑定信息
     }
 
     @Test
     @DisplayName("allowedSkillIds==null（老快照）→ 不过滤，租户技能仍全部可见")
     void nullMeansNoFiltering() {
         ToolPackage s = pkg("报销助手", "t1", 100L, ToolPackageKind.SKILL);
-        assertThat(visible(s, agent(null, null))).isTrue();
+        assertThat(visible(s, agent(null))).isTrue();
     }
 
     @Test
     @DisplayName("allowedSkillIds==空集（明确不绑）→ 租户技能全部不可见。null 与空集含义不同")
     void emptyMeansNothingBound() {
         ToolPackage s = pkg("报销助手", "t1", 100L, ToolPackageKind.SKILL);
-        assertThat(visible(s, agent(Set.of(), Set.of()))).isFalse();
+        assertThat(visible(s, agent(Set.of()))).isFalse();
     }
 
     @Test
@@ -90,7 +89,7 @@ class AgentSkillVisibilityTest {
     void tenantSkillFilteredById() {
         ToolPackage bound = pkg("A", "t1", 100L, ToolPackageKind.SKILL);
         ToolPackage unbound = pkg("B", "t1", 200L, ToolPackageKind.SKILL);
-        AgentRuntimeView a = agent(Set.of(100L), Set.of());
+        AgentRuntimeView a = agent(Set.of(100L));
         assertThat(visible(bound, a)).isTrue();
         assertThat(visible(unbound, a)).isFalse();
     }
@@ -100,19 +99,8 @@ class AgentSkillVisibilityTest {
     void sameNameDifferentIdDisambiguatedById() {
         ToolPackage first = pkg("同名技能", "t1", 100L, ToolPackageKind.SKILL);
         ToolPackage second = pkg("同名技能", "t1", 200L, ToolPackageKind.SKILL);
-        AgentRuntimeView a = agent(Set.of(200L), Set.of());
+        AgentRuntimeView a = agent(Set.of(200L));
         assertThat(visible(first, a)).isFalse();
         assertThat(visible(second, a)).isTrue();
-    }
-
-    @Test
-    @DisplayName("插件仍按 code 过滤，与技能互不干扰")
-    void pluginStillFilteredByCode() {
-        ToolPackage p = pkg("miaodong", "t1", null, ToolPackageKind.PLUGIN);
-        assertThat(visible(p, agent(Set.of(), Set.of("miaodong")))).isTrue();
-        assertThat(visible(p, agent(Set.of(), Set.of("other")))).isFalse();
-        assertThat(visible(p, agent(Set.of(), null))).isFalse();
-        // 技能绑定不会意外放行插件
-        assertThat(visible(p, agent(null, null))).isFalse();
     }
 }

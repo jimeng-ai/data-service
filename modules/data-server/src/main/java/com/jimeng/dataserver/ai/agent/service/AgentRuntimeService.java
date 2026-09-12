@@ -8,19 +8,14 @@ import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.persistence.entity.Agent;
-import com.jimeng.persistence.entity.AgentPlugin;
 import com.jimeng.persistence.entity.AgentSkill;
-import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.mapper.AgentMapper;
-import com.jimeng.persistence.mapper.AgentPluginMapper;
 import com.jimeng.persistence.mapper.AgentSkillMapper;
-import com.jimeng.persistence.mapper.PluginMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -28,7 +23,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Agent 运行时服务：给 ClaudeService 提供 byId(agentId) → AgentRuntimeView 的能力。
@@ -41,9 +35,7 @@ import java.util.stream.Collectors;
 public class AgentRuntimeService {
 
     private final AgentMapper agentMapper;
-    private final AgentPluginMapper agentPluginMapper;
     private final AgentSkillMapper agentSkillMapper;
-    private final PluginMapper pluginMapper;
     private final PermissionResolver permissionResolver;
 
     /** 兼容旧调用：默认对话端语义（只读已发布快照）。 */
@@ -69,10 +61,9 @@ public class AgentRuntimeService {
         }
 
         if (preview) {
-            // 调试台：用实时字段 + 实时插件绑定。
-            List<Long> pluginIds = listBoundPluginIds(agentId);
+            // 调试台：用实时字段 + 实时技能绑定。
             return buildView(agent, agent.getSystemPrompt(), agent.getModel(),
-                    agent.getModelParams(), agent.getKbConfig(), pluginIds, listBoundSkillIds(agentId));
+                    agent.getModelParams(), agent.getKbConfig(), listBoundSkillIds(agentId));
         }
 
         // 对话端：必须已发布并存在快照，否则拒绝。
@@ -82,7 +73,7 @@ public class AgentRuntimeService {
         return buildViewFromSnapshot(agent);
     }
 
-    /** 从发布快照还原运行时视图。快照里 modelParams / kbConfig 仍是 JSON 字符串，pluginIds 是发布时冻结的绑定集合。 */
+    /** 从发布快照还原运行时视图。快照里 modelParams / kbConfig 仍是 JSON 字符串，skillIds 是发布时冻结的绑定集合。 */
     @SuppressWarnings("unchecked")
     private AgentRuntimeView buildViewFromSnapshot(Agent agent) {
         Map<String, Object> snap;
@@ -91,13 +82,6 @@ public class AgentRuntimeService {
         } catch (Exception e) {
             log.warn("解析 agent.published_snapshot 失败, agentId={}, error={}", agent.getId(), e.getMessage());
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "Agent 发布快照损坏，请重新发布: " + agent.getCode());
-        }
-        List<Long> pluginIds = new ArrayList<>();
-        if (snap.get("pluginIds") instanceof List<?> l) {
-            for (Object o : l) {
-                Long id = toLong(o);
-                if (id != null) pluginIds.add(id);
-            }
         }
         // modelParams / kbConfig 兼容两种表示：Java 发布写入的是 JSON 字符串，
         // 历史 SQL 回填写入的可能是嵌套 JSON 对象（model_params 为 json 列时）。统一归一化成字符串再交给下游解析。
@@ -122,22 +106,13 @@ public class AgentRuntimeService {
                 asString(snap.get("model")),
                 asJsonString(snap.get("modelParams")),
                 asJsonString(snap.get("kbConfig")),
-                pluginIds, skillIds);
+                skillIds);
     }
 
-    /** 用给定的人设/模型/参数/知识库/插件 id 集合拼装运行时视图。插件 id → code 时只放行 PUBLISHED 插件。 */
+    /** 用给定的人设/模型/参数/知识库/技能 id 集合拼装运行时视图。 */
     private AgentRuntimeView buildView(Agent agent, String systemPrompt, String model,
-                                       String modelParams, String kbConfig, List<Long> pluginIds,
+                                       String modelParams, String kbConfig,
                                        Collection<Long> skillIds) {
-        Set<String> allowedPluginCodes = new HashSet<>();
-        if (pluginIds != null && !pluginIds.isEmpty()) {
-            LambdaQueryWrapper<Plugin> pluginQuery = new LambdaQueryWrapper<Plugin>()
-                    .in(Plugin::getId, pluginIds)
-                    .eq(Plugin::getStatus, "PUBLISHED");
-            List<Plugin> plugins = pluginMapper.selectList(pluginQuery);
-            allowedPluginCodes = plugins.stream().map(Plugin::getCode).collect(Collectors.toSet());
-        }
-
         KbBinding kb = parseKbConfig(kbConfig);
 
         return AgentRuntimeView.builder()
@@ -148,7 +123,6 @@ public class AgentRuntimeService {
                 .systemPrompt(systemPrompt)
                 .defaultModel(model)
                 .defaultModelParams(parseJsonMap(modelParams))
-                .allowedPluginCodes(Collections.unmodifiableSet(allowedPluginCodes))
                 .allowedSkillIds(skillIds == null ? null : Set.copyOf(skillIds))
                 .kbIds(kb.kbIds())
                 .kbTopK(kb.topK())
@@ -162,12 +136,6 @@ public class AgentRuntimeService {
         return agentSkillMapper.selectList(new LambdaQueryWrapper<AgentSkill>()
                         .eq(AgentSkill::getAgentId, agentId))
                 .stream().map(AgentSkill::getSkillId).toList();
-    }
-
-    private List<Long> listBoundPluginIds(Long agentId) {
-        return agentPluginMapper.selectList(new LambdaQueryWrapper<AgentPlugin>()
-                        .eq(AgentPlugin::getAgentId, agentId))
-                .stream().map(AgentPlugin::getPluginId).toList();
     }
 
     private String asString(Object o) {

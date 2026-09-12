@@ -19,7 +19,4 @@ public class GrantView {
 
     @Schema(description = "可用的知识库 id 列表")
     private List<Long> knowledgeBases;
-
-    @Schema(description = "可用的插件 id 列表")
-    private List<Long> plugins;
 }

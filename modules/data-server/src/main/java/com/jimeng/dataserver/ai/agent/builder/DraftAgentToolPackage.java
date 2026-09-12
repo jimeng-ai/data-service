@@ -39,9 +39,9 @@ public class DraftAgentToolPackage implements ToolPackage {
                 - model：必须取自下方「可选模型目录」的 value；按任务选型——复杂推理/长文档选 Opus，日常均衡选 Sonnet，高频简单选 Haiku。
                 - presetQuestions：3~4 个贴合该 Agent 用途、站在终端用户视角提出的引导问句。
                 - modelParams：仅在用户有明确偏好时设置（如要更稳定就调低 temperature），否则留空用默认。
-                - recommendedPluginIds / recommendedKbIds：仅当下方目录里有契合用途的项时，按其 id 推荐；这只是建议，最终由用户在右侧勾选确认，别假定一定会绑定。
+                - recommendedKbIds：仅当下方目录里有契合用途的知识库时，按其 id 推荐；这只是建议，最终由用户在右侧勾选确认，别假定一定会绑定。
 
-                不要推荐目录里不存在的模型、插件或知识库。""";
+                不要推荐目录里不存在的模型或知识库。""";
     }
 
     @Override
@@ -53,7 +53,6 @@ public class DraftAgentToolPackage implements ToolPackage {
         props.put("model", strProp("模型 id，必须取自可选模型目录的 value"));
         props.put("presetQuestions", arrProp("对话空状态的引导问题", "string"));
         props.put("modelParams", objProp("模型参数 {temperature, maxTokens, topP}"));
-        props.put("recommendedPluginIds", arrProp("推荐绑定的插件 id（取自可用插件目录）", "integer"));
         props.put("recommendedKbIds", arrProp("推荐绑定的知识库 id（取自知识库目录）", "integer"));
 
         Map<String, Object> schema = new LinkedHashMap<>();

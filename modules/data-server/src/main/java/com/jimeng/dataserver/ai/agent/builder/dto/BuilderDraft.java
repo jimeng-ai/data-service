@@ -22,8 +22,6 @@ public class BuilderDraft {
     private String model;
     /** {temperature, maxTokens, topP, ...} 驼峰 key（与前端一致）。 */
     private Map<String, Object> modelParams = new LinkedHashMap<>();
-    /** 推荐绑定的插件 id（仅推荐，finalize 时由用户确认）。 */
-    private List<Long> recommendedPluginIds;
     /** 推荐绑定的知识库 id（仅推荐）。 */
     private List<Long> recommendedKbIds;
 }

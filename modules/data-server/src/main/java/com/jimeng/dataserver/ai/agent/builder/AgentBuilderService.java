@@ -7,11 +7,9 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderDraft;
 import com.jimeng.dataserver.ai.model.ModelCatalogService;
 import com.jimeng.dataserver.ai.model.dto.ModelView;
-import com.jimeng.dataserver.ai.plugin.service.PluginCrudService;
 import com.jimeng.dataserver.ai.rag.service.KnowledgeBaseService;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.KnowledgeBase;
-import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.mapper.AgentMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,7 +29,6 @@ public class AgentBuilderService {
 
     private final AgentMapper agentMapper;
     private final ModelCatalogService modelCatalogService;
-    private final PluginCrudService pluginCrudService;
     private final KnowledgeBaseService knowledgeBaseService;
 
     /** 取（或懒建）当前租户的构建器 Agent。 */
@@ -61,24 +58,13 @@ public class AgentBuilderService {
         return JSONUtil.toBean(draftJson, BuilderDraft.class);
     }
 
-    /** 构建本轮要追加到 system 的"目录"段：可选模型 + 可用插件/知识库（行级隔离由各 list 服务保证）。 */
+    /** 构建本轮要追加到 system 的"目录"段：可选模型 + 可用知识库（行级隔离由各 list 服务保证）。 */
     public String buildCatalogSystem() {
         StringBuilder sb = new StringBuilder();
         sb.append("\n\n## 可选模型目录（model 字段只能取以下 value）\n");
         for (ModelView m : modelCatalogService.listEnabled()) {
             sb.append("- ").append(m.getValue()).append("（").append(m.getLabel()).append("）：")
               .append(StrUtil.blankToDefault(m.getDescription(), "")).append("\n");
-        }
-
-        sb.append("\n## 可用插件目录（recommendedPluginIds 只能取以下 id）\n");
-        List<Plugin> plugins = pluginCrudService.listPlugins("PUBLISHED");
-        if (plugins.isEmpty()) {
-            sb.append("（无）\n");
-        } else {
-            for (Plugin p : plugins) {
-                sb.append("- id=").append(p.getId()).append("：").append(p.getName())
-                  .append(" — ").append(StrUtil.blankToDefault(p.getDescription(), "")).append("\n");
-            }
         }
 
         sb.append("\n## 可用知识库目录（recommendedKbIds 只能取以下 id）\n");

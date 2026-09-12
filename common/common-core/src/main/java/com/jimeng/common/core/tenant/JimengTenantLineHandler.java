@@ -28,12 +28,7 @@ public class JimengTenantLineHandler implements TenantLineHandler {
 
     /** 内置的租户隔离表清单。新增表后请补充这里（或通过 {@code tenant.tenant-tables} 配置追加）。 */
     private static final Set<String> TENANT_AWARE_TABLES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-            "plugin",
-            "plugin_tool",
-            "plugin_http_mapping",
-            "plugin_credential",
             "agent",
-            "agent_plugin",
             "agent_skill",
             "connection",
             "agent_connection",

@@ -10,14 +10,12 @@ import com.jimeng.dataserver.admin.rbac.enums.ResourceType;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.KnowledgeBase;
-import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.SysRoleResource;
 import com.jimeng.persistence.entity.SysUser;
 import com.jimeng.persistence.entity.SysUserRole;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
-import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleResourceMapper;
 import com.jimeng.persistence.mapper.SysUserMapper;
 import com.jimeng.persistence.mapper.SysUserRoleMapper;
@@ -52,7 +50,6 @@ public class PermissionResolver {
     private final SysRoleResourceMapper sysRoleResourceMapper;
     // 仅用于「本人创建放行」兜底查询 create_user（修复无角色创建者孤儿），均在租户拦截器白名单内。
     private final AgentMapper agentMapper;
-    private final PluginMapper pluginMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
     private final AiSkillMapper aiSkillMapper;
 
@@ -114,10 +111,6 @@ public class PermissionResolver {
                 Agent a = agentMapper.selectById(id);
                 yield a == null ? null : a.getCreateUser();
             }
-            case PLUGIN -> {
-                Plugin pl = pluginMapper.selectById(id);
-                yield pl == null ? null : pl.getCreateUser();
-            }
             case KNOWLEDGE_BASE -> {
                 KnowledgeBase kb = knowledgeBaseMapper.selectById(id);
                 yield kb == null ? null : kb.getCreateUser();
@@ -176,7 +169,7 @@ public class PermissionResolver {
         }
         if (SysUser.TYPE_SUPER_ADMIN.equals(u.getUserType())) {
             return new ResolvedPermissions(true, u.getUserType(),
-                    new HashSet<>(PlatformConstant.ALL_MODULES), null, null, null);
+                    new HashSet<>(PlatformConstant.ALL_MODULES), null, null);
         }
 
         // 成员：取角色 → 取「角色授权」+「全公司共享授权(哨兵 role_id=0)」的并集。
@@ -193,7 +186,6 @@ public class PermissionResolver {
         Set<String> modules = new HashSet<>();
         Set<Long> agentIds = new HashSet<>();
         Set<Long> kbIds = new HashSet<>();
-        Set<Long> pluginIds = new HashSet<>();
         for (SysRoleResource g : grants) {
             ResourceType type = parseType(g.getResourceType());
             if (type == null) {
@@ -203,10 +195,10 @@ public class PermissionResolver {
                 case MENU -> { if (g.getResourceCode() != null) modules.add(g.getResourceCode()); }
                 case AGENT -> agentIds.add(g.getResourceId());
                 case KNOWLEDGE_BASE -> kbIds.add(g.getResourceId());
-                case PLUGIN -> pluginIds.add(g.getResourceId());
+                case SKILL -> { /* 技能不走 RBAC 实例授权，按 scope/owner 过滤 */ }
             }
         }
-        return new ResolvedPermissions(false, u.getUserType(), modules, agentIds, kbIds, pluginIds);
+        return new ResolvedPermissions(false, u.getUserType(), modules, agentIds, kbIds);
     }
 
     private ResourceType parseType(String raw) {

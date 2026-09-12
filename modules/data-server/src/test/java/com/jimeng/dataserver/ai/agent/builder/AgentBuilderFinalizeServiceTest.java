@@ -1,6 +1,5 @@
 package com.jimeng.dataserver.ai.agent.builder;
 
-import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderDraft;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.FinalizeRequest;
 import com.jimeng.dataserver.ai.agent.service.AgentService;
@@ -19,9 +18,8 @@ class AgentBuilderFinalizeServiceTest {
 
     private final AgentService agentService = mock(AgentService.class);
     private final ChatConversationService convSvc = mock(ChatConversationService.class);
-    private final PermissionResolver permissionResolver = mock(PermissionResolver.class);
     private final AgentBuilderFinalizeService svc =
-            new AgentBuilderFinalizeService(agentService, convSvc, permissionResolver);
+            new AgentBuilderFinalizeService(agentService, convSvc);
 
     private BuilderDraft draft() {
         BuilderDraft d = new BuilderDraft();
@@ -34,10 +32,9 @@ class AgentBuilderFinalizeServiceTest {
     }
 
     @Test
-    void finalize_createsDraftAgent_bindsPlugins_writesKbConfig() {
+    void finalize_createsDraftAgent_writesKbConfig() {
         FinalizeRequest req = new FinalizeRequest();
         req.setDraft(draft());
-        req.setPluginIds(List.of(11L));
         req.setKbIds(List.of(5L));
         req.setTopK(8);
         when(agentService.create(any(Agent.class))).thenAnswer(inv -> {
@@ -57,9 +54,6 @@ class AgentBuilderFinalizeServiceTest {
         assertNotNull(created.getCode());                     // 生成了 code
         assertTrue(created.getKbConfig().contains("\"kbIds\""));
         assertTrue(created.getKbConfig().contains("8"));      // topK
-        // 绑定插件（带权限校验）
-        verify(permissionResolver).assertCurrentAccess(any(), eq(11L));
-        verify(agentService).bindPlugin(999L, 11L);
     }
 
     @Test

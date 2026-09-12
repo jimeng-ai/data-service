@@ -12,6 +12,5 @@ public enum ResourceType {
     MENU,
     AGENT,
     KNOWLEDGE_BASE,
-    PLUGIN,
     SKILL
 }
