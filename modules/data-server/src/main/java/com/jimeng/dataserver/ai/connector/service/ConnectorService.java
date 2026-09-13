@@ -121,11 +121,24 @@ public class ConnectorService {
         row.setTransport("direct");
         apply(row, req, connector, null);
 
-        // 保存前先探。探不过就不落库——一条探不过的连接留在库里，只会在某次对话里静默失败。
-        ConnectorProbeService.ProbeReport report = probeOrThrow(row);
-        writeProbeResult(row, report);
-
+        // ★ 必须先 insert 再探测，顺序不能反。
+        //
+        // 客户库连接池按 connection.id 分桶（CustomerDataSourceManager 的 Map key），而雪花 id
+        // 是 MyBatis-Plus 在 insert 时才回填的。先探测的话 inst.id() 是 null，acquire 直接 NPE，
+        // 表现为「新建任何一条数据库连接都失败，且报错文案是没用的兜底句」。
+        //
+        // 「探不过就不落库」这条约束由事务保证：下面抛异常会回滚这一行。
         connectionMapper.insert(row);
+        try {
+            ConnectorProbeService.ProbeReport report = probeOrThrow(row);
+            writeProbeResult(row, report);
+            connectionMapper.updateById(row);
+        } catch (RuntimeException e) {
+            // 连接池不在事务里，回滚不会带走它。不显式作废就会留下一个指向已回滚行的池，
+            // 直到空闲回收才消失——期间它还占着客户库的连接。
+            dataSourceManager.invalidate(row.getId());
+            throw e;
+        }
         log.info("创建连接器实例 id={} kind={} name={}", row.getId(), row.getKind(), row.getName());
         return toView(row);
     }

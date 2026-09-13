@@ -171,8 +171,22 @@ public class ConnectorGateway {
                                : "（实际可用：" + row.getCapabilityFlags() + "）"));
         }
 
-        ConnectorInstance inst = loader.load(row);
-        Connector connector = registry.require(inst.kind());
+        // 解析实例与实现。这一段单独包 try：本方法对外的契约是「只抛 ConnectorException」，
+        // 工具层正是靠这条契约才能保证回灌模型的永远是那九类之一。loader / registry 抛出
+        // 未归类的 RuntimeException 会把这条契约打破——虽然工具层还有一道兜底 catch 能防住泄漏，
+        // 但那条路上审计不会写，且错误会被笼统归成「目标系统返回了错误」，把排查方向带偏到客户系统上。
+        ConnectorInstance inst;
+        Connector connector;
+        try {
+            inst = loader.load(row);
+            connector = registry.require(inst.kind());
+        } catch (ConnectorException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.error("连接器实例解析失败 connectorId={} kind={}", row.getId(), row.getKind(), e);
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                    "这条连接的配置无法加载，请在管理台重新保存一次");
+        }
 
         // ---- 7 限流 ----
         checkTenantRate(inst);

@@ -100,16 +100,42 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
      * <h3>按错误码判，不按消息文本判</h3>
      * 消息文本随 MySQL 版本、语言包、中间件（ProxySQL / MaxScale）而变，拿它做判据迟早失效，
      * <b>而失效的方向是「判成只读」——一个静默的安全降级</b>。错误码是稳定契约。
+     *
+     * <h3>★ 探针必须临时关掉连接的 readOnly，否则它什么都验不出来</h3>
+     * 连接池对每条连接设了 {@code readOnly=true}（那是只读的第三道防线）。但 Connector/J 是
+     * <b>在客户端就拦下</b>写语句的——{@code StatementImpl.executeUpdateInternal} 直接抛
+     * {@code "Connection is read-only. Queries leading to data modification are not allowed."}，
+     * {@code errorCode=0}，<b>语句根本没发到服务端</b>。于是我们永远拿不到 1142/1146，
+     * 每一条连接都会被判成「无法判定」而拒绝保存。
+     *
+     * <p>这是一处很典型的「防护措施让检测失效」：我们自己的第二层防线挡住了对承重层的探测。
+     * 所以这里显式 {@code setReadOnly(false)} 再跑探针、跑完恢复。安全性不受影响——
+     * 真正决定成败的是<b>服务端</b>的权限检查，而 {@code WHERE 1 = 0} 保证即使权限放行也改不动任何行。
      */
     @Override
     public ReadOnlyVerdict verifyReadOnly() {
         String probe = "UPDATE `" + PROBE_TABLE + "` SET x = 1 WHERE 1 = 0";
-        try (Connection c = borrow();
-             Statement st = c.createStatement()) {
-            st.setQueryTimeout(10);
-            st.executeUpdate(probe);
-            // 竟然成功了：说明客户真有这张表，而且这个账号能写它。
-            return ReadOnlyVerdict.writable("账号可以执行 UPDATE 语句");
+        try (Connection c = borrow()) {
+            try {
+                c.setReadOnly(false);
+            } catch (SQLException e) {
+                // 关不掉就没法探。归 unknown 而不是 confirmed——「验不了」不是「验过了」。
+                log.warn("只读探针无法关闭连接的 readOnly 标志 connectorId={}", instance.id(), e);
+                return ReadOnlyVerdict.unknown("平台无法在这条连接上执行只读校验");
+            }
+            try (Statement st = c.createStatement()) {
+                st.setQueryTimeout(10);
+                st.executeUpdate(probe);
+                // 竟然成功了：说明客户真有这张表，而且这个账号能写它。
+                return ReadOnlyVerdict.writable("账号可以执行 UPDATE 语句");
+            } finally {
+                // 连接要还回池里，必须恢复原状，否则后续查询拿到的是一条可写连接。
+                try {
+                    c.setReadOnly(true);
+                } catch (SQLException ignore) {
+                    log.debug("恢复 readOnly 失败 connectorId={}", instance.id());
+                }
+            }
         } catch (SQLException e) {
             int code = e.getErrorCode();
             return switch (code) {

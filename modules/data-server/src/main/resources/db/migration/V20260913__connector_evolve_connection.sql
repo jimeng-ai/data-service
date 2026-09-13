@@ -81,3 +81,18 @@ UPDATE `connection` SET `kind` = 'HTTP' WHERE `kind` IS NULL OR `kind` = '';
 
 -- 刻意【不】给 kind 加索引：单租户的连接数是个位数到两位数，管理面列表的主路径是
 -- uk_connection_tenant_name 已经覆盖的 tenant_id 前缀扫描，再加一个低基数索引只是白占写入成本。
+
+-- ---------------------------------------------------------------------------------------------
+-- base_url 放宽为可空。
+--
+-- 它原本是 NOT NULL 且【没有默认值】——那是为 HTTP 连接设计的，当时表里只有 HTTP 一种东西。
+-- 演化成通用连接器表之后，MySQL / Elasticsearch / 对象存储这些类型根本没有 base_url 这个概念，
+-- 插入时会直接撞 "Field 'base_url' doesn't have a default value"。
+--
+-- 为什么是放宽而不是给个默认值：这条约束【是类型相关的】（HTTP 必填、其余不适用），
+-- 而单列的 NOT NULL 表达不了「按类型必填」。正确的位置是应用层的 ParamSpec——
+-- HttpConnector 把 baseUrl 声明成 required=true，录入时按类型校验，报错也说得清是哪个参数。
+-- 给个空串默认值只会让「HTTP 连接漏填 base_url」变成一条存得进去、用起来才炸的脏数据。
+ALTER TABLE `connection`
+  MODIFY COLUMN `base_url` varchar(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    DEFAULT NULL COMMENT '真实上游 base URL，容器不可见。仅 HTTP 类型使用；其余类型为 NULL';

@@ -310,12 +310,25 @@ public class AgentService {
                 .eq(AgentSkill::getAgentId, agentId));
     }
 
+    /**
+     * 授予 Agent 一条外部连接。幂等。
+     *
+     * <p><b>三步而不是两步，中间那步是必需的</b>：软删除的授权行仍然占着
+     * {@code uk_agent_connection_tenant_agent_conn}（唯一键不含 deleted），而 selectOne 被
+     * 自动加上 {@code deleted = 0} 之后看不见它。少了复活这一步，「撤销 → 再授权」会直接撞唯一键，
+     * 对用户表现为「取消过的连接再也加不回去」。详见 {@code AgentConnectionMapper#reviveGrant}。
+     */
     public AgentConnection grantConnection(Long agentId, Long connectionId) {
         LambdaQueryWrapper<AgentConnection> w = new LambdaQueryWrapper<AgentConnection>()
                 .eq(AgentConnection::getAgentId, agentId)
                 .eq(AgentConnection::getConnectionId, connectionId);
         AgentConnection existing = agentConnectionMapper.selectOne(w);
         if (existing != null) return existing;
+        // 有软删行就复活它，而不是插一条新的——插会撞唯一键。
+        if (agentConnectionMapper.reviveGrant(agentId, connectionId) > 0) {
+            AgentConnection revived = agentConnectionMapper.selectOne(w);
+            if (revived != null) return revived;
+        }
         AgentConnection g = new AgentConnection();
         g.setAgentId(agentId);
         g.setConnectionId(connectionId);
