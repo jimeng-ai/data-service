@@ -40,6 +40,7 @@ public class JimengTenantLineHandler implements TenantLineHandler {
             "agent_connection",
             "connector_schema",
             "connector_audit",
+            "connector_pending_write",
             "skill_eval_run",
             "chat_conversation",
             "chat_message",

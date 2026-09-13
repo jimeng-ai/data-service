@@ -15,6 +15,7 @@ import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ParamField;
+import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.mapper.AgentConnectionMapper;
@@ -332,6 +333,10 @@ public class ConnectorService {
         if (req.getDisplayName() != null) {
             row.setDisplayName(req.getDisplayName());
         }
+        // 写策略：留空 / 认不出来一律落 FORBIDDEN（见 WritePolicy.parse）。
+        // 编辑时不传等于「改成只读」——这是刻意的：一个决定「能不能改客户数据」的开关，
+        // 省略它的语义只能是最严的那个，不能是「保持原样」。
+        row.setWritePolicy(WritePolicy.parse(req.getWritePolicy()).name());
 
         Map<String, Object> incoming = req.getParams() == null
                 ? new LinkedHashMap<>() : new LinkedHashMap<>(req.getParams());
@@ -460,6 +465,7 @@ public class ConnectorService {
             params.put("__error__", "参数已损坏，无法解析。请重新保存配置");
         }
         String kind = ConnectorInstanceLoader.normalizeKind(row.getKind());
+        WritePolicy policy = WritePolicy.parse(row.getWritePolicy());
         // 保险起见再剔一遍敏感字段：loader 只读 config_json 与旧列，理论上不含敏感值，
         // 但「理论上不含」不是可以不删的理由——这类地方漏一次就是凭据出网。
         registry.find(kind).ifPresent(c -> c.paramSpec().secretNames().forEach(params::remove));
@@ -473,6 +479,8 @@ public class ConnectorService {
                 .params(params)
                 .transport(row.getTransport() == null ? "direct" : row.getTransport())
                 .status(row.getStatus())
+                .writePolicy(policy.name())
+                .writePolicyLabel(policy.label())
                 .capabilities(row.getCapabilityFlags() == null || row.getCapabilityFlags().isBlank()
                         ? List.of()
                         : List.of(row.getCapabilityFlags().split(",")))

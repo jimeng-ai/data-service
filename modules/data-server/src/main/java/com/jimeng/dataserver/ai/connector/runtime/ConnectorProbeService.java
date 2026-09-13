@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
+import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -61,24 +62,40 @@ public class ConnectorProbeService {
             }
 
             // ---- 第二步：验只读（承重层，不可跳过）----
+            //
+            // ★ 注意「跳过」和「按策略判定」是两回事：无论写策略是什么，这一步都【照跑】，
+            //   因为它的结果要如实记进 readonly_verified_at 与界面。变的只是「结果决不决定能不能保存」。
+            //   跳过会让一条 AUTO 的连接在界面上显示成「未验证」，而那其实是「没验过」和
+            //   「验过是可写的」两种完全不同状态的混淆。
             ReadOnlyVerdict verdict;
             try {
                 verdict = session.verifyReadOnly();
             } catch (ConnectorException e) {
-                // 探测本身抛异常 ≠ 账号可写，但同样不能放行——归到「判不出来」。
+                // 探测本身抛异常 ≠ 账号可写，但同样不能当成只读——归到「判不出来」。
                 verdict = ReadOnlyVerdict.unknown("只读校验未能完成：" + safe(e));
             }
             if (verdict == null) {
                 verdict = ReadOnlyVerdict.unknown("连接器没有返回只读校验结果");
             }
-            if (!verdict.acceptable()) {
-                // 两种不通过要分开说：话术完全不同，客户要做的事也不同。
+
+            WritePolicy policy = inst.writePolicy();
+            if (!policy.allowsWrite() && !verdict.acceptable()) {
+                // 只读策略下，账号必须确认是只读的。两种不通过要分开说：
+                // 话术完全不同，客户要做的事也不同。
                 String reason = verdict.undetermined()
                         ? "无法确认这个账号是只读的：" + verdict.detail()
                           + "。为安全起见不予保存——请确认账号权限后重试，或换一个明确只授予查询权限的账号。"
                         : "这个账号具备写权限：" + verdict.detail()
-                          + "。请改用只读账号（数据库侧只 GRANT SELECT）后重新保存。";
+                          + "。当前连接的写策略是「只读」，请改用只读账号（数据库侧只 GRANT SELECT），"
+                          + "或者在写策略里显式开放写操作。";
                 return new ProbeReport(false, reason, verdict, Set.of());
+            }
+            if (policy.allowsWrite() && verdict.acceptable()) {
+                // 开放了写，但客户给的是只读账号——不拦（连接本身能用，查询照跑），
+                // 但必须如实告知：写操作会在【数据库】那一层被拒，而不是在平台这层。
+                // 不说的话，用户会以为开关打开了写就能写，直到某次真写才发现。
+                log.info("连接器写策略为 {} 但账号是只读的 connectorId={}：写操作将被数据库拒绝",
+                        policy, inst.id());
             }
 
             // ---- 第三步：探能力 ----
@@ -93,6 +110,20 @@ public class ConnectorProbeService {
             }
             if (caps == null || caps.isEmpty()) {
                 caps = connector.declaredCapabilities();
+            }
+            // 写能力是【策略 ∧ 类型支持 ∧ 账号确实能写】三者的交集，缺一不可：
+            //   - 策略不开 → 平台侧就不放行
+            //   - 类型不支持 → 比如 HTTP 连接器的写由 allowMethods 管，不走这条
+            //   - 账号只读 → 平台放行了数据库也会拒，此时声明「能写」是在骗人
+            // 三者都满足才回填 WRITE，界面与 conn_list 看到的就是真实可用的能力。
+            caps = new java.util.LinkedHashSet<>(caps);
+            boolean writable = policy.allowsWrite()
+                    && connector.declaredCapabilities().contains(Capability.WRITE)
+                    && !verdict.readOnly();
+            if (writable) {
+                caps.add(Capability.WRITE);
+            } else {
+                caps.remove(Capability.WRITE);
             }
             return new ProbeReport(true, null, verdict, caps);
 

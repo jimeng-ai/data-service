@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
+import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
 import com.jimeng.persistence.entity.Connection;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -90,7 +91,9 @@ public class ConnectorInstanceLoader {
                 row.getDisplayName(),
                 params,
                 credential,
-                row.getTransport() == null || row.getTransport().isBlank() ? "direct" : row.getTransport());
+                row.getTransport() == null || row.getTransport().isBlank() ? "direct" : row.getTransport(),
+                // 解析不出来一律落到 FORBIDDEN——见 WritePolicy.parse。
+                WritePolicy.parse(row.getWritePolicy()));
     }
 
     // ---------------------------------------------------------------- 内部

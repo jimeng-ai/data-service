@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.impl.mysql;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.guard.ReadOnlySqlGuard;
+import com.jimeng.dataserver.ai.connector.guard.WriteSqlGuard;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
 import com.jimeng.dataserver.ai.connector.pool.CustomerDataSourceManager;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
@@ -39,7 +40,7 @@ class MySqlConnectorTest {
 
     private final ConnectorProperties properties = new ConnectorProperties();
     private final MySqlConnector connector = new MySqlConnector(
-            mock(CustomerDataSourceManager.class), new ReadOnlySqlGuard(), properties);
+            mock(CustomerDataSourceManager.class), new ReadOnlySqlGuard(), new WriteSqlGuard(), properties);
 
     private static ConnectorInstance inst(Map<String, Object> params, String credential) {
         return new ConnectorInstance(1L, "t1", "MYSQL", "crm", "CRM 库", params, credential, "direct");

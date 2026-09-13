@@ -35,6 +35,7 @@ public class ConnectorProperties {
     private Pool pool = new Pool();
     private Limit limit = new Limit();
     private Invoke invoke = new Invoke();
+    private Write write = new Write();
     private Health health = new Health();
 
     /** 「能查」的护栏。 */
@@ -78,6 +79,28 @@ public class ConnectorProperties {
         private int perInstanceConcurrency = 2;
         /** 每租户每分钟的调用次数，走 Redis 做成分布式的。&lt;= 0 表示不限。 */
         private int perTenantPerMinute = 60;
+    }
+
+    /**
+     * 「能写」的护栏。
+     *
+     * <p>默认值刻意小。这是在客户的生产库上执行模型写的 DML——
+     * 单次能改的行数越少，一次写错的爆炸半径越小。
+     */
+    @Data
+    public static class Write {
+        /**
+         * 单条语句的影响行数上限。<b>超了整条回滚</b>。
+         *
+         * <p>200 是个刻意保守的值：正常的业务操作（改一个订单状态、补一批工单备注）
+         * 都在这个量级以内；真要批量处理上万行，应该由人写脚本在数据库侧做，
+         * 而不是让模型一条语句推过去。
+         */
+        private int maxAffectedRows = 200;
+        /** 写语句的超时。比查询短——写操作持有锁，拖久了会阻塞客户的业务。 */
+        private int timeoutSeconds = 10;
+        /** 待审批项的有效期。过期未处理即作废，避免队列里堆着一堆没人记得的陈年请求。 */
+        private int approvalTtlHours = 24;
     }
 
     /** 「能调用」的护栏。 */

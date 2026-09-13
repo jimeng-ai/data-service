@@ -36,4 +36,13 @@ public class ConnectorUpsert {
 
     @Schema(description = "direct | tunnel，默认 direct。tunnel（内网隧道）尚未实现，填了会被拒绝")
     private String transport;
+
+    /**
+     * 写操作开放程度：{@code FORBIDDEN}（默认）| {@code REQUIRE_APPROVAL} | {@code AUTO}。
+     *
+     * <p><b>留空 = FORBIDDEN。</b>这一项决定 Agent 能不能改客户的生产业务数据，
+     * 「授权的默认值只能是否」——不填、填错、填了个将来才有的值，一律落到只读。
+     */
+    @Schema(description = "写操作开放程度：FORBIDDEN(默认) | REQUIRE_APPROVAL | AUTO")
+    private String writePolicy;
 }

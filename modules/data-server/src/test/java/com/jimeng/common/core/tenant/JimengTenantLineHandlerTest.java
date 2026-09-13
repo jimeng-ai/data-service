@@ -47,6 +47,9 @@ class JimengTenantLineHandlerTest {
         // 漏登记就是跨租户静默泄露。
         assertFalse(handler.ignoreTable("connector_schema"));
         assertFalse(handler.ignoreTable("connector_audit"));
+        // 待审批写操作队列：漏登记不报错，后果是 A 租户的超管能在审批列表里看到、
+        // 并【批准】B 租户 Agent 提交的写语句——一次跨租户的数据篡改。
+        assertFalse(handler.ignoreTable("connector_pending_write"));
         assertFalse(handler.ignoreTable("knowledge_base"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));

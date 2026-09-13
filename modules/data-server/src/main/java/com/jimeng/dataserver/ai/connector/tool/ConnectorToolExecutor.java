@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.InvokeResult;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
+import com.jimeng.dataserver.ai.connector.model.WriteResult;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorGateway;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorSummary;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -16,6 +17,8 @@ import com.jimeng.dataserver.ai.connector.spi.cap.DescribeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.InvokeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryOptions;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteCapable;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
 import com.jimeng.dataserver.ai.skill.service.SkillToolExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -39,6 +42,31 @@ import java.util.Set;
  * 授权连接清单」的插入点。于是「有哪些连接器可用」只能也做成一个工具，即 {@code conn_list}。
  * <b>这是一处刻意的偏离，不是漏读文档。</b>若将来改走内置工具（有运行期注入点），可以把它退回
  * 成上下文注入、并删掉这个工具。
+ *
+ * <h3>为什么写操作是第六个独立工具，而不是把 conn_query 放宽</h3>
+ * <ol>
+ *   <li>放宽 {@code conn_query} 意味着 {@code ReadOnlySqlGuard} 要长出「有时允许写」的分支，
+ *       而那道护栏的价值恰恰在于它<b>没有例外</b>：把「这条路绝对写不了」这个一眼可验的性质，
+ *       换成一个要读条件才能确定的性质，不划算。</li>
+ *   <li>分开之后模型必须<b>明确选择</b>「我要做一次写操作」，而不是在一个通用工具里
+ *       不小心传了条 UPDATE 进去——工具名本身就是一道意图确认。</li>
+ *   <li>审计、限流、审批都按<b>能力</b>分派（{@link Capability#WRITE}），分开后不需要再解析语句
+ *       去猜这次调用是读还是写；猜错的那次，恰恰是最不该猜错的那次。</li>
+ * </ol>
+ *
+ * <h3>{@code conn_execute} 返回的两种形态</h3>
+ * 写策略是 {@code REQUIRE_APPROVAL} 时网关<b>会放行</b>（它只判 {@code WritePolicy.allowsWrite()}），
+ * 但这一档不该直接执行——提交待审批项的分支在 {@code ConnectorGateway} 之外处理。
+ * 于是本工具的 payload 有两种形态，<b>必须让模型能一眼分开</b>：
+ * <ul>
+ *   <li><b>已执行</b>：带 {@code affected_rows} / {@code statement} / {@code committed=true}
+ *       （见 {@code WriteResult.toModelPayload()}）</li>
+ *   <li><b>待审批</b>：带 {@code pending_approval=true} 与 {@code approval_id}，
+ *       <b>此时数据一行都没改</b></li>
+ * </ul>
+ * 后两个 key 是<b>预留</b>的，本类当前不产生它们，但 {@code tools.json} 与 {@code SKILL.md}
+ * 已经按这个形状写好了模型侧指引。<b>不要改这两个 key 的名字</b>：改名的表现不是报错，
+ * 而是模型把一条「已提交待审批」的操作，向用户报告成「已完成修改」。
  *
  * <h3>构造器只准注入这两个 bean</h3>
  * {@code ProviderRegistry → ChatClient → AiConversationLoop → SkillRuntimeService →
@@ -65,13 +93,16 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     static final String TOOL_DESCRIBE = "conn_describe";
     static final String TOOL_QUERY = "conn_query";
     static final String TOOL_INVOKE = "conn_invoke";
+    /** 写操作单独一个名字。{@code conn_} 前缀已与既有工具做过撞名检查——撞名会被 mergeTools <b>静默丢弃</b>。 */
+    static final String TOOL_EXECUTE = "conn_execute";
 
     /**
-     * 只认这五个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
+     * 只认这六个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
      * 是线性扫描 first-match，既无 {@code @Order} 也无冲突检测：两个执行器的 supports() 区间一旦重叠，
      * 胜者由 Spring 注入顺序静默决定。前缀匹配（{@code startsWith("conn_")}）就是在给未来埋这种雷。
      */
-    private static final Set<String> TOOLS = Set.of(TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE);
+    private static final Set<String> TOOLS =
+            Set.of(TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE, TOOL_EXECUTE);
 
     private final ConnectorGateway connectorGateway;
     private final ConnectorProperties properties;
@@ -106,6 +137,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                     return doQuery(args);
                 case TOOL_INVOKE:
                     return doInvoke(args);
+                case TOOL_EXECUTE:
+                    return doExecute(args);
                 default:
                     // supports() 已经挡过一层，走到这里说明注册中心的路由和这里分叉了。
                     throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "未知的连接器工具：" + name);
@@ -274,6 +307,40 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         return out;
     }
 
+    // ------------------------------------------------------------------ 第六个工具：写
+
+    /**
+     * 写操作。与 {@link #doQuery} 最大的差别是<b>这里没有「夹到上限继续跑」这种善意的自动修正</b>：
+     * 查询的 limit 传大了夹一下照样出结果，写操作的影响行数超限则必须<b>整条回滚</b>
+     * （在 {@code MySqlSession} 里执行之后、提交之前判定），因为「改了一半」比「一行没改」危险得多。
+     *
+     * <p>护栏参数一律从 {@code connector.write.*} 取，<b>不接受模型传入</b>——
+     * 行数上限是事故防线，能被调用方改的防线等于没有。
+     */
+    private Map<String, Object> doExecute(Map<String, Object> args) {
+        String connector = requireString(args, "connector");
+        String statement = requireString(args, "statement");
+
+        // 嵌套配置类名字不写死（用 var），与 doQuery 同一理由：它属于别人的文件。
+        var w = properties.getWrite();
+        WriteOptions options = new WriteOptions(w.getMaxAffectedRows(), w.getTimeoutSeconds());
+
+        WriteResult result = connectorGateway.execute(connector, Capability.WRITE, TOOL_EXECUTE,
+                session -> writeCapable(session).execute(statement, options));
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("connector", connector);
+        // 上限主动回给模型：它据此才能在动手前就把大批量拆成几批，而不是先撞一次回滚再来问。
+        // 撞回滚本身是安全的（数据没变），但它会多烧一轮对话，还会让用户以为出了故障。
+        out.put("max_affected_rows", w.getMaxAffectedRows());
+        if (result != null) {
+            // toModelPayload() 带着平台实际执行的语句、影响行数、committed 标记，以及 0 行时的告警。
+            // 写操作比查询更要亮出过程：改了几行、改的是哪条语句，是事后唯一能核对的东西。
+            out.putAll(result.toModelPayload());
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------ 能力窄化
 
     // 网关按 required 能力放行后会话仍未实现对应接口，说明实例的 capability_flags 和实现分叉了。
@@ -291,6 +358,13 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     private static InvokeCapable invokeCapable(Object session) {
         if (session instanceof InvokeCapable c) return c;
         throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持调用（invoke）能力");
+    }
+
+    private static WriteCapable writeCapable(Object session) {
+        if (session instanceof WriteCapable c) return c;
+        // 走到这里说明 capability_flags 里有 WRITE、写策略也放行了，但实现类压根没实现写——
+        // 三者分叉。强转抛出的 ClassCastException 会把实现类全名带进回灌模型的 payload。
+        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持写入（write）能力");
     }
 
     // ------------------------------------------------------------------ 入参与错误

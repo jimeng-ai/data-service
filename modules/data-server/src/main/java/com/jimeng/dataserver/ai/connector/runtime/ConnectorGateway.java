@@ -11,6 +11,7 @@ import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
+import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.mapper.AgentConnectionMapper;
@@ -169,6 +170,22 @@ public class ConnectorGateway {
                             + (row.getCapabilityFlags() == null || row.getCapabilityFlags().isBlank()
                                ? "（尚未完成接入探测，请在管理台点一次「测试连接」）"
                                : "（实际可用：" + row.getCapabilityFlags() + "）"));
+        }
+
+        // ---- 6.5 写策略闸 ----
+        //
+        // ★ 这一步单独存在、而不是靠上面 capability_flags 里有没有 WRITE 来兜底，
+        //   因为两者的时效不同：capability_flags 是【上次探测时】回填的快照，
+        //   而写策略是【此刻】的配置。超管刚把一条连接从 AUTO 改回只读，若只看快照，
+        //   在下次探测之前写操作仍会放行——一个「关了但没立刻生效」的安全开关，
+        //   比没有这个开关更危险。
+        if (required == Capability.WRITE) {
+            WritePolicy policy = WritePolicy.parse(row.getWritePolicy());
+            if (!policy.allowsWrite()) {
+                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                        "连接「" + row.getName() + "」的写策略是「只读」，不允许执行写操作。"
+                                + "如需开放，请由企业超管在管理台修改写策略");
+            }
         }
 
         // 解析实例与实现。这一段单独包 try：本方法对外的契约是「只抛 ConnectorException」，
@@ -366,6 +383,7 @@ public class ConnectorGateway {
             case QUERY -> "「查询」";
             case DESCRIBE -> "「自描述」";
             case INVOKE -> "「调用」";
+            case WRITE -> "「写入」";
             case SYNC -> "「同步」";
             case SUBSCRIBE -> "「订阅」";
             case HEALTH -> "「健康探测」";

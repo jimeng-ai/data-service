@@ -128,4 +128,18 @@ public class Connection extends BaseEntity {
     @Schema(description = "只读验证通过的时间；为空=未验证")
     @TableField("readonly_verified_at")
     private Date readonlyVerifiedAt;
+
+    /**
+     * 写操作开放程度：{@code FORBIDDEN}（默认，只读）| {@code REQUIRE_APPROVAL} | {@code AUTO}。
+     *
+     * <p><b>默认值只能是 FORBIDDEN。</b>这一列决定 Agent 能不能改客户的生产业务数据，
+     * 出错的后果是业务事故，所以存量行、新建行、以及任何解析不出来的值一律落到只读
+     * （解析见 {@code WritePolicy.parse}）。
+     *
+     * <p>它放宽的是<b>平台侧</b>的闸，放宽不了客户侧的账号权限——选了 AUTO 但客户给的仍是
+     * 只读账号，写操作照样会被数据库拒绝。只读的承重层本来就在客户那边。
+     */
+    @Schema(description = "写操作开放程度：FORBIDDEN | REQUIRE_APPROVAL | AUTO")
+    @TableField("write_policy")
+    private String writePolicy;
 }

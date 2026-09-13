@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.impl.mysql;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.guard.ReadOnlySqlGuard;
+import com.jimeng.dataserver.ai.connector.guard.WriteSqlGuard;
 import com.jimeng.dataserver.ai.connector.pool.CustomerDataSourceManager;
 import com.jimeng.dataserver.ai.connector.pool.PoolSpec;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
@@ -10,13 +11,17 @@ import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
+import com.jimeng.dataserver.ai.connector.spi.GrantRequest;
+import com.jimeng.dataserver.ai.connector.spi.GrantScript;
 import com.jimeng.dataserver.ai.connector.spi.ParamField;
 import com.jimeng.dataserver.ai.connector.spi.ParamSpec;
 import com.jimeng.dataserver.ai.connector.spi.ParamType;
+import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -53,6 +58,7 @@ public class MySqlConnector implements Connector {
 
     private final CustomerDataSourceManager dataSourceManager;
     private final ReadOnlySqlGuard sqlGuard;
+    private final WriteSqlGuard writeGuard;
     private final ConnectorProperties properties;
 
     @Override
@@ -91,8 +97,12 @@ public class MySqlConnector implements Connector {
 
     @Override
     public Set<Capability> declaredCapabilities() {
-        // 不含 INVOKE：存储过程调用是写操作面，本期不开。
-        return Set.of(Capability.QUERY, Capability.DESCRIBE, Capability.HEALTH);
+        // 不含 INVOKE：存储过程调用另算，本期不开。
+        //
+        // 含 WRITE 只表示【这种类型支持写】，不表示某条连接真的能写——
+        // 实例级的 WRITE 由「写策略 ∧ 类型支持 ∧ 账号确实能写」三者的交集决定，
+        // 在 ConnectorProbeService 里回填（见 Capability.WRITE 的注释）。
+        return Set.of(Capability.QUERY, Capability.DESCRIBE, Capability.HEALTH, Capability.WRITE);
     }
 
     @Override
@@ -125,7 +135,131 @@ public class MySqlConnector implements Connector {
         PoolSpec spec = new PoolSpec(pool.getMaxSize(), (int) pool.getConnectionTimeoutMs(),
                 pool.getMaxLifetimeMinutes(), pool.getIdleEvictMinutes());
         DataSource ds = dataSourceManager.acquire(instance, jdbcUrl, username, password, spec);
-        return new MySqlSession(instance, ds, database, sqlGuard);
+        return new MySqlSession(instance, ds, database, sqlGuard, writeGuard);
+    }
+
+    // ==================================================== 授权脚本
+
+    /**
+     * ★ 占位符，<b>绝不生成真实密码</b>。
+     *
+     * <p>两个理由，都不是洁癖：一是我们本来就不该知道客户的密码（平台只需要它被填进密码框，
+     * 之后是 AES-GCM 密文）；二是这段脚本会被复制来复制去，贴进工单、贴进聊天窗口、
+     * 贴进某个共享文档——里面带着真密码的那一刻，密码就已经泄了，而没有人会意识到。
+     */
+    private static final String PASSWORD_PLACEHOLDER = "请替换成一个强密码";
+
+    /** 账号名白名单。MySQL 8 的用户名上限是 32 字符，超了根本建不出来，不如在这里就说清楚。 */
+    private static final Pattern GRANT_USER_RE = Pattern.compile("^[A-Za-z0-9_$\\-]{1,32}$");
+
+    /** host 段：{@code %} 通配、IP、网段前缀（{@code 192.168.%}）、域名，冒号留给 IPv6。 */
+    private static final Pattern GRANT_HOST_RE = Pattern.compile("^[A-Za-z0-9._:%\\-]{1,255}$");
+
+    @Override
+    public GrantScript grantScript(GrantRequest req) {
+        if (req == null) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "生成授权脚本的参数不能为空");
+        }
+        // 库名与表名复用 DB_RE：同一份白名单管两件事（拼 JDBC URL、拼 GRANT）。
+        // 好处是「能存进连接的库名」与「脚本敢生成的库名」永远是同一个集合，
+        // 不会出现脚本生成得出来、连接却存不进去的错配。
+        String db = ident(req.database(), "库名", DB_RE);
+        String user = ident(req.username(), "账号名", GRANT_USER_RE);
+        String host = ident(req.host(), "登录地址", GRANT_HOST_RE);
+        List<String> tables = req.tables() == null ? List.of() : req.tables();
+
+        WritePolicy policy = req.writePolicy() == null ? WritePolicy.FORBIDDEN : req.writePolicy();
+        // 两档写策略授同一套 DML：REQUIRE_APPROVAL 与 AUTO 的差别在平台侧（要不要人点确认），
+        // 数据库侧表达不了，也不该表达——把审批做成「数据库不给权限」，审批通过后照样执行不了。
+        String privileges = policy.allowsWrite() ? "SELECT, INSERT, UPDATE, DELETE" : "SELECT";
+        String account = "'" + user + "'@'" + host + "'";
+
+        StringBuilder sql = new StringBuilder();
+        sql.append("-- 请用有授权权限的数据库账号（如 root）整段执行\n");
+        sql.append("-- 平台侧写策略：").append(policy.label()).append("，对应权限：").append(privileges).append("\n");
+        sql.append("CREATE USER ").append(account)
+                .append(" IDENTIFIED BY '").append(PASSWORD_PLACEHOLDER).append("';\n");
+        if (tables.isEmpty()) {
+            sql.append("GRANT ").append(privileges).append(" ON `").append(db).append("`.* TO ")
+                    .append(account).append(";\n");
+        } else {
+            for (String raw : tables) {
+                String t = ident(raw, "表名", DB_RE);
+                sql.append("GRANT ").append(privileges).append(" ON `").append(db).append("`.`").append(t)
+                        .append("` TO ").append(account).append(";\n");
+            }
+        }
+        // FLUSH PRIVILEGES 对 CREATE USER / GRANT 其实不是必需的（只有直接改 mysql.* 授权表才要刷），
+        // 留着是因为 DBA 普遍按「授权完刷一下」的习惯核对脚本，少一行反而要被问一轮；执行它没有副作用。
+        sql.append("FLUSH PRIVILEGES;\n");
+
+        return GrantScript.builder()
+                .sql(sql.toString())
+                .notes(grantNotes(db, account, host, tables, policy))
+                .build();
+    }
+
+    /**
+     * 校验并返回一个标识符。<b>校验不过直接抛，不做转义。</b>
+     *
+     * <p>这里是本类第二处「用户输入拼进将被执行的文本」的地方（第一处是 JDBC URL），
+     * 而这一处更阴险：脚本是<b>平台给的</b>，客户 IT 天然信任它、往 root 会话里整段粘贴。
+     * 一个叫 {@code shop`; DROP DATABASE x; --} 的「库名」，到那时执行的就不是我们生成的语句了。
+     *
+     * <p>不转义的理由：转义要对方言、对版本、对字符集都判断正确才安全，而白名单只要判断一次。
+     * 合法的库名里本来也不会有分号和反引号——被挡住的输入，十有八九本来就该被挡住。
+     */
+    private static String ident(String raw, String label, Pattern allowed) {
+        if (raw == null || raw.isBlank()) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, label + "不能为空");
+        }
+        String v = raw.trim();
+        if (!allowed.matcher(v).matches()) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                    label + "含有非法字符，已拒绝生成脚本。" + label
+                            + "只允许字母、数字、下划线、$ 和短横线（登录地址另可用点、冒号和 %）；"
+                            + "带引号、反引号、分号、空格的输入一律不接受");
+        }
+        return v;
+    }
+
+    /** 脚本表达不了的东西都在这儿。每条一句话，按「执行前最需要知道」排序。 */
+    private static List<String> grantNotes(String db, String account, String host,
+                                           List<String> tables, WritePolicy policy) {
+        List<String> notes = new ArrayList<>();
+        notes.add("把脚本里的「" + PASSWORD_PLACEHOLDER + "」换成一个随机生成的强口令，"
+                + "且不要与其它系统复用——替换后的真实密码只填进平台的密码框，不要写回这段脚本、更不要贴进聊天或工单。");
+        if ("%".equals(host)) {
+            notes.add("账号写成了 " + account + "，其中 @'%' 表示允许从任意地址登录；"
+                    + "如果能拿到平台的出口 IP，请把它收紧成具体 IP（如 '...'@'203.0.113.10'），这是成本最低的一道防线。");
+        } else {
+            notes.add("账号已限定只能从 " + host + " 登录；"
+                    + "将来平台出口 IP 变更时这个账号会突然连不上（表现为凭据/网络类报错），届时改这一处即可。");
+        }
+        notes.add("脚本只授了 `" + db + "` 这一个库"
+                + (tables.isEmpty() ? "" : "中列出的那几张表") + "的权限，不要图省事改成 *.*——"
+                + "多授的权限平台一行都用不上，真出了事却要算在这个账号头上。");
+        if (!tables.isEmpty()) {
+            // 这条是实测踩出来的：information_schema 只返回账号有权限的对象，
+            // 所以漏授一张表，平台侧的表现是「这张表不存在」而不是「没权限」，排查会绕很远。
+            notes.add("逐表授权后平台只看得见这 " + tables.size() + " 张表，"
+                    + "漏授的表在平台侧表现为「这张表不存在」而不是权限报错，所以请一次把 Agent 要用的表列全。");
+        }
+        if (policy.allowsWrite()) {
+            notes.add("这是一个能写的账号：平台会在连接上如实标注写策略「" + policy.label()
+                    + "」，界面和审计里都看得到，不会伪装成只读。");
+            notes.add("写操作仍受平台侧两道闸约束——单次影响行数上限、UPDATE/DELETE 必须带 WHERE"
+                    + (policy == WritePolicy.REQUIRE_APPROVAL ? "，且每一条都要超管点确认后才真正执行。" : "。")
+                    + "如果只是想让平台查数，请把写策略调回只读后重新生成脚本：数据库侧的只读授权才是承重层。");
+        }
+        notes.add("MySQL 8.0 起 GRANT 不再能隐式建账号，所以必须先 CREATE USER；"
+                + "5.7 的默认 sql_mode 也带 NO_AUTO_CREATE_USER，这段脚本两个版本都能直接跑。");
+        notes.add("MySQL 8.0 的默认认证插件是 caching_sha2_password，而平台连库时刻意关掉了"
+                + "「向服务端索要 RSA 公钥」（防中间人拿到明文密码）——"
+                + "所以请在连接里勾选 SSL，或把建号语句改成 IDENTIFIED WITH mysql_native_password BY '...'，否则会认证失败。");
+        notes.add("如果这个账号已存在，CREATE USER 会报 ERROR 1396；"
+                + "此时改用 ALTER USER " + account + " IDENTIFIED BY '...' 重设密码，或换一个账号名，不要直接跳过这一行。");
+        return notes;
     }
 
     /**

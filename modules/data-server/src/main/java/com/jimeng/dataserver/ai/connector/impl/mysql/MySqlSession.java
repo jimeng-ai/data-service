@@ -15,6 +15,10 @@ import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
 import com.jimeng.dataserver.ai.connector.spi.cap.DescribeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryOptions;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteCapable;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
+import com.jimeng.dataserver.ai.connector.guard.WriteSqlGuard;
+import com.jimeng.dataserver.ai.connector.model.WriteResult;
 import lombok.extern.slf4j.Slf4j;
 
 import javax.sql.DataSource;
@@ -44,7 +48,7 @@ import java.util.regex.Pattern;
  * 等模型思考是不可接受的。
  */
 @Slf4j
-public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCapable {
+public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCapable, WriteCapable {
 
     /** 目录一次最多返回多少个对象。大库几百张表，全量塞进上下文放不下也没用。 */
     private static final int CATALOG_MAX = 500;
@@ -59,12 +63,20 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
     private final DataSource dataSource;
     private final String database;
     private final ReadOnlySqlGuard sqlGuard;
+    private final WriteSqlGuard writeGuard;
 
-    MySqlSession(ConnectorInstance instance, DataSource dataSource, String database, ReadOnlySqlGuard sqlGuard) {
+    MySqlSession(ConnectorInstance instance, DataSource dataSource, String database,
+                 ReadOnlySqlGuard sqlGuard, WriteSqlGuard writeGuard) {
         this.instance = instance;
         this.dataSource = dataSource;
         this.database = database;
         this.sqlGuard = sqlGuard;
+        this.writeGuard = writeGuard;
+    }
+
+    /** 旧签名：只读场景（探测、测试）用，不需要写护栏。 */
+    MySqlSession(ConnectorInstance instance, DataSource dataSource, String database, ReadOnlySqlGuard sqlGuard) {
+        this(instance, dataSource, database, sqlGuard, new WriteSqlGuard());
     }
 
     // ================================================================ 探测三步
@@ -305,6 +317,91 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
         if (v == null) return 4;
         if (v instanceof String s) return s.getBytes(StandardCharsets.UTF_8).length;
         return 16;
+    }
+
+    // ================================================================ 能写
+
+    /**
+     * 执行一条写语句。
+     *
+     * <h3>★ 三道闸，缺一不可</h3>
+     * <ol>
+     *   <li><b>语句护栏</b>（{@link WriteSqlGuard}）——单条 DML，且 UPDATE/DELETE 必须带 WHERE。</li>
+     *   <li><b>影响行数上限 + 回滚</b>——带了 WHERE 也可能命中远超预期的行（{@code WHERE 1=1} 同样合法）。
+     *       这一层只能在<b>执行之后、提交之前</b>判定：事前估算不可靠，而不可靠的那次
+     *       恰恰是要防的那次。</li>
+     *   <li><b>客户侧账号权限</b>——平台放行了，数据库仍可能拒。这是唯一不由我们承重的一层，
+     *       也是最可靠的一层。</li>
+     * </ol>
+     *
+     * <h3>为什么必须显式关掉连接的 readOnly</h3>
+     * 连接池对每条连接设了 {@code readOnly=true}（只读的纵深防御之一），而 Connector/J 是
+     * <b>在客户端就拦下</b>写语句的——不关掉的话，写操作根本发不到服务端，
+     * 报的还是一个 {@code errorCode=0} 的含糊错误。用完必须恢复，否则这条连接还回池里之后
+     * 会带着「可写」状态被下一次查询拿到。
+     */
+    @Override
+    public WriteResult execute(String statement, WriteOptions options) {
+        WriteSqlGuard.Verdict verdict = writeGuard.check(statement);
+        String sql = verdict.effectiveSql();
+
+        long start = System.currentTimeMillis();
+        try (Connection c = borrow()) {
+            boolean originalAutoCommit = c.getAutoCommit();
+            try {
+                c.setReadOnly(false);
+                // 手动事务：拿到影响行数之后才决定 commit 还是 rollback。
+                c.setAutoCommit(false);
+                int affected;
+                try (Statement st = c.createStatement()) {
+                    st.setQueryTimeout(options.timeoutSec());
+                    affected = st.executeUpdate(sql);
+                }
+                if (affected > options.maxAffectedRows()) {
+                    c.rollback();
+                    log.warn("写操作影响行数超限已回滚 connectorId={} table={} affected={} max={}",
+                            instance.id(), verdict.targetTable(), affected, options.maxAffectedRows());
+                    throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                            "这条语句会影响 " + affected + " 行，超过平台单次上限 "
+                                    + options.maxAffectedRows() + " 行。"
+                                    + "已回滚，数据未被修改。请缩小 WHERE 的范围后分批执行");
+                }
+                c.commit();
+                return new WriteResult(affected, sql, System.currentTimeMillis() - start);
+            } catch (ConnectorException e) {
+                throw e;
+            } catch (SQLException e) {
+                safeRollback(c);
+                throw classify(e, "写入");
+            } finally {
+                // 还回池之前恢复原状：池里的连接是复用的，带着 autoCommit=false 或 readOnly=false
+                // 回去，下一次查询就会拿到一条状态不对的连接——而且不报错。
+                restore(c, originalAutoCommit);
+            }
+        } catch (SQLException e) {
+            throw classify(e, "写入");
+        }
+    }
+
+    private void safeRollback(Connection c) {
+        try {
+            c.rollback();
+        } catch (SQLException e) {
+            log.warn("写操作回滚失败 connectorId={}", instance.id(), e);
+        }
+    }
+
+    private void restore(Connection c, boolean originalAutoCommit) {
+        try {
+            c.setAutoCommit(originalAutoCommit);
+        } catch (SQLException e) {
+            log.warn("恢复 autoCommit 失败 connectorId={}", instance.id(), e);
+        }
+        try {
+            c.setReadOnly(true);
+        } catch (SQLException e) {
+            log.warn("恢复 readOnly 失败 connectorId={}", instance.id(), e);
+        }
     }
 
     // ================================================================ 能自描述

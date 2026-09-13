@@ -17,6 +17,8 @@ import java.util.Map;
  * @param params      非敏感参数，来自 {@code config_json}，已按 {@link ParamSpec} 归一
  * @param credential  敏感参数明文。单值型连接器直接是那个值；多值型是一段 JSON
  * @param transport   {@code direct} | {@code tunnel}
+ * @param writePolicy 写操作开放程度。<b>永不为 null</b>——解析不出来一律落到
+ *                    {@link WritePolicy#FORBIDDEN}，见该枚举的 parse 注释
  */
 public record ConnectorInstance(
         Long id,
@@ -26,11 +28,21 @@ public record ConnectorInstance(
         String displayName,
         Map<String, Object> params,
         String credential,
-        String transport
+        String transport,
+        WritePolicy writePolicy
 ) {
 
     public ConnectorInstance {
         params = params == null ? Map.of() : Map.copyOf(params);
+        // 紧凑构造器里兜底：任何构造路径（含测试）都不可能造出一个 writePolicy 为 null 的实例，
+        // 于是下游不需要到处判空，也不会有人"顺手"把 null 当成"没限制"。
+        writePolicy = writePolicy == null ? WritePolicy.FORBIDDEN : writePolicy;
+    }
+
+    /** 旧签名的便利构造：不指定写策略时一律按只读。 */
+    public ConnectorInstance(Long id, String tenantId, String kind, String name, String displayName,
+                             Map<String, Object> params, String credential, String transport) {
+        this(id, tenantId, kind, name, displayName, params, credential, transport, WritePolicy.FORBIDDEN);
     }
 
     public String str(String key) {

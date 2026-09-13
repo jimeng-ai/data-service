@@ -66,7 +66,7 @@ class ConnectorServiceDryRunTest {
         when(cipher.encrypt(anyString())).thenReturn("cipher-text");
 
         // 用真实的 MySqlConnector 拿 paramSpec（参数校验是 dryRun 的第一道），其余依赖 mock 掉。
-        Connector mysql = new MySqlConnector(dataSourceManager, null, null);
+        Connector mysql = new MySqlConnector(dataSourceManager, null, null, null);
         when(registry.supports("MYSQL")).thenReturn(true);
         when(registry.require("MYSQL")).thenReturn(mysql);
         when(registry.find("MYSQL")).thenReturn(java.util.Optional.of(mysql));

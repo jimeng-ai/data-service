@@ -82,5 +82,23 @@
       },
       "required": ["connector", "operation"]
     }
+  },
+  {
+    "name": "conn_execute",
+    "description": "在某个连接器上执行一条【会改变数据】的语句（INSERT / UPDATE / DELETE）。需要 write 能力：conn_list 返回的 capabilities 里没有 write 就不要调用，绝大多数连接只开放查询。【这是在改客户的生产数据】动手前必须确认清楚要改什么、改多少行；改错了不可撤销，而且往往过很久才被发现。【先查后改，不是客套】强烈建议先用 conn_query 把将要被影响的行查出来（把 UPDATE / DELETE 的 WHERE 原样搬进 SELECT），把行数和几条样例内容告诉用户、得到用户明确确认之后，再调用本工具。【不要自己决定批量范围】「把所有超期订单改成已取消」这类请求里，「所有」到底是多少条只有查过才知道——先查出来给用户看，不要直接推一条 UPDATE。【UPDATE / DELETE 必须带 WHERE】平台会直接拒绝不带 WHERE 的语句；一次也只接受一条语句；建表 / 改表 / TRUNCATE / REPLACE / 存储过程调用一律不开放。【单次影响行数上限】平台有单次影响行数上限（返回里的 max_affected_rows），超过会【整条回滚】，此时返回 error=forbidden 且 detail 里写明实际会影响多少行——数据【未被修改】，不是改了一半。遇到这种情况要把实际行数和上限如实告诉用户，并主动提出缩小 WHERE 范围（按时间切片、按 ID 区间、按状态细分）分批执行的方案。【affected_rows = 0 不是成功】通常意味着 WHERE 没有命中任何行，不要报告「已完成修改」，应回头用 conn_query 确认目标数据是否存在、条件是否写错。【可能返回待审批】返回里若含 pending_approval=true 和 approval_id，表示操作【尚未执行】、数据没有任何改变，必须如实告诉用户「已提交审批，等待管理员确认」并给出 approval_id，绝不能说「已完成」「已修改」。【如实呈现】已执行时返回 statement（平台实际执行的语句）、affected_rows 和 committed，回答用户时要把语句和行数一起给出。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "连接器名字，取自 conn_list 返回的 connector 字段，必须原样填写"
+        },
+        "statement": {
+          "type": "string",
+          "description": "你自己写的写语句。只接受单条 INSERT / UPDATE / DELETE，且 UPDATE / DELETE 必须带 WHERE 条件；写之前先用 conn_describe 确认列名与类型，再用 conn_query 确认这个 WHERE 到底命中多少行"
+        }
+      },
+      "required": ["connector", "statement"]
+    }
   }
 ]

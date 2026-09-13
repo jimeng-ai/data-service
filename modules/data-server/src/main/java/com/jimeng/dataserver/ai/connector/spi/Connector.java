@@ -59,4 +59,28 @@ public interface Connector {
      * @throws com.jimeng.dataserver.ai.connector.error.ConnectorException 连不上 / 凭据错 / 配置错
      */
     ConnectorSession open(ConnectorInstance instance);
+
+    /**
+     * 生成一段「在你自己的数据库上执行这个，就能给平台开一个刚好够用的账号」的脚本。
+     *
+     * <p><b>为什么这段方言知识必须落在连接器里，而不是前端拼字符串：</b>
+     * MySQL 是 {@code GRANT SELECT ON `db`.*}；PostgreSQL 要
+     * {@code GRANT SELECT ON ALL TABLES IN SCHEMA}，还得再管一次 {@code DEFAULT PRIVILEGES}
+     * （否则客户之后新建的表平台一律看不见，表现成「加了张表怎么查不到」）；Oracle 又是另一套。
+     * 连标识符引用都不一样（MySQL 反引号、PG 双引号）。前端既写不对也转义不对，
+     * 而它<b>每加一种类型就得改一次</b>——这正是 {@link #paramSpec()} 驱动表单要消灭的那类改动。
+     *
+     * <p>所以约定与 paramSpec 相同：<b>新增类型时顺手写自己那段，前端零改动</b>。
+     *
+     * <p>实现方必须自己兑现的一件事：{@link GrantRequest} 里的库名 / 表名 / 账号名<b>全是用户输入</b>，
+     * 拼进 SQL 之前必须校验 + 按方言引用。<b>校验不过要直接抛，不要试图转义了事</b>——
+     * 生成一段带分号的「库名」，客户复制执行就等于替别人执行了一条语句，
+     * 而这段脚本天然会被信任（是平台给的）。
+     *
+     * @return {@code null} 表示这种类型不提供脚本（例如 HTTP 连接器，授权发生在对方系统里，
+     *         没有「一段 SQL」可给）。调用方要把它翻译成「本类型暂不提供」，而不是当成失败。
+     */
+    default GrantScript grantScript(GrantRequest req) {
+        return null;
+    }
 }

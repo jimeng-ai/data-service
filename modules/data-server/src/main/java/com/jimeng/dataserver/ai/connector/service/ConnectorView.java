@@ -38,6 +38,12 @@ public class ConnectorView {
     private String transport;
     private String status;
 
+    @Schema(description = "写操作开放程度：FORBIDDEN | REQUIRE_APPROVAL | AUTO")
+    private String writePolicy;
+
+    @Schema(description = "写策略的中文名，直接展示：只读 / 写需审批 / 写自动")
+    private String writePolicyLabel;
+
     @Schema(description = "探测后回填的实际可用能力")
     private List<String> capabilities;
 
