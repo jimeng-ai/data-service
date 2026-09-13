@@ -242,13 +242,14 @@ public class ClaudeProtocolAdapter implements AiProtocolAdapter {
         return false;
     }
 
+    /** 取不到值返回空串。JSON 里的 null 也算取不到 —— 见 {@link JsonNulls}。 */
     private String str(Object v) {
-        return v == null ? "" : String.valueOf(v).trim();
+        return JsonNulls.isNull(v) ? "" : String.valueOf(v).trim();
     }
 
     private int toInt(Object v) {
         if (v instanceof Number n) return n.intValue();
-        if (v == null) return 0;
+        if (JsonNulls.isNull(v)) return 0;
         try { return Integer.parseInt(String.valueOf(v)); } catch (NumberFormatException e) { return 0; }
     }
 

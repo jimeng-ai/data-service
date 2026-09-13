@@ -171,7 +171,9 @@ public class OpenAiProtocolAdapter implements AiProtocolAdapter {
         Object msg = choice.get("message");
         if (!(msg instanceof Map<?, ?> message)) return null;
         Object content = message.get("content");
-        return content == null ? null : String.valueOf(content).trim();
+        // ★ JSON null 必须与「没这个字段」同等对待：上游只回 tool_calls 时 content 就是 null，
+        //   写成 content == null 会让这里返回字符串 "null" 当作助手正文（见 JsonNulls）。
+        return JsonNulls.isNull(content) ? null : String.valueOf(content).trim();
     }
 
     @Override
@@ -290,7 +292,7 @@ public class OpenAiProtocolAdapter implements AiProtocolAdapter {
             if (!(fnObj instanceof Map<?, ?> rawFn)) continue;
             Map<String, Object> fn = castMap(rawFn);
             if (StrUtil.isBlank(str(fn.get("name")))) continue;
-            fn.put("arguments", fn.get("arguments") == null ? "{}" : String.valueOf(fn.get("arguments")));
+            fn.put("arguments", JsonNulls.isNull(fn.get("arguments")) ? "{}" : String.valueOf(fn.get("arguments")));
             tc.put("type", StrUtil.blankToDefault(str(tc.get("type")), "function"));
             tc.put("function", fn);
             normalized.add(tc);
@@ -331,12 +333,12 @@ public class OpenAiProtocolAdapter implements AiProtocolAdapter {
         return str(tool.get("name"));
     }
 
-    private String str(Object v) { return v == null ? "" : String.valueOf(v).trim(); }
+    private String str(Object v) { return JsonNulls.isNull(v) ? "" : String.valueOf(v).trim(); }
 
     private int toInt(Object first, Object second) {
         Object v = first != null ? first : second;
         if (v instanceof Number n) return n.intValue();
-        if (v == null || StrUtil.isBlank(String.valueOf(v))) return 0;
+        if (JsonNulls.isNull(v) || StrUtil.isBlank(String.valueOf(v))) return 0;
         try { return Integer.parseInt(String.valueOf(v)); } catch (NumberFormatException e) { return 0; }
     }
 

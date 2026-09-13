@@ -278,6 +278,93 @@ class AnthropicOverOpenAiAdapterTest {
         }
     }
 
+    /**
+     * 这一组全部来自一次真实故障：用 {@code deepseek-reasoner} 提问，界面上先刷出几百个连着的
+     * {@code null}，然后才是正文。
+     *
+     * <h3>根因</h3>
+     * Hutool 把 JSON 里的 {@code null} 解析成 {@link cn.hutool.json.JSONNull} 单例，<b>不是 Java null</b>：
+     * {@code o == null} 为 false、{@code String.valueOf(o)} 得到<b>字符串 "null"</b>。
+     * 而 reasoner 类模型每产生一个思考 token 就发一帧，帧里 {@code content} 恰恰是 null
+     * （真正的内容在 {@code reasoning_content}）。
+     *
+     * <h3>为什么必须有回归测试</h3>
+     * 它不抛异常、不打日志，而且<b>看得见的刷屏还只是表层</b>：同样的 "null" 会被累加进要落库的
+     * 助手消息，下一轮对话原样喂回模型。判空写成 {@code == null} 是所有人的默认写法，
+     * 没有这组用例钉着，下次改动会原样把它写回来。
+     */
+    @Nested
+    @DisplayName("JSON null（reasoner 思考帧）不能变成字符串 \"null\"")
+    class JsonNull归零 {
+
+        private String frame(String content) {
+            return JSONUtil.toJsonStr(Map.of("choices", List.of(Map.of("delta", Map.of("content", content)))));
+        }
+
+        /** deepseek-reasoner 的思考帧：content 是 null，内容在 reasoning_content。 */
+        private static final String 思考帧 =
+                "{\"choices\":[{\"delta\":{\"content\":null,\"reasoning_content\":\"让我想想\"},"
+                        + "\"finish_reason\":null}]}";
+
+        @Test
+        @DisplayName("思考帧整帧丢弃，不往前端发任何东西")
+        void 思考帧不下发() {
+            assertNull(adapter.transformDeltaFrame(思考帧));
+        }
+
+        @Test
+        @DisplayName("★ 思考帧不得混进落库的助手消息 —— 它会被喂回下一轮")
+        void 思考帧不进历史() {
+            AiStreamAccumulator acc = adapter.createStreamAccumulator();
+            for (int i = 0; i < 5; i++) {
+                acc.accumulateEvent("message", 思考帧);
+            }
+            acc.accumulateEvent("message", frame("杭州"));
+            acc.accumulateEvent("message", "[DONE]");
+
+            Map<String, Object> out = acc.buildResponseMap();
+            String text = String.valueOf(map(list(out.get("content")).get(0)).get("text"));
+            assertEquals("杭州", text);
+            assertFalse(text.contains("null"), "助手消息里出现了字面量 null：" + text);
+        }
+
+        @Test
+        @DisplayName("非流式：只回 tool_calls 时 content 是 null，不能多出一个 \"null\" 文本块")
+        void 非流式只回工具调用时不产生null文本块() {
+            String resp = "{\"id\":\"x\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"finish_reason\":\"tool_calls\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\","
+                    + "\"function\":{\"name\":\"conn_query\",\"arguments\":\"{}\"}}]}}]}";
+            Map<String, Object> out = adapter.fromUpstreamResponse(JSONUtil.toBean(resp, Map.class));
+
+            List<Object> blocks = list(out.get("content"));
+            assertEquals(1, blocks.size(), "content 里多出了块：" + blocks);
+            assertEquals("tool_use", map(blocks.get(0)).get("type"));
+            assertEquals("tool_use", out.get("stop_reason"));
+        }
+
+        @Test
+        @DisplayName("finish_reason 为 JSON null 时不能被当成一个叫 \"null\" 的结束原因")
+        void finishReason为null不算结束原因() {
+            AiStreamAccumulator acc = adapter.createStreamAccumulator();
+            acc.accumulateEvent("message", 思考帧);
+            acc.accumulateEvent("message",
+                    "{\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"tool_calls\"}]}");
+            acc.accumulateEvent("message", "[DONE]");
+            // 最后一帧才是真正的结束原因；思考帧里的 JSON null 不能把它覆盖掉。
+            assertEquals("tool_use", acc.buildResponseMap().get("stop_reason"));
+        }
+
+        @Test
+        @DisplayName("tool_choice 为 JSON null 时落回 auto，而不是发一个字符串 \"null\" 上去")
+        void toolChoice为null落回auto() {
+            Map<String, Object> body = Map.of(
+                    "messages", List.of(Map.of("role", "user", "content", "hi")),
+                    "tools", List.of(Map.of("name", "t", "input_schema", Map.of())),
+                    "tool_choice", JSONUtil.toBean("{\"type\":null}", Map.class));
+            assertEquals("auto", adapter.toUpstreamBody(body).get("tool_choice"));
+        }
+    }
+
     @Test
     @DisplayName("默认的三个转换点在同协议 adapter 上是恒等的")
     void 同协议adapter不受影响() {

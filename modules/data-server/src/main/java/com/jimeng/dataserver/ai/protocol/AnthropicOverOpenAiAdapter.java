@@ -161,7 +161,8 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
             Object tc = body.get("tool_choice");
             if (tc instanceof Map<?, ?> tcm) {
                 Object type = tcm.get("type");
-                out.put("tool_choice", type == null ? "auto" : String.valueOf(type));
+                // JSON null 也要落回 "auto"：把字符串 "null" 发上去是个非法的 tool_choice。
+                out.put("tool_choice", JsonNulls.isNull(type) ? "auto" : String.valueOf(type));
             }
         }
         return out;
@@ -417,14 +418,14 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
 
     /** tool_result 的 content 可能是字符串，也可能是内容块数组。openai 只认字符串。 */
     private static String flattenToolResultContent(Object content) {
-        if (content == null) return "";
+        if (JsonNulls.isNull(content)) return "";
         if (content instanceof String s) return s;
         StringBuilder sb = new StringBuilder();
         for (Object b : asList(content)) {
             Map<String, Object> block = asMap(b);
             if (block == null) continue;
             Object t = block.get("text");
-            sb.append(t == null ? JSONUtil.toJsonStr(block) : String.valueOf(t));
+            sb.append(JsonNulls.isNull(t) ? JSONUtil.toJsonStr(block) : String.valueOf(t));
         }
         return sb.length() == 0 ? JSONUtil.toJsonStr(content) : sb.toString();
     }
@@ -465,14 +466,15 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
         return o instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
     }
 
+    /** 取不到值返回 null。JSON 里的 null 也算取不到 —— 见 {@link JsonNulls}。 */
     private static String str(Object o) {
-        return o == null ? null : String.valueOf(o);
+        return JsonNulls.isNull(o) ? null : String.valueOf(o);
     }
 
     private static int intOf(Object o) {
         if (o instanceof Number n) return n.intValue();
         try {
-            return o == null ? 0 : Integer.parseInt(String.valueOf(o).trim());
+            return JsonNulls.isNull(o) ? 0 : Integer.parseInt(String.valueOf(o).trim());
         } catch (NumberFormatException e) {
             return 0;
         }
