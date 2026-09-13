@@ -26,12 +26,20 @@ import java.util.stream.Collectors;
 @Component
 public class JimengTenantLineHandler implements TenantLineHandler {
 
-    /** 内置的租户隔离表清单。新增表后请补充这里（或通过 {@code tenant.tenant-tables} 配置追加）。 */
+    /**
+     * 内置的租户隔离表清单。新增表后请补充这里（或通过 {@code tenant.extra-tenant-tables} 配置追加）。
+     *
+     * <p>配置键就是下面 {@code @Value} 读的那个 {@code tenant.extra-tenant-tables}。
+     * （这段注释原先写的是 {@code tenant.tenant-tables}，根本不存在。按错键名配不报错、
+     * 也不警告，只是那张表静默地没有租户过滤——正是本文件最想防的那类错。）
+     */
     private static final Set<String> TENANT_AWARE_TABLES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
             "agent",
             "agent_skill",
             "connection",
             "agent_connection",
+            "connector_schema",
+            "connector_audit",
             "skill_eval_run",
             "chat_conversation",
             "chat_message",

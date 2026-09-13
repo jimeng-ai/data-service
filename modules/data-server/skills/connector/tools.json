@@ -1,0 +1,86 @@
+[
+  {
+    "name": "conn_list",
+    "description": "列出当前 Agent 被授权使用的外部系统连接器。返回每个连接器的 connector（调用其它 conn_* 工具时必须原样填这个名字）、display_name、kind（mysql / http 等）、capabilities（query=可执行查询 / describe=可看目录与结构 / invoke=可调用接口）、health_state 与 readonly_verified。任何一次外部系统操作都从这里开始——不要凭印象猜连接器名字。若返回 count=0，说明本 Agent 没有接入任何外部系统，请如实告知用户，不要编造数据。",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "conn_catalog",
+    "description": "列出某个连接器里有哪些对象（数据库 → 表和视图；HTTP → 接口清单）。只返回名字、子类型和一句注释，很便宜，可以放心先调。需要 describe 能力。在写任何查询语句之前先调它确认对象真实存在——凭空猜表名是这里最常见的错误来源。若返回 truncated=true，说明对象太多已被截断，这不是全部对象，找不到目标时应向用户确认名称而不是断言「系统里没有」。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "连接器名字，取自 conn_list 返回的 connector 字段，必须原样填写"
+        }
+      },
+      "required": ["connector"]
+    }
+  },
+  {
+    "name": "conn_describe",
+    "description": "查看某一个对象的结构（表的列名、类型、可空、列注释；HTTP 接口的参数）。需要 describe 能力。写查询语句前必须先看结构：列名、类型和注释决定了你该怎么写条件、怎么聚合，也决定了这张表到底是不是你要的那张。不要一次把整库都 describe 一遍，按需取。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "连接器名字，取自 conn_list"
+        },
+        "object": {
+          "type": "string",
+          "description": "对象标识，取自 conn_catalog 返回的 entries[].name"
+        }
+      },
+      "required": ["connector", "object"]
+    }
+  },
+  {
+    "name": "conn_query",
+    "description": "在某个连接器上执行一条你自己写的查询语句（数据库连接器就是 SQL）。需要 query 能力。【语句由你来写，平台不替你生成】平台只做安全护栏：只读校验、强制行数与字节上限、超时、并发限制、审计、错误归一；它不理解你的语句要做什么，也不会替你修正口径。【调用顺序】conn_list → conn_catalog → conn_describe → conn_query，不要跳过前三步凭空猜表名和列名。【结果必须如实呈现】返回里带 statement（平台实际执行的语句，可能被注入了 LIMIT）和 row_count（命中行数），回答用户时要同时给出这两样，不要只丢一个数字——只给数字会让口径错误彻底失去被发现的机会。【截断】truncated=true 表示结果不是全集，不能据此下任何「总共 / 最多 / 没有」之类的结论，应改用聚合、加过滤条件或缩小时间范围后重查。【零结果】没查到不等于业务上不存在，也可能是表选错了或条件写错了，要如实说明而不是断言。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "连接器名字，取自 conn_list"
+        },
+        "statement": {
+          "type": "string",
+          "description": "你自己写的查询语句。只读语句（数据库连接器只接受 SELECT 类语句，写操作会被拒绝）"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "返回行数上限（可选）。不传用平台默认值；超过平台上限会被夹到上限、不报错，返回里的 limit 字段是实际生效的值，若与你传的不同请在回答里说明"
+        }
+      },
+      "required": ["connector", "statement"]
+    }
+  },
+  {
+    "name": "conn_invoke",
+    "description": "在某个连接器上执行一次操作（HTTP 连接器即发起一次接口调用）。需要 invoke 能力。operation 与 params 的合法取值先用 conn_catalog / conn_describe 查清楚，不要猜接口路径。返回 status（上游状态码）与 body；truncated=true 表示响应体过大已被截断，内容不完整。连接器只被授予只读权限，不要尝试写类操作。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "连接器名字，取自 conn_list"
+        },
+        "operation": {
+          "type": "string",
+          "description": "操作标识。HTTP 连接器形如 \"GET /v1/orders\"，取自 conn_catalog 返回的 entries[].name"
+        },
+        "params": {
+          "type": "object",
+          "description": "操作参数（可选）。字段名与含义见 conn_describe 返回的 fields"
+        }
+      },
+      "required": ["connector", "operation"]
+    }
+  }
+]

@@ -31,12 +31,22 @@ class JimengTenantLineHandlerTest {
         assertEquals("tenant_id", handler.getTenantIdColumn());
     }
 
+    /**
+     * 注意这个测试<b>不校验白名单的完备性</b>：它只逐条断言"已经想到的表在里面"，
+     * 新加一张带 tenant_id 的表却忘了登记时，它照样绿。
+     * 这是一个已知的门禁缺口——真正的防线仍然是"加表时手工补白名单 + 补这里的断言"。
+     * 要堵住它得反过来做（扫实体上的 tenant_id 字段，反查白名单），目前没做。
+     */
     @Test
     void ignoreTable_tenantAwareTablesReturnFalse() {
         assertFalse(handler.ignoreTable("agent"));
         assertFalse(handler.ignoreTable("agent_skill"));
         assertFalse(handler.ignoreTable("connection"));
         assertFalse(handler.ignoreTable("agent_connection"));
+        // 连接器框架的两张新表：自描述缓存里有客户的表名/字段名，审计里有客户的语句原文，
+        // 漏登记就是跨租户静默泄露。
+        assertFalse(handler.ignoreTable("connector_schema"));
+        assertFalse(handler.ignoreTable("connector_audit"));
         assertFalse(handler.ignoreTable("knowledge_base"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));
