@@ -8,6 +8,7 @@ import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorUpsert;
+import com.jimeng.dataserver.ai.connector.service.ProbeOutcome;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaView;
 import io.swagger.v3.oas.annotations.Operation;
@@ -78,6 +79,28 @@ public class ConnectorAdminController {
     public ConnectorView get(@PathVariable Long id) {
         superAdminGuard.requireSuperAdmin();
         return connectorService.get(id);
+    }
+
+    /**
+     * 试连：按表单里的参数实际连一次，<b>不落库</b>。
+     *
+     * <p>「创建并验证」本来就会先探测、探不过就拒绝落库，所以配错的连接进不了库。
+     * 但那要求你<b>先提交才知道对不对</b>，改一版就得再提交一版。这个接口把验证从提交里拆出来，
+     * 让人能在表单上反复调到通为止。
+     *
+     * <p>跑的是同一套三步探测，所以这里过了创建就一定过——不存在「试连说行、创建又说不行」的分叉。
+     *
+     * <p>探测失败<b>不返回错误状态</b>：失败原因本来就是这个接口要回答的东西，
+     * 抛异常会让前端拿不到「探到了哪些能力」「只读判定是哪一种」这些同样有用的信息。
+     *
+     * @param id 编辑态传原连接 id，用于「敏感参数留空 = 沿用原值」；新建不传
+     */
+    @Operation(summary = "试连（不落库；编辑态传 id 以沿用原凭据）")
+    @PostMapping("/probe")
+    public ProbeOutcome probe(@RequestBody ConnectorUpsert req,
+                              @RequestParam(value = "id", required = false) Long id) {
+        superAdminGuard.requireSuperAdmin();
+        return connectorService.dryRun(req, id);
     }
 
     @Operation(summary = "新建连接器（保存前会实际探测：连通性 + 只读校验 + 能力，探不过则拒绝保存）")

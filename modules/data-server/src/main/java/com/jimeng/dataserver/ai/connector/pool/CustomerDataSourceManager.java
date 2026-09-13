@@ -230,6 +230,28 @@ public class CustomerDataSourceManager {
     private ConnectorException classify(Exception e, ConnectorInstance inst) {
         log.warn("客户库建池失败 connectorId={} kind={} tenantId={}", inst.id(), inst.kind(), inst.tenantId(), e);
 
+        // 先按 MySQL 的具体错误码判：它们比 SQLState 精确得多，而「库名填错」是最常见的一种配错，
+        // 兜底文案（「请检查主机、端口、库名与驱动参数」）等于让人四个方向一起试。
+        Integer errorCode = findErrorCode(e);
+        if (errorCode != null) {
+            switch (errorCode) {
+                // 1049 / 1044 给同一句话，是因为 MySQL 侧本来就不可区分：
+                // 对一个没有该库权限的账号，MySQL 返回的是 1044（access denied）而不是 1049（unknown database）——
+                // 这是它刻意的信息隐藏，不想泄露「这个库存不存在」。我们照实说两种可能，
+                // 不要假定库一定存在（那会让一个手抖打错库名的人一直去查授权）。
+                case 1049:  // ER_BAD_DB_ERROR
+                case 1044:  // ER_DBACCESS_DENIED_ERROR
+                    return ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                            "这个账号访问不了该库：库名可能填错了，或者这个账号还没有被授予该库的只读权限"
+                                    + "（数据库侧 GRANT SELECT ON 库名.* TO 账号）");
+                case 1045:  // ER_ACCESS_DENIED_ERROR
+                    return ConnectorException.of(ConnectorErrorCode.AUTH_FAILED,
+                            "数据库拒绝了这把凭据：用户名或密码不正确");
+                default:
+                    break;
+            }
+        }
+
         String sqlState = findSqlState(e);
         if (sqlState != null) {
             // 28xxx = invalid authorization specification（MySQL 密码错 / 该账号不允许从本机登录）
@@ -255,6 +277,16 @@ public class CustomerDataSourceManager {
         // 此时失败几乎都是参数问题（库名不存在、端口指向了别的服务、驱动参数非法）。
         return ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
                 "建立数据库连接池失败，请检查主机、端口、库名与驱动参数是否正确");
+    }
+
+    /** 同 {@link #findSqlState}：错误码也可能被 Hikari 包了好几层。0 不算有效码（驱动自造的异常常是 0）。 */
+    private static Integer findErrorCode(Throwable t) {
+        for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
+            if (c instanceof SQLException sqlEx && sqlEx.getErrorCode() != 0) {
+                return sqlEx.getErrorCode();
+            }
+        }
+        return null;
     }
 
     /** 驱动不一定把 SQLState 挂在最外层（Hikari 会用 PoolInitializationException 包一层），要顺着 cause 找。 */

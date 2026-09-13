@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
@@ -71,6 +72,20 @@ public class ConnectorService {
     private final ConnectorProbeService probeService;
     private final CustomerDataSourceManager dataSourceManager;
     private final CredentialCipher cipher;
+
+    /**
+     * 试连用的合成实例 id。
+     *
+     * <p><b>为什么不能用真实 id，两个理由都致命：</b>
+     * <ul>
+     *   <li>新建时<b>根本没有</b> id——连接池按 {@code connection.id} 分桶，
+     *       传 null 直接 NPE（这个坑踩过一次）。</li>
+     *   <li>编辑时<b>更不能用</b>真实 id——那会拿【未保存的】参数去替换掉正在服务的连接池，
+     *       一次失败的试连就能把线上正在跑的查询打断。</li>
+     * </ul>
+     * 用递减的负数：雪花 id 恒为正，永不冲突；每次调用取一个新的，并发试连之间也不会互相顶掉池。
+     */
+    private final java.util.concurrent.atomic.AtomicLong probeIdSeq = new java.util.concurrent.atomic.AtomicLong(-1);
 
     // ================================================================ 类型元数据
 
@@ -141,6 +156,66 @@ public class ConnectorService {
         }
         log.info("创建连接器实例 id={} kind={} name={}", row.getId(), row.getKind(), row.getName());
         return toView(row);
+    }
+
+    /**
+     * 试连：按表单里的参数实际连一次，<b>不落库</b>。
+     *
+     * <p>与「创建并验证」跑的是同一套 {@link ConnectorProbeService} 三步探测（探活 → 验只读 → 探能力），
+     * 所以这里过了，创建就一定过——不存在「试连说行、创建又说不行」的分叉。
+     *
+     * <p>用完立刻销毁连接池：一条可能永远不会被创建的连接，不该在客户库上留一个常驻的池。
+     *
+     * @param existingId 编辑态传原连接 id，用于「敏感参数留空 = 沿用原值」；新建传 null
+     */
+    public ProbeOutcome dryRun(ConnectorUpsert req, Long existingId) {
+        if (req == null || req.getKind() == null || !registry.supports(req.getKind())) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "不支持的连接器类型：" + (req == null ? null : req.getKind()));
+        }
+        Connector connector = registry.require(req.getKind());
+
+        Connection row = new Connection();
+        row.setKind(connector.kind());
+        row.setStatus("ACTIVE");
+        row.setTransport("direct");
+        // 名字只是占位：试连不落库，也不参与寻址。给个固定值免得 apply 里的空值判断绕圈。
+        row.setName(req.getName() == null || req.getName().isBlank() ? "__probe__" : req.getName().trim());
+        // 试连不落库，tenantId 只影响日志与池名，但还是填上——排查时能看出是哪个租户在试。
+        row.setTenantId(TenantContext.get());
+
+        Connection existing = existingId == null ? null : requireRow(existingId);
+        if (existing != null && !ConnectorRegistry.normalize(existing.getKind()).equals(connector.kind())) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "不能用另一种类型的参数试连这条连接");
+        }
+        apply(row, req, connector, existing);
+
+        // 合成 id 只在这一次调用内有效。
+        Long probeId = probeIdSeq.getAndDecrement();
+        row.setId(probeId);
+        try {
+            ConnectorInstance inst = loader.load(row);
+            ConnectorProbeService.ProbeReport report = probeService.probe(inst);
+            return ProbeOutcome.builder()
+                    .ok(report.ok())
+                    .failureReason(report.failureReason())
+                    .capabilities(report.capabilities() == null ? List.of()
+                            : report.capabilities().stream().map(Capability::name).toList())
+                    .readonlyVerified(report.readOnly() != null && report.readOnly().acceptable())
+                    .readonlyUndetermined(report.readOnly() != null && report.readOnly().undetermined())
+                    .readonlyDetail(report.readOnly() == null ? null : report.readOnly().detail())
+                    .build();
+        } catch (ConnectorException e) {
+            // 参数本身就有问题（主机非法、缺凭据…）——这也是试连要回答的问题，不该抛成 500。
+            return ProbeOutcome.builder()
+                    .ok(false)
+                    .failureReason(e.getSafeDetail() == null ? e.getCode().title() : e.getSafeDetail())
+                    .capabilities(List.of())
+                    .build();
+        } finally {
+            // 池不在事务里，也不会被别人回收——必须显式销毁，否则每点一次「测试连接」
+            // 就在客户库上留一个池，直到空闲回收才消失。
+            dataSourceManager.invalidate(probeId);
+        }
     }
 
     @Transactional
