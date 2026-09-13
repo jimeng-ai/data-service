@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
+import com.jimeng.dataserver.ai.connector.model.WritePlan;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
@@ -340,6 +341,14 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
      * 报的还是一个 {@code errorCode=0} 的含糊错误。用完必须恢复，否则这条连接还回池里之后
      * 会带着「可写」状态被下一次查询拿到。
      */
+    @Override
+    public WritePlan plan(String statement) {
+        // 只过护栏，不借连接。走到这里的语句将原样进审批队列，批准后由 execute() 再跑一次同一道护栏
+        // ——两次结论必然一致（同一个 guard、同一段文本），所以入队的就是将来执行的。
+        WriteSqlGuard.Verdict verdict = writeGuard.check(statement);
+        return new WritePlan(verdict.effectiveSql(), verdict.operation(), verdict.targetTable());
+    }
+
     @Override
     public WriteResult execute(String statement, WriteOptions options) {
         WriteSqlGuard.Verdict verdict = writeGuard.check(statement);

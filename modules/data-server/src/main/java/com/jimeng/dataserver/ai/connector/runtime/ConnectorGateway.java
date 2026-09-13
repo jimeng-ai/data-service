@@ -6,18 +6,25 @@ import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
+import com.jimeng.dataserver.ai.connector.model.WriteOutcome;
+import com.jimeng.dataserver.ai.connector.model.WritePlan;
+import com.jimeng.dataserver.ai.connector.model.WriteResult;
 import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteService;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
 import com.jimeng.dataserver.ai.connector.spi.WritePolicy;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteCapable;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.mapper.AgentConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -84,6 +91,17 @@ public class ConnectorGateway {
         T apply(ConnectorSession session);
     }
 
+    /**
+     * 内部版的 {@link Op}，多收一个 agentId。
+     *
+     * <p>存在的唯一理由：写审批入队时要记下「是哪个 Agent 提的」，而那个 agentId 正是第 4 步
+     * {@code requireAuthorized} 刚刚判定出来的。让入队方自己再从 {@code AgentContext} 取一遍，
+     * 就出现了同一个事实的两处来源——将来授权判定一改（比如支持代跑），两处就会分叉。
+     */
+    private interface BoundOp<T> {
+        T apply(ConnectorSession session, Long agentId);
+    }
+
     private final ConnectionMapper connectionMapper;
     private final AgentConnectionMapper agentConnectionMapper;
     private final ConnectorRegistry registry;
@@ -91,6 +109,27 @@ public class ConnectorGateway {
     private final ConnectorProperties properties;
     private final ConnectorAuditService auditService;
     private final RedisTemplate<String, Object> redisTemplate;
+
+    /**
+     * ★ 用 {@link ObjectProvider} 而不是直接注入：{@code PendingWriteService} 反过来依赖本类
+     * （批准之后要走网关执行那条语句），构造期直接注入会成环、启动即失败。
+     *
+     * <p>为什么不是仓库里更常见的 {@code @Lazy}：本类用 {@code @RequiredArgsConstructor}，
+     * 而 Lombok 不会把字段上的 {@code @Lazy} 抄到构造器参数上（没有 lombok.config 的
+     * copyableAnnotations），要用就得把这个八个字段的构造器手写出来。ObjectProvider 同样是
+     * 延迟解析，且它本身就写明了「这里有意不在构造期拿」。
+     *
+     * <p>放在字段列表<b>最后</b>是有意的：{@code @RequiredArgsConstructor} 按字段声明顺序生成
+     * 构造器，插在中间会让所有按位置构造本类的地方（测试）静默错位——编译期未必报错，
+     * 报错时也只是一句 NoSuchMethod，看不出是顺序问题。
+     *
+     * <h4>为什么审批入队必须由网关发起，而不是上一层的工具层</h4>
+     * 写策略的三档是<b>一个</b>判断：FORBIDDEN 拒、REQUIRE_APPROVAL 入队、AUTO 执行。
+     * 把其中一档挪到工具层，等于让「写需审批」这道闸变成可绕过的——
+     * 将来任何一个新的写入口（另一个工具、一个内部任务）只要没抄那段分支，
+     * 这条连接就会从「写需审批」悄悄退化成「写自动」。这正是本次修复的那个缺陷。
+     */
+    private final ObjectProvider<PendingWriteService> pendingWrites;
 
     /**
      * 每实例并发闸。
@@ -139,6 +178,56 @@ public class ConnectorGateway {
 
     /** 按名字执行一次能力调用。模型寻址用的是名字，不是 id。 */
     public <T> T execute(String connectorName, Capability required, String operationForAudit, Op<T> op) {
+        Connection row = preflight(connectorName, required);
+        return executeOn(row, required, operationForAudit, (session, agentId) -> op.apply(session));
+    }
+
+    /**
+     * 写操作专用入口。与 {@link #execute} 的唯一差别：它认写策略的<b>第三档</b>。
+     *
+     * <ul>
+     *   <li>{@code FORBIDDEN} —— 在下面第 6.5 步被拒，和走 {@code execute} 完全一样。</li>
+     *   <li>{@code REQUIRE_APPROVAL} —— <b>只解析不执行</b>，把语句连同「改哪张表、做什么」
+     *       一起入审批队列，返回单号。</li>
+     *   <li>{@code AUTO} —— 直接执行。</li>
+     * </ul>
+     *
+     * <h4>★ 为什么这一档不能写进 {@link #execute} 里</h4>
+     * 因为 {@code PendingWriteService.approve()} 批准之后，正是回过头来调 {@code execute()}
+     * 去执行那条语句的。若把「REQUIRE_APPROVAL 就入队」塞进 {@code execute}，
+     * 批准的动作会再入一次队，永远执行不到——审批变成一个自己咬自己的循环。
+     * 所以 {@code execute} 保持「纯执行」，分档只在这个入口发生。
+     *
+     * <h4>入队也要走完整的 4～7 步</h4>
+     * 入队路径同样经过 Agent 授权、状态校验、能力校验、限流与审计。
+     * 没被授权的 Agent 连「提交一条待审批」都不该做得到——否则它可以用垃圾请求淹掉审批队列，
+     * 或者赌某个超管会顺手点批准（批准执行时会按<b>当初那个 Agent</b> 判权限，所以最终仍拦得住，
+     * 但把明知会被拒的东西放进别人的待办列表，本身就是一次成功的骚扰）。
+     */
+    public WriteOutcome executeWrite(String connectorName, String statement, WriteOptions options,
+                                     String operationForAudit) {
+        Connection row = preflight(connectorName, Capability.WRITE);
+        WritePolicy policy = WritePolicy.parse(row.getWritePolicy());
+
+        if (policy == WritePolicy.REQUIRE_APPROVAL) {
+            // 入队那一条单独命名：它在 connector_audit 里必须与「真的写进去了」长得不一样，
+            // 否则事后翻审计时会把一次提交读成一次写入。
+            Long approvalId = executeOn(row, Capability.WRITE, operationForAudit + ".submit", (session, agentId) -> {
+                WritePlan plan = writeCapable(session, row).plan(statement);
+                return pendingWrites.getObject().submit(
+                        row.getId(), row.getName(), row.getTenantId(), agentId,
+                        plan.operation(), plan.targetTable(), plan.effectiveStatement());
+            });
+            return WriteOutcome.pending(approvalId);
+        }
+
+        WriteResult result = executeOn(row, Capability.WRITE, operationForAudit,
+                (session, agentId) -> writeCapable(session, row).execute(statement, options));
+        return WriteOutcome.done(result);
+    }
+
+    /** 第 1～3 步：总开关、租户上下文、按名字找实例。两个入口共用。 */
+    private Connection preflight(String connectorName, Capability required) {
         // ---- 1 总开关 ----
         if (!properties.isEnabled()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
@@ -154,8 +243,11 @@ public class ConnectorGateway {
         }
 
         // ---- 3 找实例 ----
-        Connection row = findByName(connectorName);
+        return findByName(connectorName);
+    }
 
+    /** 第 4～9 步。实例已解析出来，剩下的横切层对两个入口完全一致。 */
+    private <T> T executeOn(Connection row, Capability required, String operationForAudit, BoundOp<T> op) {
         // ---- 4 Agent 授权 ----
         Long agentId = requireAuthorized(row);
 
@@ -216,7 +308,7 @@ public class ConnectorGateway {
         // ---- 8 执行 + 9 审计与错误归一 ----
         long start = System.currentTimeMillis();
         try (ConnectorSession session = connector.open(inst)) {
-            T result = op.apply(session);
+            T result = op.apply(session, agentId);
             auditService.record(inst, agentId, required, operationForAudit,
                     auditStatement(operationForAudit, result), rowCountOf(result),
                     System.currentTimeMillis() - start, true, null, null);
@@ -276,6 +368,17 @@ public class ConnectorGateway {
                             + "请先用 conn_list 查看可用连接");
         }
         return agentId;
+    }
+
+    /**
+     * 网关已按 {@code capability_flags} 放行了 WRITE，但会话类压根没实现写——说明标记与实现分叉。
+     * 直接强转抛出的 {@code ClassCastException} 会被下面归成「目标系统返回了错误」，
+     * 把排查方向带到客户系统上，而问题在我们这边。
+     */
+    private static WriteCapable writeCapable(ConnectorSession session, Connection row) {
+        if (session instanceof WriteCapable w) return w;
+        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                "连接「" + row.getName() + "」的类型不支持写操作");
     }
 
     private void assertUsable(Connection row) {
@@ -398,12 +501,22 @@ public class ConnectorGateway {
         if (result instanceof com.jimeng.dataserver.ai.connector.model.QueryResult qr) {
             return qr.effectiveStatement();
         }
+        // 写操作更需要留痕：查询留不下语句顶多是排查费劲，写操作留不下语句就是「数据被改了但没人知道改的是什么」。
+        if (result instanceof WriteResult wr) {
+            return wr.effectiveStatement();
+        }
+        // 入队路径返回的是审批单 id，没有「已执行的语句」可记——语句在 connector_pending_write 里，
+        // 那才是它此刻的唯一权威副本。抄一份到审计表只会制造两个可能分叉的版本。
         return null;
     }
 
     private static Integer rowCountOf(Object result) {
         if (result instanceof com.jimeng.dataserver.ai.connector.model.QueryResult qr) {
             return qr.rowCount();
+        }
+        // 写操作的「行数」是被改动的行数——审计表里这一列对写和读是同一个含义：这次调用碰了多少行。
+        if (result instanceof WriteResult wr) {
+            return wr.affectedRows();
         }
         return null;
     }

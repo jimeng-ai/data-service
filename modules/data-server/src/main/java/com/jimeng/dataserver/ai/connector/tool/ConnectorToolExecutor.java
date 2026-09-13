@@ -9,7 +9,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.InvokeResult;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
-import com.jimeng.dataserver.ai.connector.model.WriteResult;
+import com.jimeng.dataserver.ai.connector.model.WriteOutcome;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorGateway;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorSummary;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -17,7 +17,6 @@ import com.jimeng.dataserver.ai.connector.spi.cap.DescribeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.InvokeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryOptions;
-import com.jimeng.dataserver.ai.connector.spi.cap.WriteCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
 import com.jimeng.dataserver.ai.skill.service.SkillToolExecutor;
 import lombok.RequiredArgsConstructor;
@@ -325,18 +324,33 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         var w = properties.getWrite();
         WriteOptions options = new WriteOptions(w.getMaxAffectedRows(), w.getTimeoutSeconds());
 
-        WriteResult result = connectorGateway.execute(connector, Capability.WRITE, TOOL_EXECUTE,
-                session -> writeCapable(session).execute(statement, options));
+        // 分档（拒 / 入队 / 执行）在网关里判，这里只负责把两种归宿翻译成模型读得懂的两种形状。
+        WriteOutcome outcome = connectorGateway.executeWrite(connector, statement, options, TOOL_EXECUTE);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("connector", connector);
         // 上限主动回给模型：它据此才能在动手前就把大批量拆成几批，而不是先撞一次回滚再来问。
         // 撞回滚本身是安全的（数据没变），但它会多烧一轮对话，还会让用户以为出了故障。
         out.put("max_affected_rows", w.getMaxAffectedRows());
-        if (result != null) {
+
+        if (outcome != null && outcome.pendingApproval()) {
+            out.put("pending_approval", true);
+            // 雪花 id 按字符串下发：仓库的既定契约（JS 的 Number 放不下 19 位整数，
+            // 静默丢精度之后模型报给用户的单号会对不上）。
+            out.put("approval_id", String.valueOf(outcome.approvalId()));
+            out.put("committed", false);
+            // ★ 这段话是写给模型看的，措辞是有意的：
+            //   「未执行」必须说死，否则模型很容易把「已提交」讲成「已改好」；
+            //   「不要重试」也必须说死，否则它下一轮会以为是失败，再提交一条一模一样的进队列。
+            out.put("message", "这条写操作需要人工审批，已提交审批队列，数据尚未被修改。"
+                    + "请如实告诉用户「已提交审批，等待管理员处理」，不要声称修改已完成，也不要重复提交同一条语句。");
+            return out;
+        }
+
+        if (outcome != null && outcome.result() != null) {
             // toModelPayload() 带着平台实际执行的语句、影响行数、committed 标记，以及 0 行时的告警。
             // 写操作比查询更要亮出过程：改了几行、改的是哪条语句，是事后唯一能核对的东西。
-            out.putAll(result.toModelPayload());
+            out.putAll(outcome.result().toModelPayload());
         }
         return out;
     }
@@ -358,13 +372,6 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     private static InvokeCapable invokeCapable(Object session) {
         if (session instanceof InvokeCapable c) return c;
         throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持调用（invoke）能力");
-    }
-
-    private static WriteCapable writeCapable(Object session) {
-        if (session instanceof WriteCapable c) return c;
-        // 走到这里说明 capability_flags 里有 WRITE、写策略也放行了，但实现类压根没实现写——
-        // 三者分叉。强转抛出的 ClassCastException 会把实现类全名带进回灌模型的 payload。
-        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持写入（write）能力");
     }
 
     // ------------------------------------------------------------------ 入参与错误

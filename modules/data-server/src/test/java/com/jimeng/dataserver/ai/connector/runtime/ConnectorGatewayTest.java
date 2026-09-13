@@ -6,11 +6,17 @@ import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
+import com.jimeng.dataserver.ai.connector.model.WriteOutcome;
+import com.jimeng.dataserver.ai.connector.model.WritePlan;
+import com.jimeng.dataserver.ai.connector.model.WriteResult;
 import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteService;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.Connector;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteCapable;
+import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.mapper.AgentConnectionMapper;
@@ -19,6 +25,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.RedisTemplate;
 
 import java.util.List;
@@ -26,10 +33,16 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.withSettings;
 import static org.mockito.Mockito.when;
 
 /**
@@ -48,6 +61,7 @@ class ConnectorGatewayTest {
     private ConnectorProperties properties;
     private ConnectorRegistry registry;
     private ConnectorInstanceLoader loader;
+    private PendingWriteService pendingWriteService;
     private ConnectorGateway gateway;
 
     @BeforeEach
@@ -58,6 +72,9 @@ class ConnectorGatewayTest {
         properties = new ConnectorProperties();
         registry = mock(ConnectorRegistry.class);
         loader = mock(ConnectorInstanceLoader.class);
+        pendingWriteService = mock(PendingWriteService.class);
+        ObjectProvider<PendingWriteService> pendingWrites = mock(ObjectProvider.class);
+        when(pendingWrites.getObject()).thenReturn(pendingWriteService);
         gateway = new ConnectorGateway(
                 connectionMapper,
                 agentConnectionMapper,
@@ -65,7 +82,8 @@ class ConnectorGatewayTest {
                 loader,
                 properties,
                 mock(ConnectorAuditService.class),
-                mock(RedisTemplate.class));
+                mock(RedisTemplate.class),
+                pendingWrites);
         TenantContext.set("t1");
         AgentContext.set(AgentRuntimeView.builder().agentId(7L).tenantId("t1").build());
     }
@@ -273,5 +291,94 @@ class ConnectorGatewayTest {
         assertEquals(ConnectorErrorCode.CONFIG_ERROR, e.getCode());
         // 原始异常文本不准出现在对外文案里。
         assertTrue(!e.getMessage().contains("db-prod-01"));
+    }
+
+    // ================================================================ 写策略三档
+    //
+    // ★ 这三条是本类里最贴合「坏掉的时候不吵闹」那句话的用例。
+    //   REQUIRE_APPROVAL 这一档曾经<b>整档失效</b>：网关只拦 FORBIDDEN，
+    //   其余两档都直接落到执行——界面上写着「写需审批」，实际行为与「写自动」一模一样，
+    //   没有任何报错、日志或异常能暴露它。没有回归保护，同一个缺陷会以同样的方式再回来。
+
+    /** 一条可写连接（capability_flags 带 WRITE）+ 会话同时实现 WriteCapable。 */
+    private WriteCapable givenWritableConnector(String policy) {
+        Connection c = row();
+        c.setCapabilityFlags("QUERY,DESCRIBE,WRITE");
+        c.setWritePolicy(policy);
+        givenRow(c);
+        givenGranted(true);
+        ConnectorInstance inst = new ConnectorInstance(
+                100L, "t1", "MYSQL", "crm", "CRM", Map.of(), "pwd", "direct");
+        when(loader.load(any(Connection.class))).thenReturn(inst);
+        Connector connector = mock(Connector.class);
+        when(registry.require("MYSQL")).thenReturn(connector);
+        ConnectorSession session = mock(ConnectorSession.class,
+                withSettings().extraInterfaces(WriteCapable.class));
+        when(connector.open(inst)).thenReturn(session);
+        return (WriteCapable) session;
+    }
+
+    private static final WriteOptions OPTS = new WriteOptions(100, 10);
+    private static final String SQL = "UPDATE orders SET status='PAID' WHERE id=1";
+
+    @Test
+    @DisplayName("写策略=只读 → 拒绝，且连解析都不做")
+    void 写策略只读时拒绝() {
+        WriteCapable w = givenWritableConnector("FORBIDDEN");
+
+        ConnectorException e = assertThrows(ConnectorException.class,
+                () -> gateway.executeWrite("crm", SQL, OPTS, "conn_execute"));
+
+        assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+        // 一行都不该动，也不该进审批队列——「只读」就是「这条路整个不通」。
+        verify(w, never()).execute(anyString(), any());
+        verify(pendingWriteService, never())
+                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("写策略=写需审批 → 只入队，绝不执行")
+    void 写策略需审批时入队不执行() {
+        WriteCapable w = givenWritableConnector("REQUIRE_APPROVAL");
+        when(w.plan(SQL)).thenReturn(new WritePlan(SQL, "UPDATE", "orders"));
+        when(pendingWriteService.submit(anyLong(), anyString(), anyString(), anyLong(),
+                anyString(), anyString(), anyString())).thenReturn(999L);
+
+        WriteOutcome outcome = gateway.executeWrite("crm", SQL, OPTS, "conn_execute");
+
+        assertTrue(outcome.pendingApproval());
+        assertEquals(999L, outcome.approvalId());
+        // ★ 这一条是整组用例的重点：返回了单号，但客户库上一行都没动。
+        assertNull(outcome.result());
+        verify(w, never()).execute(anyString(), any());
+        // 入队记录的必须是<b>护栏解析出来的</b>结论，不是让审批服务自己再解析一遍。
+        verify(pendingWriteService).submit(100L, "crm", "t1", 7L, "UPDATE", "orders", SQL);
+    }
+
+    @Test
+    @DisplayName("写策略=写自动 → 直接执行，不入队")
+    void 写策略自动时直接执行() {
+        WriteCapable w = givenWritableConnector("AUTO");
+        when(w.execute(SQL, OPTS)).thenReturn(new WriteResult(3, SQL, 12L));
+
+        WriteOutcome outcome = gateway.executeWrite("crm", SQL, OPTS, "conn_execute");
+
+        assertTrue(!outcome.pendingApproval());
+        assertEquals(3, outcome.result().affectedRows());
+        verify(pendingWriteService, never())
+                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString());
+    }
+
+    /**
+     * 写策略列为 null 是存量数据的常态（{@code write_policy} 这一列是后加的，
+     * 老行在 DDL 补上默认值之前可能是 NULL）。此时必须按最严的那档走。
+     */
+    @Test
+    @DisplayName("写策略为 null（存量行）→ 按只读拒绝，不是按放行兜底")
+    void 写策略为空时按只读处理() {
+        givenWritableConnector(null);
+        ConnectorException e = assertThrows(ConnectorException.class,
+                () -> gateway.executeWrite("crm", SQL, OPTS, "conn_execute"));
+        assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
     }
 }

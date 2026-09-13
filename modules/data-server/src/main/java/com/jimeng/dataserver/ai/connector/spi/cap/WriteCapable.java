@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.connector.spi.cap;
 
+import com.jimeng.dataserver.ai.connector.model.WritePlan;
 import com.jimeng.dataserver.ai.connector.model.WriteResult;
 
 /**
@@ -27,4 +28,18 @@ public interface WriteCapable {
      * @throws com.jimeng.dataserver.ai.connector.error.ConnectorException 已归一的失败
      */
     WriteResult execute(String statement, WriteOptions options);
+
+    /**
+     * 只跑护栏、<b>不执行</b>，回答「这条语句要对哪张表做什么」。
+     *
+     * <p>写策略是「写需审批」时走这条路：平台把结论连同语句一起入队，等人点批准之后
+     * 才会调 {@link #execute}。两条路共用同一道护栏，所以<b>不带 WHERE 的 UPDATE 在入队这一步就会被拒</b>——
+     * 一条注定执行失败的语句不应该先去占用一个人的审批时间。
+     *
+     * <p>实现方不得在这里借连接：它可能在没有任何网络可用的情况下被调用，
+     * 而且「解析一条语句」本来也不需要目标系统参与。
+     *
+     * @throws com.jimeng.dataserver.ai.connector.error.ConnectorException 护栏拒绝时抛出，与 execute 同一套错误
+     */
+    WritePlan plan(String statement);
 }

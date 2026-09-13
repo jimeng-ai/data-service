@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
+import com.jimeng.dataserver.ai.connector.model.WritePlan;
 import com.jimeng.dataserver.ai.connector.model.WriteResult;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorGateway;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
@@ -123,6 +124,15 @@ class PendingWriteServiceTest {
         @Override public ReadOnlyVerdict verifyReadOnly() { return null; }
         @Override public Set<Capability> probeCapabilities() { return Set.of(Capability.WRITE); }
         @Override public void close() {}
+
+        /**
+         * 审批路径永远不该走到这里：批准之后要执行的是<b>当初入队的那条语句</b>，
+         * 再 plan 一次就成了「人批准的」和「实际执行的」两次独立解析。抛异常把它钉死。
+         */
+        @Override
+        public WritePlan plan(String statement) {
+            throw new AssertionError("审批执行路径不该再解析一次语句");
+        }
 
         @Override
         public WriteResult execute(String statement, WriteOptions options) {

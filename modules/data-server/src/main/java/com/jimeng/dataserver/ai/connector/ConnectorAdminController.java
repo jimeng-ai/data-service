@@ -6,11 +6,18 @@ import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditQuery;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
+import com.jimeng.dataserver.ai.connector.service.GrantScriptRequestDto;
+import com.jimeng.dataserver.ai.connector.service.GrantScriptService;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteQuery;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteRejectDto;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorUpsert;
 import com.jimeng.dataserver.ai.connector.service.ProbeOutcome;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaView;
+import com.jimeng.dataserver.ai.connector.service.PendingWriteView;
+import com.jimeng.dataserver.ai.connector.spi.GrantScript;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -51,6 +58,8 @@ public class ConnectorAdminController {
     private final ConnectorService connectorService;
     private final ConnectorAuditService connectorAuditService;
     private final ConnectorSchemaService connectorSchemaService;
+    private final PendingWriteService pendingWriteService;
+    private final GrantScriptService grantScriptService;
     private final SuperAdminGuard superAdminGuard;
 
     /**
@@ -184,5 +193,64 @@ public class ConnectorAdminController {
         superAdminGuard.requireSuperAdmin();
         connectorService.delete(id);
         return Map.of("deleted", true);
+    }
+
+    // ================================================================ 授权脚本
+
+    /**
+     * 生成一段可直接复制执行的授权命令。
+     *
+     * <p><b>这个端点不碰任何一条已存在的连接</b>——它发生在连接建立<b>之前</b>：
+     * 客户还没有账号，正是要靠这段脚本去建。所以既不收 connectorId，也不写库。
+     *
+     * <p>把 {@code writePolicy} 一起收进来，是为了让「平台侧的闸」和「数据库侧的授权」
+     * 在同一个动作里对齐：策略选了只读，脚本就只 {@code GRANT SELECT}。
+     * 两边分开配置迟早会分叉，而分叉的方向通常是数据库那边授得更宽。
+     */
+    @Operation(summary = "生成授权脚本（建连接之前用，不落库）")
+    @PostMapping("/grant-script")
+    public GrantScript grantScript(@RequestBody GrantScriptRequestDto body) {
+        superAdminGuard.requireSuperAdmin();
+        return grantScriptService.generate(body.getKind(), body.toRequest());
+    }
+
+    // ================================================================ 写操作审批
+
+    @Operation(summary = "待审批写操作（分页；可按连接、Agent、状态筛选）")
+    @GetMapping("/pending-writes")
+    public Page<PendingWriteView> pendingWrites(PendingWriteQuery query) {
+        superAdminGuard.requireSuperAdmin();
+        return pendingWriteService.query(query);
+    }
+
+    /**
+     * 批准并执行。
+     *
+     * <h3>★ 返回 200 不等于「已批准并改好了」</h3>
+     * 这个方法<b>只有在记录不存在 / 不属于本租户时才抛异常</b>。其余四种结局都是正常返回，
+     * 真实结局写在返回体的 {@code status} 里：
+     * <ul>
+     *   <li>{@code APPROVED} —— 真的批了，也真的执行成功了（{@code affectedRows} 是影响行数）。</li>
+     *   <li>{@code FAILED} —— 批了，但在客户库上执行失败（{@code errorDetail} 是原因）。</li>
+     *   <li>{@code EXPIRED} —— 已过期，<b>没有执行</b>。陈年请求的 WHERE 今天命中的可能是另一批行。</li>
+     *   <li>{@code REJECTED} / 其它 —— 并发下被另一个操作者先处理了，本次<b>没有重复执行</b>。</li>
+     * </ul>
+     * 前端必须读 {@code status} 再决定提示语。无条件弹「已批准」是错的——
+     * 那会让人以为数据改好了，而实际可能一行没动。
+     */
+    @Operation(summary = "批准并执行（真实结局看返回体的 status，不要按 HTTP 200 判断）")
+    @PostMapping("/pending-writes/{id}/approve")
+    public PendingWriteView approvePendingWrite(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        return pendingWriteService.approve(id);
+    }
+
+    /** 拒绝。与批准同一套抢锁逻辑：已被别人处理过的直接返回真实状态，不覆盖别人的决定。 */
+    @Operation(summary = "拒绝（真实结局同样看返回体的 status）")
+    @PostMapping("/pending-writes/{id}/reject")
+    public PendingWriteView rejectPendingWrite(@PathVariable Long id,
+                                               @RequestBody(required = false) PendingWriteRejectDto body) {
+        superAdminGuard.requireSuperAdmin();
+        return pendingWriteService.reject(id, body == null ? null : body.getReason());
     }
 }
