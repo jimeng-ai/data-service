@@ -5,9 +5,11 @@ import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditQuery;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorUpsert;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaView;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -47,6 +49,7 @@ public class ConnectorAdminController {
 
     private final ConnectorService connectorService;
     private final ConnectorAuditService connectorAuditService;
+    private final ConnectorSchemaService connectorSchemaService;
     private final SuperAdminGuard superAdminGuard;
 
     /**
@@ -121,6 +124,30 @@ public class ConnectorAdminController {
      * <p>注意路径是 {@code /audit} 而不是 {@code /{id}/audit}：连接维度只是最常用的一种筛选，
      * 「某个 Agent 都访问过什么」同样是要回答的问题，做成 {@code /{id}/audit} 就把它挡死了。
      */
+    @Operation(summary = "已缓存的结构快照（表 / 列，含上次同步时间）")
+    @GetMapping("/{id}/schema")
+    public List<ConnectorSchemaView> schema(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        return connectorSchemaService.current(id);
+    }
+
+    /**
+     * 重新拉取结构并与上一份快照比对。
+     *
+     * <p>返回里的 {@code diffs} 才是这个接口的价值所在：<b>客户悄悄加了一个字段、删了一张表，
+     * 我们应该知道</b>——语义层（指标口径、业务名、样例问答）都挂在具体的表和列上，
+     * 结构一变挂在上面的口径就跟着失效，而这件事今天没有任何机制会发现。
+     *
+     * <p>注意它会对客户库发 1 + N 次 information_schema 查询（N = 对象数，封顶 200），
+     * 所以是<b>手动触发</b>的，没有做成定时任务。
+     */
+    @Operation(summary = "刷新结构快照并返回与上次的差异")
+    @PostMapping("/{id}/schema/refresh")
+    public ConnectorSchemaService.SnapshotResult refreshSchema(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        return connectorSchemaService.refresh(id);
+    }
+
     @Operation(summary = "使用记录（分页；可按连接、Agent、能力、成败、时间筛选）")
     @GetMapping("/audit")
     public Page<ConnectorAuditView> audit(ConnectorAuditQuery query) {

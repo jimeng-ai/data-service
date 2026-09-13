@@ -35,6 +35,7 @@ public class ConnectorProperties {
     private Pool pool = new Pool();
     private Limit limit = new Limit();
     private Invoke invoke = new Invoke();
+    private Health health = new Health();
 
     /** 「能查」的护栏。 */
     @Data
@@ -84,5 +85,23 @@ public class ConnectorProperties {
     public static class Invoke {
         private int timeoutSeconds = 20;
         private int maxResponseBytes = 262144;
+    }
+
+    /**
+     * 定时健康探测。
+     *
+     * <p><b>它只做 ping，不做接入探测那三步。</b>三步里的只读校验会往客户库发一条 UPDATE
+     * （靠权限拒绝来证明账号只读），那是录入时验一次的动作——每 5 分钟往客户的生产库发一次
+     * 写尝试，无论多无害都不可接受，客户的 DBA 看到审计日志会先来找我们。
+     *
+     * <p>间隔由 {@code connector.health.interval-ms} 控制（{@code @Scheduled} 直接读占位符，
+     * 所以改它要重启才生效）。
+     */
+    @Data
+    public static class Health {
+        /** 关掉之后界面上的健康态就只在「新建 / 编辑 / 点测试连接」时更新。 */
+        private boolean enabled = true;
+        /** 单次 ping 的超时由各连接器实现自己控制，这里限的是整轮扫描的总时长上限。 */
+        private int sweepTimeoutSeconds = 120;
     }
 }

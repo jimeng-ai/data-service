@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.runtime;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
@@ -101,9 +102,21 @@ public class ConnectorInstanceLoader {
             return null;
         }
         int version = row.getEncryptionVersion() == null ? 0 : row.getEncryptionVersion();
-        // CredentialCipher.decrypt 对 version < 1 会直接抛（拒绝明文回落），这里不做任何兜底——
-        // 兜底就等于把「这条其实没加密」这件事永久埋掉。
-        return cipher.decrypt(row.getCredentialCipher(), version);
+        try {
+            // CredentialCipher.decrypt 对 version < 1 会直接抛（拒绝明文回落），这里不做任何兜底——
+            // 兜底就等于把「这条其实没加密」这件事永久埋掉。
+            return cipher.decrypt(row.getCredentialCipher(), version);
+        } catch (ServiceException e) {
+            // ★ 归类必须在这里做。CredentialCipher 抛的是 ServiceException（common-core 的 Web 层异常），
+            // 不是 ConnectorException，于是它会一路穿到调用方的兜底 catch，把一条【可操作】的信息
+            // （「密钥轮换过，请重新填写凭据」）降级成「探测失败，请点测试连接查看详情」——
+            // 而点了测试连接才看到真正的原因，等于让人多绕一圈。
+            //
+            // 归到 AUTH_FAILED 而不是 CONFIG_ERROR：从使用者的角度，这就是「这把凭据用不了」。
+            log.warn("连接器凭据解密失败 connectorId={} encryptionVersion={}", row.getId(), version);
+            throw ConnectorException.of(ConnectorErrorCode.AUTH_FAILED,
+                    "连接凭据无法解密（多半是加密密钥已轮换），请在管理台重新填写凭据");
+        }
     }
 
     private Map<String, Object> readConfigJson(Connection row) {
