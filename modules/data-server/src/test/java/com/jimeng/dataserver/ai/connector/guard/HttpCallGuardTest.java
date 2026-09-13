@@ -48,7 +48,13 @@ class HttpCallGuardTest {
     class Methods {
 
         @Test
-        void 默认只读_POST被拒() {
+        /**
+         * ★ 这里断言的是 FORBIDDEN 而不是 GUARD_BLOCKED，而且这个区别是**有意的**：
+         * 对 HTTP 连接来说 allow_methods 就是「写策略」本身（HttpSession.verifyReadOnly 正是
+         * 拿它减去幂等方法来判只读），它是整条 HTTP 通路上唯一的写授权闸。
+         * 说成「护栏拦截、改写后重试」会让模型 POST → PUT → PATCH 一路撞同一个 admin 配置项。
+         */
+        void 默认只读_POST被拒_按权限而非护栏() {
             assertEquals(ConnectorErrorCode.FORBIDDEN, reject("POST", "/v1/x", null, null).getCode());
         }
 
@@ -87,14 +93,14 @@ class HttpCallGuardTest {
 
         @Test
         void 不命中被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("GET", "/v2/secrets", "GET", "[\"/v1/orders/**\"]").getCode());
         }
 
         @Test
         void 单星不跨段() {
             // /v1/* 只能匹配一段——否则「只许调订单列表」会悄悄变成「订单下面什么都能调」。
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("GET", "/v1/a/b", "GET", "[\"/v1/*\"]").getCode());
         }
 
@@ -133,7 +139,7 @@ class HttpCallGuardTest {
                 "/v1//../admin"
         })
         void 穿越被拒(String path) {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("GET", path, "GET", null).getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("GET", path, "GET", null).getCode());
         }
 
         @ParameterizedTest
@@ -143,7 +149,7 @@ class HttpCallGuardTest {
                 "//evil.com/x"
         })
         void 绝对URL被拒_目标主机只能由连接配置决定(String path) {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("GET", path, "GET", null).getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("GET", path, "GET", null).getCode());
         }
 
         @Test

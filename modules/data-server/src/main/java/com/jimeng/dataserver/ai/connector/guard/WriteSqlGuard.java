@@ -60,7 +60,7 @@ public class WriteSqlGuard {
         String trimmed = sql.trim();
 
         if (INTO_FILE.matcher(trimmed).find()) {
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "语句包含 INTO OUTFILE / DUMPFILE，会往数据库服务器磁盘写文件，已拒绝执行");
         }
 
@@ -81,7 +81,7 @@ public class WriteSqlGuard {
         }
         if (list.size() > 1) {
             // 写操作的多语句风险远大于查询：一条合法 UPDATE 后面跟一条 DROP，前一条还会给出成功的假象。
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "一次只能执行一条写语句，检测到 " + list.size() + " 条。请拆成多次调用");
         }
         Statement st = list.get(0);
@@ -89,14 +89,14 @@ public class WriteSqlGuard {
         String normalized = st.toString();
         var m = DANGEROUS.matcher(normalized);
         if (m.find()) {
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "语句中使用了被禁止的函数 " + m.group(1).toLowerCase(Locale.ROOT) + "()");
         }
 
         if (st instanceof Update up) {
             // ★ 本类最重要的一条。
             if (up.getWhere() == null) {
-                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "UPDATE 语句必须带 WHERE 条件。不带 WHERE 会改掉整张表——"
                                 + "如果确实要更新全表，请拆成带明确条件的多次操作");
             }
@@ -104,7 +104,7 @@ public class WriteSqlGuard {
         }
         if (st instanceof Delete del) {
             if (del.getWhere() == null) {
-                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "DELETE 语句必须带 WHERE 条件。不带 WHERE 会清空整张表——"
                                 + "如果确实要清空，请由数据库管理员在数据库侧操作");
             }
@@ -118,7 +118,7 @@ public class WriteSqlGuard {
 
         // 判据是解析出来的【类型】，不是关键字匹配：DDL、TRUNCATE、REPLACE、CALL、SET 全部落到这里。
         // 尤其 REPLACE：它看着像 INSERT，实际会先 DELETE 同键的行，作用范围完全不同。
-        throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+        throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                 "只允许 INSERT / UPDATE / DELETE，检测到的是 " + st.getClass().getSimpleName()
                         + "。建表、改表、清空表（TRUNCATE）、REPLACE、存储过程调用一律不开放");
     }

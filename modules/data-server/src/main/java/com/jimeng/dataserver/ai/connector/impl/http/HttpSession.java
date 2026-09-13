@@ -196,7 +196,8 @@ public class HttpSession implements ConnectorSession, InvokeCapable {
             String k = String.valueOf(e.getKey());
             if (PROTECTED_HEADERS.contains(k.toLowerCase(Locale.ROOT))) {
                 // 拒绝而不是静默忽略：静默忽略会让模型以为自己换了身份、然后对结果做出错误解读。
-                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                // 平台自己的受保护请求头白名单，请求没发出去；模型去掉这个头重发即可。
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "不允许自定义 " + k + " 请求头，身份与目标主机由连接配置决定");
             }
             rb.header(k, e.getValue() == null ? "" : String.valueOf(e.getValue()));

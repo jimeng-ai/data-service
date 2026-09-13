@@ -33,7 +33,7 @@ class ReadOnlySqlGuardTest {
         @Test
         void 堆叠语句被拒() {
             ConnectorException e = reject("SELECT 1; DROP TABLE users");
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
         }
 
         @Test
@@ -49,22 +49,22 @@ class ReadOnlySqlGuardTest {
 
         @Test
         void UPDATE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("UPDATE orders SET status = 1").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("UPDATE orders SET status = 1").getCode());
         }
 
         @Test
         void DELETE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("DELETE FROM orders").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("DELETE FROM orders").getCode());
         }
 
         @Test
         void DROP_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("DROP TABLE orders").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("DROP TABLE orders").getCode());
         }
 
         @Test
         void INSERT_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("INSERT INTO orders(id) VALUES (1)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("INSERT INTO orders(id) VALUES (1)").getCode());
         }
 
         @Test
@@ -86,13 +86,13 @@ class ReadOnlySqlGuardTest {
 
         @Test
         void INTO_OUTFILE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT * FROM orders INTO OUTFILE '/tmp/x.csv'").getCode());
         }
 
         @Test
         void INTO_变量_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT COUNT(*) INTO @c FROM orders").getCode());
         }
 
@@ -108,24 +108,24 @@ class ReadOnlySqlGuardTest {
 
         @Test
         void SLEEP_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("SELECT SLEEP(10)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("SELECT SLEEP(10)").getCode());
         }
 
         @Test
         void LOAD_FILE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT LOAD_FILE('/etc/passwd')").getCode());
         }
 
         @Test
         void BENCHMARK_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT BENCHMARK(1000000, MD5('x'))").getCode());
         }
 
         @Test
         void 大小写混写也被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("SELECT SlEeP(1)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("SELECT SlEeP(1)").getCode());
         }
 
         @Test
@@ -160,7 +160,7 @@ class ReadOnlySqlGuardTest {
 
         @Test
         void 无ON无WHERE的多表连接被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT * FROM a, b").getCode());
         }
 

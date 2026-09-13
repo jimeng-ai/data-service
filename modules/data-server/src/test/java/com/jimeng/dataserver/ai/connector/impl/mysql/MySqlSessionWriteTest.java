@@ -99,7 +99,8 @@ class MySqlSessionWriteTest {
             ConnectorException e = assertThrows(ConnectorException.class,
                     () -> session.execute(SQL, OPTS));
 
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            // 平台的行数闸 → 护栏拦截：模型的下一步是收窄 WHERE 分批做，不是去要权限。
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
             verify(conn).rollback();
             verify(conn, never()).commit();
             // 文案要让人（和模型）确信数据没变，否则接下来会有人去手工「补救」一次本没发生的修改。

@@ -80,7 +80,7 @@ public class ReadOnlySqlGuard {
 
         // ---- 文本层：只用来抓解析器可能看不见的构造，不作为主判据 ----
         if (INTO_FILE.matcher(trimmed).find() || INTO_VAR.matcher(trimmed).find()) {
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "语句包含 INTO OUTFILE / INTO DUMPFILE / INTO @变量，这属于写操作，已拒绝执行");
         }
 
@@ -102,16 +102,20 @@ public class ReadOnlySqlGuard {
         }
         if (list.size() > 1) {
             // 堆叠语句是最经典的绕过：`SELECT 1; DROP TABLE x`。
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "一次只能执行一条语句，检测到 " + list.size() + " 条。请拆成多次调用");
         }
         Statement st = list.get(0);
         if (!(st instanceof Select select)) {
             // 类型判据，而不是关键字判据——`WITH x AS (...) SELECT` 也是 Select，
             // 而 `/*!50000 DROP*/` 这种骗不过解析器。
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
-                    "只允许执行查询（SELECT），检测到的是 " + st.getClass().getSimpleName()
-                            + "。这条连接只被授予了只读权限");
+            // 文案刻意不提「这条连接只被授予了只读权限」：那句话会把模型推去要写权限，
+            // 而这里真正的下一步是【换工具】——写操作有独立的 conn_execute，
+            // 能不能写由连接的写策略决定，不由这个查询工具决定。
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
+                    "查询工具只接受 SELECT，检测到的是 " + st.getClass().getSimpleName()
+                            + "。如果确实要修改数据，请改用写操作工具（conn_execute）；"
+                            + "那条连接是否允许写由它的写策略决定");
         }
 
         // 用解析后重新序列化的文本做危险函数扫描：此时注释已被解析器消化，
@@ -119,7 +123,7 @@ public class ReadOnlySqlGuard {
         String normalized = select.toString();
         var m = DANGEROUS.matcher(normalized);
         if (m.find()) {
-            throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+            throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                     "语句中使用了被禁止的函数 " + m.group(1).toLowerCase(Locale.ROOT)
                             + "()，它会在客户的数据库上产生副作用或占用资源");
         }
@@ -137,7 +141,7 @@ public class ReadOnlySqlGuard {
     private void assertNoIntoTables(SelectBody body) {
         if (body instanceof PlainSelect ps) {
             if (ps.getIntoTables() != null && !ps.getIntoTables().isEmpty()) {
-                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "语句包含 SELECT ... INTO，这会写入数据，已拒绝执行");
             }
         } else if (body instanceof SetOperationList sol && sol.getSelects() != null) {
@@ -169,7 +173,7 @@ public class ReadOnlySqlGuard {
             boolean hasOn = j.getOnExpressions() != null && !j.getOnExpressions().isEmpty();
             // NATURAL JOIN 自带关联列，不算无界。
             if (!hasOn && !j.isNatural()) {
-                throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "多表查询既没有 JOIN ... ON 条件也没有 WHERE 条件，这会产生笛卡尔积并可能拖垮数据库。"
                                 + "请补上表之间的关联条件");
             }

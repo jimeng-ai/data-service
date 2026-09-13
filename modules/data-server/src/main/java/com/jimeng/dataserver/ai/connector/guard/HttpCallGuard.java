@@ -76,6 +76,11 @@ public class HttpCallGuard {
         }
         Set<String> allowedMethods = parseMethods(allowMethodsCsv);
         if (!allowedMethods.contains(m)) {
+            // ★ 这一处刻意<b>不</b>用 GUARD_BLOCKED：对 HTTP 连接来说 allow_methods 就是「写策略」本身
+            // （HttpSession.verifyReadOnly 正是拿它减去幂等方法来判只读，而 ConnectorGateway 的
+            // 写策略闸只对 Capability.WRITE 触发、HTTP 走的是 INVOKE，永远到不了那一步）。
+            // 它是整条 HTTP 通路上唯一的写授权闸，说成「改写后重试」会让模型
+            // POST → PUT → PATCH 一路撞同一个 admin 配置项。
             throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
                     "这条连接不允许 " + m + " 方法，当前允许的是 " + String.join(" / ", allowedMethods));
         }
@@ -84,7 +89,7 @@ public class HttpCallGuard {
         //    baseUrl 白名单与 SSRF 校验一起形同虚设。协议相对（//host/x）同理。
         String raw = path == null || path.isBlank() ? "/" : path.trim();
         if (isAbsolute(raw)) {
-            throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
+            throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED,
                     "path 只能是以 / 开头的相对路径，不能是完整 URL——目标主机由连接配置决定，不由调用方决定");
         }
         if (!raw.startsWith("/")) {
@@ -110,7 +115,7 @@ public class HttpCallGuard {
             }
         }
         if (!hit) {
-            throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
+            throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED,
                     "路径 " + rawPath + " 不在这条连接的允许范围内，允许的是 " + String.join(" / ", allowedPaths));
         }
 
@@ -236,14 +241,14 @@ public class HttpCallGuard {
         for (int i = 0; i < rawPath.length(); i++) {
             char c = rawPath.charAt(i);
             if (c < 0x20 || c == 0x7f || c == '\\') {
-                throw new ConnectorException(ConnectorErrorCode.FORBIDDEN, "path 含控制字符或反斜杠");
+                throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED, "path 含控制字符或反斜杠");
             }
         }
         if (lower.contains("%25")) {
-            throw new ConnectorException(ConnectorErrorCode.FORBIDDEN, "path 含二次编码（%25），已拒绝");
+            throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED, "path 含二次编码（%25），已拒绝");
         }
         if (lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c")) {
-            throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
+            throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED,
                     "path 含编码过的路径分隔符或点（%2e / %2f / %5c），已拒绝");
         }
         // 解码一次再复判：上面的字面量拒绝已经覆盖了已知变体，这一道是兜我们没想到的编码形式。
@@ -251,19 +256,19 @@ public class HttpCallGuard {
         try {
             decoded = URLDecoder.decode(rawPath, StandardCharsets.UTF_8);
         } catch (IllegalArgumentException e) {
-            throw new ConnectorException(ConnectorErrorCode.FORBIDDEN, "path 含非法的百分号编码");
+            throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED, "path 含非法的百分号编码");
         }
         for (String candidate : new String[]{rawPath, decoded}) {
             if (candidate.contains("//")) {
-                throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
+                throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED,
                         "path 含连续斜杠，不同服务端对它的归一方式不一致，一律拒绝");
             }
             if (candidate.indexOf('\\') >= 0) {
-                throw new ConnectorException(ConnectorErrorCode.FORBIDDEN, "path 含反斜杠");
+                throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED, "path 含反斜杠");
             }
             for (String seg : candidate.split("/", -1)) {
                 if (seg.equals("..") || seg.equals(".")) {
-                    throw new ConnectorException(ConnectorErrorCode.FORBIDDEN,
+                    throw new ConnectorException(ConnectorErrorCode.GUARD_BLOCKED,
                             "path 含相对段（. 或 ..），已拒绝");
                 }
             }

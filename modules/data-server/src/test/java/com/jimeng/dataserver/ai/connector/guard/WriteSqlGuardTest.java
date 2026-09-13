@@ -46,7 +46,7 @@ class WriteSqlGuardTest {
         @Test
         void UPDATE_不带WHERE_被拒() {
             ConnectorException e = reject("UPDATE orders SET status = 'CANCELLED'");
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
             // 文案要说清「为什么拒」和「该怎么办」：模型拿到的就是这句话，
             // 只说「被拒绝」它会原样重试一遍。
             assertTrue(e.getMessage().contains("WHERE"));
@@ -62,7 +62,7 @@ class WriteSqlGuardTest {
         @Test
         void DELETE_不带WHERE_被拒() {
             ConnectorException e = reject("DELETE FROM orders");
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
             assertTrue(e.getMessage().contains("WHERE"));
         }
 
@@ -120,7 +120,7 @@ class WriteSqlGuardTest {
         @Test
         void SELECT_被拒() {
             // 这是写通道，查询该走 conn_query。放行 SELECT 等于给只读护栏开了一条旁路。
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("SELECT * FROM orders").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("SELECT * FROM orders").getCode());
         }
     }
 
@@ -130,24 +130,24 @@ class WriteSqlGuardTest {
 
         @Test
         void DROP_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("DROP TABLE orders").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("DROP TABLE orders").getCode());
         }
 
         @Test
         void TRUNCATE_被拒() {
             // TRUNCATE 没有 WHERE 可带，效果等同「DELETE 全表」还不可回滚——
             // 恰恰是上面那条规则要防的事，必须单独挡住，不能因为它不是 Delete 类型就漏过去。
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("TRUNCATE TABLE orders").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("TRUNCATE TABLE orders").getCode());
         }
 
         @Test
         void ALTER_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("ALTER TABLE orders ADD COLUMN memo VARCHAR(64)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("ALTER TABLE orders ADD COLUMN memo VARCHAR(64)").getCode());
         }
 
         @Test
         void CREATE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("CREATE TABLE tmp_x (id INT)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("CREATE TABLE tmp_x (id INT)").getCode());
         }
 
         /**
@@ -161,19 +161,19 @@ class WriteSqlGuardTest {
         @Test
         void REPLACE_INTO_被拒() {
             ConnectorException e = reject("REPLACE INTO orders (id, status) VALUES (1, 'PAID')");
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
         }
 
         @Test
         void CALL_存储过程_被拒() {
             // 存储过程里干了什么平台完全看不见，护栏的任何一条都管不到它。
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("CALL settle_orders(1)").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("CALL settle_orders(1)").getCode());
         }
 
         @Test
         void SET_会话变量_被拒() {
             // SET autocommit = 0 会把框架的事务控制掀翻：影响行数超限时那条 rollback 就不再兜底。
-            assertEquals(ConnectorErrorCode.FORBIDDEN, reject("SET autocommit = 0").getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, reject("SET autocommit = 0").getCode());
         }
     }
 
@@ -190,7 +190,7 @@ class WriteSqlGuardTest {
         @Test
         void 堆叠语句被拒() {
             ConnectorException e = reject("UPDATE t SET a = 1 WHERE id = 1; DROP TABLE t");
-            assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
         }
 
         @Test
@@ -208,19 +208,19 @@ class WriteSqlGuardTest {
 
         @Test
         void SLEEP_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("UPDATE orders SET memo = CONCAT(memo, SLEEP(5)) WHERE id = 1").getCode());
         }
 
         @Test
         void LOAD_FILE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("UPDATE orders SET memo = LOAD_FILE('/etc/passwd') WHERE id = 1").getCode());
         }
 
         @Test
         void 大小写混写也被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("UPDATE orders SET memo = SlEeP(1) WHERE id = 1").getCode());
         }
 
@@ -237,13 +237,13 @@ class WriteSqlGuardTest {
 
         @Test
         void INTO_OUTFILE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT * FROM orders INTO OUTFILE '/tmp/x.csv'").getCode());
         }
 
         @Test
         void INTO_DUMPFILE_被拒() {
-            assertEquals(ConnectorErrorCode.FORBIDDEN,
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
                     reject("SELECT memo FROM orders INTO DUMPFILE '/tmp/x.bin'").getCode());
         }
 

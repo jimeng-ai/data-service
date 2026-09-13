@@ -370,7 +370,9 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                     c.rollback();
                     log.warn("写操作影响行数超限已回滚 connectorId={} table={} affected={} max={}",
                             instance.id(), verdict.targetTable(), affected, options.maxAffectedRows());
-                    throw ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
+                    // 平台自己的行数闸：语句虽然发到了客户库，但事务已回滚，数据库本身并没有拒绝。
+                    // 模型的下一步是收窄 WHERE 分批做，不是去要权限。
+                    throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                             "这条语句会影响 " + affected + " 行，超过平台单次上限 "
                                     + options.maxAffectedRows() + " 行。"
                                     + "已回滚，数据未被修改。请缩小 WHERE 的范围后分批执行");
