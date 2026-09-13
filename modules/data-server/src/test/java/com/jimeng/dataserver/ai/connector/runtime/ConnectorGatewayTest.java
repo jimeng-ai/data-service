@@ -333,7 +333,7 @@ class ConnectorGatewayTest {
         // 一行都不该动，也不该进审批队列——「只读」就是「这条路整个不通」。
         verify(w, never()).execute(anyString(), any());
         verify(pendingWriteService, never())
-                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString());
+                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString(), any());
     }
 
     @Test
@@ -341,8 +341,9 @@ class ConnectorGatewayTest {
     void 写策略需审批时入队不执行() {
         WriteCapable w = givenWritableConnector("REQUIRE_APPROVAL");
         when(w.plan(SQL)).thenReturn(new WritePlan(SQL, "UPDATE", "orders"));
+        when(w.estimateAffectedRows(SQL)).thenReturn(37);
         when(pendingWriteService.submit(anyLong(), anyString(), anyString(), anyLong(),
-                anyString(), anyString(), anyString())).thenReturn(999L);
+                anyString(), anyString(), anyString(), any())).thenReturn(999L);
 
         WriteOutcome outcome = gateway.executeWrite("crm", SQL, OPTS, "conn_execute");
 
@@ -352,7 +353,30 @@ class ConnectorGatewayTest {
         assertNull(outcome.result());
         verify(w, never()).execute(anyString(), any());
         // 入队记录的必须是<b>护栏解析出来的</b>结论，不是让审批服务自己再解析一遍。
-        verify(pendingWriteService).submit(100L, "crm", "t1", 7L, "UPDATE", "orders", SQL);
+        // 第 8 个参数是提交时预估的影响行数，它必须原样传到入队里——
+        // 审批的人光看一条 SQL 判不出它命中 3 行还是 30 万行，这个数是他唯一的范围参考。
+        verify(pendingWriteService).submit(100L, "crm", "t1", 7L, "UPDATE", "orders", SQL, 37);
+    }
+
+    /**
+     * ★ 预估只是给人的参考，不是准入条件。它挂了就该按「估不出来」处理，
+     * 而不是把一条本可以进审批队列的写请求挡在门外——那等于用一个可选功能的故障
+     * 去否决一个必要功能。
+     */
+    @Test
+    @DisplayName("预估影响行数失败 → 仍然入队，只是行数为空")
+    void 预估失败不挡入队() {
+        WriteCapable w = givenWritableConnector("REQUIRE_APPROVAL");
+        when(w.plan(SQL)).thenReturn(new WritePlan(SQL, "UPDATE", "orders"));
+        when(w.estimateAffectedRows(SQL)).thenThrow(new IllegalStateException("连接池炸了"));
+        when(pendingWriteService.submit(anyLong(), anyString(), anyString(), anyLong(),
+                anyString(), anyString(), anyString(), any())).thenReturn(1000L);
+
+        WriteOutcome outcome = gateway.executeWrite("crm", SQL, OPTS, "conn_execute");
+
+        assertTrue(outcome.pendingApproval(), "预估失败不该影响入队");
+        assertEquals(1000L, outcome.approvalId());
+        verify(pendingWriteService).submit(100L, "crm", "t1", 7L, "UPDATE", "orders", SQL, null);
     }
 
     @Test
@@ -366,7 +390,7 @@ class ConnectorGatewayTest {
         assertTrue(!outcome.pendingApproval());
         assertEquals(3, outcome.result().affectedRows());
         verify(pendingWriteService, never())
-                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString());
+                .submit(anyLong(), anyString(), anyString(), anyLong(), anyString(), anyString(), anyString(), any());
     }
 
     /**

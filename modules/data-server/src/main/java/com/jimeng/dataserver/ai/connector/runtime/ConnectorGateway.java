@@ -213,10 +213,20 @@ public class ConnectorGateway {
             // 入队那一条单独命名：它在 connector_audit 里必须与「真的写进去了」长得不一样，
             // 否则事后翻审计时会把一次提交读成一次写入。
             Long approvalId = executeOn(row, Capability.WRITE, operationForAudit + ".submit", (session, agentId) -> {
-                WritePlan plan = writeCapable(session, row).plan(statement);
+                WriteCapable w = writeCapable(session, row);
+                WritePlan plan = w.plan(statement);
+                // 预估影响行数：审批的人光看一条 SQL 判不出它命中 3 行还是 30 万行。
+                // 估算失败不能挡住入队——它是给人的参考，不是准入条件。
+                Integer estimated;
+                try {
+                    estimated = w.estimateAffectedRows(plan.effectiveStatement());
+                } catch (RuntimeException e) {
+                    log.warn("预估影响行数失败，按未知处理 connectorId={} op={}", row.getId(), plan.operation(), e);
+                    estimated = null;
+                }
                 return pendingWrites.getObject().submit(
                         row.getId(), row.getName(), row.getTenantId(), agentId,
-                        plan.operation(), plan.targetTable(), plan.effectiveStatement());
+                        plan.operation(), plan.targetTable(), plan.effectiveStatement(), estimated);
             });
             return WriteOutcome.pending(approvalId);
         }

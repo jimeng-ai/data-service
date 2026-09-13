@@ -42,4 +42,25 @@ public interface WriteCapable {
      * @throws com.jimeng.dataserver.ai.connector.error.ConnectorException 护栏拒绝时抛出，与 execute 同一套错误
      */
     WritePlan plan(String statement);
+
+    /**
+     * 估算这条语句<b>会改动多少行</b>——只在「写需审批」入队时调用，给审批的人看。
+     *
+     * <h3>为什么必须有它</h3>
+     * 审批页原本只展示语句原文。但**看语句判不了范围**：
+     * {@code UPDATE orders SET status='X' WHERE created_at < '2026-08-01'} 这条语句，
+     * 审批的人无从知道它命中 3 行还是 30 万行，而这正是他唯一需要判断的事。
+     * 影响行数原本只在<b>执行之后</b>才回填，那时候批已经批完了。
+     *
+     * <h3>它不是承诺</h3>
+     * 估算发生在<b>提交时</b>，执行发生在<b>批准时</b>，中间隔着人的思考时间，数据会变。
+     * 所以返回值只能当参考，界面上必须标明「提交时预估」。真正的防线仍是执行时的
+     * {@code maxAffectedRows} 整条回滚。
+     *
+     * <p>估不出来返回 {@code null}（例如 INSERT ... SELECT、或方言不支持），
+     * <b>不要抛异常</b>——估不出来不该阻止一条写请求进入审批队列。
+     */
+    default Integer estimateAffectedRows(String statement) {
+        return null;
+    }
 }

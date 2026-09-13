@@ -92,6 +92,13 @@ public class ConnectorPendingWrite extends BaseEntity {
     private Integer affectedRows;
 
     /**
+     * 提交时预估的影响行数。<b>不是承诺</b>——估算在提交时、执行在批准时，中间数据会变。
+     * 它存在的唯一理由是：审批的人光看语句判不出范围，而 {@code affectedRows}
+     * 要等执行完才有值，那时候批已经批完了。估不出来为 null。
+     */
+    private Integer estimatedRows;
+
+    /**
      * 失败 / 拒绝 / 过期的原因。
      *
      * <p><b>只放 {@code ConnectorException.getSafeDetail()} 或平台自己写的文案</b>，

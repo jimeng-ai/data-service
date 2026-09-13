@@ -101,7 +101,8 @@ public class PendingWriteService {
      * @return 落库后的 id
      */
     public Long submit(Long connectorId, String connectorName, String tenantId, Long agentId,
-                       String operation, String targetTable, String statementText) {
+                       String operation, String targetTable, String statementText,
+                       Integer estimatedRows) {
         if (tenantId == null || tenantId.isBlank()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "当前请求缺少租户上下文，无法提交写请求");
         }
@@ -131,6 +132,8 @@ public class PendingWriteService {
         row.setOperation(operation);
         row.setTargetTable(targetTable);
         row.setStatementText(statementText);
+        // 估不出来就留空——估不出来不该阻止一条写请求进入队列。
+        row.setEstimatedRows(estimatedRows);
         row.setStatus(STATUS_PENDING);
         // 取不到就留空：Agent 跑在异步线程上时 user-id 不一定捎带得到，
         // 而「提交人是谁」不是授权依据（授权依据是 agentId），缺了不影响正确性。
@@ -490,6 +493,11 @@ public class PendingWriteService {
                 .operation(r.getOperation())
                 .targetTable(r.getTargetTable())
                 .statementText(r.getStatementText())
+                // ★ 之前漏了这两个，而它们恰恰是审批时唯一能判断「该不该批」的信息：
+                //   traceId 让人回到「模型当时为什么要写这一条」，estimatedRows 给出影响范围。
+                //   只给一条 SQL 原文，人能做的只有走个过场。
+                .traceId(r.getTraceId())
+                .estimatedRows(r.getEstimatedRows())
                 .status(r.getStatus())
                 .affectedRows(r.getAffectedRows())
                 .errorDetail(r.getErrorDetail())

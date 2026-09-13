@@ -163,7 +163,7 @@ class PendingWriteServiceTest {
         // 要么 WHERE 少一半变成范围完全不同的更新——所以只能在入口拒，不能截。
         String huge = "UPDATE orders SET memo = '" + "x".repeat(20000) + "' WHERE id = 1";
         ConnectorException e = assertThrows(ConnectorException.class,
-                () -> service.submit(500L, "crm", "t1", 7L, "UPDATE", "orders", huge));
+                () -> service.submit(500L, "crm", "t1", 7L, "UPDATE", "orders", huge, null));
         assertEquals(ConnectorErrorCode.CONFIG_ERROR, e.getCode());
         verify(mapper, never()).insert(any());
     }
@@ -174,7 +174,7 @@ class PendingWriteServiceTest {
         // 批准时要按「当初那个 Agent」判权限；没有 agentId 就只剩「按点批准的人判」，
         // 那等于超管点一下就绕过了 Agent 授权。
         ConnectorException e = assertThrows(ConnectorException.class,
-                () -> service.submit(500L, "crm", "t1", null, "UPDATE", "orders", "UPDATE orders SET a=1 WHERE id=1"));
+                () -> service.submit(500L, "crm", "t1", null, "UPDATE", "orders", "UPDATE orders SET a=1 WHERE id=1", null));
         assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
         verify(mapper, never()).insert(any());
     }
@@ -183,7 +183,7 @@ class PendingWriteServiceTest {
     @DisplayName("提交落 PENDING、带过期时间、语句原样保存")
     void 提交落库() {
         String sql = "UPDATE orders SET status = 'PAID' WHERE id = 9";
-        service.submit(500L, "crm", "t1", 7L, "UPDATE", "orders", sql);
+        service.submit(500L, "crm", "t1", 7L, "UPDATE", "orders", sql, 42);
 
         ArgumentCaptor<ConnectorPendingWrite> cap = ArgumentCaptor.forClass(ConnectorPendingWrite.class);
         verify(mapper).insert(cap.capture());

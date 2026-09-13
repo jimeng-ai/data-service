@@ -46,6 +46,10 @@ public class WriteSqlGuard {
      */
     public record Verdict(String effectiveSql, String operation, String targetTable) {}
 
+    private static boolean isEmpty(java.util.List<?> l) {
+        return l == null || l.isEmpty();
+    }
+
     /** 与只读护栏同一份清单：这些函数在任何语句里都不该出现。 */
     private static final Pattern DANGEROUS = Pattern.compile(
             "(?i)\\b(load_file|sleep|benchmark|get_lock|release_lock|is_used_lock|master_pos_wait|"
@@ -94,6 +98,19 @@ public class WriteSqlGuard {
         }
 
         if (st instanceof Update up) {
+            // ★ 多表 UPDATE 必须拒。
+            //
+            // 不是因为它危险到不能做，是因为**它在审批环节是不可判的**：jsqlparser 的
+            // Update.getTable() 只返回第一张表，于是 `UPDATE a JOIN b SET a.x, b.y WHERE ...`
+            // 在待审批列表里显示成「UPDATE a」——改了两张表，人只看得见一张。
+            // 一个看不见全部影响面的审批，比没有审批更糟：它让人以为已经审过了。
+            //
+            // 让它改两张表的正确做法是拆成两条语句，每条各自过护栏、各自被看见。
+            if (!isEmpty(up.getJoins()) || !isEmpty(up.getStartJoins())) {
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
+                        "不允许多表 UPDATE（带 JOIN）。请拆成针对单张表的多条语句——"
+                                + "多表语句在审批时只能显示其中一张表，改了什么没人看得全");
+            }
             // ★ 本类最重要的一条。
             if (up.getWhere() == null) {
                 throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
@@ -103,6 +120,13 @@ public class WriteSqlGuard {
             return new Verdict(normalized, "UPDATE", tableName(up.getTable()));
         }
         if (st instanceof Delete del) {
+            // 同 UPDATE：多表 DELETE（`DELETE a, b FROM ...` / `USING` / JOIN）在审批时同样不可判。
+            if (!isEmpty(del.getJoins()) || !isEmpty(del.getUsingList())
+                    || (del.getTables() != null && del.getTables().size() > 1)) {
+                throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
+                        "不允许多表 DELETE（带 JOIN / USING / 多个目标表）。请拆成针对单张表的多条语句——"
+                                + "多表语句在审批时只能显示其中一张表，删了什么没人看得全");
+            }
             if (del.getWhere() == null) {
                 throw ConnectorException.of(ConnectorErrorCode.GUARD_BLOCKED,
                         "DELETE 语句必须带 WHERE 条件。不带 WHERE 会清空整张表——"

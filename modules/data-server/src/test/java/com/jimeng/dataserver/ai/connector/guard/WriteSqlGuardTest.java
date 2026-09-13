@@ -117,6 +117,37 @@ class WriteSqlGuardTest {
                             + "ON DUPLICATE KEY UPDATE n = n + 1").operation());
         }
 
+        /**
+         * ★ 多表 DML 不是「危险到不能做」，是<b>在审批环节不可判</b>：
+         * jsqlparser 的 {@code Update.getTable()} 只返回第一张表，于是
+         * {@code UPDATE a JOIN b SET a.x, b.y} 在待审批列表里显示成「UPDATE a」——
+         * 改了两张表，人只看得见一张。一个看不见全部影响面的审批比没有审批更糟：
+         * 它让人以为已经审过了。
+         *
+         * <p>这条是对抗审查实测出来的：改之前它能过护栏，targetTable 只记 orders。
+         */
+        @Test
+        void 多表UPDATE被拒_因为审批时只显示一张表() {
+            ConnectorException e = reject(
+                    "UPDATE orders o JOIN order_item i ON i.ord_id=o.id "
+                            + "SET o.status='CANCELLED', i.status='X' WHERE o.region='HD'");
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED, e.getCode());
+            assertTrue(e.getMessage().contains("拆成"), "要告诉模型怎么改：" + e.getMessage());
+        }
+
+        @Test
+        void 多表DELETE被拒() {
+            assertEquals(ConnectorErrorCode.GUARD_BLOCKED,
+                    reject("DELETE o FROM orders o JOIN order_item i ON i.ord_id=o.id WHERE o.id=1").getCode());
+        }
+
+        @Test
+        void 单表UPDATE仍然放行() {
+            WriteSqlGuard.Verdict v = new WriteSqlGuard().check("UPDATE orders SET status='X' WHERE id=1");
+            assertEquals("UPDATE", v.operation());
+            assertEquals("orders", v.targetTable());
+        }
+
         @Test
         void SELECT_被拒() {
             // 这是写通道，查询该走 conn_query。放行 SELECT 等于给只读护栏开了一条旁路。

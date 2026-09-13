@@ -53,6 +53,14 @@ public class PendingWriteView {
     @Schema(description = "待执行的语句原文。批准时【照这段文本执行】，界面必须完整展示，不要省略中间")
     private String statementText;
 
+    @Schema(description = "★ 发起这次写请求的那轮对话的 trace_id。审批的人要能顺着它回到"
+            + "「模型当时为什么要写这一条」——只看一条 SQL 是判不出它该不该执行的")
+    private String traceId;
+
+    @Schema(description = "提交时预估会改动多少行。**不是承诺**：估算在提交时、执行在批准时，"
+            + "中间数据会变。估不出来为 null（如 INSERT ... SELECT）")
+    private Integer estimatedRows;
+
     @Schema(description = "★ 状态：PENDING | APPROVED | REJECTED | EXPIRED | FAILED。approve 的真实结果看这里，不要看「有没有抛异常」")
     private String status;
 

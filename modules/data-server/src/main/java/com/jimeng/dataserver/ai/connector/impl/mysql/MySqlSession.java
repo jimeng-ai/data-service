@@ -10,6 +10,7 @@ import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
 import com.jimeng.dataserver.ai.connector.model.WritePlan;
+import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorSession;
@@ -65,6 +66,15 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
     private final String database;
     private final ReadOnlySqlGuard sqlGuard;
     private final WriteSqlGuard writeGuard;
+
+    /**
+     * 预估影响行数的超时，<b>刻意比写操作本身的超时短</b>。
+     *
+     * <p>它产出的是给人看的参考信息，不是执行路径的一部分：估不出来只是审批页少一个数字，
+     * 而一条卡住的 COUNT 会占着客户库的连接和我们的并发闸。宁可放弃，不要拖住。
+     * 对抗审查实测过：高基数列上的聚合能跑到 24 秒，远超写操作默认的 15 秒。
+     */
+    private static final int ESTIMATE_TIMEOUT_SEC = 5;
 
     MySqlSession(ConnectorInstance instance, DataSource dataSource, String database,
                  ReadOnlySqlGuard sqlGuard, WriteSqlGuard writeGuard) {
@@ -347,6 +357,61 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
         // ——两次结论必然一致（同一个 guard、同一段文本），所以入队的就是将来执行的。
         WriteSqlGuard.Verdict verdict = writeGuard.check(statement);
         return new WritePlan(verdict.effectiveSql(), verdict.operation(), verdict.targetTable());
+    }
+
+    /**
+     * 预估影响行数：把 {@code UPDATE t ... WHERE w} / {@code DELETE FROM t WHERE w}
+     * 改写成 {@code SELECT COUNT(*) FROM t WHERE w}，在客户库上真跑一次。
+     *
+     * <h3>三个刻意的取舍</h3>
+     * <ul>
+     *   <li><b>走 AST 重写，不拼字符串。</b>从已经解析好的语法树上取表与 WHERE 再重新序列化，
+     *       不会因为 WHERE 里有子查询、注释、奇怪的引号而拼错——拼错的后果是拿一个
+     *       <b>看起来合理但数错了</b>的行数去给人做审批依据。</li>
+     *   <li><b>INSERT 不估。</b>{@code INSERT ... SELECT} 的行数由子查询决定，
+     *       跑一遍子查询才知道，代价与副作用都不可控；{@code INSERT ... VALUES} 的行数
+     *       在语句里一眼可见，不需要估。两者都返回 null。</li>
+     *   <li><b>任何失败都返回 null，绝不抛。</b>估不出来只是少一条参考信息，
+     *       不该把一条本可以进审批队列的写请求挡在门外。</li>
+     * </ul>
+     *
+     * <p>这个数只是<b>提交时</b>的快照，执行发生在人点批准之后。真正的防线仍是执行时的
+     * {@code maxAffectedRows} 整条回滚。
+     */
+    @Override
+    public Integer estimateAffectedRows(String statement) {
+        String countSql;
+        try {
+            net.sf.jsqlparser.statement.Statement st = CCJSqlParserUtil.parse(statement);
+            net.sf.jsqlparser.schema.Table table;
+            net.sf.jsqlparser.expression.Expression where;
+            if (st instanceof net.sf.jsqlparser.statement.update.Update up) {
+                table = up.getTable();
+                where = up.getWhere();
+            } else if (st instanceof net.sf.jsqlparser.statement.delete.Delete del) {
+                table = del.getTable();
+                where = del.getWhere();
+            } else {
+                return null;   // INSERT 及其它：见类注释
+            }
+            if (table == null || where == null) return null;
+            countSql = "SELECT COUNT(*) FROM " + table + " WHERE " + where;
+        } catch (Exception e) {
+            log.debug("预估影响行数：语句无法改写成 COUNT，跳过");
+            return null;
+        }
+
+        try (Connection c = borrow();
+             java.sql.Statement st = c.createStatement()) {
+            st.setQueryTimeout(ESTIMATE_TIMEOUT_SEC);
+            try (ResultSet rs = st.executeQuery(countSql)) {
+                return rs.next() ? rs.getInt(1) : null;
+            }
+        } catch (Exception e) {
+            // 超时、权限、方言差异都落这里。原始异常只进日志：它可能带 SQL 片段与主机名。
+            log.warn("预估影响行数失败，按未知处理", e);
+            return null;
+        }
     }
 
     @Override
