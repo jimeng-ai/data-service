@@ -120,7 +120,8 @@ public class AiConversationLoop {
             try {
                 RequestService.HttpResp resp;
                 try {
-                    resp = requestService.post(url, headers, Collections.emptyMap(), body);
+                    // 跨协议 adapter 在这里把 body 转成上游形状；同协议的 adapter 恒等返回，零影响。
+                    resp = requestService.post(url, headers, Collections.emptyMap(), adapter.toUpstreamBody(body));
                 } catch (RuntimeException callEx) {
                     llmCallGuard.recordFailure();
                     throw callEx;
@@ -130,7 +131,12 @@ public class AiConversationLoop {
                 recordGuardOutcome(resp.getStatusCode());
                 log.info("{} 接口返回: {}", rc.provider(), resp.getBody());
 
-                Object parsed = tryParseJson(resp.getBody());
+                // ★ 跨协议 adapter 在这里把上游响应转成【入口协议】形状；同协议的恒等返回。
+                // 转换点必须在这一句，不能更靠后：下面 parsed 会被直接 return 给调用方
+                // （无工具时的短路径），而调用方是按入口协议解析的。
+                Object rawParsed = tryParseJson(resp.getBody());
+                Map<String, Object> rawMap = asMapOrNull(rawParsed);
+                Object parsed = rawMap == null ? rawParsed : adapter.fromUpstreamResponse(rawMap);
                 if (!isSuccess(resp.getStatusCode()) || (!skillApplyResult.isEnabled() && !builtinToolsEnabled)) {
                     boolean ok = isSuccess(resp.getStatusCode());
                     traceRecorder.recordLlm(logId, "推理·生成回答", modelOf(body, rc),
@@ -138,7 +144,7 @@ public class AiConversationLoop {
                     return parsed;
                 }
 
-                Map<String, Object> responseMap = parseResponseMap(resp.getBody());
+                Map<String, Object> responseMap = adapter.fromUpstreamResponse(parseResponseMap(resp.getBody()));
                 if (responseMap == null || responseMap.isEmpty()) return parsed;
 
                 int[] usage = adapter.extractUsage(responseMap);
@@ -224,7 +230,8 @@ public class AiConversationLoop {
 
                 try {
                     EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch, streamFailed);
-                    EventSource upstream = requestService.postStream(url, headers, JSONUtil.toJsonStr(body), listener);
+                    EventSource upstream = requestService.postStream(url, headers,
+                            JSONUtil.toJsonStr(adapter.toUpstreamBody(body)), listener);
                     // 发布上游句柄到 run 注册表，使「停止」能真正中断本次 LLM 调用（无 run 句柄=调试台直连，忽略）。
                     RunHandle handle = runRegistry.get(connectionId);
                     if (handle != null) handle.setUpstream(upstream);
@@ -506,7 +513,12 @@ public class AiConversationLoop {
 
             @Override
             public void onEvent(EventSource eventSource, String id, String type, String data) {
-                tee.tee(connectionId, adapter.getDeltaEventType(), data);
+                // 跨协议时上游帧的形状前端不认识，先让 adapter 转一道；返回 null 表示这一帧不转发
+                // （OpenAI 流里有不少只带 role / finish_reason 的空帧，转过去只会让前端解析出空串）。
+                String forward = adapter.transformDeltaFrame(data);
+                if (forward != null) {
+                    tee.tee(connectionId, adapter.getDeltaEventType(), forward);
+                }
                 accumulator.accumulateEvent(type, data);
                 if (adapter.isDoneSignal(data)) latch.countDown();
             }
@@ -648,6 +660,12 @@ public class AiConversationLoop {
             if ("activate_skills".equals(call.getToolName())) return call;
         }
         return null;
+    }
+
+    /** 只有 Map 形状的响应才值得交给 adapter 转换；其余（数组/字符串/null）原样走老路。 */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asMapOrNull(Object parsed) {
+        return parsed instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
     }
 
     private boolean isSuccess(Integer httpStatus) {

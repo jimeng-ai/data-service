@@ -46,12 +46,35 @@ public class AiProviderProperties {
 
     @Data
     public static class Chat {
-        /** "anthropic" 或 "openai"。决定走 /v1/messages 还是 /v1/chat/completions。 */
+        /**
+         * <b>上游</b>说什么协议："anthropic" 或 "openai"。决定发出去的请求体形状、
+         * 以及默认走 /messages 还是 /chat/completions。
+         */
         private String protocol;
+
+        /**
+         * <b>对平台内部表现为</b>什么协议。留空 = 与 {@link #protocol} 相同（绝大多数情况）。
+         *
+         * <p>它存在的唯一理由是：平台整条对话链路的入口协议写死是 anthropic
+         * （{@code ClaudeService.EXPECTED_PROTOCOL}），而 DeepSeek / 通义 / Kimi / vLLM
+         * 这些只有 OpenAI 协议。配成 {@code protocol: openai} + {@code entry-protocol: anthropic}，
+         * 意思是「上游是 openai，但对内装成 anthropic」——中间的转换由
+         * {@code AnthropicOverOpenAiAdapter} 承担。
+         *
+         * <p><b>不要拿它当开关随便改</b>：它改变的是请求体形状的解释方式，配错的表现是
+         * 上游 400 或者回复解析不出来，而不是一个清楚的报错。
+         */
+        private String entryProtocol;
+
         private String model;
         private int maxTokens = 8192;
         /** 选填覆盖；为空时按 protocol 推导。 */
         private String endpointPath;
+
+        /** 入口协议，留空时回落上游协议。 */
+        public String entryProtocolOrDefault() {
+            return entryProtocol == null || entryProtocol.isBlank() ? protocol : entryProtocol;
+        }
     }
 
     @Data

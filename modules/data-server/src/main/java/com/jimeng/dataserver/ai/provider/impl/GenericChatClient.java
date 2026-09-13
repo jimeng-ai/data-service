@@ -40,6 +40,8 @@ public class GenericChatClient implements ChatClient {
     private final AiConversationLoop conversationLoop;
     private final AiProtocolAdapter anthropicAdapter;
     private final AiProtocolAdapter openaiAdapter;
+    /** 入口 anthropic / 上游 openai 的跨协议适配器。同协议的 provider 用不到它。 */
+    private final AiProtocolAdapter crossAdapter;
     private final SseServiceUtil sseServiceUtil;
 
     public GenericChatClient(String providerName,
@@ -48,6 +50,7 @@ public class GenericChatClient implements ChatClient {
                              AiConversationLoop conversationLoop,
                              AiProtocolAdapter anthropicAdapter,
                              AiProtocolAdapter openaiAdapter,
+                             AiProtocolAdapter crossAdapter,
                              SseServiceUtil sseServiceUtil) {
         this.providerName = providerName;
         this.config = config;
@@ -55,6 +58,7 @@ public class GenericChatClient implements ChatClient {
         this.conversationLoop = conversationLoop;
         this.anthropicAdapter = anthropicAdapter;
         this.openaiAdapter = openaiAdapter;
+        this.crossAdapter = crossAdapter;
         this.sseServiceUtil = sseServiceUtil;
     }
 
@@ -89,8 +93,11 @@ public class GenericChatClient implements ChatClient {
 
     @Override
     public ChatCapabilities capabilities() {
-        return new ChatCapabilities(config.getChat().getProtocol(),
-                PROTOCOL_ANTHROPIC.equals(config.getChat().getProtocol()),
+        // ★ 对外声明的是【入口协议】：ModelResolver.ensureProtocol 校验的就是这个值。
+        // 上游实际说什么协议（config.chat.protocol）对调用方不可见，也不该可见。
+        String entry = config.getChat().entryProtocolOrDefault();
+        return new ChatCapabilities(entry,
+                PROTOCOL_ANTHROPIC.equals(entry),
                 providerName,
                 config.getChat().getModel());
     }
@@ -107,7 +114,9 @@ public class GenericChatClient implements ChatClient {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "providers." + providerName + ".chat.model 未配置");
         }
-        String protocol = config.getChat().getProtocol();
+        // 按【入口协议】补默认值：requestBody 进来时是入口协议的形状，
+        // 转成上游形状是 adapter.toUpstreamBody 的事，不在这里做。
+        String protocol = config.getChat().entryProtocolOrDefault();
         if (PROTOCOL_ANTHROPIC.equals(protocol)) {
             return prepareAnthropicBody(requestBody);
         }
@@ -204,8 +213,25 @@ public class GenericChatClient implements ChatClient {
         if (effective != null) body.put("max_completion_tokens", effective);
     }
 
+    /**
+     * 选 adapter：入口协议与上游协议<b>不同</b>时用跨协议适配器，相同时用原生的那个。
+     *
+     * <p>目前只支持「入口 anthropic / 上游 openai」这一个方向——因为平台的对话链路入口
+     * 就只有 anthropic 一种。反方向（入口 openai / 上游 anthropic）没有使用场景，
+     * 真需要时再加，不提前抽。
+     */
     private AiProtocolAdapter adapter() {
-        return PROTOCOL_ANTHROPIC.equals(config.getChat().getProtocol()) ? anthropicAdapter : openaiAdapter;
+        String upstream = config.getChat().getProtocol();
+        String entry = config.getChat().entryProtocolOrDefault();
+        if (!entry.equalsIgnoreCase(upstream)) {
+            if (PROTOCOL_ANTHROPIC.equals(entry) && PROTOCOL_OPENAI.equals(upstream)) {
+                return crossAdapter;
+            }
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "providers." + providerName + " 的 entry-protocol=" + entry
+                            + " / protocol=" + upstream + " 这个组合没有对应的适配器");
+        }
+        return PROTOCOL_ANTHROPIC.equals(upstream) ? anthropicAdapter : openaiAdapter;
     }
 
     private Map<String, String> buildHeaders() {
@@ -218,6 +244,7 @@ public class GenericChatClient implements ChatClient {
     private String buildUrl() {
         String path = config.getChat().getEndpointPath();
         if (StrUtil.isBlank(path)) {
+            // 路径按【上游】协议推导——URL 是发给上游的，与入口协议无关。
             path = PROTOCOL_ANTHROPIC.equals(config.getChat().getProtocol())
                     ? DEFAULT_ANTHROPIC_PATH : DEFAULT_OPENAI_PATH;
         }

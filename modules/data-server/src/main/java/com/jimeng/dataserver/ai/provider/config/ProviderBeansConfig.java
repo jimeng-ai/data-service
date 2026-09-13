@@ -5,6 +5,7 @@ import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.conversation.AiConversationLoop;
 import com.jimeng.dataserver.ai.protocol.ClaudeProtocolAdapter;
+import com.jimeng.dataserver.ai.protocol.AnthropicOverOpenAiAdapter;
 import com.jimeng.dataserver.ai.protocol.OpenAiProtocolAdapter;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.impl.DefaultContextualizationClient;
@@ -46,8 +47,9 @@ public class ProviderBeansConfig {
                                            AiConversationLoop loop,
                                            ClaudeProtocolAdapter anthropic,
                                            OpenAiProtocolAdapter openai,
-                                           SseServiceUtil sse) {
-        return newChat("openrouter", props, selection, loop, anthropic, openai, sse);
+                                           AnthropicOverOpenAiAdapter cross,
+                                    SseServiceUtil sse) {
+        return newChat("openrouter", props, selection, loop, anthropic, openai, cross, sse);
     }
 
     @Bean(name = "openrouter-embedding")
@@ -81,8 +83,9 @@ public class ProviderBeansConfig {
                                       AiConversationLoop loop,
                                       ClaudeProtocolAdapter anthropic,
                                       OpenAiProtocolAdapter openai,
-                                      SseServiceUtil sse) {
-        return newChat("302ai", props, selection, loop, anthropic, openai, sse);
+                                      AnthropicOverOpenAiAdapter cross,
+                                    SseServiceUtil sse) {
+        return newChat("302ai", props, selection, loop, anthropic, openai, cross, sse);
     }
 
     @Bean(name = "302ai-embedding")
@@ -97,6 +100,31 @@ public class ProviderBeansConfig {
                                           RequestService requestService,
                                           List<RerankClientFactory> rerankFactories) {
         return newRerankByProtocol("302ai", props, requestService, rerankFactories);
+    }
+
+    // ============================================================ deepseek
+    //
+    // ★ 只注册 chat，【刻意】不注册 embedding / rerank / contextualization。
+    //
+    // DeepSeek 根本没有 embedding 和 rerank 接口。而 newRerankByProtocol 是在
+    // 【bean 创建期】校验 rerank.protocol 的（认不出来就抛 IllegalStateException，
+    // 应用直接起不来）。为了让它过而随便填一个 cohere/qwen3，等于注册了一个
+    // 一调用就报错的假 bean——那正是本项目反复吃亏的「配错了不报错，只是悄悄降级成
+    // 某种能用但不对的状态」。宁可没有，不要有个假的。
+    //
+    // 代价：ai.provider 不能设成 deepseek（ProviderRegistry 的 @PostConstruct 会校验
+    // active provider 四件套齐全）。它只能作为【模型级】的 provider 被 ai_model 行引用，
+    // 检索/精排仍走 active provider。这是对的——DeepSeek 本来就只提供对话能力。
+
+    @Bean(name = "deepseek-chat")
+    public ChatClient deepseekChatClient(AiProviderProperties props,
+                                         AiSelectionProperties selection,
+                                         AiConversationLoop loop,
+                                         ClaudeProtocolAdapter anthropic,
+                                         OpenAiProtocolAdapter openai,
+                                         AnthropicOverOpenAiAdapter cross,
+                                         SseServiceUtil sse) {
+        return newChat("deepseek", props, selection, loop, anthropic, openai, cross, sse);
     }
 
     @Bean(name = "302ai-contextualization")
@@ -125,9 +153,10 @@ public class ProviderBeansConfig {
                                       AiConversationLoop loop,
                                       ClaudeProtocolAdapter anthropic,
                                       OpenAiProtocolAdapter openai,
+                                      AnthropicOverOpenAiAdapter cross,
                                       SseServiceUtil sse) {
         return new GenericChatClient(providerName, configOf(providerName, props),
-                selection, loop, anthropic, openai, sse);
+                selection, loop, anthropic, openai, cross, sse);
     }
 
     private static EmbeddingClient newEmbedding(String providerName,

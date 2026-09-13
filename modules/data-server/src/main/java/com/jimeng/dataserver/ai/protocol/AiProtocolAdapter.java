@@ -65,4 +65,36 @@ public interface AiProtocolAdapter {
 
     /** True when this data token signals the end of the stream (e.g. OpenAI's "[DONE]"). */
     boolean isDoneSignal(String data);
+
+    // ================================================================ 入口协议 ≠ 上游协议
+
+    /*
+     * 下面三个方法是为「入口协议与上游协议不同」准备的转换点，**默认全部恒等**。
+     *
+     * 既有的两个 adapter（Claude / OpenAi）入口与上游同协议，一个字节都不受影响。
+     * 只有跨协议的 adapter（如 AnthropicOverOpenAiAdapter）才覆写它们。
+     *
+     * 为什么要有这三个点：AiConversationLoop 全程把 body 和 responseMap 当成【入口协议】的形状
+     * 在操作（注工具、拼多轮、抽 tool_use），这是它能保持协议无关的前提。
+     * 跨协议时只需要在「发出去之前」「收回来之后」「转发给前端之前」这三处做转换，
+     * 循环本身完全不用动——差异被收敛在 adapter 这一层，这正是它存在的意义。
+     */
+
+    /** 发给上游前的最后一道转换。 */
+    default java.util.Map<String, Object> toUpstreamBody(java.util.Map<String, Object> body) {
+        return body;
+    }
+
+    /** 上游响应 → 入口协议形状。之后循环里的所有 extract/append 都按入口协议处理。 */
+    default java.util.Map<String, Object> fromUpstreamResponse(java.util.Map<String, Object> resp) {
+        return resp;
+    }
+
+    /**
+     * 上游 SSE 帧 → 转发给前端的帧。返回 {@code null} 表示这一帧不转发
+     * （上游有些心跳/元数据帧对前端没有意义，转过去只会让它解析失败）。
+     */
+    default String transformDeltaFrame(String data) {
+        return data;
+    }
 }
