@@ -1,6 +1,10 @@
 package com.jimeng.dataserver.ai.connector;
 
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorAuditQuery;
+import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorUpsert;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
@@ -42,6 +46,7 @@ import java.util.Map;
 public class ConnectorAdminController {
 
     private final ConnectorService connectorService;
+    private final ConnectorAuditService connectorAuditService;
     private final SuperAdminGuard superAdminGuard;
 
     /**
@@ -105,6 +110,22 @@ public class ConnectorAdminController {
         superAdminGuard.requireSuperAdmin();
         connectorService.setStatus(id, status);
         return Map.of("status", status);
+    }
+
+    /**
+     * 使用记录。回答「这个连接被谁、在什么时候、用来做了什么」——产品方案第 10 节的第四块。
+     *
+     * <p>用 {@code GET} + 查询参数而不是 {@code POST} + body：它是一次纯读取，
+     * 前端要能把筛选条件放进 URL 以便刷新和分享。
+     *
+     * <p>注意路径是 {@code /audit} 而不是 {@code /{id}/audit}：连接维度只是最常用的一种筛选，
+     * 「某个 Agent 都访问过什么」同样是要回答的问题，做成 {@code /{id}/audit} 就把它挡死了。
+     */
+    @Operation(summary = "使用记录（分页；可按连接、Agent、能力、成败、时间筛选）")
+    @GetMapping("/audit")
+    public Page<ConnectorAuditView> audit(ConnectorAuditQuery query) {
+        superAdminGuard.requireSuperAdmin();
+        return connectorAuditService.query(query);
     }
 
     @Operation(summary = "删除（同时摘除所有 Agent 授权、清掉自描述缓存、作废连接池）")
