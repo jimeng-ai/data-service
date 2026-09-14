@@ -50,6 +50,9 @@ class JimengTenantLineHandlerTest {
         // 待审批写操作队列：漏登记不报错，后果是 A 租户的超管能在审批列表里看到、
         // 并【批准】B 租户 Agent 提交的写语句——一次跨租户的数据篡改。
         assertFalse(handler.ignoreTable("connector_pending_write"));
+        // 语义层：存的是客户的表名、字段名和业务口径，比自描述缓存更敏感——
+        // 漏登记的后果不只是泄露，还会让 A 租户的口径注入到 B 租户的问数里，答案静默出错。
+        assertFalse(handler.ignoreTable("connector_semantic"));
         assertFalse(handler.ignoreTable("knowledge_base"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));

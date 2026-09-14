@@ -24,19 +24,25 @@ import com.jimeng.persistence.mapper.ConnectionMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -62,6 +68,14 @@ class ConnectorGatewayTest {
     private ConnectorRegistry registry;
     private ConnectorInstanceLoader loader;
     private PendingWriteService pendingWriteService;
+    /**
+     * 审计与 Redis 从前是就地 {@code mock(...)} 的。现在提到字段上，是因为「管理面那条路
+     * 有没有真的经过限流与审计」本身就是这次要钉住的东西——只有留着引用才验得了。
+     * 对已有用例没有任何影响：默认行为与就地 mock 完全一样（{@code opsForValue()} 返回 null，
+     * 于是限流那一步走 fail-open 的 catch，与从前一致）。
+     */
+    private ConnectorAuditService auditService;
+    private RedisTemplate<String, Object> redisTemplate;
     private ConnectorGateway gateway;
 
     @BeforeEach
@@ -73,6 +87,8 @@ class ConnectorGatewayTest {
         registry = mock(ConnectorRegistry.class);
         loader = mock(ConnectorInstanceLoader.class);
         pendingWriteService = mock(PendingWriteService.class);
+        auditService = mock(ConnectorAuditService.class);
+        redisTemplate = mock(RedisTemplate.class);
         ObjectProvider<PendingWriteService> pendingWrites = mock(ObjectProvider.class);
         when(pendingWrites.getObject()).thenReturn(pendingWriteService);
         gateway = new ConnectorGateway(
@@ -81,8 +97,8 @@ class ConnectorGatewayTest {
                 registry,
                 loader,
                 properties,
-                mock(ConnectorAuditService.class),
-                mock(RedisTemplate.class),
+                auditService,
+                redisTemplate,
                 pendingWrites);
         TenantContext.set("t1");
         AgentContext.set(AgentRuntimeView.builder().agentId(7L).tenantId("t1").build());
@@ -404,5 +420,232 @@ class ConnectorGatewayTest {
         ConnectorException e = assertThrows(ConnectorException.class,
                 () -> gateway.executeWrite("crm", SQL, OPTS, "conn_execute"));
         assertEquals(ConnectorErrorCode.FORBIDDEN, e.getCode());
+    }
+
+    // ================================================================ 管理面入口
+    //
+    // ★ 这一组守的是一条很容易被写反的边界：管理面<b>没有 Agent</b>，所以第 4 步判不了；
+    //   但「没有 Agent」绝不等于「没有身份」。在此之前管理面的唯一先例
+    //   （ConnectorSchemaService.refresh）是自己 open() 绕过整个网关的——限流、并发闸、
+    //   审计全都没有，而它一次要往客户的生产库打上百条查询。
+    //   把那条路接进网关的同时，最怕的就是顺手把租户隔离也一起跳过去。
+
+    @Nested
+    @DisplayName("管理面入口 executeAsPlatform")
+    class AsPlatform {
+
+        private static final String OP = ConnectorAuditService.OP_SCHEMA_REFRESH;
+
+        /** {@link #givenOpenable()} 建出来的连接器实现，验「一次都没 open」时要用。 */
+        private Connector connector;
+
+        /** 按 id 寻址（管理面不像模型那样用名字）。 */
+        private void givenRowById(Connection c) {
+            when(connectionMapper.selectById(100L)).thenReturn(c);
+        }
+
+        /** 六道闸全过的一条连接：实例、实现、会话都就绪。 */
+        private ConnectorInstance givenOpenable() {
+            ConnectorInstance inst = new ConnectorInstance(
+                    100L, "t1", "MYSQL", "crm", "CRM", Map.of(), "pwd", "direct");
+            when(loader.load(any(Connection.class))).thenReturn(inst);
+            connector = mock(Connector.class);
+            when(registry.require("MYSQL")).thenReturn(connector);
+            when(connector.open(inst)).thenReturn(mock(ConnectorSession.class));
+            return inst;
+        }
+
+        private ConnectorException callPlatform() {
+            return assertThrows(ConnectorException.class,
+                    () -> gateway.executeAsPlatform(100L, Capability.QUERY, OP, session -> "never"));
+        }
+
+        // ------------------------------------------------------------ 跳过的只有第 4 步
+
+        /**
+         * 管理面没有 Agent 身份，所以第 4 步无从判起——但也<b>只</b>跳过这一步。
+         * 顺带钉住它不去查 {@code agent_connection}：查了就说明有人想用「平台 Agent」
+         * 之类的东西补上这一步，那是另一个设计，不该悄悄长出来。
+         */
+        @Test
+        @DisplayName("没有 AgentContext 照样放行（跳过的只有第 4 步）")
+        void 无Agent上下文也放行() {
+            AgentContext.clear();
+            givenRowById(row());
+            givenOpenable();
+
+            String out = gateway.executeAsPlatform(100L, Capability.QUERY, OP, session -> "已执行");
+
+            assertEquals("已执行", out);
+            verify(agentConnectionMapper, never()).selectCount(any(LambdaQueryWrapper.class));
+        }
+
+        // ------------------------------------------------------------ 但租户隔离一点没松
+
+        /**
+         * ★ 最关键的一条：跳过 Agent 授权 ≠ 跳过租户隔离。
+         * 后台任务要碰客户的生产库，就必须说清楚碰的是<b>哪一个</b>客户的库。
+         */
+        @Test
+        @DisplayName("没有租户上下文 → 拒绝（后台任务必须自己 set 一个真租户）")
+        void 无租户上下文时拒绝() {
+            TenantContext.clear();
+            givenRowById(row());
+            assertEquals(ConnectorErrorCode.CONFIG_ERROR, callPlatform().getCode());
+            verify(connectionMapper, never()).selectById(any());
+        }
+
+        /**
+         * ★ {@code runAsSystem} 不是租户身份。它只把 SYSTEM_MODE 打开、让 MyBatis 拦截器
+         * 别注入租户条件，{@code CURRENT_TENANT} 原样为空——这恰恰是最危险的组合：
+         * 拦截器不管了，而调用方以为自己「以系统身份」拿到了通行证。
+         */
+        @Test
+        @DisplayName("TenantContext.runAsSystem 不算数 → 照样拒绝")
+        void runAsSystem不算租户身份() {
+            TenantContext.clear();
+            givenRowById(row());
+            // 写成带 return 的块体，是为了避开 runAsSystem(Supplier) / runAsSystem(Runnable)
+            // 这一对重载的歧义——表达式体的 lambda 两边都匹配，编译不过。
+            ConnectorException e = TenantContext.runAsSystem(() -> {
+                return callPlatform();
+            });
+            assertEquals(ConnectorErrorCode.CONFIG_ERROR, e.getCode());
+        }
+
+        /**
+         * ★ 这一句显式的归属校验专治上面那种情形：系统模式下 {@code selectById} 捞得到
+         * 别的租户的行。没有它，一个「顺手包了 runAsSystem」的后台任务就是跨租户访问
+         * 客户生产库的入口，而且不报任何错。
+         */
+        @Test
+        @DisplayName("连接属于别的租户 → 按「不存在」拒，且与真不存在同形")
+        void 别的租户的连接取不到() {
+            Connection other = row();
+            other.setTenantId("t2");
+            givenRowById(other);
+            ConnectorException crossTenant = callPlatform();
+
+            when(connectionMapper.selectById(100L)).thenReturn(null);
+            ConnectorException missing = callPlatform();
+
+            assertEquals(ConnectorErrorCode.NOT_FOUND, crossTenant.getCode());
+            assertEquals(ConnectorErrorCode.NOT_FOUND, missing.getCode());
+            // 同形：否则可以拿报错差异去枚举别的租户有哪些连接 id。
+            assertEquals(missing.getSafeDetail(), crossTenant.getSafeDetail());
+        }
+
+        // ------------------------------------------------------------ 其余八步一步不少
+
+        @Test
+        @DisplayName("总开关关闭 → 拒绝（与 Agent 面同一段代码）")
+        void 总开关对管理面同样有效() {
+            properties.setEnabled(false);
+            assertEquals(ConnectorErrorCode.CONFIG_ERROR, callPlatform().getCode());
+        }
+
+        @Test
+        @DisplayName("能力不匹配 → 拒绝")
+        void 能力校验对管理面同样有效() {
+            Connection c = row();
+            c.setCapabilityFlags("INVOKE,HEALTH");
+            givenRowById(c);
+            assertEquals(ConnectorErrorCode.CONFIG_ERROR, callPlatform().getCode());
+        }
+
+        @Test
+        @DisplayName("连接已停用 → 拒绝")
+        void 停用的连接对管理面同样拒绝() {
+            Connection c = row();
+            c.setStatus("DISABLED");
+            givenRowById(c);
+            assertEquals(ConnectorErrorCode.CONFIG_ERROR, callPlatform().getCode());
+        }
+
+        /**
+         * ★ 限流这一步是整件事的由头：推导会往客户的生产库打几百条查询。
+         * 管理面绕过网关的那些年，这一步对它压根不存在。
+         */
+        @Test
+        @DisplayName("每租户速率对管理面同样生效")
+        void 租户限流对管理面同样有效() {
+            properties.getLimit().setPerTenantPerMinute(1);
+            @SuppressWarnings("unchecked")
+            ValueOperations<String, Object> ops = mock(ValueOperations.class);
+            when(redisTemplate.opsForValue()).thenReturn(ops);
+            when(ops.increment(anyString())).thenReturn(99L);
+            givenRowById(row());
+            givenOpenable();
+
+            assertEquals(ConnectorErrorCode.RATE_LIMITED, callPlatform().getCode());
+        }
+
+        // ------------------------------------------------------------ 审计
+
+        /**
+         * ★ 设计里这条是硬要求：<b>客户的 DBA 要分得清哪些查询是平台在剖析、
+         * 哪些是 Agent 在问数</b>。所以管理面的 operation 必须带 {@code platform.} 前缀，
+         * 而 agentId 必须是 null——随手填个 0 或 -1 会在审计表里造出一个查无此人的 Agent。
+         */
+        @Test
+        @DisplayName("审计落在 platform.* 名下，且 agentId 为空")
+        void 审计与Agent面分得开() {
+            givenRowById(row());
+            givenOpenable();
+            gateway.executeAsPlatform(100L, Capability.QUERY, OP, session -> "已执行");
+
+            ArgumentCaptor<String> op = ArgumentCaptor.forClass(String.class);
+            ArgumentCaptor<Long> agentId = ArgumentCaptor.forClass(Long.class);
+            verify(auditService).record(any(), agentId.capture(), any(), op.capture(),
+                    any(), any(), anyLong(), anyBoolean(), any(), any());
+
+            assertTrue(op.getValue().startsWith(ConnectorAuditService.PLATFORM_OP_PREFIX));
+            assertNull(agentId.getValue(), "管理面没有 Agent，这一列就该是空的");
+        }
+
+        /** 另一半：Agent 面的名字与 agentId 原样不动，两条路在审计里天然分得开。 */
+        @Test
+        @DisplayName("Agent 面的审计名与 agentId 不受影响")
+        void Agent面审计不受影响() {
+            givenRow(row());
+            givenGranted(true);
+            givenOpenable();
+            gateway.execute("crm", Capability.QUERY, "conn_query", session -> "已执行");
+
+            ArgumentCaptor<String> op = ArgumentCaptor.forClass(String.class);
+            ArgumentCaptor<Long> agentId = ArgumentCaptor.forClass(Long.class);
+            verify(auditService).record(any(), agentId.capture(), any(), op.capture(),
+                    any(), any(), anyLong(), anyBoolean(), any(), any());
+
+            assertEquals("conn_query", op.getValue());
+            assertEquals(7L, agentId.getValue());
+            assertFalse(op.getValue().startsWith(ConnectorAuditService.PLATFORM_OP_PREFIX));
+            assertNotEquals(ConnectorAuditService.OP_SCHEMA_REFRESH, op.getValue());
+        }
+
+        /**
+         * ★ 动作名传错要<b>当场炸</b>，而不是记一行 warn 然后照常执行。
+         * 一次混进 Agent 命名空间的平台查询，事后没有任何办法从审计里择出来——
+         * 「事后择不出来」正是这条约束存在的全部理由。
+         *
+         * <p>抛的是 {@code IllegalArgumentException} 而不是 {@code ConnectorException}：
+         * 这是接错线，不是运行期故障。归成 ConnectorException 会被上层那些
+         * 「失败只记日志」的 catch 顺手吞掉，于是又变成一次静默。
+         */
+        @Test
+        @DisplayName("动作名不是 platform.* → 当场拒绝，且一个字节都没打到客户库")
+        void 动作名必须是平台命名空间() {
+            givenRowById(row());
+            givenOpenable();
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> gateway.executeAsPlatform(100L, Capability.QUERY, "conn_catalog", s -> "never"));
+            assertThrows(IllegalArgumentException.class,
+                    () -> gateway.executeAsPlatform(100L, Capability.QUERY, null, s -> "never"));
+
+            verify(connector, never()).open(any());
+            verify(auditService, never()).record(any(), any(), any(), any(),
+                    any(), any(), anyLong(), anyBoolean(), any(), any());
+        }
     }
 }

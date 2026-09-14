@@ -124,8 +124,54 @@ public class ConnectorService {
         return toView(requireRow(id));
     }
 
+    /**
+     * 「这条连接允许我读到哪一层？」——数据出库档位的<b>唯一查询入口</b>。
+     *
+     * <p>后续要去客户库里做事的代码（S3 采样验证算包含率、将来取 top-k 维值）在动手之前问这里，
+     * 拿到 {@link SemanticDataTier} 之后问谓词：{@code allowsDerivedStats()} /
+     * {@code allowsSampleValues()}。<b>不要自己去读 {@code connection.semantic_data_tier} 这个字符串</b>，
+     * 更不要把它换算成 1/2/3 再比大小——兜底规则（空值 → 默认档、认不出来 → 最严档）
+     * 只在 {@link SemanticDataTier#parse(String)} 里有一份，绕过去就等于绕过了兜底。
+     *
+     * <p>走 {@link #requireRow(Long)} 是刻意的：它带租户过滤，连接不存在或不属于本租户直接抛。
+     * 一个「查权限」的方法如果能跨租户查到别人的连接，那它查回来的许可也是别人的。
+     * 后台线程调用时必须已经由 {@code MdcAsyncSupport.wrap} 带上 TenantContext——
+     * 这与推导链路上的其它 selectById 是同一条前提。
+     */
+    public SemanticDataTier dataTier(Long connectorId) {
+        return SemanticDataTier.parse(requireRow(connectorId).getSemanticDataTier());
+    }
+
     // ================================================================ 写
 
+    /**
+     * 新建并落库。
+     *
+     * <h3>★ 语义层推导<b>不在这里</b>发起，在 {@code ConnectorAdminController.create} 里，本方法返回之后</h3>
+     * 「接入即触发、接入时零人工」要求建完连接就自动去推导说明书，但推导<b>必须发生在本事务提交之后</b>。
+     * 在这里（事务内）调 {@code deriveAsync} 会踩两个坑，而且两个都不报错：
+     * <ul>
+     *   <li><b>后台线程读不到这一行。</b>{@code insert} 还没提交，推导线程用自己的连接去查
+     *       {@code connection}，查不到——{@code requireOwned} 抛「连接不存在」，日志里留下一条
+     *       看起来像 bug 的报错，而 {@code semantic_status} 永远停在 NONE。谁都不会发现。</li>
+     *   <li><b>更糟的是探不过回滚的那一支。</b>下面 {@code probeOrThrow} 失败会回滚这一行，
+     *       但推导任务已经派出去了，它会围着一个根本不存在的连接跑一圈。</li>
+     * </ul>
+     *
+     * <p>本仓库没有任何 after-commit 钩子。备选是
+     * {@code TransactionSynchronizationManager.registerSynchronization(...)} 的 afterCommit，
+     * <b>没有采用</b>：afterCommit 回调跑在事务已提交、但 {@code cleanupAfterCompletion} 还没执行的
+     * 窗口里，此时 {@code TransactionSynchronizationManager} 的连接仍然绑着、
+     * {@code isTransactionActive()} 仍然是 true。只要 {@code deriveAsync} 哪天不是真异步
+     * （而它在<b>另一个类</b>里，本类管不着），它内部的 {@code @Transactional(REQUIRED)} 就会
+     * 「加入」这个已经提交完的事务，写下去的行永远不会被再提交一次——<b>静默丢失</b>。
+     * 控制器那一层没有事务，无论 {@code deriveAsync} 是不是真异步都不会错。
+     * 用一个依赖别人实现细节才成立的正确性，换一点代码位置上的内聚，不划算。
+     *
+     * <p>代价说清楚：今天 {@code ConnectorService} 只被那一个控制器注入，所以不存在漏网的调用方。
+     * <b>将来若新增第二条建连接的入口（批量导入之类），必须在那里同样补上派发</b>，
+     * 否则从新入口建的连接会没有语义层，而且不报错。
+     */
     @Transactional
     public ConnectorView create(ConnectorUpsert req) {
         validateBasics(req, true);
@@ -318,6 +364,16 @@ public class ConnectorService {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "内网隧道（tunnel）尚未实现，当前只支持 direct");
         }
+        // 数据出库档位：留空是合法的（= 默认档），但【填了个认不出来的值必须当场报错】。
+        // 这里刻意不复用 SemanticDataTier.parse 的宽松兜底：那条兜底是给库里的脏值准备的
+        //（没人可问，只能往严的方向猜），而入参是有人可问的——把超管拼错的档位悄悄降一档存下去，
+        // 界面上显示的还是他刚选的那个，就成了一次不报错的配置失效。
+        if (req.getSemanticDataTier() != null && !req.getSemanticDataTier().isBlank()
+                && SemanticDataTier.tryParse(req.getSemanticDataTier()).isEmpty()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "semanticDataTier 只能是 METADATA_ONLY / DERIVED_STATS / SAMPLE_VALUES，收到："
+                            + req.getSemanticDataTier());
+        }
     }
 
     /**
@@ -337,6 +393,19 @@ public class ConnectorService {
         // 编辑时不传等于「改成只读」——这是刻意的：一个决定「能不能改客户数据」的开关，
         // 省略它的语义只能是最严的那个，不能是「保持原样」。
         row.setWritePolicy(WritePolicy.parse(req.getWritePolicy()).name());
+        // 数据出库档位：与写策略同一条规则——留空落到【默认档】（DERIVED_STATS），不是「保持原样」。
+        //
+        // ★ 后果要认下来：编辑一条已经开了第 3 档的连接时不传这个字段，它会被降回第 2 档。
+        // 这是两害相权取的那个：
+        //   * 降错了 —— 关系推断变差，有人来问「为什么最近答得不准了」，吵闹，能被发现；
+        //   * 留错了 —— 客户的真实取值继续出库，而没有任何人再决定过一次，安静，发现不了。
+        // 让「省略」等于「沿用」还会造出一个没人审计得到的粘性状态：此后每一次改显示名的保存
+        // 都在默默给第 3 档续期，事后谁也说不清当初是谁把它打开的。
+        // 前端的编辑表单必须把详情接口返回的 semanticDataTier 原样回填再提交。
+        //
+        // 认不出来的值走不到这里：validateBasics 已经在上面 400 拒绝了。
+        // parse 在这里只剩「空 → 默认档」这一条兜底，且它永远到不了 SAMPLE_VALUES。
+        row.setSemanticDataTier(SemanticDataTier.parse(req.getSemanticDataTier()).name());
 
         Map<String, Object> incoming = req.getParams() == null
                 ? new LinkedHashMap<>() : new LinkedHashMap<>(req.getParams());
@@ -466,6 +535,7 @@ public class ConnectorService {
         }
         String kind = ConnectorInstanceLoader.normalizeKind(row.getKind());
         WritePolicy policy = WritePolicy.parse(row.getWritePolicy());
+        SemanticDataTier tier = SemanticDataTier.parse(row.getSemanticDataTier());
         // 保险起见再剔一遍敏感字段：loader 只读 config_json 与旧列，理论上不含敏感值，
         // 但「理论上不含」不是可以不删的理由——这类地方漏一次就是凭据出网。
         registry.find(kind).ifPresent(c -> c.paramSpec().secretNames().forEach(params::remove));
@@ -490,6 +560,18 @@ public class ConnectorService {
                 .readonlyVerified(row.getReadonlyVerifiedAt() != null)
                 .readonlyVerifiedAt(row.getReadonlyVerifiedAt())
                 .createTime(row.getCreateTime())
+                // 存量连接（语义层上线之前建的）这一列是 NULL。归一成 NONE 而不是原样透出 null：
+                // 界面上「语义层：null」读不出任何意思，而「没跑过」是一个明确的、可操作的状态。
+                .semanticStatus(row.getSemanticStatus() == null || row.getSemanticStatus().isBlank()
+                        ? "NONE" : row.getSemanticStatus())
+                .semanticSyncedAt(row.getSemanticSyncedAt())
+                .semanticClaimAt(row.getSemanticClaimAt())
+                .semanticNote(row.getSemanticNote())
+                // 同样归一：存量行这一列是 NULL，parse 会把它落到默认档。界面上显示 null
+                // 读不出任何意思，而「第 2 档 · 派生统计」外加那句出库说明，客户当场就知道自己在什么位置。
+                .semanticDataTier(tier.name())
+                .semanticDataTierLabel(tier.label())
+                .semanticDataTierEgress(tier.egressStatement())
                 .build();
     }
 

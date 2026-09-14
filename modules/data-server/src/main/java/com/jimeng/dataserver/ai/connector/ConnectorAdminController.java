@@ -6,6 +6,9 @@ import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditQuery;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticDeriveService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticView;
 import com.jimeng.dataserver.ai.connector.service.GrantScriptRequestDto;
 import com.jimeng.dataserver.ai.connector.service.GrantScriptService;
 import com.jimeng.dataserver.ai.connector.service.PendingWriteQuery;
@@ -21,6 +24,7 @@ import com.jimeng.dataserver.ai.connector.spi.GrantScript;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -49,6 +53,7 @@ import java.util.Map;
  * 一条访问许可，谁能建连接谁就能让任意被授权的 Agent 以该身份访问客户的生产系统。
  * <b>在连接器进入 RBAC 资源体系之前，权限上的默认值取最严的那个——收紧容易，放开难。</b>
  */
+@Slf4j
 @Tag(name = "连接器", description = "客户系统接入：数据库 / HTTP 接口等外部资源的注册与探测")
 @RestController
 @RequestMapping("/data/admin/connectors")
@@ -58,6 +63,8 @@ public class ConnectorAdminController {
     private final ConnectorService connectorService;
     private final ConnectorAuditService connectorAuditService;
     private final ConnectorSchemaService connectorSchemaService;
+    private final ConnectorSemanticService connectorSemanticService;
+    private final ConnectorSemanticDeriveService connectorSemanticDeriveService;
     private final PendingWriteService pendingWriteService;
     private final GrantScriptService grantScriptService;
     private final SuperAdminGuard superAdminGuard;
@@ -112,11 +119,95 @@ public class ConnectorAdminController {
         return connectorService.dryRun(req, id);
     }
 
+    /**
+     * 新建。<b>建完就地派发语义层推导——这是「接入即触发」的落点。</b>
+     *
+     * <p>派发放在这里而不是 {@code ConnectorService.create()} 里面，理由写在那个方法的 javadoc 上，
+     * 一句话：推导必须在<b>事务提交之后</b>发生，而这里是唯一一个「提交已经完成、且不在任何事务里」
+     * 的位置（{@code create} 的 {@code @Transactional} 代理在返回给本方法之前就已经提交了）。
+     *
+     * <h3>★ 这次推导<b>不是零成本的</b></h3>
+     * 建连这条路上谁都没有拉过结构，{@code connector_schema} 此刻是空的，所以<b>首次推导会自己先去
+     * 客户库拉一次结构</b>（1 次 catalog + 最多 200 次 describe），拉完才叫模型。之后手工重跑时快照
+     * 已经在，那时才是只读我们自己的库。
+     * （连接器类型不支持自描述——今天的 HTTP 就是，它只声明 INVOKE / HEALTH——这一步不会发生，
+     * 推导直接落在 {@code NOT_APPLICABLE}。）
+     * <b>这句话必须写在建连入口上</b>：「新建一条连接 = 顺手对客户的生产库发最多两百次 information_schema
+     * 查询」这件事，不写在这里就没有任何一个读代码的人会知道。
+     *
+     * <p><b>但建连接口不等它。</b>派发只是把任务扔进 {@code streamExecutor} 就返回。
+     * 一个例外要认下来：那个池是 SynchronousQueue + CallerRunsPolicy，池打满时任务会<b>就地跑在这条
+     * 请求线程上</b>，于是这次建连的响应要一直等到推导结束。那是
+     * {@code ConnectorSemanticDeriveService.deriveAsync} 上写明的取舍——宁可慢一次（看得见），
+     * 不肯丢一次（看不见）。
+     *
+     * <h3>★ 推导完了还有第二段，它更贵</h3>
+     * 推导写完 READY 之后会自动再派发一段<b>采样验证</b>（S3 表关系包含性验证 + S4 列取值域采集），
+     * 跑在<b>另一个</b>线程池上，<b>不占</b> {@code semanticStatus}。它是这条链路上真正的大头：
+     * <ul>
+     *   <li>S3 对客户库发 {@code LEFT JOIN} 包含性探查，自我节流 30 次/分钟，200 条候选最坏约 20 分钟；</li>
+     *   <li>S4 对够格的列发 {@code COUNT(DISTINCT)} + {@code SELECT DISTINCT}，节流 20 条/分钟，
+     *       200 列最坏约 30 分钟。<b>它取的是真实取值</b>，所以只有数据出库档位开到第 3 档才会跑，
+     *       而那一档默认是关的。</li>
+     * </ul>
+     * 换句话说：<b>一次建连，最坏会在接下来的半小时里陆陆续续打客户的生产库几百条查询。</b>
+     * 这句话必须写在建连入口上——不写在这里，就没有任何一个读代码的人会知道。
+     * 两段都完成后，进度与结论在 {@code semanticNote} 的后半段。
+     *
+     * <p><b>返回体里的 {@code semanticStatus} 恒为 {@code NONE}，这不代表推导没跑。</b>
+     * 视图在 {@code create} 里就构造完了（那时行上这一列还是 NULL），派发之后没有人再刷它一次。
+     * 前端不能拿这次响应判断语义层结果，只能轮询连接详情。
+     *
+     * <p>派发失败不影响本次新建：连接已经落库并探测通过，它<b>现在就是可用的</b>。
+     * 语义层是叠加上去的注解，用一个可选增强的故障去否决一个已经成功的操作是错的。
+     */
     @Operation(summary = "新建连接器（保存前会实际探测：连通性 + 只读校验 + 能力，探不过则拒绝保存）")
     @PostMapping
     public ConnectorView create(@RequestBody ConnectorUpsert req) {
         superAdminGuard.requireSuperAdmin();
-        return connectorService.create(req);
+        ConnectorView created = connectorService.create(req);
+        dispatchSemanticDerive(created);
+        return created;
+    }
+
+    /**
+     * 接入时零人工：没有表单、没有勾选清单、没有确认页，说明书是背着人生成的。
+     *
+     * <p>三层保护，缺一不可：
+     * <ul>
+     *   <li><b>只给落了库的真实 id。</b>试连（{@code /probe}）用的是递减的<b>负数</b>合成 id 且从不落库
+     *       （见 {@code ConnectorService.dryRun}）。它走的是另一个端点、返回的也不是 {@code ConnectorView}，
+     *       今天到不了这里；但这个前提是别人代码里的，不值得依赖，所以在派发口上再挡一道。</li>
+     *   <li><b>吞掉派发异常。</b>注意<b>不是</b>「线程池满了被拒」——{@code streamExecutor} 挂的是
+     *       CallerRunsPolicy，满了会就地跑而不是拒。真正能从这一行抛出来的是应用关停窗口里的
+     *       {@code TaskRejectedException}。连接已经建好了，不该因此给人一个红色报错。</li>
+     *   <li><b>不等结果。</b>首次推导要先把客户库的结构拉一遍（catalog + 最多 200 次 describe）
+     *       再叫一次模型，几十秒起步；结果本来就写在 {@code semanticStatus} / {@code semanticNote}
+     *       上供界面轮询。</li>
+     * </ul>
+     */
+    private void dispatchSemanticDerive(ConnectorView view) {
+        String raw = view == null ? null : view.getId();
+        if (raw == null || raw.isBlank()) {
+            return;
+        }
+        long id;
+        try {
+            id = Long.parseLong(raw);
+        } catch (NumberFormatException e) {
+            log.warn("连接 id 不是数字，跳过语义层推导 id={}", raw);
+            return;
+        }
+        // 雪花 id 恒为正；负数只可能是试连的合成 id，而那种行从不落库，推它等于推一个不存在的连接。
+        if (id <= 0) {
+            return;
+        }
+        try {
+            connectorSemanticDeriveService.deriveAsync(id);
+        } catch (RuntimeException e) {
+            // 只记不抛：这条连接已经落库、已经探测通过，它现在就能用。
+            log.warn("语义层推导派发失败，连接照常可用 connectorId={}", id, e);
+        }
     }
 
     @Operation(summary = "编辑连接器（敏感参数留空则沿用原值；同样会重新探测）")
@@ -178,6 +269,123 @@ public class ConnectorAdminController {
     public ConnectorSchemaService.SnapshotResult refreshSchema(@PathVariable Long id) {
         superAdminGuard.requireSuperAdmin();
         return connectorSchemaService.refresh(id);
+    }
+
+    // ================================================================ 语义层
+
+    /**
+     * 已生成的「说明书」全文。
+     *
+     * <p>结构快照回答「有哪些表、哪些列」，这个接口回答<b>「它们是什么意思」</b>——
+     * 表是干什么的、字段什么含义、表之间怎么连、业务口径怎么算。客户给的只读账号里
+     * 全是 {@code t_ord_mst} 这样的名字，没有这一层模型就只能猜，而猜错不会报错，
+     * 只会返回一个看起来很正常的错数字。
+     *
+     * <p>界面上<b>必须把 {@code evidence} 和 {@code status} 一起显示出来</b>：
+     * 「有没有外部依据」是这条断言能不能被当真的唯一判据，而 {@code STALE} 意味着它挂的结构
+     * 已经变了。只显示 {@code gloss} 会让一句可能已经不成立的话看起来像事实。
+     */
+    @Operation(summary = "语义层：已生成的全部语义行（表用途 / 字段含义 / 表关系 / 业务口径）")
+    @GetMapping("/{id}/semantic")
+    public List<ConnectorSemanticView> semantic(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        // all() 内部会按 id 查连接做归属校验，跑在请求线程上，租户条件由拦截器注入 —— 越权取不到。
+        return connectorSemanticService.all(id).stream().map(ConnectorSemanticView::of).toList();
+    }
+
+    /**
+     * 手工重跑推导。
+     *
+     * <p>接入时是自动跑的，但它<b>会失败</b>（模型超时、模型返回的 JSON 坏了、拉客户库结构那一步没成），
+     * 而失败之后没有重试入口就等于永久失败——只能删了连接重建。所以留这个口子。
+     *
+     * <p><b>立刻返回，不等推导结束。</b>推导要把整库结构喂给模型跑一次，同步等会直接超时。
+     *
+     * <h3>重跑要花多少钱，取决于结构快照在不在</h3>
+     * <b>已经有快照</b>（正常情况：建连时那次推导已经拉过，或者有人点过「刷新结构」）——只读我们自己库里的
+     * {@code connector_schema}，对客户系统零字节访问，代价就是一次模型调用。
+     * <b>快照是空的</b>（从没拉成过，或者被清了）——推导会自己先去客户库补拉一次，那是 1 次 catalog +
+     * 最多 200 次 describe。
+     * <p>两个方向记反了都会误导人：记成「永远要打客户库」，会让人不敢用这个多数时候很便宜的口子；
+     * 记成「永远不打」，会让人以为对着一条没快照的连接连点十次也没有客户侧成本。
+     *
+     * <h3>★ 但推导之外还有两笔客户侧成本，都<b>不是</b>「只读我们自己的库」</h3>
+     * <ol>
+     *   <li><b>推导之前</b>会同步读一次客户的视图 / 存储过程定义（S1，{@code platform.sql_corpus}）。
+     *       纯元数据、不出一个业务值，解析总时长 20 秒封顶——很便宜，但它确实打了客户的库。</li>
+     *   <li><b>推导成功之后</b>会自动派发一段<b>采样验证</b>（S3 + S4），跑在另一个线程池上，
+     *       <b>不占</b> {@code semanticStatus}。S3 按 30 次/分钟探查表关系（200 条候选最坏约 20 分钟），
+     *       S4 按 20 条/分钟采集列取值（200 列最坏约 30 分钟，且只在数据出库档位开到第 3 档时才跑）。
+     *       它们在 {@code connector_audit} 里的动作名分别是 {@code platform.semantic_probe}
+     *       和 {@code platform.semantic_values}。</li>
+     * </ol>
+     * 所以「重跑一次推导」的真实代价是：一次模型调用 + 一次语料读取 +（异步地）最长约半小时的采样。
+     * 只想重跑采样、不想再花一次模型调用的，走 {@code POST /{id}/semantic/validate}。
+     *
+     * <p><b>{@code NOT_APPLICABLE} 不是失败，重跑也不会变。</b>连接器类型不支持自描述
+     * （今天的 HTTP 就是，它只声明 INVOKE / HEALTH）就没有结构可推，语义层对这种连接本来就不适用。
+     * 它和 {@code FAILED} 分开成两个状态，就是为了让人别在这里做无意义的重试。
+     *
+     * <p>真实进度写在连接详情的 {@code semanticStatus} / {@code semanticNote} 上，前端轮询那里。
+     *
+     * <h3>重跑<b>只覆盖机器推断的行</b></h3>
+     * {@code ConnectorSemanticService.replaceInferred} 先执行 {@code physicalDeleteInferred}
+     * ——那条 SQL 是 {@code DELETE FROM connector_semantic WHERE connector_id = ? AND source = 'INFERRED'}
+     * ——再把新推出来的行整批插回去，且每一行的 {@code source} 都被强制写成 {@code INFERRED}。
+     * 所以<b>人在对话里答过的口径（{@code source=HUMAN}）一行不动</b>，直接采信客户库注释的
+     * {@code IMPORTED} 同样不动。否则每点一次「重新生成」，就把业务方辛辛苦苦确认过的口径抹掉一次。
+     */
+    @Operation(summary = "语义层：手工重新推导（异步，立即返回；进度看连接详情的 semanticStatus）")
+    @PostMapping("/{id}/semantic/derive")
+    public Map<String, Object> deriveSemantic(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        // ★ 先做一次租户内的存在性校验，再把 id 交给后台线程。
+        // 后台那条路上的租户过滤只有一层：推导线程里的 selectById 靠 MyBatis 拦截器注入 tenant_id，
+        // 而那依赖 MdcAsyncSupport.wrap 把请求线程的 TenantContext 捎带过去。捎带一旦断掉
+        //（或者哪天有人为了读结构给推导套上 runAsSystem），后台的 selectById 就不再过滤租户，
+        // 路径参数里的任意 id 立刻变成一个跨租户触发器。这一行在【还有请求上下文】的地方把边界钉死，
+        // 不是「顺手查一下」。
+        connectorService.get(id);
+        connectorSemanticDeriveService.deriveAsync(id);
+        return Map.of("started", true);
+    }
+
+    /**
+     * 手工触发一次<b>采样验证</b>（S3 表关系验证 + S4 列取值域采集）。
+     *
+     * <p>与「重新推导」分开成两个端点，因为两者花的是<b>不同人的钱</b>：推导花一次模型调用（我们的），
+     * 采样花客户库的配额和负载（客户的）。把它们绑在一起，就只剩「两样一起花」这一个选项——
+     * 而实际最常见的两种需求恰恰是单边的：
+     * <ul>
+     *   <li>模型那次输出坏了 → 只想重推，<b>不想</b>再对客户的库打几百条探查；</li>
+     *   <li>企业超管刚把数据出库档位从第 1 档调到第 2/3 档 → 说明书没问题，
+     *       只是那些关系当初<b>没被探查过</b>（{@code verified=NONE}），现在想补上。</li>
+     * </ul>
+     *
+     * <h3>它做什么、不做什么</h3>
+     * <b>只验没决过的</b>：候选是按 {@code verified == NONE} 挑的，已经有结论的一条都不重验
+     *（验证器本身没有跨轮次游标，过滤在接线这一侧做）。{@code source=HUMAN} 的行一行不碰。
+     * 结论是<b>逐条</b>落库的：跑到一半被重启打断，已经验出来的结论一条不丢。
+     *
+     * <h3>要花多少</h3>
+     * S3 自我节流 30 次探查/分钟，S4 自我节流 20 条语句/分钟，两段<b>先后</b>跑。
+     * 200 条候选 + 200 列的连接，最坏约 20 + 30 分钟。
+     * <b>档位不够就什么都不做</b>：第 1 档（仅结构）下 S3 一条探查都不会发，S4 同理要第 3 档。
+     * 那种情况下返回 {@code started=true} 仍然是对的——任务确实派出去了，
+     * 真实结局（包括「因为档位没开所以一条都没验」）写在连接详情的 {@code semanticNote} 后半段。
+     *
+     * <p><b>立刻返回，不等结果。</b>同一条连接上已有一轮在跑时本次会被跳过（也写进 note）。
+     */
+    @Operation(summary = "语义层：手工触发采样验证（异步；只验未决过的关系，进度看连接详情的 semanticNote）")
+    @PostMapping("/{id}/semantic/validate")
+    public Map<String, Object> validateSemantic(@PathVariable Long id) {
+        superAdminGuard.requireSuperAdmin();
+        // ★ 与 deriveSemantic 同一条：在【还有请求上下文】的地方先做一次租户内的存在性校验。
+        // 后台那条路上的租户过滤依赖 MdcAsyncSupport.wrap 把 TenantContext 捎过去，捎带一旦断掉，
+        // 路径参数里的任意 id 就变成一个跨租户的触发器——而它会真的去打别的租户的客户库。
+        connectorService.get(id);
+        connectorSemanticDeriveService.validateAsync(id);
+        return Map.of("started", true);
     }
 
     @Operation(summary = "使用记录（分页；可按连接、Agent、能力、成败、时间筛选）")

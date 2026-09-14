@@ -22,6 +22,13 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <p>当前是项目里唯一的 {@link java.util.concurrent.Executor} bean，会抑制 Spring Boot 默认的
  * applicationTaskExecutor（项目未用 @EnableAsync，无影响）。后续若引入 @Async，请用
  * {@code @Async("具体执行器名")} 显式指定，勿复用本流式池。
+ *
+ * <h3>★ 什么活儿<b>不能</b>放上面那两个池</h3>
+ * 两者都是 {@code queueCapacity=0} + {@link ThreadPoolExecutor.CallerRunsPolicy}：池满时任务
+ * <b>就地跑在调用线程上</b>。对一个几秒钟的 SSE 流，那只是慢一次；对一个以<b>分钟</b>计的后台作业，
+ * 那是把几十分钟直接加到某次 HTTP 请求的响应时间上——网关早就读超时了，而调用方看到的是
+ * 「建连接超时」，没有任何线索指向真凶是一个后台剖析任务。
+ * 长作业要自己的池、自己的队列，见 {@link #semanticStageExecutor()}。
  */
 @Configuration
 public class StreamExecutorConfig {
@@ -55,6 +62,55 @@ public class StreamExecutorConfig {
         executor.setAllowCoreThreadTimeOut(true);
         executor.setThreadNamePrefix("run-pump-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * 语义层<b>采样验证阶段</b>（S3 表关系包含性验证 + S4 值域采集）专用线程池。
+     *
+     * <h3>为什么不能复用 {@code streamExecutor}</h3>
+     * 这两件事都是<b>自我节流</b>的：S3 每分钟最多 30 次探查（200 条候选 ≈ 20 分钟），
+     * S4 每分钟最多 20 条语句（200 列 ≈ 30 分钟）。节流不是可以调快的性能问题，
+     * 它是「别把客户的生产库打爆」这条纪律的实现方式，所以一个阶段跑<b>半小时</b>是正常形态。
+     *
+     * <p>而 {@code streamExecutor} 是 {@code SynchronousQueue} + {@code CallerRunsPolicy}：
+     * 并发流一旦超过 {@code maxPoolSize}，新任务<b>就地跑在调用线程上</b>。派发采样验证的那条调用
+     * 线程是一次「新建连接」或「重新生成语义层」的 HTTP 请求线程——把半小时的剖析压回去，
+     * 这次建连就永远回不去了。慢一次看得见、丢一次看不见那条取舍在这里不成立：
+     * <b>这里两种都看不见，而且慢的那一种还会顺手拖垮一次本来已经成功的建连。</b>
+     *
+     * <h3>所以这个池的三个参数都是反过来选的</h3>
+     * <ul>
+     *   <li><b>有界队列</b>（不是 SynchronousQueue）：排队是这类作业的正常状态，不是异常。</li>
+     *   <li><b>core = max</b>：{@code ThreadPoolExecutor} 只在<b>队列满了之后</b>才把线程数涨过
+     *       core，而这里的队列有 64 个坑——写成 {@code core=2, max=8} 的话，第 3 个线程要等到
+     *       积压 64 个作业才会出现，{@code maxPoolSize} 形同虚设。两者写等就是说实话：
+     *       同时最多 4 条连接在被剖析。</li>
+     *   <li><b>{@link ThreadPoolExecutor.AbortPolicy}</b>（默认策略，这里显式写出来）：满了就拒，
+     *       派发方收到 {@code TaskRejectedException} 后<b>会把「这次没派出去」写进
+     *       {@code connection.semantic_note}</b>。既不悄悄丢，也不就地跑。</li>
+     * </ul>
+     *
+     * <p>队列 64 个坑 × 单个作业最长约 50 分钟，意味着极端积压下末尾的作业要等到很久以后。
+     * 这是刻意的：语义层是叠加的注解，它晚一点到没关系；它把客户的库打爆、或者把一次建连拖超时，
+     * 才是不能接受的。
+     */
+    @Bean("semanticStageExecutor")
+    public ThreadPoolTaskExecutor semanticStageExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(64);
+        // 一个作业可能跑半小时，keepAlive 要明显大于「两批作业之间的间隙」才有意义；
+        // 这里给 5 分钟，allowCoreThreadTimeOut 让空闲期不常驻 4 条线程。
+        executor.setKeepAliveSeconds(300);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setThreadNamePrefix("semantic-stage-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        // 关停时不等这半小时：阶段内部按 Thread.interrupted() 主动收手，已经落库的结论一条不丢
+        //（每决完一条就写一条，见 ConnectorSemanticDeriveService 的 ProbeProgress 回调）。
+        executor.setWaitForTasksToCompleteOnShutdown(false);
         executor.initialize();
         return executor;
     }

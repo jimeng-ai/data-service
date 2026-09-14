@@ -142,4 +142,56 @@ public class Connection extends BaseEntity {
     @Schema(description = "写操作开放程度：FORBIDDEN | REQUIRE_APPROVAL | AUTO")
     @TableField("write_policy")
     private String writePolicy;
+
+    /**
+     * 语义层推导状态。<b>推导失败不影响连接可用</b>——语义层是叠加的注解，没有它
+     * conn_catalog / conn_describe 照常可用，只是模型少了那份「说明书」。
+     * 所以这里是一个状态字段，不是一道闸。
+     */
+    @Schema(description = "语义层推导状态：NONE | RUNNING | READY | FAILED")
+    @TableField("semantic_status")
+    private String semanticStatus;
+
+    @Schema(description = "语义层最近一次【成功】生成的时间；失败的重试不覆盖它")
+    @TableField("semantic_synced_at")
+    private Date semanticSyncedAt;
+
+    /**
+     * 并发认领凭据，<b>不是</b>给人看的时间。
+     *
+     * <p>单独一列而不是复用 {@code semantic_synced_at}：那一列要回答「上次什么时候还是好的」，
+     * 而认领戳每次推导开始都会变、失败也会变。两个含义挤进一列的后果是——
+     * 一次失败的重试就把上一次成功的时间抹掉，排查时最想要的那条信息正好没了。
+     */
+    @Schema(description = "语义层推导的认领时间（并发凭据，非业务时间）")
+    @TableField("semantic_claim_at")
+    private Date semanticClaimAt;
+
+    @Schema(description = "推导结果摘要或失败原因，给管理台显示")
+    @TableField("semantic_note")
+    private String semanticNote;
+
+    /**
+     * 数据出库档位：{@code METADATA_ONLY}（纯元数据）| {@code DERIVED_STATS}（派生统计，<b>默认</b>）
+     * | {@code SAMPLE_VALUES}（样本值，默认关闭、须企业超管显式开启）。
+     *
+     * <p>它回答的是客户最在意的那个问题：<b>为了看懂这个库，到底有什么东西会离开它</b>。
+     * 「数据不出域」和「不能读数据」不是一回事——一个字节的数据值都不碰，表关系推断的精确率
+     * 在真实生产库上从约 1.00 掉到约 0.49，<b>大约腰斩</b>，而推错的关系不报错，
+     * 只会让模型 join 出一个看着很正常的错数字。所以这是三档，不是一个布尔。
+     *
+     * <p><b>不要在业务代码里比较这个字符串，也不要把它换算成 1/2/3。</b>
+     * 一律 {@code SemanticDataTier.parse(...)} 成枚举后问谓词
+     * （{@code allowsDerivedStats()} / {@code allowsSampleValues()}）。
+     * 只要有人能拿到序号，迟早会出现一处本该是 {@code >} 的 {@code >=}，
+     * 而那个错不会编译失败、不会跑挂，只是让客户的真实取值多走一档出去。
+     *
+     * <p>空值 = 默认档（{@code DERIVED_STATS}）：这一列是后加的，存量行的 NULL 只说明
+     * 「没选过」，不说明「选了最严的」。认不出来的值 = 最严档（{@code METADATA_ONLY}）。
+     * 两条兜底方向不同，但共守一条：<b>{@code SAMPLE_VALUES} 永远不可能由兜底到达</b>。
+     */
+    @Schema(description = "数据出库档位：METADATA_ONLY=只出结构 | DERIVED_STATS=可出派生统计（默认）"
+            + " | SAMPLE_VALUES=可出真实取值（默认关闭，须超管显式开启）。空值按默认档，认不出来按最严档")
+    @TableField("semantic_data_tier")
+    private String semanticDataTier;
 }

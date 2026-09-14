@@ -35,6 +35,7 @@ import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -52,8 +53,43 @@ import java.util.regex.Pattern;
 @Slf4j
 public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCapable, WriteCapable {
 
-    /** 目录一次最多返回多少个对象。大库几百张表，全量塞进上下文放不下也没用。 */
+    /**
+     * 目录一次最多返回多少个对象。大库几百张表，全量塞进上下文放不下也没用。
+     *
+     * <p><b>上限本身不重要，「砍掉哪一批」才重要。</b>这个 LIMIT 是数据库执行的，
+     * 被砍掉的行根本不会回到 Java——所以决定去留的只能是 SQL 里的 ORDER BY，
+     * 见 {@link #CATALOG_LIST_SQL}。
+     */
     private static final int CATALOG_MAX = 500;
+
+    /**
+     * 「行数未知」算第几档。见 {@link #importanceTier(Long)}。
+     *
+     * <p>3 = 当它是一张几百行的普通表：排在真正空的表和个位数行的表<b>前面</b>，
+     * 排在上千行的实表<b>后面</b>。
+     */
+    private static final int UNKNOWN_ROWS_TIER = 3;
+
+    /** {@link CatalogView#ordering()}：这个连接器按什么排目录，一句人话，会进截断消息。 */
+    static final String CATALOG_ORDERING =
+            "按估算行数的数量级降序（行数未知的视图等按几百行量级插队），同档内按对象名升序";
+
+    /**
+     * 目录列表 SQL。<b>提成常量是为了能被单测钉住</b>：整个「按重要性截断」的修复，
+     * 全部力气都在这段 ORDER BY 上，它一旦被谁顺手改回 {@code ORDER BY TABLE_NAME}，
+     * 行为会<b>静默</b>退回老样子——大库里 t_ 开头的业务表整片消失，没有任何报错。
+     *
+     * <p>排序表达式与 {@link #importanceTier(Long)} 必须是<b>同一个函数</b>。
+     * 这里用 {@code LENGTH(TABLE_ROWS)}（整数转字符串取十进制位数）而不是
+     * {@code FLOOR(LOG10(TABLE_ROWS))+1}：后者走浮点，{@code LOG10(1000)} 在某些平台上
+     * 会得到 2.9999999999999996 从而 FLOOR 成 2，SQL 侧和 Java 侧就会在 10 的整数次幂上分叉。
+     */
+    static final String CATALOG_LIST_SQL =
+            "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT, TABLE_ROWS "
+                    + "FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? "
+                    + "ORDER BY CASE WHEN TABLE_ROWS IS NULL THEN " + UNKNOWN_ROWS_TIER
+                    + " WHEN TABLE_ROWS < 1 THEN 0 ELSE LENGTH(TABLE_ROWS) END DESC, TABLE_NAME ASC "
+                    + "LIMIT " + CATALOG_MAX;
 
     /** 只读探针用的表名。刻意取一个不可能与客户业务表重名的名字。 */
     private static final String PROBE_TABLE = "__jm_readonly_probe__";
@@ -482,12 +518,65 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
 
     // ================================================================ 能自描述
 
+    /**
+     * 排序用的临时二元组：目录条目 + 它的重要性档位。
+     *
+     * <p>package-private 而不是 private：排序规则是这次修复的全部内容，
+     * 得让单测能直接钉住它，而这个仓库里没有 testcontainers / H2，连不了真库。
+     * 只在排序时存在，从不序列化。
+     */
+    record Ranked(CatalogEntry entry, int tier) {
+        String name() {
+            return entry.name();
+        }
+    }
+
+    /** 档位降序、同档按名字升序。见 {@link #importanceTier(Long)} 里的两条理由。 */
+    static final Comparator<Ranked> BY_IMPORTANCE =
+            Comparator.<Ranked>comparingInt(Ranked::tier).reversed().thenComparing(Ranked::name);
+
+    /**
+     * 目录的重要性档位：<b>估算行数的十进制位数</b>，越大越靠前。
+     *
+     * <h3>为什么是「数量级」而不是直接拿行数排</h3>
+     * {@code TABLE_ROWS} 对 InnoDB 是<b>估算值</b>——来自索引统计的随机采样，
+     * 同一张表两次查能差几倍，刚建或刚 ANALYZE 过的表还可能是 0。
+     * 拿一个会抖的数做全序，排在第 200 名和第 201 名的两张表每次刷新都可能互换，
+     * 而第 200 名正好是 {@code ConnectorSchemaService.MAX_OBJECTS} 的刀口——
+     * 换位就意味着<b>保留下来的集合变了</b>，结构漂移检测会永远报一对 ADDED/REMOVED，
+     * 挂在上面的语义跟着反复 STALE、反复恢复。一个永远在响的报警等于没有报警。
+     * <p>取数量级之后，一张表要跨一档得让估算值动 <b>10 倍</b>——那已经不是采样噪声，是真的变了。
+     *
+     * <h3>为什么同档一定要用名字兜底</h3>
+     * 同一个数量级里的表之间没有可信的高下之分，这时唯一重要的性质是<b>可重复</b>。
+     * 表名在一个库里唯一、且不会自己变，是天然的确定性 tie-break。
+     *
+     * <h3>★ NULL 不是 0</h3>
+     * VIEW 的 {@code TABLE_ROWS} <b>恒为 NULL</b>，某些引擎、统计信息不可用时也是 NULL。
+     * 把 NULL 当 0，等于让客户 DBA 亲手建的 {@code v_xxx} 汇总视图——
+     * 业务语义最浓、名字最像人话的那一批对象——整批沉到表尾被截掉。
+     * 所以「不知道」单独放在 {@link #UNKNOWN_ROWS_TIER} 档，
+     * 即「当它是一张几百行的普通表」：排在真正空的表前面，排在上千行的实表后面。
+     * 这是个折中，但方向是对的——宁可让一个没人用的视图占掉一个名额，也不要整类对象消失。
+     *
+     * <p>用位数而不是 {@code log10}：SQL 侧走 {@code LENGTH(TABLE_ROWS)}，纯整数，没有浮点，
+     * 两边算的是同一个函数。理由见 {@link #CATALOG_LIST_SQL}。
+     *
+     * @param approxRows {@code information_schema} 给的估算行数，{@code null} = 不知道
+     */
+    static int importanceTier(Long approxRows) {
+        if (approxRows == null) {
+            return UNKNOWN_ROWS_TIER;
+        }
+        if (approxRows < 1) {
+            return 0;
+        }
+        return Long.toString(approxRows).length();
+    }
+
     @Override
     public CatalogView catalog() {
         String countSql = "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?";
-        String listSql = "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT, TABLE_ROWS "
-                + "FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? "
-                + "ORDER BY TABLE_NAME LIMIT " + CATALOG_MAX;
         try (Connection c = borrow()) {
             applyReadOnly(c);
             int total;
@@ -498,8 +587,8 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                     total = rs.next() ? rs.getInt(1) : 0;
                 }
             }
-            List<CatalogEntry> entries = new ArrayList<>();
-            try (PreparedStatement ps = c.prepareStatement(listSql)) {
+            List<Ranked> ranked = new ArrayList<>();
+            try (PreparedStatement ps = c.prepareStatement(CATALOG_LIST_SQL)) {
                 ps.setQueryTimeout(15);
                 ps.setString(1, database);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -507,17 +596,32 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                         String comment = rs.getString("TABLE_COMMENT");
                         // MySQL 对视图的 TABLE_COMMENT 会返回字面量 "VIEW"，那不是注释，去掉免得误导模型。
                         if ("VIEW".equals(comment)) comment = null;
-                        long rows = rs.getLong("TABLE_ROWS");
+                        long raw = rs.getLong("TABLE_ROWS");
+                        // ★ getLong 把 SQL NULL 读成 0。VIEW 的 TABLE_ROWS 恒为 NULL，
+                        //   不做这一步区分，所有视图都会被当成空表排到最后然后被截掉。
+                        Long rows = rs.wasNull() ? null : raw;
                         // TABLE_ROWS 对 InnoDB 是估算值，差几倍很常见。附上「约」字，
                         // 免得模型把它当成 COUNT(*) 的答案直接回给用户。
+                        // 未知（null）和 0 都不写行数：前者没数可写，后者可能只是没统计过，
+                        // 写「约 0 行」会让模型断言这张表是空的。
                         String withRows = (comment == null || comment.isBlank() ? "" : comment)
-                                + (rows > 0 ? "（约 " + rows + " 行，InnoDB 估算值，不可当作准确计数）" : "");
-                        entries.add(new CatalogEntry(rs.getString("TABLE_NAME"),
-                                rs.getString("TABLE_TYPE"), withRows.isBlank() ? null : withRows));
+                                + (rows != null && rows > 0
+                                ? "（约 " + rows + " 行，InnoDB 估算值，不可当作准确计数）" : "");
+                        ranked.add(new Ranked(new CatalogEntry(rs.getString("TABLE_NAME"),
+                                rs.getString("TABLE_TYPE"), withRows.isBlank() ? null : withRows),
+                                importanceTier(rows)));
                     }
                 }
             }
-            return new CatalogView("TABLE", entries, total > entries.size(), total);
+            // SQL 已经按同一个表达式排过一遍了，这里再排不是白做，两件事：
+            // 一、SQL 那遍决定的是【哪 CATALOG_MAX 个能回来】，这件事只有数据库能做，Java 救不回来；
+            // 二、这一遍决定【回来的这些以什么顺序交出去】。SQL 的 TABLE_NAME tie-break 走
+            //    information_schema 那一列的排序规则，受 lower_case_table_names 影响，可能大小写不敏感；
+            //    换一台 MySQL 就换一种顺序，而快照顺序不稳定正是漂移检测报假警的来源。
+            //    把最终顺序钉在 Java 这边，同一个库在哪台机器上都得到同一份目录。
+            ranked.sort(BY_IMPORTANCE);
+            List<CatalogEntry> entries = ranked.stream().map(Ranked::entry).toList();
+            return new CatalogView("TABLE", entries, total > entries.size(), total, CATALOG_ORDERING);
         } catch (SQLException e) {
             throw classify(e, "列目录");
         }

@@ -54,6 +54,21 @@ public class SkillRuntimeService {
     private final com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage draftAgentToolPackage;
     private final com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage draftSkillToolPackage;
 
+    /**
+     * 连接器「默认注入目录」+「这一轮命中的口径」的来源。
+     *
+     * <h4>★ 加这条依赖之前必须确认它闭不上环</h4>
+     * 本类身处 {@code ProviderRegistry → ChatClient → AiConversationLoop → SkillRuntimeService →
+     * SkillToolExecutorRegistryService → ConnectorToolExecutor} 这条链上，仓库已经被同一个环
+     * 咬过两次。{@code ConnectorOverviewService} 只注入四个 MyBatis mapper、
+     * {@code ConnectorProperties}（一个 {@code @ConfigurationProperties} 叶子）和
+     * {@code MetricRewriter}（纯匹配函数，自己没有任何注入依赖），
+     * <b>没有任何一条边能回到 {@code ProviderRegistry} / {@code ClaudeService} / {@code ChatClient}</b>，
+     * 所以这条新边是安全的。往这里加别的连接器组件前，把那条链重新走一遍——
+     * 尤其别换成 {@code ConnectorGateway}（它拖着 registry / loader / audit / redis / PendingWriteService）。
+     */
+    private final com.jimeng.dataserver.ai.connector.service.ConnectorOverviewService connectorOverviewService;
+
     // ------------------------------------------------------------------ public API
 
     public SkillApplyResult applySkillContext(Map<String, Object> body, AiProtocolAdapter adapter) {
@@ -90,6 +105,10 @@ public class SkillRuntimeService {
         // 平台级 Skill「rag-knowledge」可见性取决于当前 Agent 是否绑定知识库：绑了→提升为直接注入工具；
         // 没绑→直接摘除（没有库可检索，暴露只会诱导模型盲调 rag.search 失败）。
         resolveRagSkillVisibility(skillOnly, boundPlugins);
+
+        // 平台级 Skill「connector」在场且 Agent 真的授权了连接器时，把表清单概览 + 这一轮命中的口径
+        // 直接注入上下文，省掉模型开口前的那次 conn_catalog 往返。与上面 RAG 那段一样，取决于 Agent 绑了什么。
+        injectConnectorContext(body, skillMap, adapter, messages);
 
         if (!boundPlugins.isEmpty()) {
             injectFullSkillContext(body, boundPlugins, adapter);
@@ -204,6 +223,63 @@ public class SkillRuntimeService {
             }
             it.remove();
             break;
+        }
+    }
+
+    /** 平台级连接器 Skill 的名称（SKILL.md frontmatter name）。 */
+    private static final String CONNECTOR_SKILL_NAME = "connector";
+
+    /**
+     * 「默认注入目录」+「这一轮的确定性口径命中」：两段都进 system 上下文。
+     *
+     * <p>今天模型必须先烧一次 {@code conn_catalog} 往返才知道库里有哪些表；而那份「表名 + 注释」
+     * 很小，来源又是<b>我们自己的</b> {@code connector_schema} 快照，完全可以提前给。
+     * 口径（{@code glossary}）也一并给：销售额扣不扣退款决定了要不要 join 退款表，
+     * 它必须在<b>选表之前</b>被看见。
+     *
+     * <h4>★ 口径块只按【用户这一轮说的话】命中</h4>
+     * 传进去的是 {@link #latestUserText}（最后一条 user 消息），<b>不是整段对话历史</b>。
+     * 传历史的后果很具体：三轮前提过一次「销售额」，之后每一轮都会把它重新注入一遍，
+     * 于是这套东西退化成「每次都提供给大模型作参考」——真正相关的那一条被十几条无关定义稀释掉。
+     *
+     * <h4>★ 它是附加上下文，不是对用户原话的改写</h4>
+     * 这里只 {@code appendSystemContent}，<b>从不改 {@code messages} 里的任何一个字</b>。
+     * 改写用户输入会让「用户说的话」和「模型看到的话」不再是同一句，答案错了的时候，
+     * 对话记录里就没有任何材料能复原模型当时读到了什么——而本仓库的审计、trace_id 回溯、
+     * 口径变更留痕全都建立在「对话可复核」这个前提上。
+     *
+     * <p><b>两个前提都满足才注入，缺一不注入一个字节：</b>
+     * <ul>
+     *   <li>{@code connector} 这个平台 Skill 在本次请求的工具包视图里——没有它，模型根本没有
+     *       conn_* 工具，给一份表清单只会诱导它去调不存在的工具；</li>
+     *   <li>当前 Agent 真的被授权了连接器（{@code agent_connection} 里有行）——这一条由
+     *       {@code ConnectorOverviewService} 自己判，并且和 {@code ConnectorGateway} 一样 fail-closed：
+     *       没有 {@code AgentContext} / 没有租户上下文 = 谁也没授权。</li>
+     * </ul>
+     *
+     * <p>注入是叠加增强，<b>任何失败都只是少一段文字</b>：概览服务内部吞掉全部异常并返回空，
+     * 这里只判空，外加一层 catch 兜住"它哪天不再吞异常了"。用一个可选优化的故障去打断一轮对话是错的。
+     */
+    private void injectConnectorContext(Map<String, Object> body,
+                                         Map<String, ToolPackage> allPackages,
+                                         AiProtocolAdapter adapter,
+                                         List<?> messages) {
+        if (toolPackageRegistry.findByName(allPackages, CONNECTOR_SKILL_NAME) == null) return;
+        com.jimeng.dataserver.ai.connector.service.ConnectorOverviewService.RequestContext ctx;
+        try {
+            ctx = connectorOverviewService.buildRequestContext(latestUserText(messages));
+        } catch (Exception e) {
+            log.warn("构建连接器上下文失败，本轮不注入", e);
+            return;
+        }
+        if (ctx == null) return;
+        if (StrUtil.isNotBlank(ctx.getOverview())) {
+            adapter.appendSystemContent(body, ctx.getOverview());
+            log.info("连接器目录概览已注入 chars={}", ctx.getOverview().length());
+        }
+        if (StrUtil.isNotBlank(ctx.getMetricContext())) {
+            adapter.appendSystemContent(body, ctx.getMetricContext());
+            log.info("已确认口径命中并注入 chars={}", ctx.getMetricContext().length());
         }
     }
 
