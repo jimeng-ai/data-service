@@ -111,6 +111,8 @@ class ConnectorSemanticServiceTest {
         semanticMapper = mock(ConnectorSemanticMapper.class);
         connectionMapper = mock(ConnectionMapper.class);
         service = new ConnectorSemanticService(semanticMapper, connectionMapper);
+        // 回写一律带「仍是读到时的样子」为条件；单测里没有并发写者，条件总成立。
+        when(semanticMapper.update(any(), any())).thenReturn(1);
     }
 
     /** 连接存在且属于本租户。不 stub 它就等于「连接不存在」，那是另一组用例。 */
@@ -398,7 +400,7 @@ class ConnectorSemanticServiceTest {
             assertEquals(0, r.staled());
             assertEquals(ST_DRAFT, obj.getStatus());
             // 一行都不该写库：每次刷新都 UPDATE 一遍全表语义，本身也是个问题。
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
 
         /** 表整个没了，挂在它上面的一切都失效——这时候锚点粒度不参与判断。 */
@@ -607,7 +609,7 @@ class ConnectorSemanticServiceTest {
 
             assertEquals(0, r.staled());
             assertEquals(0, r.revived());
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
 
         /** 一次刷新里两种变化同时发生，计数要分得开——否则报表里看不出到底出了什么事。 */
@@ -628,7 +630,7 @@ class ConnectorSemanticServiceTest {
             assertEquals(1, r.revived());
             assertEquals(ST_STALE, willStale.getStatus());
             assertEquals(ST_DRAFT, willRevive.getStatus());
-            verify(semanticMapper, times(2)).updateById(any());
+            verify(semanticMapper, times(2)).update(any(), any());
         }
 
         /** 归属校验在读之前。连接不存在就不该有任何后续动作。 */
@@ -640,7 +642,7 @@ class ConnectorSemanticServiceTest {
             assertThrows(ServiceException.class,
                     () -> service.applyDrift(CONN_ID, ordersOnly(ORD_ID), List.of()));
             verify(semanticMapper, never()).selectList(any());
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
     }
 
@@ -749,7 +751,7 @@ class ConnectorSemanticServiceTest {
                     CONN_ID, "销售额", "已支付订单的实付金额合计，扣退款", null, "u9", "张三", "trace-2");
 
             assertSame(e, returned);
-            verify(semanticMapper).updateById(e);
+            verify(semanticMapper).update(any(), any());
             verify(semanticMapper, never()).insert(any());
             assertEquals("已支付订单的实付金额合计，扣退款", e.getGloss());
         }
@@ -860,7 +862,7 @@ class ConnectorSemanticServiceTest {
             assertThrows(ServiceException.class,
                     () -> service.defineMetric(CONN_ID, "  ", "实付金额合计", null, "u9", "张三", null));
             verify(semanticMapper, never()).insert(any());
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
 
         /** 空说明比没有这条口径更糟：注入层会把一句空话当成已澄清的口径喂给模型。 */
@@ -870,7 +872,7 @@ class ConnectorSemanticServiceTest {
             assertThrows(ServiceException.class,
                     () -> service.defineMetric(CONN_ID, "销售额", "   ", null, "u9", "张三", null));
             verify(semanticMapper, never()).insert(any());
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
 
         @Test
@@ -881,7 +883,7 @@ class ConnectorSemanticServiceTest {
             assertThrows(ServiceException.class, () -> service.defineMetric(
                     CONN_ID, "销售额", "实付金额合计", null, "u9", "张三", null));
             verify(semanticMapper, never()).insert(any());
-            verify(semanticMapper, never()).updateById(any());
+            verify(semanticMapper, never()).update(any(), any());
         }
     }
 

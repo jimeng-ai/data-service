@@ -458,8 +458,8 @@ public class ConnectorOverviewService {
         }
         ConnectorSemantic s = g.objects.get(r.name());
         if (s != null && !isBlank(s.getGloss())) {
-            // 短版本：选表那一刻需要的就是一句话，完整版在 conn_describe 给。
-            // 直接复用 conn_catalog 那条 80 字规则，免得两处对"短"的理解分叉。
+            // 短版本：选表那一刻需要的就是一句话。完整版由 conn_describe 放在响应顶层的 semantic
+            // （与顶层 comment 并排）；这里直接复用 conn_catalog 那条 80 字规则，免得两处对"短"的理解分叉。
             boolean stale = ConnectorSemanticService.ST_STALE.equals(s.getStatus());
             line.append(stale ? " | 语义(已过期,以 conn_describe 为准): " : " | 语义: ")
                     .append(oneLine(ConnectorSemanticService.shortGloss(s.getGloss())));

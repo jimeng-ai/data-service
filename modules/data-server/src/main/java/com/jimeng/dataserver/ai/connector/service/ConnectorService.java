@@ -23,8 +23,13 @@ import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSchemaMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.Date;
@@ -73,6 +78,27 @@ public class ConnectorService {
     private final ConnectorProbeService probeService;
     private final CustomerDataSourceManager dataSourceManager;
     private final CredentialCipher cipher;
+
+    /**
+     * 档位从第 3 档降下来时删掉库里存着的真实取值（契约 K-5）。
+     *
+     * <p><b>不会成环</b>：它只注入两个 mapper，是条叶子。放在字段列表末尾：按位置构造本类的测试不会静默错位。
+     */
+    private final ConnectorSemanticService semanticService;
+
+    /** {@link #update} 用的编程式事务。为什么不用注解，见那个方法的注释。 */
+    private final PlatformTransactionManager transactionManager;
+
+    /**
+     * 档位调到第 3 档之后派发一轮采样验证。
+     *
+     * <p>★ 必须是 {@link ObjectProvider}：推导链上的 {@code SemanticValueProfiler} 构造期注入了本类，
+     * 直接注入推导服务就闭合 {@code ConnectorService → ConnectorSemanticDeriveService → SemanticValueProfiler → ConnectorService}，
+     * 启动即失败。与 {@code ConnectorSchemaService} 对它的处理同一个办法。
+     */
+    private final ObjectProvider<ConnectorSemanticDeriveService> semanticDerive;
+
+    private volatile TransactionTemplate txTemplate;
 
     /**
      * 试连用的合成实例 id。
@@ -265,29 +291,126 @@ public class ConnectorService {
         }
     }
 
-    @Transactional
+    /**
+     * 编辑并落库。
+     *
+     * <h3>★ 数据出库档位变了，事情不在 connection 这一行上结束</h3>
+     * <ul>
+     *   <li><b>结果档位不允许真实取值</b>（从第 3 档降下来，或者本来就不在第 3 档）：在<b>同一个事务里</b>删掉语义层存着的真实取值
+     *       （{@link ConnectorSemanticService#purgeSampleValues}）。客户收回授权，意思是他的取值不该再留在我们库里；
+     *       只改档位不删，那些取值集合与判别值会一直躺着，而读出侧的拦截只保证「不给模型看」。
+     *       删不掉就让这次编辑失败——档位与删除同生共死，不存在「界面上已经降档、库里取值还在」的中间态。
+     *       本来就不在第 3 档时也删一遍：把此前的残留（改动上线之前降过档的连接）一起清掉，没有残留时只是一次查询。</li>
+     *   <li><b>从第 3 档降下来</b>：事务提交之后再删一遍。事务里那一遍读的是快照，事务期间恰好写回来的采集结果它看不见。</li>
+     *   <li><b>调到第 3 档</b>：事务提交之后派发一轮不限范围的采样验证。在读不到取值的档位下验过的多态外键，
+     *       要等这一轮才会回头按判别值分组重探；不派发的话，这件事只有等有人去点「验证表关系」才会发生，而没有任何提示让人去点。</li>
+     * </ul>
+     *
+     * <h3>为什么这里用编程式事务，不用 {@code @Transactional}</h3>
+     * 派发出去的验证线程读档位读的是<b>已提交</b>的值：在事务里派发，它读到的还是旧档位，重探一条都不会发生，也不报错。
+     * {@link #create} 的注释解释过为什么不用 afterCommit 回调（正确性要依赖另一个类的派发一定是真异步）。
+     * 编程式事务在 {@code execute} 返回时已经提交并清理完，之后再做的事与事务无关。
+     * 只有被外层事务包着调用时（今天没有这样的调用方）才退回 afterCommit，否则就是在外层提交之前派发。
+     */
     public ConnectorView update(Long id, ConnectorUpsert req) {
-        Connection row = requireRow(id);
-        // kind 不可改：config_json 的形状是按类型定的，改 kind 等于把一堆 MySQL 参数
-        // 交给 HTTP 连接器去解释。要换类型就删了重建。
-        if (req.getKind() != null && !req.getKind().isBlank()
-                && !ConnectorRegistry.normalize(req.getKind()).equals(ConnectorRegistry.normalize(row.getKind()))) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "不能修改连接器类型。请删除后重新创建");
+        TierChange[] change = new TierChange[1];
+        ConnectorView view = tx().execute(status -> {
+            Connection row = requireRow(id);
+            boolean samplesBefore = SemanticDataTier.parse(row.getSemanticDataTier()).allowsSampleValues();
+            // kind 不可改：config_json 的形状是按类型定的，改 kind 等于把一堆 MySQL 参数
+            // 交给 HTTP 连接器去解释。要换类型就删了重建。
+            if (req.getKind() != null && !req.getKind().isBlank()
+                    && !ConnectorRegistry.normalize(req.getKind()).equals(ConnectorRegistry.normalize(row.getKind()))) {
+                throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                        "不能修改连接器类型。请删除后重新创建");
+            }
+            validateBasics(req, false);
+            Connector connector = registry.require(row.getKind());
+            apply(row, req, connector, row);
+
+            ConnectorProbeService.ProbeReport report = probeOrThrow(row);
+            writeProbeResult(row, report);
+
+            connectionMapper.updateById(row);
+            boolean samplesAfter = SemanticDataTier.parse(row.getSemanticDataTier()).allowsSampleValues();
+            if (!samplesAfter) {
+                int purged = semanticService.purgeSampleValues(id);
+                if (purged > 0) {
+                    log.info("数据出库档位不允许真实取值，已删除语义层里存着的取值 id={} 行数={}", id, purged);
+                }
+            }
+            // 参数或凭据可能变了，旧池必须作废——否则改了密码之后旧池还在用旧凭据，
+            // 表现为「改了没生效」，而且要等池自然过期才恢复。
+            dataSourceManager.invalidate(id);
+            change[0] = new TierChange(samplesBefore, samplesAfter);
+            log.info("更新连接器实例 id={} kind={} name={}", id, row.getKind(), row.getName());
+            return toView(row);
+        });
+        afterTierChangeCommitted(id, change[0]);
+        return view;
+    }
+
+    /** 档位变化在事务提交之后要做的事。理由见 {@link #update}。 */
+    private void afterTierChangeCommitted(Long id, TierChange change) {
+        if (change == null || change.samplesBefore() == change.samplesAfter()) {
+            return;
         }
-        validateBasics(req, false);
-        Connector connector = registry.require(row.getKind());
-        apply(row, req, connector, row);
+        Runnable after = change.samplesAfter() ? () -> dispatchValidationQuietly(id) : () -> purgeAgainQuietly(id);
+        if (TransactionSynchronizationManager.isSynchronizationActive()
+                && TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    after.run();
+                }
+            });
+        } else {
+            after.run();
+        }
+    }
 
-        ConnectorProbeService.ProbeReport report = probeOrThrow(row);
-        writeProbeResult(row, report);
+    /** 降档提交之后的第二遍删除。失败只记日志：第一遍已经在事务里删过，结构刷新还会再扫。 */
+    private void purgeAgainQuietly(Long id) {
+        try {
+            int n = semanticService.purgeSampleValues(id);
+            if (n > 0) {
+                log.warn("数据出库档位下调提交后又删到了真实取值（事务期间有采集结果写回） id={} 行数={}", id, n);
+            }
+        } catch (Exception e) {
+            log.warn("数据出库档位下调提交后的第二遍删除失败，结构刷新时会再扫 id={}", id, e);
+        }
+    }
 
-        connectionMapper.updateById(row);
-        // 参数或凭据可能变了，旧池必须作废——否则改了密码之后旧池还在用旧凭据，
-        // 表现为「改了没生效」，而且要等池自然过期才恢复。
-        dataSourceManager.invalidate(id);
-        log.info("更新连接器实例 id={} kind={} name={}", id, row.getKind(), row.getName());
-        return toView(row);
+    /**
+     * 调到第 3 档之后派发一轮不限范围的采样验证。失败只记日志、不让一次成功的编辑报错：
+     * 派发本身落不下去时（队列满）推导服务会把「没派发出去」写进语义层状态说明，管理台看得见。
+     */
+    private void dispatchValidationQuietly(Long id) {
+        try {
+            ConnectorSemanticDeriveService derive = semanticDerive == null ? null : semanticDerive.getIfAvailable();
+            if (derive == null) {
+                log.warn("数据出库档位已调到第 3 档，但推导服务不可用，没有派发采样验证：多态外键不会按判别值重探 id={}", id);
+                return;
+            }
+            derive.validateAsync(id);
+            log.info("数据出库档位已调到第 3 档，已派发一轮采样验证 id={}", id);
+        } catch (Exception e) {
+            log.warn("数据出库档位已调到第 3 档，但派发采样验证失败：多态外键不会按判别值重探，可在管理台点「验证表关系」 id={}",
+                    id, e);
+        }
+    }
+
+    private TransactionTemplate tx() {
+        TransactionTemplate t = txTemplate;
+        if (t == null) {
+            t = new TransactionTemplate(transactionManager);
+            txTemplate = t;
+        }
+        return t;
+    }
+
+    /** 一次编辑前后「允不允许真实取值」。只在本类内部流转。 */
+    private record TierChange(boolean samplesBefore, boolean samplesAfter) {
     }
 
     /** 重新探测并回填。给管理台的「测试连接」按钮用。 */
@@ -402,6 +525,7 @@ public class ConnectorService {
         // 让「省略」等于「沿用」还会造出一个没人审计得到的粘性状态：此后每一次改显示名的保存
         // 都在默默给第 3 档续期，事后谁也说不清当初是谁把它打开的。
         // 前端的编辑表单必须把详情接口返回的 semanticDataTier 原样回填再提交。
+        // ★ 降下来的那一刻 update() 会删掉语义层里存着的真实取值——「降错了」的代价因此还包括重新采集一遍。
         //
         // 认不出来的值走不到这里：validateBasics 已经在上面 400 拒绝了。
         // parse 在这里只剩「空 → 默认档」这一条兜底，且它永远到不了 SAMPLE_VALUES。

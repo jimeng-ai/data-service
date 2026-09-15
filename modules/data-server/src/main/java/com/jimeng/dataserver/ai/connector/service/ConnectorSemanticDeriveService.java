@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.service;
 
 import cn.hutool.json.JSONObject;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
@@ -21,23 +22,29 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBucket;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 语义层<b>推导</b>：拿已经快照下来的结构，叫一次模型，把产出落成语义行。
@@ -179,8 +186,44 @@ public class ConnectorSemanticDeriveService {
      */
     private static final String KEY_SEP = "\u0001";
 
-    /** 补写字段行时，gloss 里允许列出的取值文本长度。超了只报个数，理由见 {@link #valueGloss}。 */
-    private static final int GLOSS_VALUES_MAX = 600;
+    /**
+     * K-3：值域阶段补写的 FIELD 行在 detail_json 里带的来源标记（{@code "origin": "value_profile"}）。
+     *
+     * <p>为什么要一个标记，而不是靠 gloss 长什么样去认：这类行的 gloss 从前是把真实取值原样列出来的一句话，
+     * 注入层只能在 {@code value_domain} 里还存着取值时把它挡下；一次没有枚举出取值的重采（基数超限、超时、PII、失败）
+     * 会把 {@code value_domain} 换掉，那句带着取值的 gloss 于是在任何档位上都照常出库，没有任何信号。
+     * 标记让「这一行是谁写的」不再依赖任何一句话的措辞。
+     */
+    static final String KEY_ORIGIN = "origin";
+
+    static final String ORIGIN_VALUE_PROFILE = "value_profile";
+
+    /**
+     * 值域阶段补写的行的 gloss。★ <b>一个取值、一个取值个数都不含</b>（K-3）：真实取值只活在 {@code value_domain} 里，
+     * 那里有档位闸；gloss 没有闸，写进去就等于绕过它。个数也不写——它和取值出自同一次第 3 档采集，
+     * 注入层在档位不开放时连 {@code distinct_count} 一起不给。
+     *
+     * <p>措辞刻意不随重采变化：它不说「采到了完整集合」，下一次重采可能采不全，那时这句话就成了假话。
+     */
+    static final String VALUE_ROW_GLOSS = "这一列没有推导出的字段说明，本行由列取值采集补写；"
+            + "取值情况只以 value_domain 为准，这句话不复述任何取值。";
+
+    /**
+     * 上线过的旧版补写行 gloss 的开头与结尾记号，原样取自那一版的 {@code valueGloss}，<b>不许改</b>。
+     *
+     * <p>这里按措辞认是成立的，与注入层「不按措辞认」并不矛盾：要认的是<b>已经写进库里</b>的那批旧行，
+     * 它们的文字不会再变；新写的行一律带 {@link #KEY_ORIGIN}，不靠这几个字。
+     * 不能只凭「INFERRED + FIELD + DATA」就改写 gloss：提示词允许模型给字段含义标 DATA（从类型 / 约束推得到），
+     * 那样会把模型写的说明一起抹掉。
+     */
+    private static final String LEGACY_VALUE_GLOSS_LISTED = "取值只有这 ";
+
+    private static final String LEGACY_VALUE_GLOSS_COUNTED = "取值共 ";
+
+    private static final String LEGACY_VALUE_GLOSS_MARK = "（采样时点";
+
+    /** 表形态测量冷却键前缀。后面接连接 id 与「折叠表名 + 结构指纹」的摘要，见 {@link #shapeCooldownKey}。 */
+    static final String SHAPE_COOLDOWN_KEY_PREFIX = "connector:semantic:shape-cooldown:";
 
     /** 拼进阶段 note 时，给「推导结论」留的字数。剩下的留给进度，两边都要放得下。 */
     private static final int NOTE_PREFIX_MAX = 240;
@@ -237,6 +280,31 @@ public class ConnectorSemanticDeriveService {
     private final ThreadPoolTaskExecutor semanticStageExecutor;
 
     /**
+     * 表形态测量（键值对表判定）。它读的是派生统计（第 2 档），所以<b>只在验证阶段里跑</b>，
+     * 绝不进 {@link #derive}——推导向客户库发送的字节数必须保持为零。
+     *
+     * <p>新的 final 字段一律<b>往后加</b>：{@code @RequiredArgsConstructor} 按声明顺序生成构造器，
+     * 插在中间会让按位置构造本类的测试静默错位。
+     */
+    private final TableShapeDetector shapeDetector;
+
+    /**
+     * 增量补写的「最近试过」冷却标记，见 {@link #planAddedBatch}。
+     *
+     * <h3>为什么冷却必须落在 Redis，不能放进程内存</h3>
+     * 本仓库 push main 即部署。进程内的冷却每次部署清零，于是一张模型怎么都写不出东西的表（只有 GUESS 产出）
+     * 会在每次部署后的第一次刷新里再花一次模型调用——与 {@code ConnectorHealthJob} 把刷新冷却放进 Redis
+     * 是同一个理由：进程的存活时长不是可靠的时钟。
+     *
+     * <h3>为什么是这个 bean、为什么不会成环</h3>
+     * 用的是 {@code ConnectorHealthJob} 做刷新冷却的同一个 {@link RedissonClient}，写法也照抄那边
+     * （{@code RBucket} + TTL，读失败按「不在冷却」）。它由 common-core 的 {@code RedissonConfig} 直接
+     * {@code Redisson.create}，只依赖三个 {@code @Value}，是一片叶子；本类的注入方只有管理台控制器和
+     * （经 {@code ObjectProvider}）{@code ConnectorSchemaService}，加这条边闭合不了任何环。
+     */
+    private final RedissonClient redissonClient;
+
+    /**
      * 推导用的模型。留空即<b>不下发 model</b>，由 {@code GenericChatClient} 回落到
      * {@code providers.<active>.chat.model}（它是 putIfAbsent，缺 model 不会报错）。
      *
@@ -258,7 +326,33 @@ public class ConnectorSemanticDeriveService {
     private boolean validateStageEnabled = true;
 
     /**
-     * 本进程内正在跑验证阶段的连接。
+     * 为一张表补写过说明书之后，多少小时内不再为它叫模型。
+     *
+     * <p>它防的是一个真实的死循环：模型对某张表只给得出 GUESS（整批丢弃），这张表就永远算「没覆盖」，
+     * 而每次刷新结构（定时每 6 小时一次，外加手动）都会把它重新算进来。24 小时是定时刷新间隔的 4 倍：
+     * 一张注定写不出东西的表每天最多花一次模型调用。
+     * <b>表结构一变（比如客户补了注释）冷却立刻失效</b>——冷却键里带着那张表的结构指纹，
+     * 那一刻恰恰是重试最可能写出东西的时候，见 {@link #addedCooldownKey}。
+     *
+     * <p>配成 {@code <= 0} 按 1 小时处理：关掉冷却不是一个选项，那等于把上面那个死循环请回来。
+     */
+    @Value("${connector.semantic.added-cooldown-hours:24}")
+    private long addedCooldownHours = 24L;
+
+    /**
+     * <b>没有表用途行</b>的表测过表形态之后，多少小时内不再测。
+     *
+     * <p>有用途行的表测完结论落在行上，下一轮按行跳过；没有用途行的表测出「不是键值对表」无处可放，
+     * 从前每一轮验证都重测一遍——而验证一度每天都会被派发，等于每天在客户库上重跑一次分组统计，永远。
+     * 冷却键里带着结构指纹，表结构一变立刻失效。默认一周：表形态是很少变的东西，且结构变了就会重测。
+     * 配成 {@code <= 0} 按 1 小时处理，理由同 {@link #addedCooldownHours}。
+     */
+    @Value("${connector.semantic.shape-cooldown-hours:168}")
+    private long shapeCooldownHours = 168L;
+
+    /**
+     * 本进程内正在跑验证阶段的连接。刷新结构那条心跳上的结构补标（{@link #healStructureOnRefresh}）也占这道闸——
+     * 两边都会整份改写 JOIN 行的 detail_json，不能交错。
      *
      * <h3>为什么这里<b>没有</b>像推导那样的库级 CAS 认领</h3>
      * 推导的认领戳写在 {@code connection.semantic_status} 上，而这个阶段的第一条纪律就是
@@ -273,6 +367,41 @@ public class ConnectorSemanticDeriveService {
      * 而不是去借 {@code semantic_status}。
      */
     private final Set<Long> validating = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 验证阶段正在跑时又来了一次派发（典型：增量推导刚写下几行 V_NONE）。记下范围，这一轮跑完补跑一轮。
+     *
+     * <p>不记的话，那几行要等到下一次有人手动点「验证表关系」——正在跑的那一轮开跑时就读完了语义行，
+     * 看不见它们；而新派发的那一轮在 {@link #validating} 上被挡回。两边都以为对方会做。
+     */
+    private final Map<Long, Set<String>> validateAgain = new ConcurrentHashMap<>();
+
+    /** 「全部对象」的哨兵。ConcurrentHashMap 不收 null 值，按引用比较，所以必须是独一份的实例。 */
+    private static final Set<String> SCOPE_ALL = Collections.unmodifiableSet(new HashSet<>());
+
+    /**
+     * 待补写的<b>提示</b>：键在 = 这条连接要跑一圈覆盖检查；值 = 刷新时报 ADDED 的表名（可以是空集合）。
+     * 按连接合并：同一条连接上连着刷新几次，并成一圈。
+     *
+     * <p>★ 它<b>不是</b>「哪些表还没有说明书」的账本——那本账由 {@link #planAddedBatch} 每一圈从库里现算。
+     * 这里只在进程内存里，每次部署清零、池子拒绝时也可能留不住；把它当账本，丢了的表就永远没人补。
+     * 值里的名字唯一的额外含义是「允许原地重写」，理由见 {@link #deriveAdded(Long, Set, Set)}。
+     */
+    private final Map<Long, Set<String>> pendingAdded = new ConcurrentHashMap<>();
+
+    /**
+     * 读库失败、这一轮没法消化又不能丢的 ADDED 提示名单。
+     *
+     * <p><b>不放回 {@link #pendingAdded}</b>：那里的键一在就会让 drain 收尾时「再看一眼」立刻再派一轮，
+     * 库挂着的时候就是一轮接一轮原地空转。停在这里，下一次入队（下一次刷新结构）时并回去。
+     *
+     * <p>为什么不能丢：名字唯一的含义是「允许原地重写」，而下一次刷新的 diff 不会再把这些表报成 ADDED。
+     * 丢了之后，删了又建的表身上那批旧化身的行就再也没有机会被换成新结构上的说明。
+     */
+    private final Map<Long, Set<String>> parkedAdded = new ConcurrentHashMap<>();
+
+    /** 本进程内正在消化 {@link #pendingAdded} 的连接。同一条连接的增量推导串行，避免两批互相覆盖状态。 */
+    private final Set<Long> addedRunning = ConcurrentHashMap.newKeySet();
 
     // ================================================================ 入口
 
@@ -539,6 +668,893 @@ public class ConnectorSemanticDeriveService {
             log.warn("语义层推导前补拉结构失败 connectorId={}: {}", connectorId, reason);
             return new Bootstrap(true, null, reason);
         }
+    }
+
+    // ================================================================ 增量推导（§8 ADDED：新对象入队，只跑 S2）
+
+    /** 增量推导期间结构又变了时，同一批表最多重新入队几次。再多说明客户那边在持续改结构，等下一次刷新。 */
+    private static final int MAX_ADDED_SNAPSHOT_RETRIES = 2;
+
+    /**
+     * 一次增量模型调用最多带几张表。多出来的在同一轮 drain 里排下一圈。
+     *
+     * <p>摘要字符上限（{@code connector.semantic.max-digest-chars}）管的是<b>输入</b>，管不住<b>输出</b>：
+     * 35 张表的全量推导就能产出几百条字段含义，而 max_tokens 默认 16000。输出被截断时解析侧会截到最后一个完整条目
+     * 并明说，但被截掉的那几张表已经记了冷却，要等一个冷却期才会再补。30 张让一次调用的产出大体落在 max_tokens 之内，
+     * 同时「补 140 张没覆盖的表」也只是 5 次调用。
+     */
+    static final int ADDED_BATCH_MAX = 30;
+
+    /** 冷却键前缀。后面接连接 id 与「折叠表名 + 结构指纹」的摘要，见 {@link #addedCooldownKey}。 */
+    static final String ADDED_COOLDOWN_KEY_PREFIX = "connector:semantic:added-cooldown:";
+
+    /**
+     * 刷新结构之后补写说明书：入队，立刻返回，<b>不抛</b>。给 {@code ConnectorSchemaService.refresh} 调——
+     * <b>每一次</b>非首次、未被拦下的成功刷新都会调，哪怕这次没有新增的表（名单为空）。
+     *
+     * <h3>★ 为什么名单为空也要跑一圈</h3>
+     * 「哪些表还没有说明书」不能靠「谁通知过我」来记：通知只活在进程内存里，每次部署（push main 即部署）清零；
+     * 一批里超出摘要上限的那部分从前不会再排队；池子拒绝之后只能干等下一个 ADDED 事件，而那个事件可能永远不来。
+     * 所以覆盖改成<b>按数据算</b>：每一圈从快照和语义行现算「有列、却没有表用途行」的表（{@link #planAddedBatch}），
+     * 与这次报 ADDED 的名字合在一起补。刷新结构就是心跳，名单为空的这一次调用正是它的脉搏。
+     *
+     * <h3>为什么不能让新表等下一次「重新生成」</h3>
+     * 重新生成走 {@code replaceInferred}：整层 INFERRED 物理删掉重插，S3 的采样验证结论、S4 的值域、
+     * 表形态测量全部清零，而且要重新花一轮客户库的配额才补得回来。一张新表的代价不该是这个。
+     *
+     * <h3>为什么落在阶段池而不是 streamExecutor</h3>
+     * 调用线程是一次「刷新结构」的 HTTP 请求。streamExecutor 池满时 CallerRunsPolicy 会让一次模型调用
+     * 就地跑在这条请求线程上——刷新要等几十秒。阶段池满了是抛出来，由这里写进 note。
+     * 覆盖检查要读快照、读语义行、问 Redis，同样一概放在后台线程上：请求线程上只做一次入队。
+     */
+    public void deriveAddedAsync(Long connectorId, Collection<String> objectNames) {
+        if (connectorId == null || !properties.getSemantic().isEnabled()) {
+            return;
+        }
+        final String tenantId = TenantContext.get();
+        if (blank(tenantId)) {
+            log.warn("增量补写说明书被跳过：当前线程没有租户上下文 connectorId={}", connectorId);
+            return;
+        }
+        Set<String> names = new LinkedHashSet<>();
+        if (objectNames != null) {
+            for (String n : objectNames) {
+                if (!blank(n)) {
+                    names.add(n.trim());
+                }
+            }
+        }
+        // 上一轮读库失败停在一边的提示名单，借这一次入队带回去，理由见 parkedAdded。
+        Set<String> parked = parkedAdded.remove(connectorId);
+        if (parked != null) {
+            names.addAll(parked);
+        }
+        // 空集合照样入队：键在就代表「跑一圈覆盖检查」，理由见上。
+        pendingAdded.merge(connectorId, names, ConnectorSemanticDeriveService::union);
+        if (addedRunning.add(connectorId)) {
+            dispatchAddedDrain(connectorId, tenantId);
+        }
+    }
+
+    private void dispatchAddedDrain(Long connectorId, String tenantId) {
+        try {
+            semanticStageExecutor.execute(MdcAsyncSupport.wrap("semantic-added-" + connectorId,
+                    () -> drainAdded(connectorId, tenantId)));
+        } catch (RuntimeException e) {
+            addedRunning.remove(connectorId);
+            // 提示名单留在 pendingAdded 里，下一次刷新入队时一起带走；没有名单的表下一次刷新会被重新算出来。
+            log.warn("增量补写说明书派发失败 connectorId={}: {}", connectorId, describe(e));
+            Set<String> waiting = pendingAdded.get(connectorId);
+            if (waiting == null || waiting.isEmpty()) {
+                // 只是一圈例行的覆盖检查没派出去，没有哪张新表在等。每次刷新结构都会触发它，
+                // 在这里写一句「队列满了」就是一条每次刷新都可能冒出来、却不需要任何人做任何事的警报。
+                return;
+            }
+            // 有新表在等就必须说出来，否则「新表没有说明书」和「新表的说明书还在路上」长得一样。
+            try {
+                Connection c = connectionMapper.selectById(connectorId);
+                writeStageNote(connectorId, notePrefix(c == null ? null : c.getSemanticNote()),
+                        "新增表的说明书没有派发出去（后台队列已满），下一次刷新结构时会自动补写");
+            } catch (Exception ignore) {
+                // note 写不进去只剩日志，不能让它反过来把一次成功的刷新变成失败。
+            }
+        }
+    }
+
+    /**
+     * 后台线程上消化这条连接的补写。一圈 = 现算一批 → 一次模型调用 → 记冷却；还有剩的就再来一圈。
+     *
+     * <h3>★ 这个 while 为什么一定会停</h3>
+     * <ul>
+     *   <li>每一圈要么至少把一张表送进模型、并把它记进 {@code skip}（本轮 drain 不再送它），
+     *       要么一张都没送——后一种<b>不重新入队</b>，只有别的线程新入队的提示能让它再转一圈。</li>
+     *   <li>{@code skip} 是进程内的兜底：Redis 冷却读写失败时按「放行」处理，没有这一道，
+     *       一张模型写不出东西的表会在这个 while 里被一遍遍送进去。</li>
+     *   <li>结构在推导期间变了的重推有 {@link #MAX_ADDED_SNAPSHOT_RETRIES} 次封顶。</li>
+     * </ul>
+     *
+     * <p>收尾那段是标准的「放闸后再看一眼」：别的线程可能正好在本线程最后一次 remove 之后、
+     * 放掉 {@link #addedRunning} 之前入队，它看见闸还关着就没有派发——不补这一眼，那批表就只能等下一次刷新。
+     *
+     * <p>读库失败的那两处（{@link AddedBatch#readFailed()} / {@link AddedOutcome#readFailed()}）同样有界：
+     * 原地重试与「结构变了重推」共用 {@link #MAX_ADDED_SNAPSHOT_RETRIES}，用完就把提示名单停到 {@link #parkedAdded}，
+     * 那里不触发 drain。
+     */
+    void drainAdded(Long connectorId, String tenantId) {
+        if (!TenantContext.isSet() && tenantId != null) {
+            TenantContext.set(tenantId);
+        }
+        int retries = 0;
+        Set<String> skip = new HashSet<>();
+        try {
+            // ★ 结构形态补标挂在这条心跳上，理由见 healStructureOnRefresh。它在 try 里：它抛出任何东西，
+            //   addedRunning 这道闸也必须放掉，否则这条连接在本进程里再也不会补写说明书。
+            healStructureOnRefresh(connectorId, tenantId);
+            while (true) {
+                Set<String> hints = pendingAdded.remove(connectorId);
+                if (hints == null) {
+                    break;
+                }
+                AddedBatch batch = planAddedBatch(connectorId, hints, skip);
+                if (batch.readFailed()) {
+                    // 连接或快照读不出来：这一圈什么都算不了。提示名单停到一边等下一次刷新（没覆盖的表那时会被重新算出来），
+                    // 原地重排只会在库挂着的时候空转。
+                    park(connectorId, hints);
+                    continue;
+                }
+                if (batch.names().isEmpty()) {
+                    continue;
+                }
+                AddedOutcome out = deriveAdded(connectorId, new LinkedHashSet<>(batch.names()), batch.rewritable());
+                // 这一批手上的全部提示名单：送进去的，和这一批装不下的。任何「这批作废、重来」的出路都要整份带回去。
+                Set<String> batchHints = union(batch.rewritable(), batch.overflowHints());
+                if (out.readFailed()) {
+                    // ★ 认领之前读连接失败（库抖了一下）：一张没送、一行没写。从前这一次读在 try 外面，异常直接冲出 while，
+                    //   这一批的提示名单连同这一轮剩下的一起没了。先原地重试，重试用完就停到一边等下一次刷新。
+                    if (retries++ < MAX_ADDED_SNAPSHOT_RETRIES) {
+                        pendingAdded.merge(connectorId, batchHints, ConnectorSemanticDeriveService::union);
+                    } else {
+                        park(connectorId, batchHints);
+                    }
+                    continue;
+                }
+                if (out.sent().isEmpty()) {
+                    // 一张都没送进模型：说明书没 READY、认领被全量推导抢走、开关关着、或表已不在快照里。
+                    // 原地再排一圈结果不会变，只会空转着打库；这些表下一次刷新会被重新算出来。
+                    continue;
+                }
+                if (out.snapshotMoved() && retries++ < MAX_ADDED_SNAPSHOT_RETRIES) {
+                    // 这批一行没落库：不记冷却、不进 skip，用新快照再推一次。
+                    // ★ 提示名单整份带回去（它决定「允许重写」）：这一批里的，和这一批装不下的（overflowHints）——
+                    //   后者从前在这条路上被丢掉，它们的「允许重写」就此没了。没覆盖的表下一圈会被重新算出来。
+                    pendingAdded.merge(connectorId, batchHints, ConnectorSemanticDeriveService::union);
+                    continue;
+                }
+                Set<String> sentFolded = new HashSet<>();
+                for (String n : out.sent()) {
+                    sentFolded.add(fold(n));
+                }
+                skip.addAll(sentFolded);
+                markAddedAttempted(connectorId, out.sent(), batch.contentHashes());
+
+                // ★ 没送进去的再排一圈：摘要字符上限挤出去的，和这一批装不下的。
+                //   从前丢表的正是这里——超出上限的那部分不会再入队，只能等一个可能永远不来的 ADDED 事件。
+                boolean leftover = batch.more();
+                Set<String> leftoverHints = new LinkedHashSet<>(batch.overflowHints());
+                for (String n : batch.names()) {
+                    if (!sentFolded.contains(fold(n))) {
+                        leftover = true;
+                        if (batch.rewritable().contains(n)) {
+                            leftoverHints.add(n);
+                        }
+                    }
+                }
+                if (leftover) {
+                    pendingAdded.merge(connectorId, leftoverHints, ConnectorSemanticDeriveService::union);
+                }
+            }
+        } finally {
+            addedRunning.remove(connectorId);
+            if (pendingAdded.containsKey(connectorId) && addedRunning.add(connectorId)) {
+                dispatchAddedDrain(connectorId, tenantId);
+            }
+        }
+    }
+
+    /**
+     * 现算这一圈要送进模型的表。<b>顺序</b>：这次报 ADDED 的在前，然后是快照里「有列、却没有表用途行」的表。
+     *
+     * <h3>过滤，各防一种空转</h3>
+     * <ol>
+     *   <li><b>只在 {@link #SEM_READY} 上算。</b>没 READY 时「没覆盖」没有意义：全量推导要么正在跑、要么失败了。
+     *       在失败的说明书上逐张补，会把「全量没生成出来」补成「看起来差不多都有」。</li>
+     *   <li><b>没取到列的表不算没覆盖</b>（只读账号只授权到部分表时，快照里存的是只有名字的行）。
+     *       模型对着一张没有列的表写不出东西，算进来就是每个冷却期白叫一次模型。表名超过 varchar(191) 的同理——
+     *       写出来也落不了库，它会永远「没覆盖」。</li>
+     *   <li><b>最近试过的跳过</b>：本轮 drain 送过的（{@code skip}），和 Redis 冷却还在的。
+     *       Redis 读失败按「放行」：冷却是省钱的，不是一道闸，为省一次模型调用让新表一直没有说明书是本末倒置。
+     *       失败一次之后这一圈不再问 Redis——Redis 不可达时 Redisson 每问一次要等上几秒，逐张问会把阶段池的线程拖住几分钟。</li>
+     * </ol>
+     *
+     * <h3>★ 表用途行读失败时，一张都不算没覆盖</h3>
+     * 读不出来就当「一张都没覆盖」，会把整个快照送进模型——而这些表身上多半已经挂着验证结论。
+     * 读不出来 = 不知道；不知道就只补这次明确报了 ADDED 的那几张。
+     *
+     * @param skip 本轮 drain 已经送过、或查到还在冷却里的表（折叠名）。本方法会往里加冷却命中的表：
+     *             冷却以小时计，同一轮 drain 里没必要再问一遍
+     */
+    AddedBatch planAddedBatch(Long connectorId, Set<String> hints, Set<String> skip) {
+        if (!properties.getSemantic().isEnabled()) {
+            return AddedBatch.EMPTY;
+        }
+        List<ConnectorSchema> rows;
+        try {
+            Connection conn = connectionMapper.selectById(connectorId);
+            // READY，或者一次已经超时的认领（多半是被发版杀掉的补写），理由见 addedEligible。
+            if (!addedEligible(conn)) {
+                log.info("增量补写这一圈不跑：说明书尚未生成成功（或另一次推导正在进行） connectorId={} status={} 提示名单 {} 张",
+                        connectorId, conn == null ? null : conn.getSemanticStatus(), hints.size());
+                return AddedBatch.EMPTY;
+            }
+            rows = schemaService.currentRows(connectorId);
+        } catch (Exception e) {
+            log.warn("增量补写这一圈不跑：读连接或结构快照失败，提示名单留到下一次刷新 connectorId={}: {}",
+                    connectorId, describe(e));
+            return AddedBatch.READ_FAILED;
+        }
+        if (rows == null || rows.isEmpty()) {
+            return AddedBatch.EMPTY;
+        }
+        Map<String, ConnectorSchema> byFolded = new LinkedHashMap<>();
+        for (ConnectorSchema r : rows) {
+            if (r != null && !blank(r.getObjectName())) {
+                byFolded.putIfAbsent(fold(r.getObjectName()), r);
+            }
+        }
+
+        List<ConnectorSchema> ordered = new ArrayList<>();
+        Set<String> hintFolded = new HashSet<>();
+        for (String h : hints) {
+            ConnectorSchema r = byFolded.get(fold(h));
+            if (r != null && hintFolded.add(fold(h))) {
+                ordered.add(r);
+            }
+        }
+        int uncovered = 0;
+        Set<String> covered = coveredObjects(connectorId);
+        if (covered != null) {
+            Map<String, Map<String, FieldDetail>> fields = parseFields(rows);
+            for (ConnectorSchema r : byFolded.values()) {
+                String f = fold(r.getObjectName());
+                Map<String, FieldDetail> cols = fields.get(r.getObjectName());
+                if (hintFolded.contains(f) || covered.contains(f) || cols == null || cols.isEmpty()
+                        || len(r.getObjectName()) > NAME_MAX) {
+                    continue;
+                }
+                ordered.add(r);
+                uncovered++;
+            }
+        }
+
+        List<String> names = new ArrayList<>();
+        Set<String> rewritable = new LinkedHashSet<>();
+        Map<String, String> hashes = new HashMap<>();
+        Set<String> overflowHints = new LinkedHashSet<>();
+        boolean more = false;
+        boolean askRedis = true;
+        int cooling = 0;
+        for (ConnectorSchema r : ordered) {
+            String name = r.getObjectName();
+            String f = fold(name);
+            if (names.size() >= ADDED_BATCH_MAX) {
+                // 装不下了。剩下的是否冷却留给下一圈去问；提示名单要带回去，没覆盖的表下一圈会被重新算出来。
+                more = true;
+                if (hintFolded.contains(f)) {
+                    overflowHints.add(name);
+                }
+                continue;
+            }
+            if (skip.contains(f)) {
+                continue;
+            }
+            if (askRedis) {
+                try {
+                    if (redissonClient.getBucket(addedCooldownKey(connectorId, name, r.getContentHash())).isExists()) {
+                        skip.add(f);
+                        cooling++;
+                        continue;
+                    }
+                } catch (Exception e) {
+                    askRedis = false;
+                    log.warn("读增量补写冷却标记失败，这一圈按不在冷却处理 connectorId={}: {}", connectorId, describe(e));
+                }
+            }
+            names.add(name);
+            hashes.put(f, r.getContentHash());
+            if (hintFolded.contains(f)) {
+                rewritable.add(name);
+            }
+        }
+        if (!names.isEmpty() || cooling > 0) {
+            log.info("增量补写这一圈 connectorId={}：新增 {} 张、没覆盖 {} 张、冷却中 {} 张；本批送 {} 张，还有下一圈={}",
+                    connectorId, hintFolded.size(), uncovered, cooling, names.size(), more);
+        }
+        return new AddedBatch(List.copyOf(names), Collections.unmodifiableSet(rewritable), hashes,
+                Collections.unmodifiableSet(overflowHints), more, false);
+    }
+
+    /** 把提示名单停到 {@link #parkedAdded}，等下一次入队带回去。空的不停：它不代表任何一张表。 */
+    private void park(Long connectorId, Set<String> hints) {
+        if (hints != null && !hints.isEmpty()) {
+            parkedAdded.merge(connectorId, new LinkedHashSet<>(hints), ConnectorSemanticDeriveService::union);
+        }
+    }
+
+    /**
+     * 增量补写能不能在这条连接上跑：说明书 {@link #SEM_READY}；或者停在 {@link #SEM_RUNNING} 的那次认领<b>已经超时</b>、
+     * 而且这条连接<b>成功生成过</b>说明书。
+     *
+     * <h3>为什么要接管超时的 RUNNING</h3>
+     * 增量补写认领时把状态抢成 RUNNING。发版恰好杀掉这次补写，状态就永远停在 RUNNING：之后每一次刷新的覆盖检查
+     * 都因为「没 READY」静默跳过，唯一的出路是整层重新生成——而那会把 S3 / S4 的结论一并物理删掉。
+     * 这里给它与全量推导的 {@link #claim} 同一个逃生口、同一个 {@link #CLAIM_STALE_MINUTES}，凭据同样落在 {@code semantic_claim_at}。
+     *
+     * <h3>为什么多一个「成功生成过」</h3>
+     * 停住的 RUNNING 也可能是一次被杀掉的<b>全量</b>推导，它之前的状态可能是 FAILED 或从没生成过。在那种连接上补几张表再写 READY，
+     * 会把「全量没生成出来」盖成「可用」——READY 那道闸防的正是这个。{@code semantic_synced_at} 只在成功时盖戳，
+     * 它非空 = 库里有一份成功生成过的说明书（全量替换是一个事务，被杀在哪一步，留下的都是完整的一份），在它上面接着补是实话。
+     * 从没成功过的，留给全量推导去接管。
+     */
+    private static boolean addedEligible(Connection conn) {
+        if (conn == null) {
+            return false;
+        }
+        if (SEM_READY.equals(conn.getSemanticStatus())) {
+            return true;
+        }
+        return SEM_RUNNING.equals(conn.getSemanticStatus()) && conn.getSemanticSyncedAt() != null
+                && (conn.getSemanticClaimAt() == null
+                || conn.getSemanticClaimAt().getTime() < staleBefore(truncateToSecond(new Date())).getTime());
+    }
+
+    /** 认领早于这一刻就算超时，理由见 {@link #CLAIM_STALE_MINUTES}。 */
+    private static Date staleBefore(Date now) {
+        return new Date(now.getTime() - CLAIM_STALE_MINUTES * 60_000L);
+    }
+
+    /**
+     * 已经有表用途行（OBJECT，不论来源、不论是否过期）的表，折叠名。
+     *
+     * <p>过期（STALE）的也算覆盖：表消失又回来时 {@code applyDrift} 会把它复活；它若真要换成新结构上的说明，
+     * 会以 ADDED 的身份进来。
+     *
+     * @return <b>读失败返回 {@code null}</b>，理由见 {@link #planAddedBatch}「表用途行读失败时，一张都不算没覆盖」
+     */
+    private Set<String> coveredObjects(Long connectorId) {
+        try {
+            List<ConnectorSemantic> objects = semanticMapper.selectList(new LambdaQueryWrapper<ConnectorSemantic>()
+                    .eq(ConnectorSemantic::getConnectorId, connectorId)
+                    .eq(ConnectorSemantic::getScope, ConnectorSemanticService.SCOPE_OBJECT));
+            Set<String> out = new HashSet<>();
+            if (objects != null) {
+                for (ConnectorSemantic o : objects) {
+                    if (o != null && !blank(o.getObjectName())) {
+                        out.add(fold(o.getObjectName()));
+                    }
+                }
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("读表用途行失败，这一圈只补报了 ADDED 的表 connectorId={}: {}", connectorId, describe(e));
+            return null;
+        }
+    }
+
+    /**
+     * 冷却键：连接 id + sha256(折叠表名 + 结构指纹)。
+     *
+     * <p>带上 {@code content_hash}（表名、类型、每列 name:type:nullable:comment）是有意的：客户给表补了注释、加了列，
+     * 指纹就变，冷却自然失效——一张只写得出 GUESS 的表最有可能被写出东西的时刻，恰恰是它的结构刚变过的时候。
+     * 指纹对同一份结构是确定的，所以这不会反过来绕开冷却、造成空转。
+     * 表名先折叠再摘要：唯一键按 utf8mb4_unicode_ci 比较，大小写不同的写法是同一张表；摘要也让键长与表名里的字符无关。
+     */
+    static String addedCooldownKey(Long connectorId, String objectName, String contentHash) {
+        return ADDED_COOLDOWN_KEY_PREFIX + connectorId + ":"
+                + ConnectorSemanticService.sha256(fold(objectName) + KEY_SEP + (contentHash == null ? "" : contentHash));
+    }
+
+    /**
+     * 给这批真的送进过模型的表记冷却——<b>不论这次写出了什么、成没成功</b>：只写得出 GUESS 的表要冷却，
+     * 这是冷却存在的理由；模型调用失败的也要，否则一个确定性的失败（比如请求被上游拒掉）会在每次刷新里重演。
+     *
+     * <p>写失败只记日志：本轮 drain 里有 {@code skip} 兜着，最坏是下一次刷新再试一次。
+     */
+    private void markAddedAttempted(Long connectorId, List<String> sent, Map<String, String> hashByFolded) {
+        long hours = Math.max(1L, addedCooldownHours);
+        String stamp = String.valueOf(System.currentTimeMillis());
+        for (String name : sent) {
+            try {
+                RBucket<String> mark = redissonClient.getBucket(
+                        addedCooldownKey(connectorId, name, hashByFolded.get(fold(name))));
+                mark.set(stamp, hours, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("写增量补写冷却标记失败，本批剩下的不再写 connectorId={}: {}", connectorId, describe(e));
+                return;
+            }
+        }
+    }
+
+    /** 整批都按 ADDED 处理（都允许原地重写）。 */
+    AddedOutcome deriveAdded(Long connectorId, Set<String> requested) {
+        return deriveAdded(connectorId, requested, requested);
+    }
+
+    /**
+     * 为一批表跑一次 S2，结果<b>原地 UPSERT</b>，一行都不删。<b>不抛</b>。
+     *
+     * <h3>★ 报过 ADDED 的表可以重写，一直没覆盖到的表只补缺</h3>
+     * 两种表走同一次模型调用，落库规矩不一样：
+     * <ul>
+     *   <li><b>报过 ADDED 的表</b>（{@code rewritable}）：上一份快照里没有它。表上若还挂着旧行（删了又建的表，
+     *       行已经是 STALE），那是上一个化身的说明，原地换成新结构上的说明是对的。</li>
+     *   <li><b>一直在、只是没有表用途行的表</b>：它身上可能已经有 S4 补写的字段值域、验证过的关系。
+     *       模型这次没给它写出表用途，不代表那些结论作废。重写会把 {@code verified} 打回 NONE、把值域抹掉；
+     *       而这张表若仍然只写得出 GUESS，每个冷却期就会再抹一次、再花一次客户库的配额把它们补回来。
+     *       所以只插入缺的行，已有的一行不改（不进 {@code upsertInferred} 的 {@code updatableObjects}）。</li>
+     * </ul>
+     *
+     * <h3>三道闸，每一道都对应一种静默的错</h3>
+     * <ol>
+     *   <li><b>只在 {@link #SEM_READY} 上跑。</b>说明书从没生成成功过（FAILED / 从未推导）时，
+     *       写一批行再写一个 READY，会把「全量失败」盖成「可用」——9 成的表没有说明书，界面却是绿的。
+     *       正在全量推导（RUNNING）时同样让开：它读的是最新快照，要么把新表一起推了，
+     *       要么因为快照在它开跑之后变了而作废并要求重来——两种结局都不需要这里插手。</li>
+     *   <li><b>认领 CAS 以 READY（或一次已经超时的认领）为前提</b>（{@link #claimAdded}），和全量推导抢的是同一个
+     *       {@code semantic_claim_at}：两者不可能交错写。认领之后的每一条出路都回到 READY。</li>
+     *   <li><b>落库前复核结构</b>：模型调用期间有人刷新了结构、而且真的改了列，这批行锚的就是旧结构，
+     *       而那一轮漂移检测已经跑完、不会回头看它们。此时整批重新入队，用新快照再推一次。
+     *       只按列指纹比、不按 synced_at 比：一次什么都没变的刷新不该让这批作废。</li>
+     * </ol>
+     *
+     * <h3>只为这批表写，但已有的表要给模型看</h3>
+     * 新表最有价值的往往是指向老表的那条关系。老表上已有的 INFERRED 行一行不改（它们身上可能有
+     * 采样验证结论），见 {@link ConnectorSemanticService#upsertInferred} 的 {@code updatableObjects}。
+     *
+     * @param requested  这一批要补写的表
+     * @param rewritable 其中允许原地重写已有推断行的表（报过 ADDED 的），理由见上
+     * @return {@code sent} = 真的把结构送进了模型请求的表（快照写法）。调用方据此记冷却、决定哪些要再排一圈
+     */
+    AddedOutcome deriveAdded(Long connectorId, Set<String> requested, Set<String> rewritable) {
+        ConnectorProperties.Semantic cfg = properties.getSemantic();
+        if (!cfg.isEnabled()) {
+            return AddedOutcome.skipped("语义层推导已关闭（connector.semantic.enabled=false）");
+        }
+        Connection conn;
+        try {
+            conn = connectionMapper.selectById(connectorId);
+        } catch (Exception e) {
+            // ★ 认领之前的这一次读必须接住：它从前在 try 外面，库抖一下异常就冲出 drain 的 while，
+            //   这一批的提示名单连同这一轮剩下的一起没了。一行没写、一张没送、什么都没认领，交回 drain 决定重试还是暂存。
+            log.warn("增量补写说明书这一批没有开始：读连接失败 connectorId={}: {}", connectorId, describe(e));
+            return AddedOutcome.failedToRead("读连接失败：" + describe(e));
+        }
+        if (conn == null) {
+            return AddedOutcome.skipped("连接不存在");
+        }
+        if (!addedEligible(conn)) {
+            log.info("增量补写说明书被跳过：说明书尚未生成成功（或另一次推导正在进行） connectorId={} status={} 待补写={}",
+                    connectorId, conn.getSemanticStatus(), requested.size());
+            return AddedOutcome.skipped("说明书尚未生成成功（当前状态 " + conn.getSemanticStatus()
+                    + "），这些表留给下一次完整生成");
+        }
+        // 走到这里还是 RUNNING = 一次超时的认领，这次要接管它（addedEligible）。上一版结论那句话已经被那次认领的
+        // 「正在……」盖掉了，接在后面只会误导，换成一句说清发生了什么的话。
+        boolean takeover = SEM_RUNNING.equals(conn.getSemanticStatus());
+        String prevPrefix = takeover
+                ? "上一次推导停在「进行中」超过 " + CLAIM_STALE_MINUTES + " 分钟没有结束（多半是被发版打断），本次已接管"
+                : notePrefix(conn.getSemanticNote());
+        Date claimAt = claimAdded(connectorId, requested.size());
+        if (claimAt == null) {
+            log.info("增量补写说明书被跳过：认领不到（另一次推导在进行中） connectorId={}", connectorId);
+            return AddedOutcome.skipped("同一条连接上已有一次推导在进行中，这些表留给它");
+        }
+        if (takeover) {
+            log.warn("增量补写接管了一次超时的认领 connectorId={} 上次认领={}", connectorId, conn.getSemanticClaimAt());
+        }
+
+        // 送进模型请求的表。它在 try 外面，catch 里也要带出去：请求发出去之后抛的异常照样算「试过」。
+        List<String> sent = List.of();
+        // ★ 认领之后的每一条出路都必须回到 READY。正常出口各自写一句结论并置位；catch 接不住的 Error（OOM、栈溢出）
+        //   由 finally 兜底——少了它，状态停在 RUNNING，要等一次超时接管（30 分钟起）才恢复，这期间每次刷新都静默跳过。
+        boolean restored = false;
+        try {
+            List<ConnectorSchema> rows = schemaService.currentRows(connectorId);
+            Map<String, Map<String, FieldDetail>> fieldsByObject = parseFields(rows);
+            String structure = structureStamp(fieldsByObject);
+
+            Set<String> requestedFolded = new HashSet<>();
+            for (String r : requested) {
+                requestedFolded.add(fold(r));
+            }
+            Set<String> rewritableFolded = new HashSet<>();
+            if (rewritable != null) {
+                for (String r : rewritable) {
+                    rewritableFolded.add(fold(r));
+                }
+            }
+            List<ConnectorSchema> targets = rows.stream()
+                    .filter(r -> requestedFolded.contains(fold(r.getObjectName())))
+                    .toList();
+            if (targets.isEmpty()) {
+                String note = restoreReady(connectorId, prevPrefix,
+                        "待补写的 " + requested.size() + " 张表在推导前已不在结构快照里，没有需要补写的", false, claimAt);
+                restored = true;
+                return AddedOutcome.skipped(note);
+            }
+            int addedTargets = 0;
+            for (ConnectorSchema t : targets) {
+                if (rewritableFolded.contains(fold(t.getObjectName()))) {
+                    addedTargets++;
+                }
+            }
+
+            Digest digest = buildDigest(targets, fieldsByObject, cfg.getMaxDigestChars(), 0, false);
+            List<String> includedNames = new ArrayList<>();
+            List<String> updatableNames = new ArrayList<>();
+            Set<String> included = new HashSet<>();
+            for (int i = 0; i < digest.includedObjects(); i++) {
+                String name = targets.get(i).getObjectName();
+                includedNames.add(name);
+                included.add(fold(name));
+                if (rewritableFolded.contains(fold(name))) {
+                    updatableNames.add(name);
+                }
+            }
+            Set<String> allTargets = new HashSet<>();
+            targets.forEach(t -> allTargets.add(fold(t.getObjectName())));
+            AddedContext ctx = buildAddedContext(rows, fieldsByObject, allTargets,
+                    Math.max(0, cfg.getMaxDigestChars() - digest.text().length()));
+
+            List<String> notes = new ArrayList<>(digest.notes());
+            String content = SemanticPrompts.deriveAddedUser(conn.getName(), conn.getKind(),
+                    digest.includedObjects(), targets.size(), digest.notes(), digest.text(),
+                    ctx.text(), ctx.complete());
+            // 从这一刻起就算「试过」：请求发出去之后，不论模型返回什么、抛什么，这批表都该进冷却。
+            sent = List.copyOf(includedNames);
+            String raw = sendToModel(connectorId, content, cfg, "语义层增量推导开始",
+                    digest.includedObjects(), targets.size(), digest.text().length() + ctx.text().length());
+            Map<String, Object> parsed = parseJson(raw, notes);
+
+            Stats st = new Stats();
+            // 写库之前的已有行：既用来挑掉人答过的口径，也用来算「这批真的多出了哪些行」（决定验证派给谁）。
+            List<ConnectorSemantic> existing = existingRows(connectorId);
+            List<ConnectorSemantic> fresh = toRows(parsed, fieldsByObject, answeredTerms(existing), st, List.of());
+            List<ConnectorSemantic> scoped = new ArrayList<>();
+            int outOfScope = 0;
+            for (ConnectorSemantic r : fresh) {
+                if (inAddedScope(r, included)) {
+                    scoped.add(r);
+                } else {
+                    outOfScope++;
+                }
+            }
+
+            if (!structure.equals(structureStamp(parseFields(schemaService.currentRows(connectorId))))) {
+                String note = restoreReady(connectorId, prevPrefix,
+                        "补写说明书期间结构又变了，本批作废并用新结构重推", false, claimAt);
+                restored = true;
+                log.warn("语义层增量推导期间结构变化，本批重新入队 connectorId={}", connectorId);
+                return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), true, sent);
+            }
+
+            // ★ 只有报过 ADDED 的表允许原地重写；一直没覆盖到的表只补缺，理由见方法注释。
+            ConnectorSemanticService.UpsertResult w =
+                    semanticService.upsertInferred(connectorId, scoped, updatableNames);
+            String note = restoreReady(connectorId, prevPrefix,
+                    addedSummary(digest.includedObjects(), targets.size(), addedTargets, scoped, w, st,
+                            outOfScope, notes),
+                    true, claimAt);
+            restored = true;
+
+            // ★ 验证只派给这次真的多出了行的表（理由见 tablesWithNewRows）。一行都没多出来就不派：
+            //   按「送进过模型的表」派，一张模型写不出东西的表会每个冷却期都在客户库上重跑一遍表形态测量和列取值采集。
+            Set<String> toValidate = tablesWithNewRows(scoped, existing, updatableNames, w);
+            if (!toValidate.isEmpty()) {
+                dispatchValidation(connectorId, tenantOf(conn), note, toValidate);
+            }
+
+            log.info("语义层增量推导完成 connectorId={} 待补写 {} 张（其中新增 {}，本次覆盖 {}） 插入 {} 原地更新 {} "
+                            + "未动人工 {} 保持原样 {} 撞键 {} 超范围丢弃 {}",
+                    connectorId, targets.size(), addedTargets, digest.includedObjects(), w.inserted(), w.updated(),
+                    w.skippedNotInferred(), w.keptExisting(), w.conflicts(), outOfScope);
+            int[] c = countByScope(scoped);
+            return new AddedOutcome(DeriveResult.builder().ok(true)
+                    .objectCount(c[0]).fieldCount(c[1]).joinCount(c[2]).caveatCount(c[3])
+                    .droppedGuess(st.droppedGuess).droppedUnknown(st.droppedUnknown)
+                    .droppedTooLong(st.droppedTooLong).skippedAnswered(st.droppedAnswered)
+                    .truncated(digest.includedObjects() < targets.size())
+                    .note(note).build(), false, sent);
+        } catch (Exception e) {
+            String reason = describe(e);
+            log.error("语义层增量推导失败 connectorId={}: {}", connectorId, reason, e);
+            // 说明书本身没坏（一行没删），状态回到 READY；失败写在 note 里，synced_at 不盖。
+            String note = restoreReady(connectorId, prevPrefix, "补写说明书失败：" + reason, false, claimAt);
+            restored = true;
+            return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), false, sent);
+        } finally {
+            if (!restored) {
+                // 只有 catch 接不住的 Error 会走到这里。说明书一行没删（upsert 是一个事务），回到 READY 是实话。
+                restoreReady(connectorId, prevPrefix, "补写说明书被意外中断，状态已恢复", false, claimAt);
+            }
+        }
+    }
+
+    /**
+     * 这次补写真的多出了（或原地改写了）行的表，折叠名。验证只派给它们。
+     *
+     * <h3>为什么不能按「送进过模型的表」派</h3>
+     * 模型对一张表一个字都写不出来（只给得出 GUESS）时，这张表永远算没覆盖、每个冷却期都会被再送一次；按送过的表派验证，
+     * 就是每天为它在客户库上重跑一遍表形态测量（第 2 档）和列取值采集（第 3 档），永远——而这一轮没有任何一行新东西需要验。
+     *
+     * <p>「多出了行」按写库之前读到的已有行现算（{@code upsertInferred} 只回计数）：唯一键没见过的行必然是插入；
+     * 报过 ADDED 的表允许原地改写，改写过的行可能被打回未验证，所以那几张整张算上。口径问题（CAVEAT）不需要验证。
+     * 已有行读失败时不知道哪些是新的——只要这批真的写进了东西，就把这批行涉及的表全算上：宁可多验一次，不让新行没人验。
+     */
+    private static Set<String> tablesWithNewRows(List<ConnectorSemantic> scoped, List<ConnectorSemantic> existing,
+                                                 Collection<String> updatableNames,
+                                                 ConnectorSemanticService.UpsertResult w) {
+        if (w == null || w.inserted() + w.updated() <= 0) {
+            return Set.of();
+        }
+        Set<String> existingKeys = null;
+        if (existing != null) {
+            existingKeys = new HashSet<>();
+            for (ConnectorSemantic e : existing) {
+                existingKeys.add(dedupKey(e));
+            }
+        }
+        Set<String> rewritten = new HashSet<>();
+        if (updatableNames != null) {
+            for (String n : updatableNames) {
+                rewritten.add(fold(n));
+            }
+        }
+        Set<String> out = new LinkedHashSet<>();
+        for (ConnectorSemantic r : scoped) {
+            String scope = r.getScope();
+            if (!ConnectorSemanticService.SCOPE_OBJECT.equals(scope) && !ConnectorSemanticService.SCOPE_FIELD.equals(scope)
+                    && !ConnectorSemanticService.SCOPE_JOIN.equals(scope)) {
+                continue;
+            }
+            String obj = fold(r.getObjectName());
+            if (existingKeys == null || !existingKeys.contains(dedupKey(r)) || rewritten.contains(obj)) {
+                out.add(obj);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 增量推导的认领：从 {@link #SEM_READY} 抢，或者接管一次<b>已经超时</b>、且这条连接成功生成过说明书的 RUNNING
+     * （条件与 {@link #addedEligible} 同一套，理由见那里）。与 {@link #claim} 仍有一处刻意不同：
+     * 写不进去就<b>不跑</b>，不像全量那样「按无并发继续」——增量是锦上添花，没认领就跑可能和一次全量推导交错写。
+     *
+     * <p>接管的判据写在 CAS 条件里而不是先读后写：两个副本同时看见同一个超时的 RUNNING，先写进去的那个把
+     * {@code semantic_claim_at} 换成了现在，后一个的条件自然不再成立。
+     */
+    private Date claimAdded(Long connectorId, int count) {
+        Date now = truncateToSecond(new Date());
+        Date stale = staleBefore(now);
+        try {
+            int n = connectionMapper.update(
+                    statusEntity(SEM_RUNNING, "正在为 " + count + " 张表补写说明书……", null, now),
+                    new LambdaUpdateWrapper<Connection>()
+                            .eq(Connection::getId, connectorId)
+                            .and(w -> w.eq(Connection::getSemanticStatus, SEM_READY)
+                                    .or(x -> x.eq(Connection::getSemanticStatus, SEM_RUNNING)
+                                            .isNotNull(Connection::getSemanticSyncedAt)
+                                            .and(y -> y.isNull(Connection::getSemanticClaimAt)
+                                                    .or().lt(Connection::getSemanticClaimAt, stale)))));
+            return n > 0 ? now : null;
+        } catch (Exception e) {
+            log.warn("新增表增量推导认领失败，本次不跑 connectorId={}: {}", connectorId, describe(e));
+            return null;
+        }
+    }
+
+    /** 回到 READY：本次结论排在前、上一版结论接在后（note 被截断时丢的是最旧的那一截）。 */
+    private String restoreReady(Long connectorId, String prevPrefix, String summary, boolean success, Date claimAt) {
+        String note = clip(blank(prevPrefix) ? summary : summary + "。此前：" + prevPrefix, NOTE_MAX);
+        writeStatus(connectorId, SEM_READY, note, success, claimAt);
+        return note;
+    }
+
+    /**
+     * 这条行在不在本次增量的范围里。范围之外的一律丢：模型被告知不要写，写了也不能进库——
+     * 为老表写的 OBJECT / FIELD 在 upsert 里会被「保持原样」挡住，但插入缺失的那部分会让一张
+     * 没被重新看过完整结构的老表凭空多出说明。
+     */
+    private boolean inAddedScope(ConnectorSemantic r, Set<String> included) {
+        String scope = r.getScope();
+        if (ConnectorSemanticService.SCOPE_OBJECT.equals(scope) || ConnectorSemanticService.SCOPE_FIELD.equals(scope)) {
+            return included.contains(fold(r.getObjectName()));
+        }
+        if (ConnectorSemanticService.SCOPE_JOIN.equals(scope)) {
+            String to = str(readDetail(r.getDetailJson()), "to_object");
+            return included.contains(fold(r.getObjectName())) || (to != null && included.contains(fold(to)));
+        }
+        if (ConnectorSemanticService.SCOPE_CAVEAT.equals(scope)) {
+            for (String a : strList(readDetail(r.getDetailJson()), "applies_to")) {
+                if (included.contains(fold(a))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 已有表的精简清单（表名、注释、列名与类型），给模型写「新表 → 老表」的关系用。
+     * 超出预算就停，不挑小的往里塞——「列到哪儿为止」要是一句说得清的话。
+     */
+    private AddedContext buildAddedContext(List<ConnectorSchema> rows, Map<String, Map<String, FieldDetail>> fieldsByObject,
+                                           Set<String> exclude, int budget) {
+        StringBuilder b = new StringBuilder();
+        boolean complete = true;
+        for (ConnectorSchema r : rows) {
+            if (exclude.contains(fold(r.getObjectName()))) {
+                continue;
+            }
+            StringBuilder line = new StringBuilder("- ").append(r.getObjectName());
+            if (!blank(r.getObjectComment())) {
+                line.append("（").append(nz(r.getObjectComment())).append("）");
+            }
+            line.append("：");
+            Map<String, FieldDetail> cols = fieldsByObject.get(r.getObjectName());
+            if (cols == null || cols.isEmpty()) {
+                line.append("(字段未取到)");
+            } else {
+                List<String> parts = new ArrayList<>();
+                for (FieldDetail f : cols.values()) {
+                    parts.add(f.name() + " " + nz(f.type()));
+                }
+                line.append(String.join(", ", parts));
+            }
+            line.append('\n');
+            if (b.length() + line.length() > budget) {
+                complete = false;
+                break;
+            }
+            b.append(line);
+        }
+        return new AddedContext(b.toString(), complete);
+    }
+
+    /**
+     * 结构指纹：表名 + 每列的锚点指纹。<b>不含 synced_at</b>——一次什么都没变的刷新不该让一批增量作废；
+     * 列指纹与锚点同形，所以「指纹没变」恰好等于「这批行的锚点在新快照上照样成立」。
+     */
+    private static String structureStamp(Map<String, Map<String, FieldDetail>> fieldsByObject) {
+        List<String> names = new ArrayList<>(fieldsByObject.keySet());
+        Collections.sort(names);
+        StringBuilder b = new StringBuilder();
+        for (String n : names) {
+            b.append(n).append('|');
+            for (FieldDetail f : fieldsByObject.get(n).values()) {
+                b.append(ConnectorSemanticService.fieldAnchor(f)).append(',');
+            }
+            b.append(';');
+        }
+        return ConnectorSemanticService.sha256(b.toString());
+    }
+
+    /**
+     * 管理台上那一行字。<b>「新增」只说真的新增了的表</b>：一次例行刷新之后写「新增 30 张表已补写说明书」，
+     * 看的人会去找那 30 张根本不存在的新表。
+     *
+     * @param added 其中报过 ADDED 的表数；其余是一直在库里、此前没有说明书的
+     */
+    private static String addedSummary(int included, int total, int added, List<ConnectorSemantic> scoped,
+                                       ConnectorSemanticService.UpsertResult w, Stats st, int outOfScope,
+                                       List<String> notes) {
+        int[] c = countByScope(scoped);
+        int uncovered = Math.max(0, total - added);
+        StringBuilder b = new StringBuilder();
+        if (uncovered == 0) {
+            b.append("新增 ").append(total).append(" 张表");
+        } else if (added <= 0) {
+            b.append("此前没有说明书的 ").append(total).append(" 张表");
+        } else {
+            b.append("新增 ").append(added).append(" 张、此前没有说明书的 ").append(uncovered).append(" 张表");
+        }
+        if (included < total) {
+            b.append("（本次覆盖 ").append(included).append(" 张，其余超出摘要上限，接着补）");
+        }
+        b.append("已补写说明书：表用途 ").append(c[0]).append("、字段含义 ").append(c[1])
+                .append("、关系 ").append(c[2]).append("（均未经数据验证）、待确认口径 ").append(c[3])
+                .append("；插入 ").append(w.inserted()).append(" 行、原地更新 ").append(w.updated()).append(" 行");
+        if (w.skippedNotInferred() > 0) {
+            b.append("、人工确认的 ").append(w.skippedNotInferred()).append(" 条未改动");
+        }
+        if (w.keptExisting() > 0) {
+            b.append("、已有表上的 ").append(w.keptExisting()).append(" 条保持原样");
+        }
+        if (w.conflicts() > 0) {
+            b.append("、撞键跳过 ").append(w.conflicts()).append(" 条");
+        }
+        if (st.droppedGuess > 0 || st.droppedUnknown > 0 || outOfScope > 0) {
+            b.append("；已丢弃：无外部依据 ").append(st.droppedGuess).append("、名字对不上结构 ")
+                    .append(st.droppedUnknown).append("、超出本次范围 ").append(outOfScope);
+        }
+        for (String n : notes) {
+            b.append("；").append(n);
+        }
+        return b.toString();
+    }
+
+    /** [表用途, 字段, 关系, 其余] */
+    private static int[] countByScope(List<ConnectorSemantic> rows) {
+        int[] c = new int[4];
+        for (ConnectorSemantic r : rows) {
+            switch (r.getScope()) {
+                case ConnectorSemanticService.SCOPE_OBJECT -> c[0]++;
+                case ConnectorSemanticService.SCOPE_FIELD -> c[1]++;
+                case ConnectorSemanticService.SCOPE_JOIN -> c[2]++;
+                default -> c[3]++;
+            }
+        }
+        return c;
+    }
+
+    private static Set<String> union(Set<String> a, Set<String> b) {
+        Set<String> u = new LinkedHashSet<>(a);
+        u.addAll(b);
+        return u;
+    }
+
+    /**
+     * 增量推导一批的结局。
+     *
+     * @param snapshotMoved 结构在推导期间变了，这批要用新快照重推
+     * @param sent          真的把结构送进了模型请求的表（快照写法）。<b>空 = 一张都没送</b>（没 READY、认领不到……），
+     *                      drain 据此判断「这一圈有没有进展」，见 {@link #drainAdded}
+     */
+    record AddedOutcome(DeriveResult result, boolean snapshotMoved, List<String> sent, boolean readFailed) {
+        AddedOutcome(DeriveResult result, boolean snapshotMoved, List<String> sent) {
+            this(result, snapshotMoved, sent, false);
+        }
+
+        AddedOutcome(DeriveResult result, boolean snapshotMoved) {
+            this(result, snapshotMoved, List.of(), false);
+        }
+
+        static AddedOutcome skipped(String note) {
+            return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), false);
+        }
+
+        /** 认领之前读库失败：一张没送、一行没写、什么都没认领。drain 据此重试或暂存提示名单，见 {@link #drainAdded}。 */
+        static AddedOutcome failedToRead(String note) {
+            return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), false, List.of(), true);
+        }
+    }
+
+    /**
+     * 一圈的计划，见 {@link #planAddedBatch}。纯内部，可以是 record。
+     *
+     * @param names         这一圈送进模型的表（快照写法，顺序即摘要顺序）
+     * @param rewritable    其中报过 ADDED 的——只有它们允许原地重写已有的推断行
+     * @param contentHashes 折叠表名 → 算计划时的结构指纹，记冷却用
+     * @param overflowHints 这一批装不下的 ADDED 名字，下一圈要带回去（它们的「允许重写」不能丢）
+     * @param more          这一批装不下，还有下一圈
+     * @param readFailed    连接或快照读不出来，这一圈什么都没算。<b>和「没有要补的表」是两回事</b>：前者提示名单不能丢
+     */
+    record AddedBatch(List<String> names, Set<String> rewritable, Map<String, String> contentHashes,
+                      Set<String> overflowHints, boolean more, boolean readFailed) {
+        static final AddedBatch EMPTY = new AddedBatch(List.of(), Set.of(), Map.of(), Set.of(), false, false);
+        static final AddedBatch READ_FAILED = new AddedBatch(List.of(), Set.of(), Map.of(), Set.of(), false, true);
+    }
+
+    private record AddedContext(String text, boolean complete) {
     }
 
     // ================================================================ S1：客户自己写的 SQL 语料
@@ -829,6 +1845,19 @@ public class ConnectorSemanticDeriveService {
      */
     private String callModel(Long connectorId, Connection conn, Digest d, ConnectorProperties.Semantic cfg,
                              List<String> gaps) {
+        String content = SemanticPrompts.deriveUser(conn.getName(), conn.getKind(),
+                d.includedObjects(), d.totalObjects(), gaps, d.text());
+        return sendToModel(connectorId, content, cfg, "语义层推导开始",
+                d.includedObjects(), d.totalObjects(), d.text().length());
+    }
+
+    /**
+     * 全量推导与增量推导共用的那一次模型调用。系统提示词是同一份——四条硬约束对新表一样成立。
+     *
+     * @param what 日志开头那几个字，区分全量与增量
+     */
+    private String sendToModel(Long connectorId, String userContent, ConnectorProperties.Semantic cfg,
+                               String what, int included, int total, int digestChars) {
         // 必须用【可变】集合：下游 ModelResolver / GenericChatClient 会就地改写 body 与 messages。
         // Map.of / List.of 会在那里抛 UnsupportedOperationException，而它的 getMessage() 是 null，
         // 在结果里只表现为一个孤零零的 "null"，极难排查。SkillEvalService:332-336 是用血记下来的同一条。
@@ -842,16 +1871,15 @@ public class ConnectorSemanticDeriveService {
 
         Map<String, Object> userMsg = new LinkedHashMap<>();
         userMsg.put("role", "user");
-        userMsg.put("content", SemanticPrompts.deriveUser(conn.getName(), conn.getKind(),
-                d.includedObjects(), d.totalObjects(), gaps, d.text()));
+        userMsg.put("content", userContent);
         List<Map<String, Object>> messages = new ArrayList<>();
         messages.add(userMsg);
         body.put("messages", messages);
 
-        log.info("语义层推导开始 connectorId={} 请求模型={} 对象={}/{} 摘要={}字符 max_tokens={}",
-                connectorId,
+        log.info("{} connectorId={} 请求模型={} 对象={}/{} 摘要={}字符 max_tokens={}",
+                what, connectorId,
                 model == null ? "(未配 connector.semantic.infer-model，回落 provider 默认模型)" : model,
-                d.includedObjects(), d.totalObjects(), d.text().length(), cfg.getMaxTokens());
+                included, total, digestChars, cfg.getMaxTokens());
 
         Object resp = claudeService.messages(body);
         return extractText(resp);
@@ -1019,7 +2047,12 @@ public class ConnectorSemanticDeriveService {
                 continue;
             }
             Map<String, Object> detail = new LinkedHashMap<>();
-            detail.put("table_shape", clip(str(o, "table_shape"), DETAIL_TEXT_MAX));
+            // ★ 只认四个枚举值。认不出来的不写——落成 OTHER 等于替模型编了一个判断。
+            //   来源标 MODEL：这是模型看结构的推测；验证阶段会对疑似键值对表做数据测量。
+            TableShape.parse(str(o, "table_shape")).ifPresent(shape -> {
+                detail.put(TableShape.KEY_SHAPE, shape.name());
+                detail.put(TableShape.KEY_SOURCE, TableShape.SOURCE_MODEL);
+            });
             detail.put("typical_questions", detailList(strList(o, "typical_questions")));
 
             ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_OBJECT, name, "", "");
@@ -1529,8 +2562,10 @@ public class ConnectorSemanticDeriveService {
      * S3 自我节流 <b>30/min</b>（{@code join-probes-per-minute}），
      * S4 自我节流 <b>20/min</b>（{@code value-statements-per-minute}），合计 <b>50/min</b>——
      * 两者<b>同时</b>跑在同一条连接上仍在预算内，剩 10/min 的余量。
-     * 不过本方法派发的这一个任务里，两阶段是<b>先后</b>跑的（见 {@link #validate}），
-     * 峰值只有 30/min，把余量留给客户随时可能在管理台点的「刷新结构」
+     * 不过本方法派发的这一个任务里，S3 → 表形态测量（{@code shape-statements-per-minute}，默认 <b>20/min</b>）
+     * → S4 三段是<b>先后</b>跑的（见 {@link #validate}），峰值只有 30/min。表形态测量是第三条平台侧剖析路径，
+     * 它<b>没有</b>让账越过 60，靠的正是「先后跑」这一条——哪天把这三段改成并发，先把加法重算一遍。
+     * 余量留给客户随时可能在管理台点的「刷新结构」
      *（那也走同一个平台桶：1 次 catalog + 最多 200 次 describe）。
      * <p><b>要再加第三条平台侧剖析路径之前，先把这笔加法重算一遍。</b>超预算之后的表现不是报错，
      * 是其中<b>某一条</b>路径被网关以 {@code RATE_LIMITED} 中止——而它会被记成那条路径自己的失败，
@@ -1541,6 +2576,14 @@ public class ConnectorSemanticDeriveService {
      * @param deriveNote 推导刚写下去的那句结论，作为阶段 note 的前缀保留，见 {@link #notePrefix}
      */
     private void dispatchValidation(Long connectorId, String tenantId, String deriveNote) {
+        dispatchValidation(connectorId, tenantId, deriveNote, null);
+    }
+
+    /**
+     * @param scope 只验这些表（折叠过大小写的表名）；{@code null} = 全部。
+     *              增量推导传它：为 3 张新表把 200 张老表的列取值再全量采一遍，花的是客户的库。
+     */
+    private void dispatchValidation(Long connectorId, String tenantId, String deriveNote, Set<String> scope) {
         if (!validateStageEnabled || connectorId == null) {
             return;
         }
@@ -1548,9 +2591,10 @@ public class ConnectorSemanticDeriveService {
             log.warn("语义层采样验证未派发：拿不到租户 connectorId={}", connectorId);
             return;
         }
+        final Set<String> s = scope == null ? null : Set.copyOf(scope);
         try {
             semanticStageExecutor.execute(MdcAsyncSupport.wrap("semantic-validate-" + connectorId,
-                    () -> runValidation(connectorId, tenantId)));
+                    () -> runValidation(connectorId, tenantId, s)));
         } catch (RuntimeException e) {
             // semanticStageExecutor 挂的是 AbortPolicy（★ 不是 CallerRunsPolicy，理由见那个 bean），
             // 所以队列满时这里会真的抛。绝不能只 log 就算了：
@@ -1591,10 +2635,14 @@ public class ConnectorSemanticDeriveService {
      * 租户一丢，整轮验证会以「连接不存在」被整批拒掉，而那句话读起来像是客户把连接删了。
      */
     void runValidation(Long connectorId, String tenantId) {
+        runValidation(connectorId, tenantId, null);
+    }
+
+    void runValidation(Long connectorId, String tenantId, Set<String> scope) {
         if (!TenantContext.isSet() && tenantId != null) {
             TenantContext.set(tenantId);
         }
-        validate(connectorId);
+        validate(connectorId, scope);
     }
 
     /**
@@ -1608,6 +2656,14 @@ public class ConnectorSemanticDeriveService {
      * <p>两阶段<b>先后</b>跑而不是并发，速率账见 {@link #dispatchValidation}。
      */
     public ValidationResult validate(Long connectorId) {
+        return validate(connectorId, null);
+    }
+
+    /**
+     * @param scope 只验这些表（折叠名）；{@code null} = 全部。范围只收窄「挑候选」与「采哪些表」，
+     *              落库纪律一条不变。
+     */
+    public ValidationResult validate(Long connectorId, Set<String> scope) {
         if (connectorId == null) {
             return ValidationResult.builder().ok(false).note("缺少连接 id").build();
         }
@@ -1617,8 +2673,12 @@ public class ConnectorSemanticDeriveService {
             return ValidationResult.builder().ok(false).note(note).build();
         }
         if (!validating.add(connectorId)) {
-            String note = "同一条连接上已有一轮采样验证在进行中，本次跳过";
-            log.info("语义层采样验证被跳过：本进程内已有一轮在跑 connectorId={}", connectorId);
+            // ★ 不是简单跳过：正在跑的那一轮开跑时就读完了语义行，看不见之后新写的 V_NONE 行。
+            //   记下来，由它收尾时补一轮，见 validateAgain。
+            validateAgain.merge(connectorId, scope == null ? SCOPE_ALL : Set.copyOf(scope),
+                    ConnectorSemanticDeriveService::mergeScope);
+            String note = "同一条连接上已有一轮采样验证在进行中，本次并入它结束后的补跑";
+            log.info("语义层采样验证推迟：本进程内已有一轮在跑，结束后补跑 connectorId={}", connectorId);
             return ValidationResult.builder().ok(false).note(note).build();
         }
         long start = System.currentTimeMillis();
@@ -1639,6 +2699,9 @@ public class ConnectorSemanticDeriveService {
                 return ValidationResult.builder().ok(false).note(note).build();
             }
             Map<String, Map<String, FieldDetail>> fieldsByObject = parseFields(rows);
+            // ★ 唯一键从【同一份】快照行里解，不查任何库。不传它，验证器认不出组合键、关系一律按 SIMPLE 处理——
+            //   组合键判定写好了、单测也绿着，在线上却等于没上线。
+            Map<String, List<List<String>>> uniqueKeys = SemanticJoinValidator.uniqueKeysByObject(rows);
 
             List<ConnectorSemantic> all = existingRows(connectorId);
             if (all == null) {
@@ -1646,18 +2709,30 @@ public class ConnectorSemanticDeriveService {
                 writeStageNote(connectorId, prefix, note);
                 return ValidationResult.builder().ok(false).note(note).build();
             }
+            // ★ K-3：带着真实取值的补写 gloss 先换掉，再跑任何一段。理由见 neutraliseValueGlosses。
+            neutraliseValueGlosses(all);
 
-            JoinStage js = runJoinStage(connectorId, all, fieldsByObject, prefix);
-            ValueStage vs = runValueStage(connectorId, conn, rows, all, fieldsByObject);
+            List<ConnectorSchema> scopedRows = scope == null ? rows
+                    : rows.stream().filter(r -> scope.contains(fold(r.getObjectName()))).toList();
 
-            String note = js.note() + "；" + vs.note();
+            // 三段先后跑，速率账见 dispatchValidation。表形态排在 S4 前：它是第 2 档、语句少，
+            // 而 S4 是第 3 档、默认关着——别让一段通常不跑的阶段排在一段通常要跑的阶段前面。
+            JoinStage js = runJoinStage(connectorId, all, fieldsByObject, uniqueKeys, prefix, scope);
+            ShapeStage ss = runShapeStage(connectorId, conn, scopedRows, all);
+            ValueStage vs = scopedRows.isEmpty()
+                    ? new ValueStage(0, 0, 0, 0, "本批表已不在结构快照里，未采集列取值")
+                    : runValueStage(connectorId, conn, scopedRows, all, fieldsByObject);
+
+            String note = js.note() + "；" + ss.note() + "；" + vs.note();
             writeStageNote(connectorId, prefix, note);
-            log.info("语义层采样验证完成 connectorId={} 用时 {}ms；关系：候选 {} 成立 {} 部分成立 {} "
-                            + "不成立 {} 判不出 {} 未探查 {} 已落库 {} 探查次数 {}；"
+            log.info("语义层采样验证完成 connectorId={} 用时 {}ms 范围={}；关系：候选 {} 成立 {} 部分成立 {} "
+                            + "不成立 {} 判不出 {} 未探查 {} 已落库 {} 探查次数 {} 结构补标 {}；"
+                            + "表形态：测量 {} 键值对表 {} 推翻模型 {} 语句 {}；"
                             + "值域：剖析 {} 列 枚举成功 {} 补写新行 {} 语句 {}",
-                    connectorId, System.currentTimeMillis() - start,
+                    connectorId, System.currentTimeMillis() - start, scope == null ? "全部" : scope.size() + " 张表",
                     js.candidates(), js.confirmed(), js.weak(), js.rejected(), js.undecidable(),
-                    js.notProbed(), js.written(), js.probeCount(),
+                    js.notProbed(), js.written(), js.probeCount(), js.structureMarked(),
+                    ss.measured(), ss.keyValue(), ss.overrides(), ss.statements(),
                     vs.columns(), vs.enumerated(), vs.created(), vs.statements());
             return ValidationResult.builder()
                     .ok(true)
@@ -1674,6 +2749,10 @@ public class ConnectorSemanticDeriveService {
                     .valueEnumerated(vs.enumerated())
                     .valueRowsCreated(vs.created())
                     .valueStatements(vs.statements())
+                    .shapeMeasured(ss.measured())
+                    .shapeKeyValue(ss.keyValue())
+                    .shapeOverrides(ss.overrides())
+                    .shapeStatements(ss.statements())
                     .note(clip(note, NOTE_MAX))
                     .build();
         } catch (Exception e) {
@@ -1682,8 +2761,22 @@ public class ConnectorSemanticDeriveService {
             writeStageNote(connectorId, null, "采样验证失败：" + reason);
             return ValidationResult.builder().ok(false).note("采样验证失败：" + reason).build();
         } finally {
+            // 顺序要紧：先放闸再取补跑名单。反过来的话，两步之间进来的那次派发既没被记下、又被闸挡回。
             validating.remove(connectorId);
+            Set<String> again = validateAgain.remove(connectorId);
+            if (again != null) {
+                dispatchValidation(connectorId, TenantContext.get(), null, again == SCOPE_ALL ? null : again);
+            }
         }
+    }
+
+    private static Set<String> mergeScope(Set<String> a, Set<String> b) {
+        if (a == SCOPE_ALL || b == SCOPE_ALL) {
+            return SCOPE_ALL;
+        }
+        Set<String> u = new HashSet<>(a);
+        u.addAll(b);
+        return Collections.unmodifiableSet(u);
     }
 
     // ---------------------------------------------------------------- S3：表关系采样验证
@@ -1702,19 +2795,28 @@ public class ConnectorSemanticDeriveService {
      *       就把客户的库重新扫一遍，而结论一条都不会变。</li>
      *   <li><b>{@code source=HUMAN} 的行一行不碰。</b>人答过的东西不接受机器覆盖，
      *       和 {@code replaceInferred} 里那条 {@code source='INFERRED'} 是同一条纪律。</li>
+     *   <li><b>结构形态（多态外键 / 组合键）不等探查。</b>它只读快照与唯一键，第 1 档就能下：没探查的结论只并结构键
+     *       （{@link #persistVerdict}），没有 {@code join_kind} 的关系——不论决没决过、在不在本轮范围里——用 {@code structureOnly}
+     *       补标（{@link #examineStructure}）。少了这一条，第 1 档连接和线上存量的关系会一直以普通关系的身份进 joins。</li>
      * </ol>
+     *
+     * <p>已决过的行只有一种会重新成为候选：档位调上去之后、还没有判别值的多态外键，见 {@link #wantsDiscriminatorReprobe}。
      *
      * <p>回调返回 {@code false} 会让验证器立刻停手，这里用线程中断作判据：应用关停时池子会中断
      * 这些线程，那之后继续打客户的库没有意义。已经决出来的结论一条不丢——它们在决出的那一刻
      * 就已经落库了，这正是那个回调存在的理由。
      */
     private JoinStage runJoinStage(Long connectorId, List<ConnectorSemantic> all,
-                                   Map<String, Map<String, FieldDetail>> fieldsByObject, String prefix) {
+                                   Map<String, Map<String, FieldDetail>> fieldsByObject,
+                                   Map<String, List<List<String>>> uniqueKeys, String prefix,
+                                   Set<String> scope) {
         Map<String, ConnectorSemantic> pending = new LinkedHashMap<>();
         List<SemanticJoinValidator.JoinCandidate> candidates = new ArrayList<>();
+        JoinCounters c = new JoinCounters();
         int alreadyDecided = 0;
         int human = 0;
         int unusable = 0;
+        int reprobe = 0;
         for (ConnectorSemantic r : all) {
             if (!ConnectorSemanticService.SCOPE_JOIN.equals(r.getScope())) {
                 continue;
@@ -1723,13 +2825,32 @@ public class ConnectorSemanticDeriveService {
                 human++;
                 continue;
             }
+            String[] to = joinTarget(r);
+            boolean usable = to != null && !blank(r.getObjectName()) && !blank(r.getFieldName());
+            Map<String, Object> detail = readDetail(r.getDetailJson());
+            // ★ 结构补标先于一切过滤：不看验证范围、不看决没决过。它一分客户配额都不花；而线上存量关系多半只等得到范围很窄的
+            //   自动验证——从前范围之外的 V_NONE 行在任何结构写入之前就被跳过，第 1 档连接上的存量关系于是永远没有结构。
+            boolean resetNow = usable && tally(examineStructure(r, detail, to, fieldsByObject, uniqueKeys), c);
+            boolean reprobeRow = false;
             // null 按「没决过」处理：把未知当成已决 = 永远不验它，而那恰好是最该验的一类。
             if (r.getVerified() != null && !ConnectorSemanticService.V_NONE.equals(r.getVerified())) {
-                alreadyDecided++;
+                if (!usable || !wantsDiscriminatorReprobe(connectorId, detail, c)) {
+                    alreadyDecided++;
+                    continue;
+                }
+                reprobeRow = true;
+            }
+            // 刚被打回未验证的不看范围：打回就是为了让验证按结构重判，这一轮不验，范围窄的自动验证可能永远轮不到它。
+            // 每条关系只会被打回一次（打回的同时结构已经写下），客户侧成本有界。
+            if (!resetNow && scope != null && !scope.contains(fold(r.getObjectName()))
+                    && (to == null || !scope.contains(fold(to[0])))) {
+                // 本轮只验这批表（增量推导派来的），两端都不在范围里的关系留给全量那一轮。
+                if (reprobeRow) {
+                    alreadyDecided++;
+                }
                 continue;
             }
-            String[] to = joinTarget(r);
-            if (to == null || blank(r.getObjectName()) || blank(r.getFieldName())) {
+            if (!usable) {
                 unusable++;
                 continue;
             }
@@ -1737,22 +2858,26 @@ public class ConnectorSemanticDeriveService {
             if (pending.putIfAbsent(key, r) != null) {
                 continue;
             }
+            if (reprobeRow) {
+                reprobe++;
+            }
             candidates.add(SemanticJoinValidator.JoinCandidate.of(
                     r.getObjectName(), r.getFieldName(), to[0], to[1]));
         }
 
         if (candidates.isEmpty()) {
-            String note = alreadyDecided > 0
+            String note = (alreadyDecided > 0
                     ? "表关系此前已全部验证过（" + alreadyDecided + " 条），本轮没有新候选"
-                    : "没有待验证的表关系";
-            return new JoinStage(SemanticJoinValidator.OUT_NOTHING_TO_DO, 0, 0, 0, 0, 0, 0, 0, 0, note);
+                    : "没有待验证的表关系") + structureNote(c);
+            return new JoinStage(SemanticJoinValidator.OUT_NOTHING_TO_DO, 0, 0, 0, 0, 0, 0, 0, 0,
+                    c.structureMarked, note);
         }
 
-        JoinCounters c = new JoinCounters();
         SemanticJoinValidator.JoinValidationResult res;
         try {
-            res = joinValidator.validate(connectorId, candidates, fieldsByObject, (v, decided, total) -> {
-                persistVerdict(pending, v, c);
+            // ★ 五参版本：唯一键不传，组合键判定在线上就不生效。
+            res = joinValidator.validate(connectorId, candidates, fieldsByObject, uniqueKeys, (v, decided, total) -> {
+                persistVerdict(connectorId, pending, v, c, uniqueKeys);
                 maybeProgress(connectorId, prefix, decided, total, c);
                 return !Thread.currentThread().isInterrupted();
             });
@@ -1761,14 +2886,18 @@ public class ConnectorSemanticDeriveService {
             String reason = describe(e);
             log.warn("表关系采样验证抛了异常（契约上不该） connectorId={}: {}", connectorId, reason);
             return new JoinStage(SemanticJoinValidator.OUT_ABORTED, candidates.size(),
-                    c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0,
-                    "表关系采样验证失败：" + reason);
+                    c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0, c.structureMarked,
+                    "表关系采样验证失败：" + reason + structureNote(c));
         }
         if (res == null) {
             return new JoinStage(SemanticJoinValidator.OUT_ABORTED, candidates.size(),
-                    c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0,
-                    "表关系采样验证没有返回结果");
+                    c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0, c.structureMarked,
+                    "表关系采样验证没有返回结果" + structureNote(c));
         }
+
+        // ★ 没探查的结论只落结构形态，而且要扫返回的全集：TIER_BLOCKED / DISABLED 整批一次都不回调，
+        //   而第 1 档连接恰恰是最需要这句结构警告的客户。理由见 persistUnprobedStructure。
+        persistUnprobedStructure(pending, res.getVerdicts(), c, uniqueKeys);
 
         // ★ 计数以【返回的 verdicts 全集】为准，不以回调累计为准。
         //   回调只在真的决出一条时才响：一次 TIER_BLOCKED / 半路 ABORTED 的运行，
@@ -1792,6 +2921,10 @@ public class ConnectorSemanticDeriveService {
             //（档位不够 / 开关关了 / 被中止 / 没有候选各是一句不同的话）。
             note.append(blank(res.getNote()) ? "表关系没有做采样验证" : res.getNote());
         }
+        if (reprobe > 0) {
+            note.append("；其中 ").append(reprobe)
+                    .append(" 条多态外键此前是在读不到取值的档位下验的，现在档位允许读取值，本轮重新探查判别值");
+        }
         if (alreadyDecided > 0) {
             note.append("；另有 ").append(alreadyDecided).append(" 条此前已验证过，本轮跳过");
         }
@@ -1801,33 +2934,40 @@ public class ConnectorSemanticDeriveService {
         if (unusable > 0) {
             note.append("；").append(unusable).append(" 条关系缺少目标表列，无法验证");
         }
+        note.append(structureNote(c));
         return new JoinStage(res.getOutcome(), candidates.size(), c.confirmed, c.weak, c.rejected,
-                c.undecidable, c.notProbed, c.written, res.getProbeCount(), note.toString());
+                c.undecidable, c.notProbed, c.written, res.getProbeCount(), c.structureMarked, note.toString());
     }
 
     /**
      * 落一条结论。
      *
-     * <h3>★ {@code V_NONE} 的那些<b>一个字都不写</b></h3>
+     * <h3>★ {@code V_NONE} 的那些<b>只并结构形态，别的一个字都不写</b></h3>
      * {@code V_NONE} 的意思是「<b>没探查</b>」（档位不允许、预算用完、被中止、标识符对不上快照），
      * 而不是「探查了判不出来」——后者是 {@code V_UNDECIDABLE}。对没探查过的那条，
      * {@code JoinVerdict.detailPatch()} 会把 {@code basis} 覆盖成一句泛泛的「未经数据验证」，
      * 那会<b>抹掉 S1 写进去的「来自视图 v_x 的定义」</b>：这一轮什么都没做，
-     * 却顺手删掉了这条关系唯一的来源线索。所以直接跳过——行保持原样，
+     * 却顺手删掉了这条关系唯一的来源线索。所以 {@code detailPatch()} 不能用。
+     *
+     * <p>但结构形态（多态外键 / 组合键）是第 1 档就能下的结论，与探没探查无关。连它一起跳过，第 1 档连接——
+     * 恰恰是最需要这句警告的客户，它们永远不会有探查结论——以及预算用尽、被中止的那些关系，会以普通关系的身份
+     * 继续进 joins。所以只并 {@code structuralPatch()}：{@code verified} / {@code basis} / {@code gloss} 不动，
      * 下一轮（比如档位被调上去之后）它仍然是 {@code NONE}，仍然会被挑成候选。
      */
-    private void persistVerdict(Map<String, ConnectorSemantic> pending,
-                                SemanticJoinValidator.JoinVerdict v, JoinCounters c) {
+    private void persistVerdict(Long connectorId, Map<String, ConnectorSemantic> pending,
+                                SemanticJoinValidator.JoinVerdict v, JoinCounters c,
+                                Map<String, List<List<String>>> uniqueKeys) {
         if (v == null) {
-            return;
-        }
-        String verified = v.getVerified();
-        if (blank(verified) || ConnectorSemanticService.V_NONE.equals(verified)) {
             return;
         }
         // 分类计数不在这里累加，统一由 recount 按返回的全集算一次，理由见那个方法。
         ConnectorSemantic row = pending.get(
                 joinKey(v.getFromObject(), v.getFromColumn(), v.getToObject(), v.getToColumn()));
+        String verified = v.getVerified();
+        if (blank(verified) || ConnectorSemanticService.V_NONE.equals(verified)) {
+            persistStructure(row, v, c, uniqueKeys);
+            return;
+        }
         if (row == null) {
             log.debug("采样验证结论找不到对应的语义行，已忽略 {}.{} -> {}.{}",
                     v.getFromObject(), v.getFromColumn(), v.getToObject(), v.getToColumn());
@@ -1839,12 +2979,28 @@ public class ConnectorSemanticDeriveService {
         }
         try {
             Map<String, Object> detail = readDetail(row.getDetailJson());
-            detail.putAll(v.detailPatch());
+            Map<String, Object> patch = new LinkedHashMap<>(v.detailPatch());
+            // 结构键单独处理：整组替换（只 putAll 会让一条已经不是多态外键的关系留着旧的判别列和那句警告），
+            // 并且目标表唯一键不知道时判成普通关系的不写——理由见 examineStructure。
+            STRUCTURE_KEYS.forEach(patch::remove);
+            detail.putAll(patch);
+            Map<String, Object> structure = knownStructure(v, uniqueKeys);
+            if (!structure.isEmpty()) {
+                // 与 mergeStructure 不同，判别值这里要写：它正是这一次第 3 档探查、过了 PII 的结论。
+                STRUCTURE_KEYS.forEach(detail::remove);
+                detail.putAll(structure);
+            }
             if (v.isProbed() && v.getCardinality() == null) {
                 // ★ detailPatch 在基数判不出来时【不放】这个键，于是上一轮模型自己标的基数会原样留着。
                 //   一条写着「已采样验证」、却带着一个模型猜出来的 N:1 的关系，比没验证过更危险：
                 //   自动 join 正是按基数决定的，而一次 fan-out 会让 SUM 出来的金额凭空变大且不报错。
                 detail.remove("cardinality");
+            }
+            if (SemanticJoinValidator.KIND_POLYMORPHIC.equals(v.getJoinKind())) {
+                // ★ K-2：记的是第 3 档的分组探查【真的跑了没有】，不是「这条连接当时的档位允不允许」。
+                //   档位允许、却因为运维急停开着或判别列名没过 PII 而一条分组探查都没发的结论，按档位记成 true，
+                //   就再也不会回头补判别值：急停关掉、PII 规则调整之后，这条多态外键仍然永远缺着那个条件，没有任何信号。
+                detail.put(KEY_PROBED_WITH_SAMPLE_VALUES, v.isGroupedProbeRan());
             }
             ConnectorSemantic u = new ConnectorSemantic();
             u.setId(row.getId());
@@ -1861,6 +3017,474 @@ public class ConnectorSemanticDeriveService {
             log.warn("采样验证结论落库失败 semanticId={} verified={}: {}",
                     row.getId(), verified, describe(e));
         }
+    }
+
+    /** JOIN 行 detail_json 里的结构键（共享契约）。整组替换的理由见 {@link #mergeStructure}。 */
+    private static final List<String> STRUCTURE_KEYS = List.of(
+            "join_kind", "discriminator_column", "discriminator_value", "composite_columns", "care_reason");
+
+    private static final String KEY_JOIN_KIND = "join_kind";
+
+    private static final String KEY_DISCRIMINATOR_VALUE = "discriminator_value";
+
+    /**
+     * 多态外键决出结论的那一轮，第 3 档的分组判别探查<b>真的跑了没有</b>（布尔，K-2：取自 {@code JoinVerdict.isGroupedProbeRan()}）。
+     *
+     * <p><b>追加键，不在共享契约里</b>——与 {@code ConnectorSemanticService.KEY_STALE_REMOVED} 同一个做法。
+     * 它是「档位调上去之后只重探一次」能停下来的那个记号，理由见 {@link #wantsDiscriminatorReprobe}。
+     */
+    static final String KEY_PROBED_WITH_SAMPLE_VALUES = "probed_with_sample_values";
+
+    private static final String KEY_DISCRIMINATOR_COLUMN = "discriminator_column";
+
+    private static final String KEY_COMPOSITE_COLUMNS = "composite_columns";
+
+    /**
+     * 一条 JOIN 行上<b>采样结论</b>的那组键（不含结构键），外加本类记下的 {@link #KEY_PROBED_WITH_SAMPLE_VALUES}。
+     * 结构形态翻成多态外键 / 组合键、与之矛盾的结论整组作废时用，见 {@link #resetContradictedVerdict}。
+     * 与 {@code ConnectorSemanticService.JOIN_VERDICT_KEYS} 去掉结构键之后是同一组。
+     */
+    private static final List<String> VERDICT_KEYS = List.of("sample_n", "match_n", "containment", "cardinality",
+            "auto_joinable", "basis", "verify_note", KEY_PROBED_WITH_SAMPLE_VALUES);
+
+    /**
+     * 没探查的结论（{@code V_NONE}）只落结构形态。
+     *
+     * <p>★ 必须扫返回的全集，不能只靠回调：验证器对 TIER_BLOCKED / DISABLED 整批一次都不回调，
+     * 半路中止之后剩下的那些也不回调。回调里已经写过的，内存里的行已经带上了结构键（见 {@link #writeStructure}），
+     * 这里比对得出「没变」，不会重复写。
+     */
+    private void persistUnprobedStructure(Map<String, ConnectorSemantic> pending,
+                                          List<SemanticJoinValidator.JoinVerdict> verdicts, JoinCounters c,
+                                          Map<String, List<List<String>>> uniqueKeys) {
+        if (verdicts == null) {
+            return;
+        }
+        for (SemanticJoinValidator.JoinVerdict v : verdicts) {
+            if (v != null && (blank(v.getVerified()) || ConnectorSemanticService.V_NONE.equals(v.getVerified()))) {
+                persistStructure(pending.get(joinKey(v.getFromObject(), v.getFromColumn(),
+                        v.getToObject(), v.getToColumn())), v, c, uniqueKeys);
+            }
+        }
+    }
+
+    private void persistStructure(ConnectorSemantic row, SemanticJoinValidator.JoinVerdict v, JoinCounters c,
+                                  Map<String, List<List<String>>> uniqueKeys) {
+        if (row == null || ConnectorSemanticService.SOURCE_HUMAN.equals(row.getSource())) {
+            return;
+        }
+        if (writeStructure(row, readDetail(row.getDetailJson()), knownStructure(v, uniqueKeys))) {
+            c.structureMarked++;
+        }
+    }
+
+    /**
+     * 验证器结论里的结构键，按 {@link #examineStructure} 的同一条规矩收一道：目标表唯一键不知道时，判成普通关系的<b>不写</b>。
+     * 返回空 Map = 没判 / 不该写，{@link #mergeStructure} 据此不覆盖行上已有的结构键。
+     */
+    private static Map<String, Object> knownStructure(SemanticJoinValidator.JoinVerdict v,
+                                                      Map<String, List<List<String>>> uniqueKeys) {
+        Map<String, Object> s = v.structuralPatch();
+        String kind = upper(str(s, KEY_JOIN_KIND));
+        if (kind == null || (SemanticJoinValidator.KIND_SIMPLE.equals(kind) && !keysKnown(uniqueKeys, v.getToObject()))) {
+            return new LinkedHashMap<>();
+        }
+        return new LinkedHashMap<>(s);
+    }
+
+    /** 快照里有没有这张表的唯一键信息。不在 = 不知道（旧快照、那次读索引失败），与「确实没有唯一键」（空列表）是两回事。 */
+    private static boolean keysKnown(Map<String, List<List<String>>> uniqueKeys, String table) {
+        return uniqueKeys != null && table != null && uniqueKeys.containsKey(table);
+    }
+
+    /** 一条关系这一次结构补标的结局，见 {@link #examineStructure}。 */
+    private enum StructureMark {
+        /** 不需要补，或判不了（标识符对不上快照）：什么都没写。 */
+        NONE,
+        /** 结构键写下了，采样结论不动。 */
+        MARKED,
+        /** 结构键写下了，而且已决的采样结论与新结构矛盾，整条打回未验证。 */
+        RESET,
+        /** 目标表唯一键还不知道、判出来是普通关系：不写，留给唯一键到了之后的那一趟。 */
+        PENDING_KEYS
+    }
+
+    /** 把一次结构补标的结局记进计数器；返回这条是不是刚被打回未验证。 */
+    private static boolean tally(StructureMark mark, JoinCounters c) {
+        switch (mark) {
+            case MARKED -> c.structureMarked++;
+            case RESET -> {
+                c.structureMarked++;
+                c.structureReset++;
+            }
+            case PENDING_KEYS -> c.structurePending++;
+            default -> {
+            }
+        }
+        return mark == StructureMark.RESET;
+    }
+
+    /**
+     * 刷新结构这条心跳上补标关系的结构形态（多态外键 / 组合键）。<b>零次客户库访问、不叫模型</b>：只读快照与我们自己的语义行。
+     *
+     * <h3>为什么非挂在这里不可</h3>
+     * 结构补标原本只在验证阶段里跑，而验证只有三个入口：全量推导之后、增量补写真的写出了行之后、有人手动点。
+     * 一条早就覆盖完、不再出新表的线上连接，这三件事一件都不会自己发生——它身上结构判定上线之前验过的关系就永远以
+     * 普通关系的身份留在 joins 里：组合键上一条带着 {@code auto_joinable=true} 的关系会一直把行数放大，还压着注入层的 fan-out 警告。
+     * 刷新结构是唯一一定会发生的事（定时 + 手动），而旧快照也正是在一次刷新之后才带上唯一键——就在这之后补。
+     *
+     * <h3>和验证阶段不能交错写</h3>
+     * 占用同一道 {@link #validating} 闸：两边都会整份改写 JOIN 行的 detail_json，交错时后写的一方会拿读到的旧 detail
+     * 覆盖掉对方刚落的采样结论。闸在别人手里就不补——正在跑的那一轮开头已经把全部关系扫过一遍。
+     * 这一趟是毫秒级的；其间进来的验证派发照 {@link #validate} 的规矩记进 {@link #validateAgain}，放闸时补派。
+     *
+     * <p>有关系被打回未验证（结构翻成多态外键 / 组合键，见 {@link #examineStructure}）时，派一轮只限那几张表的验证：
+     * 打回就是为了按结构重判，没人派，它们会一直停在「未验证」。每条关系只会被打回一次，客户侧成本有界。
+     */
+    private void healStructureOnRefresh(Long connectorId, String tenantId) {
+        if (!validating.add(connectorId)) {
+            return;
+        }
+        Set<String> resetTables = new LinkedHashSet<>();
+        try {
+            List<ConnectorSemantic> rows = semanticMapper.selectList(new LambdaQueryWrapper<ConnectorSemantic>()
+                    .eq(ConnectorSemantic::getConnectorId, connectorId)
+                    .eq(ConnectorSemantic::getScope, ConnectorSemanticService.SCOPE_JOIN));
+            List<ConnectorSemantic> joins = new ArrayList<>();
+            if (rows != null) {
+                for (ConnectorSemantic r : rows) {
+                    if (r != null && ConnectorSemanticService.SCOPE_JOIN.equals(r.getScope())
+                            && !ConnectorSemanticService.SOURCE_HUMAN.equals(r.getSource())
+                            && mayNeedStructure(readDetail(r.getDetailJson()))) {
+                        joins.add(r);
+                    }
+                }
+            }
+            if (joins.isEmpty()) {
+                // 没有要补的就不读快照：这一趟每次刷新都会走，绝大多数连接走到这里就结束。
+                return;
+            }
+            List<ConnectorSchema> snapshot = schemaService.currentRows(connectorId);
+            if (snapshot == null || snapshot.isEmpty()) {
+                return;
+            }
+            Map<String, Map<String, FieldDetail>> fieldsByObject = parseFields(snapshot);
+            Map<String, List<List<String>>> uniqueKeys = SemanticJoinValidator.uniqueKeysByObject(snapshot);
+            JoinCounters c = new JoinCounters();
+            for (ConnectorSemantic r : joins) {
+                String[] to = joinTarget(r);
+                if (to == null || blank(r.getObjectName()) || blank(r.getFieldName())) {
+                    continue;
+                }
+                if (tally(examineStructure(r, readDetail(r.getDetailJson()), to, fieldsByObject, uniqueKeys), c)) {
+                    resetTables.add(fold(r.getObjectName()));
+                }
+            }
+            if (c.structureMarked > 0 || c.structurePending > 0) {
+                log.info("刷新后补标关系结构形态 connectorId={} 补标 {} 条（其中结论与结构矛盾、打回未验证 {} 条） "
+                                + "目标表唯一键未知暂缓 {} 条",
+                        connectorId, c.structureMarked, c.structureReset, c.structurePending);
+            }
+        } catch (Exception e) {
+            log.warn("刷新后补标关系结构形态失败，下一次刷新再补 connectorId={}: {}", connectorId, describe(e));
+        } finally {
+            // 顺序与 validate 的 finally 一样：先放闸再取补跑名单。
+            validating.remove(connectorId);
+            Set<String> again = validateAgain.remove(connectorId);
+            if (again != null) {
+                dispatchValidation(connectorId, tenantId, null,
+                        again == SCOPE_ALL ? null : (resetTables.isEmpty() ? again : mergeScope(again, resetTables)));
+            } else if (!resetTables.isEmpty()) {
+                dispatchValidation(connectorId, tenantId, null, resetTables);
+            }
+        }
+    }
+
+    /** 不看快照就能排除的行：已经有 join_kind、且不是「还没有组合键信息的多态外键」。 */
+    private static boolean mayNeedStructure(Map<String, Object> detail) {
+        String kind = upper(str(detail, KEY_JOIN_KIND));
+        return kind == null
+                || (SemanticJoinValidator.KIND_POLYMORPHIC.equals(kind) && detail.get(KEY_COMPOSITE_COLUMNS) == null);
+    }
+
+    /**
+     * 这一行要不要跑结构判定：没有 {@code join_kind} 的；以及目标表唯一键<b>现在已知</b>、却还没有组合键信息的多态外键
+     * （它可能是在不知道唯一键时标下的，见 {@link #examineStructure}）。
+     */
+    private static boolean needsStructureExam(Map<String, Object> detail, String[] to,
+                                              Map<String, List<List<String>>> uniqueKeys) {
+        String kind = upper(str(detail, KEY_JOIN_KIND));
+        if (kind == null) {
+            return true;
+        }
+        return SemanticJoinValidator.KIND_POLYMORPHIC.equals(kind) && detail.get(KEY_COMPOSITE_COLUMNS) == null
+                && to != null && keysKnown(uniqueKeys, to[0]);
+    }
+
+    /**
+     * 给一条关系跑一次结构判定并落库。<b>零次客户库访问</b>：{@code structureOnly} 只读快照与唯一键。不看验证范围、不看决没决过。
+     *
+     * <h3>★ 不知道目标表唯一键时，普通关系（SIMPLE）一个字都不写</h3>
+     * 组合键只能从唯一键认出来；唯一键不在快照里（本功能上线之前拉的快照、或那次读索引失败）时，判定只能落到 SIMPLE。
+     * 从前照写 {@code join_kind=SIMPLE}，而写下 join_kind 的行之后再不回头看——等快照带上唯一键、目标表其实是组合键，
+     * 这条关系已经永远是普通关系了：只按一列 join 一行连出多行、SUM 放大且不报错。所以此时<b>让 join_kind 缺着</b>
+     * （注入层对缺省本来就按普通关系处理，与现状一样），唯一键到了之后的下一趟会重新判它，阶段 note 里如实说「暂缓」。
+     *
+     * <p>多态外键照写：它按列名判、与唯一键无关，是一句已经成立的警告，压着不写就是让它以普通关系的身份继续进 joins。
+     * 它缺的只是「目标表恰好也是组合键」那半句——所以唯一键到了之后，还没有组合键信息的多态外键会被再判一次
+     * （{@link #needsStructureExam}），真的多出组合键才写，判别列与判别值原样留着（{@link #mergeStructure}）。
+     *
+     * <h3>★ 结构翻成多态外键 / 组合键时，与之矛盾的采样结论整条作废</h3>
+     * 已决过的存量关系是在不知道结构的时候验的：多态外键上的 CONFIRMED / WEAK 来自不分判别条件的包含率（可能被重叠的自增 id 抬高），
+     * REJECTED 可能只是被别的类型的行拉低（而 REJECTED 永不注入，这条关系就此消失）；组合键上的 CONFIRMED / WEAK 带着
+     * 前 1000 行测出来的「右侧唯一」、N:1 和 {@code auto_joinable=true}——后者会让注入层不给 fan-out 警告。
+     * 留着它们，结构键说「要当心」、结论说「放心连」，模型只能二选一。所以打回 {@code V_NONE}，见 {@link #resetContradictedVerdict}。
+     * 组合键上的 REJECTED / UNDECIDABLE 不打回：组合键的包含率探查与从前一模一样，那两个结论仍然成立；
+     * 多态外键上的 UNDECIDABLE 同理（第 3 档上还缺判别值的，由 {@link #wantsDiscriminatorReprobe} 回头补）。
+     *
+     * @param detail 这一行当前的 detail，会被就地改成落库后的样子（调用方接着拿它判断要不要重探）
+     */
+    private StructureMark examineStructure(ConnectorSemantic row, Map<String, Object> detail, String[] to,
+                                           Map<String, Map<String, FieldDetail>> fieldsByObject,
+                                           Map<String, List<List<String>>> uniqueKeys) {
+        if (to == null || !needsStructureExam(detail, to, uniqueKeys)) {
+            return StructureMark.NONE;
+        }
+        String oldKind = upper(str(detail, KEY_JOIN_KIND));
+        Map<String, Object> patch;
+        try {
+            patch = joinValidator.structureOnly(SemanticJoinValidator.JoinCandidate.of(
+                    row.getObjectName(), row.getFieldName(), to[0], to[1]), fieldsByObject, uniqueKeys);
+        } catch (RuntimeException e) {
+            log.warn("关系结构形态补标失败，本条跳过 semanticId={}: {}", row.getId(), describe(e));
+            return StructureMark.NONE;
+        }
+        String newKind = upper(str(patch, KEY_JOIN_KIND));
+        if (newKind == null) {
+            return StructureMark.NONE;
+        }
+        if (oldKind != null && (!SemanticJoinValidator.KIND_POLYMORPHIC.equals(newKind)
+                || patch.get(KEY_COMPOSITE_COLUMNS) == null)) {
+            // 回头再判的多态外键：唯一键到了也没有多出组合键信息，原样留着——验证侧写下的 care_reason 可能比这里的更具体。
+            return StructureMark.NONE;
+        }
+        if (SemanticJoinValidator.KIND_SIMPLE.equals(newKind) && !keysKnown(uniqueKeys, to[0])) {
+            return StructureMark.PENDING_KEYS;
+        }
+        if (contradicts(row.getVerified(), oldKind, newKind)) {
+            return resetContradictedVerdict(row, detail, patch, to) ? StructureMark.RESET : StructureMark.NONE;
+        }
+        return writeStructure(row, detail, patch) ? StructureMark.MARKED : StructureMark.NONE;
+    }
+
+    /** 已决的结论与新判出的结构形态是否矛盾，规则见 {@link #examineStructure}。旧行没有 join_kind 按普通关系算。 */
+    private static boolean contradicts(String verified, String oldKind, String newKind) {
+        String v = upper(verified);
+        if (v == null || v.isEmpty() || ConnectorSemanticService.V_NONE.equals(v)) {
+            return false;
+        }
+        String before = oldKind == null ? SemanticJoinValidator.KIND_SIMPLE : oldKind;
+        if (before.equals(newKind)) {
+            return false;
+        }
+        if (SemanticJoinValidator.KIND_POLYMORPHIC.equals(newKind)) {
+            return ConnectorSemanticService.V_CONFIRMED.equals(v) || ConnectorSemanticService.V_WEAK.equals(v)
+                    || ConnectorSemanticService.V_REJECTED.equals(v);
+        }
+        if (SemanticJoinValidator.KIND_COMPOSITE.equals(newKind)) {
+            return ConnectorSemanticService.V_CONFIRMED.equals(v) || ConnectorSemanticService.V_WEAK.equals(v);
+        }
+        return false;
+    }
+
+    /**
+     * 结构写下的同时把矛盾的结论打回未验证：{@code verified=NONE}、结论键整组删掉（{@link #VERDICT_KEYS}，
+     * 含 {@code auto_joinable} / {@code cardinality}）、{@code basis} 与 gloss 换回未验证的那句（S1 的来源原样留着）。
+     * 一次 UPDATE 写完三列，不会出现「结构已写、结论还在」的中间态。成功后回填内存里的行，调用方据此把它当本轮候选。
+     */
+    private boolean resetContradictedVerdict(ConnectorSemantic row, Map<String, Object> detail,
+                                             Map<String, Object> patch, String[] to) {
+        Map<String, Object> after = new LinkedHashMap<>(detail);
+        mergeStructure(after, patch);
+        VERDICT_KEYS.forEach(after::remove);
+        String sourceSql = str(after, ConnectorSemanticService.KEY_SOURCE_SQL);
+        after.put("basis", sourceSql == null ? "未经数据验证" : clip(sourceSql + "；未经数据验证", DETAIL_TEXT_MAX));
+        String json = toJson(after);
+        if (json == null) {
+            return false;
+        }
+        String gloss = clip(unverifiedJoinGloss(to[0], to[1], after), GLOSS_MAX);
+        try {
+            ConnectorSemantic u = new ConnectorSemantic();
+            u.setId(row.getId());
+            u.setVerified(ConnectorSemanticService.V_NONE);
+            u.setGloss(gloss);
+            u.setDetailJson(json);
+            if (semanticMapper.updateById(u) > 0) {
+                log.info("关系结构形态判为 {}，原有采样结论与之矛盾，已打回未验证 semanticId={} {}.{} -> {}.{} 原结论={}",
+                        after.get(KEY_JOIN_KIND), row.getId(), row.getObjectName(), row.getFieldName(), to[0], to[1],
+                        row.getVerified());
+                row.setVerified(ConnectorSemanticService.V_NONE);
+                row.setGloss(gloss);
+                row.setDetailJson(json);
+                detail.clear();
+                detail.putAll(after);
+                return true;
+            }
+        } catch (Exception e) {
+            // 单条落库失败不该让整轮停：它下一趟仍然没有 join_kind，还会再判一次。
+            log.warn("关系结构形态落库（打回未验证）失败 semanticId={}: {}", row.getId(), describe(e));
+        }
+        return false;
+    }
+
+    /** 未经验证的关系那一句 gloss，与推导写出来的同形；不带基数——基数正是被作废的那一项。 */
+    private static String unverifiedJoinGloss(String toObj, String toCol, Map<String, Object> detail) {
+        StringBuilder b = new StringBuilder("关联 ").append(toObj).append('.').append(toCol).append('。');
+        appendIfPresent(b, detail.get(ConnectorSemanticService.KEY_SOURCE_SQL));
+        appendIfPresent(b, detail.get("note"));
+        b.append("本条未经数据验证，join 前建议先看该列的取值分布。");
+        return b.toString();
+    }
+
+    private static String upper(String s) {
+        return s == null ? null : s.trim().toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * 把结构键并进一行的 detail_json，<b>只写 detail_json 这一列</b>：{@code verified} / {@code gloss} 不碰，
+     * {@code basis} / {@code source_sql} 这类非结构键原样留着。写成功后回填内存里的行，同一轮再来一次时比对得出「没变」。
+     *
+     * @param detail 这一行当前的 detail，会被就地改成合并后的样子（调用方接着拿它判断要不要重探）
+     * @return 真的写了一次
+     */
+    private boolean writeStructure(ConnectorSemantic row, Map<String, Object> detail, Map<String, Object> patch) {
+        if (!mergeStructure(detail, patch)) {
+            return false;
+        }
+        String json = toJson(detail);
+        if (json == null) {
+            return false;
+        }
+        try {
+            ConnectorSemantic u = new ConnectorSemantic();
+            u.setId(row.getId());
+            u.setDetailJson(json);
+            if (semanticMapper.updateById(u) > 0) {
+                row.setDetailJson(json);
+                return true;
+            }
+        } catch (Exception e) {
+            // 单条落库失败不该让整轮停：剩下的关系仍然值得补标。
+            log.warn("关系结构形态落库失败 semanticId={}: {}", row.getId(), describe(e));
+        }
+        return false;
+    }
+
+    /**
+     * 结构键<b>整组替换</b>：先清掉行上旧的结构键，再放这次判出来的。
+     *
+     * <p>为什么不是 putAll：结构判定按的是当前快照，结论可能从 POLYMORPHIC 变成 SIMPLE（判别列被删了）。
+     * 只 putAll 会让旧的 {@code discriminator_column} / {@code care_reason} 留在一条已经是 SIMPLE 的关系上，
+     * 注入层会照着那句旧警告让模型去加一个已经不存在的条件。
+     *
+     * <p>{@code discriminator_value} <b>从 patch 里只清不写</b>：结构判定这条路绝不产出真实取值（那只能来自第 3 档、过了 PII 的探查），
+     * 上游哪天漏了一个出来，这里也不接。行上<b>已有</b>的判别值只在一种情况下留着：新旧都是多态外键、判别列没变——
+     * 那是唯一键到了之后回头补组合键信息的那一趟（{@link #examineStructure}），判别值仍然成立，而结构判定这条路补不回它
+     * （那一轮分组探查已经跑过，{@link #wantsDiscriminatorReprobe} 不会再挑它）。其余情况结构都变了，旧判别值一并作废。
+     *
+     * @param patch 没有 {@code join_kind} 的 patch（标识符对不上快照）= 没判，<b>不</b>覆盖行上已有的结构键
+     * @return 合并后与原来不同
+     */
+    static boolean mergeStructure(Map<String, Object> detail, Map<String, Object> patch) {
+        if (patch == null || patch.get(KEY_JOIN_KIND) == null) {
+            return false;
+        }
+        Object keptValue = samePolymorphicDiscriminator(detail, patch) ? detail.get(KEY_DISCRIMINATOR_VALUE) : null;
+        Map<String, Object> after = new LinkedHashMap<>(detail);
+        STRUCTURE_KEYS.forEach(after::remove);
+        for (Map.Entry<String, Object> e : patch.entrySet()) {
+            if (STRUCTURE_KEYS.contains(e.getKey()) && !KEY_DISCRIMINATOR_VALUE.equals(e.getKey())
+                    && e.getValue() != null) {
+                after.put(e.getKey(), e.getValue());
+            }
+        }
+        if (keptValue != null) {
+            after.put(KEY_DISCRIMINATOR_VALUE, keptValue);
+        }
+        if (after.equals(detail)) {
+            return false;
+        }
+        detail.clear();
+        detail.putAll(after);
+        return true;
+    }
+
+    /** 新旧都是多态外键、判别列（忽略大小写）没变。 */
+    private static boolean samePolymorphicDiscriminator(Map<String, Object> detail, Map<String, Object> patch) {
+        String oldCol = str(detail, KEY_DISCRIMINATOR_COLUMN);
+        String newCol = str(patch, KEY_DISCRIMINATOR_COLUMN);
+        return SemanticJoinValidator.KIND_POLYMORPHIC.equals(upper(str(detail, KEY_JOIN_KIND)))
+                && SemanticJoinValidator.KIND_POLYMORPHIC.equals(upper(str(patch, KEY_JOIN_KIND)))
+                && oldCol != null && oldCol.equalsIgnoreCase(newCol);
+    }
+
+    /**
+     * 已决过的多态外键要不要重新探查判别值。四个条件缺一不可：结构是 POLYMORPHIC；还没有判别值；
+     * 决出结论那一轮第 3 档的分组探查<b>没有真的跑</b>（{@link #KEY_PROBED_WITH_SAMPLE_VALUES} 不是 true——档位不够、
+     * 运维急停开着、判别列名没过 PII 都算没跑；存量行没有这个键，按没跑处理）；这条连接<b>现在</b>允许读取值。
+     *
+     * <p>★ 第三条是这件事能停下来的原因。第 3 档上判别值记不下来是常态之一：几张目标表的自增 id 重叠
+     * （实测 role_resource.resource_id 按 resource_type 分组，AGENT 2/2、KB 2/2，分不出来）、判别值没过 PII、
+     * 样本没采到那一类行。只看「没有判别值」就重探，这些行会在每一轮验证里把客户的库再扫一遍，
+     * 而结论一条都不会变——那正是 S3 明确拒绝过的做法。
+     */
+    private boolean wantsDiscriminatorReprobe(Long connectorId, Map<String, Object> detail, JoinCounters c) {
+        return SemanticJoinValidator.KIND_POLYMORPHIC.equals(str(detail, KEY_JOIN_KIND))
+                && str(detail, KEY_DISCRIMINATOR_VALUE) == null
+                && !Boolean.TRUE.equals(detail.get(KEY_PROBED_WITH_SAMPLE_VALUES))
+                && sampleValuesAllowed(connectorId, c);
+    }
+
+    /**
+     * 这条连接现在允不允许读真实取值（第 3 档）。一轮验证只问一次，缓存在计数器上。
+     *
+     * <p>走 {@link ConnectorSemanticService#allowsSampleValues}（它 fail-closed），这里再兜一层：
+     * 判成「不允许」的代价只是晚一轮补判别值；真正读取值之前验证器还会自己再查一次档位。
+     */
+    private boolean sampleValuesAllowed(Long connectorId, JoinCounters c) {
+        if (c.sampleValues == null) {
+            boolean allowed;
+            try {
+                allowed = semanticService.allowsSampleValues(connectorId);
+            } catch (RuntimeException e) {
+                log.warn("读取数据出库档位失败，按不允许读取值处理 connectorId={}: {}", connectorId, describe(e));
+                allowed = false;
+            }
+            c.sampleValues = allowed;
+        }
+        return c.sampleValues;
+    }
+
+    /**
+     * 结构补标那半句。「暂缓」必须说出来：目标表唯一键一直读不到时，这些关系会一直按普通关系进 joins，
+     * 不说的话它和「补过了、都是普通关系」长得一模一样。
+     */
+    private static String structureNote(JoinCounters c) {
+        StringBuilder b = new StringBuilder();
+        if (c.structureMarked > 0) {
+            b.append("；为 ").append(c.structureMarked)
+                    .append(" 条关系补标了结构形态（多态外键 / 组合键 / 普通关联，只读结构快照，没有访问客户库）");
+            if (c.structureReset > 0) {
+                b.append("，其中 ").append(c.structureReset)
+                        .append(" 条原有的采样结论与结构矛盾，已打回未验证、按结构重验");
+            }
+        }
+        if (c.structurePending > 0) {
+            b.append("；").append(c.structurePending)
+                    .append(" 条关系的目标表还没有唯一键信息，结构形态暂缓到下一次「刷新结构」之后再判");
+        }
+        return b.toString();
     }
 
     /**
@@ -1924,6 +3548,256 @@ public class ConnectorSemanticDeriveService {
         return b.toString();
     }
 
+    // ---------------------------------------------------------------- 表形态测量（键值对表判定）
+
+    /**
+     * 挑表 → 交给 {@link TableShapeDetector} → <b>测一张落一张</b>。
+     *
+     * <h3>★ 落库纪律</h3>
+     * <ol>
+     *   <li><b>只有测出键值对表才改 {@code table_shape}</b>，写 {@code MEASURED}；模型原来说的是别的，
+     *       原话留在 {@code table_shape_model_guess}。<b>分歧本身是信号</b>——它回答「模型在哪类表上会看走眼」，
+     *       丢了就再也没有。</li>
+     *   <li>测不出键值对形态<b>不改</b>模型的判断，只把测量留痕写进 {@code table_shape_measurement}：
+     *       名列是按结构挑的，挑错列测出的「不是」说明不了任何事（理由见检测器类注释）。</li>
+     *   <li>测过的（{@code MEASURED}，或留痕结论不是「判不出」）<b>下一轮跳过</b>——每点一次验证就把客户的库
+     *       重新扫一遍、而结论不会变，是 S3 已经明确拒绝过的做法。</li>
+     *   <li>{@code source=HUMAN} 的表用途行一个字不碰。</li>
+     *   <li>测出键值对表、但说明书里没有这张表的用途行：补一行。键值对表恰恰是名字最晦涩、模型最说不清的那类，
+     *       不补的话这条最要紧的结论无处可放。</li>
+     * </ol>
+     *
+     * <p>档位不够（第 1 档）时一行都不写，只在阶段 note 里说一次：行上的 {@code table_shape_source=MODEL}
+     * 本身就是「未经数据测量」的标签。理由同 S4 不给每一行铺「未启用」。
+     */
+    private ShapeStage runShapeStage(Long connectorId, Connection conn, List<ConnectorSchema> rows,
+                                     List<ConnectorSemantic> all) {
+        Map<String, ConnectorSemantic> objectRows = new LinkedHashMap<>();
+        for (ConnectorSemantic r : all) {
+            if (ConnectorSemanticService.SCOPE_OBJECT.equals(r.getScope()) && !blank(r.getObjectName())) {
+                objectRows.putIfAbsent(fold(r.getObjectName()), r);
+            }
+        }
+        List<TableShapeDetector.Target> targets = new ArrayList<>();
+        // 没有用途行、这一轮要测的表：折叠名 → 结构指纹。测完记冷却用，见 markShapeCooldown。
+        Map<String, String> unownedHashes = new HashMap<>();
+        int measuredBefore = 0;
+        int cooling = 0;
+        boolean askRedis = true;
+        for (ConnectorSchema t : rows) {
+            ConnectorSemantic obj = objectRows.get(fold(t.getObjectName()));
+            TableShape guess = null;
+            if (obj != null) {
+                if (!ConnectorSemanticService.SOURCE_INFERRED.equals(obj.getSource())) {
+                    continue;
+                }
+                Map<String, Object> d = readDetail(obj.getDetailJson());
+                if (shapeAlreadyMeasured(d)) {
+                    measuredBefore++;
+                    continue;
+                }
+                guess = TableShape.parse(str(d, TableShape.KEY_SHAPE)).orElse(null);
+            } else {
+                // ★ 没有用途行的表测出「不是键值对表」无处落结论，从前每一轮验证都重测一遍——那是每轮一条打在客户库上的分组统计。
+                //   冷却落在 Redis，理由见 shapeCooldownHours。读失败按「不在冷却」：冷却是省客户配额的，不是一道闸；
+                //   失败一次之后这一轮不再问（Redis 不可达时每问一次要等几秒）。
+                if (askRedis) {
+                    try {
+                        if (redissonClient.getBucket(
+                                shapeCooldownKey(connectorId, t.getObjectName(), t.getContentHash())).isExists()) {
+                            cooling++;
+                            continue;
+                        }
+                    } catch (Exception e) {
+                        askRedis = false;
+                        log.warn("读表形态测量冷却标记失败，这一轮按不在冷却处理 connectorId={}: {}", connectorId, describe(e));
+                    }
+                }
+                unownedHashes.put(fold(t.getObjectName()), t.getContentHash());
+            }
+            targets.add(new TableShapeDetector.Target(t, guess));
+        }
+        String before = (measuredBefore > 0 ? "；另有 " + measuredBefore + " 张此前已测量过，本轮跳过" : "")
+                + (cooling > 0 ? "；另有 " + cooling + " 张没有用途说明的表此前测过、结构没变，冷却中未重测" : "");
+        if (targets.isEmpty()) {
+            return new ShapeStage(0, 0, 0, 0, measuredBefore + cooling > 0
+                    ? "表形态此前已测量过（" + (measuredBefore + cooling) + " 张），本轮没有要测的表"
+                    + (cooling > 0 ? "（其中 " + cooling + " 张没有用途说明、结构没变，在冷却中）" : "")
+                    : "没有需要测量表形态的表");
+        }
+
+        TableShapeDetector.ShapeRun run;
+        try {
+            run = shapeDetector.detect(connectorId, targets, v -> {
+                persistShape(connectorId, conn, objectRows, v);
+                return !Thread.currentThread().isInterrupted();
+            });
+        } catch (RuntimeException e) {
+            // 契约上它不抛，这里兜底。已经落库的结论不受影响。
+            log.warn("表形态测量抛了异常（契约上不该） connectorId={}: {}", connectorId, describe(e));
+            return new ShapeStage(0, 0, 0, 0, "表形态测量失败：" + describe(e) + before);
+        }
+        if (run == null) {
+            return new ShapeStage(0, 0, 0, 0, "表形态测量没有返回结果" + before);
+        }
+        markShapeCooldown(connectorId, run, unownedHashes);
+        int kv = 0;
+        int overrides = 0;
+        List<TableShapeDetector.ShapeVerdict> verdicts =
+                run.getVerdicts() == null ? List.<TableShapeDetector.ShapeVerdict>of() : run.getVerdicts();
+        for (TableShapeDetector.ShapeVerdict v : verdicts) {
+            if (v.getOutcome() == TableShapeDetector.Outcome.KEY_VALUE) {
+                kv++;
+                if (v.overridesModel()) {
+                    overrides++;
+                }
+            }
+        }
+        String note = blank(run.getNote()) ? "表形态没有测量" : run.getNote();
+        return new ShapeStage(verdicts.size(), kv, overrides, run.getStatements(), note + before);
+    }
+
+    /**
+     * 表形态测量冷却键：连接 id + sha256(折叠表名 + 结构指纹)。
+     *
+     * <p>带结构指纹的理由与 {@link #addedCooldownKey} 相同：表结构一变（加列、改类型、补注释）冷却自然失效，那正是值得重测的时候。
+     * 落在 Redis 而不是进程内存，同样因为 push main 即部署，进程内的冷却每次发版清零。
+     */
+    static String shapeCooldownKey(Long connectorId, String objectName, String contentHash) {
+        return SHAPE_COOLDOWN_KEY_PREFIX + connectorId + ":"
+                + ConnectorSemanticService.sha256(fold(objectName) + KEY_SEP + (contentHash == null ? "" : contentHash));
+    }
+
+    /**
+     * 没有表用途行的表测完之后记冷却，理由见 {@link #shapeCooldownHours}。
+     *
+     * <ul>
+     *   <li>测出键值对表的不记：那一张已经补了用途行，下一轮按行跳过；补行失败的，下一轮本来就该重测。</li>
+     *   <li>没真的发语句的不记（被中断）。</li>
+     *   <li>中途停下的那一轮，最后一条不记：让它停下的多半就是这一张（连接不可用、被限流），它什么都没测出来。</li>
+     * </ul>
+     * 测过的「不是 / 证据不足 / 判不出」都记：判不出多半是表太小（不到 30 行），天天重测结论也不会变。
+     * 在测量返回之后统一记、不在回调里记，就是为了看得到「这一轮是不是中途停下的」。写失败只记日志，最坏是下一轮再测一次。
+     */
+    private void markShapeCooldown(Long connectorId, TableShapeDetector.ShapeRun run, Map<String, String> unownedHashes) {
+        List<TableShapeDetector.ShapeVerdict> vs = run.getVerdicts();
+        if (unownedHashes.isEmpty() || vs == null || vs.isEmpty()) {
+            return;
+        }
+        int end = TableShapeDetector.OUT_ABORTED.equals(run.getOutcome()) ? vs.size() - 1 : vs.size();
+        long hours = Math.max(1L, shapeCooldownHours);
+        String stamp = String.valueOf(System.currentTimeMillis());
+        for (int i = 0; i < end; i++) {
+            TableShapeDetector.ShapeVerdict v = vs.get(i);
+            if (v == null || !v.isProbed() || v.getOutcome() == null
+                    || v.getOutcome() == TableShapeDetector.Outcome.KEY_VALUE || blank(v.getObjectName())) {
+                continue;
+            }
+            String f = fold(v.getObjectName());
+            if (!unownedHashes.containsKey(f)) {
+                continue;
+            }
+            try {
+                RBucket<String> mark = redissonClient.getBucket(
+                        shapeCooldownKey(connectorId, v.getObjectName(), unownedHashes.get(f)));
+                mark.set(stamp, hours, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("写表形态测量冷却标记失败，本轮剩下的不再写 connectorId={}: {}", connectorId, describe(e));
+                return;
+            }
+        }
+    }
+
+    /** 测过、结论不是「判不出」的表不再测。{@code MEASURED} 必然测过。 */
+    private static boolean shapeAlreadyMeasured(Map<String, Object> detail) {
+        if (TableShape.SOURCE_MEASURED.equals(str(detail, TableShape.KEY_SOURCE))) {
+            return true;
+        }
+        if (detail.get(TableShape.KEY_MEASUREMENT) instanceof Map<?, ?> m) {
+            Object o = m.get("outcome");
+            return o != null && !TableShapeDetector.Outcome.UNDECIDABLE.name().equals(String.valueOf(o));
+        }
+        return false;
+    }
+
+    private void persistShape(Long connectorId, Connection conn, Map<String, ConnectorSemantic> objectRows,
+                              TableShapeDetector.ShapeVerdict v) {
+        if (v == null || blank(v.getObjectName()) || v.getOutcome() == null) {
+            return;
+        }
+        boolean kv = v.getOutcome() == TableShapeDetector.Outcome.KEY_VALUE;
+        ConnectorSemantic row = objectRows.get(fold(v.getObjectName()));
+        try {
+            if (row == null) {
+                if (kv) {
+                    createShapeObjectRow(connectorId, conn, v);
+                }
+                // 没有用途行、又不是键值对表：不为一句「测过了，不是」凭空补一行说明。
+                return;
+            }
+            if (!ConnectorSemanticService.SOURCE_INFERRED.equals(row.getSource())) {
+                return;
+            }
+            Map<String, Object> detail = readDetail(row.getDetailJson());
+            detail.put(TableShape.KEY_MEASUREMENT, v.measurementFragment());
+            if (kv) {
+                String previous = str(detail, TableShape.KEY_SHAPE);
+                detail.put(TableShape.KEY_SHAPE, TableShape.KEY_VALUE.name());
+                detail.put(TableShape.KEY_SOURCE, TableShape.SOURCE_MEASURED);
+                detail.put(TableShape.KEY_KV_NAME_COLUMN, v.getNameColumn());
+                detail.put(TableShape.KEY_KV_VALUE_COLUMN, v.getValueColumn());
+                if (previous != null && !TableShape.KEY_VALUE.name().equals(previous)) {
+                    detail.put(TableShape.KEY_MODEL_GUESS, previous);
+                    log.info("表形态实测推翻了模型的判断 connectorId={} object={} 模型={} 实测=KEY_VALUE",
+                            connectorId, v.getObjectName(), previous);
+                }
+            } else if (v.getModelGuess() == TableShape.KEY_VALUE) {
+                // 反方向的分歧不改模型的判断（理由见 runShapeStage），但要看得见。
+                log.info("模型判为键值对表但实测未确认 connectorId={} object={} 结论={}",
+                        connectorId, v.getObjectName(), v.getOutcome());
+            }
+            ConnectorSemantic u = new ConnectorSemantic();
+            u.setId(row.getId());
+            u.setDetailJson(toJson(detail));
+            semanticMapper.updateById(u);
+        } catch (Exception e) {
+            // 单条落库失败不该让整轮停：剩下的表仍然值得测。
+            log.warn("表形态结论落库失败 connectorId={} object={}: {}", connectorId, v.getObjectName(), describe(e));
+        }
+    }
+
+    /** 测出键值对表、说明书里却没有这张表的用途行：补一行。理由见 {@link #runShapeStage} 第 5 条。 */
+    private void createShapeObjectRow(Long connectorId, Connection conn, TableShapeDetector.ShapeVerdict v) {
+        if (len(v.getObjectName()) > NAME_MAX) {
+            return;
+        }
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put(TableShape.KEY_SHAPE, TableShape.KEY_VALUE.name());
+        detail.put(TableShape.KEY_SOURCE, TableShape.SOURCE_MEASURED);
+        detail.put(TableShape.KEY_KV_NAME_COLUMN, v.getNameColumn());
+        detail.put(TableShape.KEY_KV_VALUE_COLUMN, v.getValueColumn());
+        detail.put(TableShape.KEY_MEASUREMENT, v.measurementFragment());
+
+        ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_OBJECT, v.getObjectName(), "", "");
+        row.setTenantId(conn.getTenantId());
+        row.setConnectorId(connectorId);
+        row.setSource(ConnectorSemanticService.SOURCE_INFERRED);
+        row.setGloss(clip("实测为键值对表：一行是某一个指标的一个值，指标名在 " + v.getNameColumn()
+                + " 列、指标值在 " + v.getValueColumn() + " 列。聚合前必须先按 " + v.getNameColumn()
+                + " 过滤到单个指标，不同指标的值不能相加。这张表原本没有用途说明，业务含义需向用户确认。", GLOSS_MAX));
+        row.setDetailJson(toJson(detail));
+        // 「在数据里测得到」正是 DATA 这一档的定义。
+        row.setEvidence(ConnectorSemanticService.EV_DATA);
+        // 不给 90：判据是统计上的代理（单位混存），不是逐行核对过每个指标。
+        row.setConfidence(80);
+        row.setAnchorKind(ConnectorSemanticService.ANCHOR_NONE);
+        semanticMapper.insert(row);
+    }
+
+    /** 表形态那一段的结果。纯内部，可以是 record。 */
+    private record ShapeStage(int measured, int keyValue, int overrides, int statements, String note) {
+    }
+
     // ---------------------------------------------------------------- S4：列取值域采集
 
     /**
@@ -1942,6 +3816,7 @@ public class ConnectorSemanticDeriveService {
      * 于是「取值只有 0/1/2/3」这条确凿的事实<b>无处可放</b>，S4 白跑。
      * 所以缺行就补一条，依据标 {@code EV_DATA}（「在数据里查得到」，这正是那一档的定义）。
      * <b>只在拿到完整取值集合时补</b>：给一列补一行说「它取值太多」纯属噪音。
+     * ★ 取值只进 {@code value_domain}，补写行的 gloss 一个取值都不复述（K-3），见 {@link #VALUE_ROW_GLOSS}。
      */
     private ValueStage runValueStage(Long connectorId, Connection conn, List<ConnectorSchema> rows,
                                      List<ConnectorSemantic> all,
@@ -2030,18 +3905,33 @@ public class ConnectorSemanticDeriveService {
                 p.getStatements(), note.toString());
     }
 
-    /** 把值域并进一条已有的 FIELD 行。只动 {@code detail_json} 里 {@code value_domain} 这一个键。 */
+    /**
+     * 把值域并进一条已有的 FIELD 行。只动 {@code detail_json} 里 {@code value_domain} 这一个键——
+     * 唯一的例外是这一行的 gloss 是值域阶段写下、可能带着取值的那种（{@link #carriesValueGloss}）：同一次写里换成
+     * {@link #VALUE_ROW_GLOSS}。这一次重采若没枚举出取值，{@code value_domain} 被换掉的那一刻，注入层就不再挡那句 gloss 了。
+     */
     private boolean patchValueDomain(ConnectorSemantic row, SemanticValueProfiler.ColumnValueDomain d) {
         try {
             Map<String, Object> detail = readDetail(row.getDetailJson());
+            boolean neutralise = carriesValueGloss(row, detail);
             // 片段一律走 detailFragment：「只有完整集合才写 values」这条不变式只有那一个出口。
             // 自己从 getValues() 拼，早晚有一处把高基数列的 null 写成 []，
             // 而 [] 读起来是「这列没有取值」——和事实正好相反。
             detail.put(SemanticValueProfiler.DETAIL_KEY, SemanticValueProfiler.detailFragment(d));
+            if (neutralise) {
+                detail.put(KEY_ORIGIN, ORIGIN_VALUE_PROFILE);
+            }
             ConnectorSemantic u = new ConnectorSemantic();
             u.setId(row.getId());
             u.setDetailJson(toJson(detail));
-            return semanticMapper.updateById(u) > 0;
+            if (neutralise) {
+                u.setGloss(VALUE_ROW_GLOSS);
+            }
+            boolean ok = semanticMapper.updateById(u) > 0;
+            if (ok && neutralise) {
+                row.setGloss(VALUE_ROW_GLOSS);
+            }
+            return ok;
         } catch (Exception e) {
             log.warn("值域落库失败 semanticId={} {}.{}: {}",
                     row.getId(), d.getObjectName(), d.getFieldName(), describe(e));
@@ -2063,6 +3953,8 @@ public class ConnectorSemanticDeriveService {
         }
         try {
             Map<String, Object> detail = new LinkedHashMap<>();
+            // ★ K-3 来源标记：之后任何一方（重采、清除样本值、注入层）认这一行都认它，不认 gloss 长什么样。
+            detail.put(KEY_ORIGIN, ORIGIN_VALUE_PROFILE);
             detail.put(SemanticValueProfiler.DETAIL_KEY, SemanticValueProfiler.detailFragment(d));
 
             ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_FIELD,
@@ -2071,7 +3963,9 @@ public class ConnectorSemanticDeriveService {
             row.setConnectorId(connectorId);
             // INFERRED：下一次推导会连它一起物理删掉重来，这是对的——那时值域本来也该重采一遍。
             row.setSource(ConnectorSemanticService.SOURCE_INFERRED);
-            row.setGloss(clip(valueGloss(d), GLOSS_MAX));
+            // ★ gloss 里一个取值都不写（K-3）。从前这里写的是「取值只有这 N 种：……」——注入层只能在 value_domain
+            //   还列着取值时挡它，下一次没枚举出取值的重采一换掉 value_domain，同一批真实取值就在任何档位上出库。
+            row.setGloss(VALUE_ROW_GLOSS);
             row.setDetailJson(toJson(detail));
             row.setEvidence(ConnectorSemanticService.EV_DATA);
             // 不给 100：这是【采样那一刻】的完整集合，客户明天新增一个状态值它就不完整了。
@@ -2090,21 +3984,78 @@ public class ConnectorSemanticDeriveService {
     }
 
     /**
-     * 补写的那一行的 gloss。
+     * K-3：把值域阶段补写的 FIELD 行上<b>可能带着取值</b>的 gloss 换成 {@link #VALUE_ROW_GLOSS}。零次客户库访问。
      *
-     * <p>★ 取值列表<b>宁可不列全，也绝不截一半</b>：被 {@code clip} 从中间切掉的列表看起来仍然
-     * 像一个完整集合，模型会照着它写 {@code WHERE status IN (...)}，然后漏掉后面那几种取值——
-     * 一个不报错的错答案。放不下就只报个数，让完整集合待在 {@code detail_json} 里。
+     * <h3>为什么在每一轮验证开头扫一遍，而不只在并值域的那一刻</h3>
+     * 并值域只碰这一轮真的采到的列，而档位不开放时值域阶段根本不跑。那句旧 gloss 此时全靠注入层看 {@code value_domain}
+     * 里还有没有取值来挡——任何一条把取值从 {@code value_domain} 里拿掉的路（重采没枚举出来、清除样本值）只要有一处漏改 gloss，
+     * 同一批真实取值就在任何档位上出库，而且没有任何信号。先扫掉，这类失误就无从发生。
+     * 线上旧行只在第一轮改写一次（顺手补上来源标记），之后比对得出「已经是那句」，一次库都不写。
      */
-    private static String valueGloss(SemanticValueProfiler.ColumnValueDomain d) {
-        List<String> values = d.getValues() == null ? List.<String>of() : d.getValues();
-        String joined = String.join("、", values);
-        if (joined.length() <= GLOSS_VALUES_MAX) {
-            return "取值只有这 " + values.size() + " 种：" + joined
-                    + "。（采样时点的完整集合，之后客户新增的取值不在其中）";
+    private int neutraliseValueGlosses(List<ConnectorSemantic> all) {
+        int n = 0;
+        for (ConnectorSemantic r : all) {
+            // 先按 gloss 的记号粗筛，绝大多数行（模型写的字段说明）在这里就过去了，不必逐行解 detail_json。
+            if (r == null || !legacyValueGloss(r.getGloss())) {
+                continue;
+            }
+            Map<String, Object> detail = readDetail(r.getDetailJson());
+            if (!carriesValueGloss(r, detail)) {
+                continue;
+            }
+            detail.put(KEY_ORIGIN, ORIGIN_VALUE_PROFILE);
+            String json = toJson(detail);
+            try {
+                ConnectorSemantic u = new ConnectorSemantic();
+                u.setId(r.getId());
+                u.setGloss(VALUE_ROW_GLOSS);
+                if (json != null) {
+                    u.setDetailJson(json);
+                }
+                if (semanticMapper.updateById(u) > 0) {
+                    r.setGloss(VALUE_ROW_GLOSS);
+                    if (json != null) {
+                        r.setDetailJson(json);
+                    }
+                    n++;
+                }
+            } catch (Exception e) {
+                // 单条失败不停：这一行下一轮还会被认出来；这一轮值域阶段并它时还会再换一次。
+                log.warn("值域补写行的 gloss 换成不含取值的说明失败 semanticId={}: {}", r.getId(), describe(e));
+            }
         }
-        return "取值共 " + values.size() + " 种，太长放不进这句话，完整集合见本行 detail_json 的 "
-                + SemanticValueProfiler.DETAIL_KEY + "。（采样时点的完整集合）";
+        if (n > 0) {
+            log.info("值域补写行的 gloss 可能带着真实取值，已换成不含取值的说明 条数={}", n);
+        }
+        return n;
+    }
+
+    /**
+     * 这一行的 gloss 是不是值域阶段写下、<b>带着取值</b>的那种：FIELD + INFERRED + gloss 是旧版补写的那句话
+     * （{@link #legacyValueGloss}），并且是 K-3 行（带来源标记，或标记出现之前的存量行：依据 DATA）。
+     *
+     * <h3>为什么只认那句话，不把「K-3 行、gloss 不是本类那句」一律改写</h3>
+     * 如今没有任何一条路会往 K-3 行的 gloss 里写取值：本类补写的是 {@link #VALUE_ROW_GLOSS}，清除样本值那一处
+     * （{@code ConnectorSemanticService.purgeSampleValues}）写的是它自己那句不含取值的话。能带着取值的只剩旧版那句。
+     * 一律改写的话，那两处会在每次刷新（清除）与每轮验证（这里）之间来回互相覆盖，一个取值也没多挡住。
+     *
+     * <p>人写的（HUMAN / IMPORTED）一律不算；模型写的也不算——提示词允许它标 DATA，但它写不出旧版那句话。
+     */
+    private static boolean carriesValueGloss(ConnectorSemantic row, Map<String, Object> detail) {
+        if (!ConnectorSemanticService.SCOPE_FIELD.equals(row.getScope())
+                || !ConnectorSemanticService.SOURCE_INFERRED.equals(row.getSource())
+                || !legacyValueGloss(row.getGloss())) {
+            return false;
+        }
+        return ConnectorSemanticService.EV_DATA.equals(row.getEvidence())
+                || ORIGIN_VALUE_PROFILE.equals(str(detail, KEY_ORIGIN));
+    }
+
+    /** 上线过的旧版补写行的那两句话之一，理由见 {@link #LEGACY_VALUE_GLOSS_LISTED}。 */
+    static boolean legacyValueGloss(String gloss) {
+        return gloss != null
+                && (gloss.startsWith(LEGACY_VALUE_GLOSS_LISTED) || gloss.startsWith(LEGACY_VALUE_GLOSS_COUNTED))
+                && gloss.contains(LEGACY_VALUE_GLOSS_MARK);
     }
 
     // ---------------------------------------------------------------- 阶段小工具
@@ -2416,7 +4367,8 @@ public class ConnectorSemanticDeriveService {
      *                  看起来会和一次真的跑完、只是样本不给力的验证一模一样。
      */
     private record JoinStage(String outcome, int candidates, int confirmed, int weak, int rejected,
-                             int undecidable, int notProbed, int written, int probeCount, String note) {
+                             int undecidable, int notProbed, int written, int probeCount, int structureMarked,
+                             String note) {
     }
 
     /** S4 那一段的结果。同上。 */
@@ -2434,6 +4386,14 @@ public class ConnectorSemanticDeriveService {
         /** 真的 UPDATE 成功的行数。<b>它和上面四个数的差额是要盯的</b>：差额不为 0 说明结论对不上行。 */
         int written;
         long lastNoteAt;
+        /** 只落了结构形态（没探查的结论 + 存量行补标）的行数。不计入 {@link #written}：那一个是给结论对账用的。 */
+        int structureMarked;
+        /** 其中结论与新结构矛盾、被打回未验证的行数（已计入 {@link #structureMarked}）。 */
+        int structureReset;
+        /** 目标表唯一键还不知道、结构形态暂缓的行数。 */
+        int structurePending;
+        /** 这条连接现在允不允许读取值；{@code null} = 这一轮还没问过。 */
+        Boolean sampleValues;
     }
 
     /**
@@ -2471,6 +4431,15 @@ public class ConnectorSemanticDeriveService {
         private int valueRowsCreated;
         /** 值域采集打到客户库的语句条数。 */
         private int valueStatements;
+
+        /** 真的发了语句去测表形态的表数。 */
+        private int shapeMeasured;
+        /** 其中测出是键值对表的表数。 */
+        private int shapeKeyValue;
+        /** 其中推翻了模型判断的表数。<b>这个数不为 0 是信号</b>：模型在这类表上会看走眼。 */
+        private int shapeOverrides;
+        /** 表形态测量打到客户库的语句条数。 */
+        private int shapeStatements;
 
         private String note;
     }

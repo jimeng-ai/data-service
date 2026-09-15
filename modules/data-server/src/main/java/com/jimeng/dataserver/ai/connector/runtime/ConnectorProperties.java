@@ -37,6 +37,7 @@ public class ConnectorProperties {
     private Invoke invoke = new Invoke();
     private Write write = new Write();
     private Health health = new Health();
+    private SchemaRefresh schemaRefresh = new SchemaRefresh();
     private Semantic semantic = new Semantic();
     private Overview overview = new Overview();
 
@@ -146,6 +147,77 @@ public class ConnectorProperties {
         private boolean enabled = true;
         /** 单次 ping 的超时由各连接器实现自己控制，这里限的是整轮扫描的总时长上限。 */
         private int sweepTimeoutSeconds = 120;
+    }
+
+    /**
+     * 结构快照的定时刷新：{@code ConnectorHealthJob} 搭车做的低频 {@code ConnectorSchemaService.refresh()}
+     * （Nacos {@code connector.schema-refresh.*}）。
+     *
+     * <h3>为什么要有它</h3>
+     * 漂移处置（ObjectDiff → applyDrift → STALE）挂在 {@code refresh()} 上，而在此之前 {@code refresh()}
+     * 只在超管手工点「刷新结构」时才跑。客户改了表、没人去点，过期的说明书就一直被当成事实注入——
+     * {@code ConnectorOverviewService} 把那份快照塞进的是<b>每一个</b>请求的 system 上下文。
+     *
+     * <h3>★ 只刷新，绝不重新推导</h3>
+     * 周期性重推要走 {@code replaceInferred}：物理删掉全部 INFERRED 行，连同平台花客户查询额度换来的
+     * 每一条采样验证结论。设计文档 §12 把「周期性重新推断」明文列为不做（会覆盖人工确认过的口径）。
+     *
+     * <h3>★「间隔」按快照年龄算，不按定时器算</h3>
+     * 本仓库 push main 即部署，一天可能重启好几次。{@code fixedDelay = 6h} 的定时器每次重启都从零计时，
+     * 部署比 6 小时勤的时候它<b>一次都不会触发，而且不报错</b>。所以时钟用落库的
+     * {@code connector_schema.synced_at}：快照比 {@link SchemaRefresh#intervalHours} 旧就算到期，最旧的先刷。
+     * 手工点「刷新结构」同样盖新的 synced_at，所以不会紧跟着再被定时任务刷一遍。
+     *
+     * <p>「有没有到期的」这个检查本身每 10 分钟一次，由 {@code connector.schema-refresh.check-interval-ms}
+     * 控制（{@code @Scheduled} 直接读占位符，<b>改它要重启</b>）。下面四个字段走配置绑定，Nacos 改完即生效。
+     * 没有到期的连接时，一次检查只是<b>我们自己库上</b>的一条 GROUP BY，一个字节都不发到客户那边。
+     *
+     * <h3>容量账</h3>
+     * 默认每 10 分钟最多 3 条 → 每 6 小时最多 108 条。连接数超过这个量级时，「最旧的先刷」保证公平，
+     * 代价是快照的最长年龄会超过 6 小时；要追回来就调大 {@link SchemaRefresh#maxPerSweep}（先看下面那笔账）。
+     *
+     * <h3>平台侧速率账（与 S3 30/min、S4 20/min 合看）</h3>
+     * 一次 refresh 是<b>一次</b> {@code executeAsPlatform}（1 + N 次往返装在同一个调用里），只吃平台桶
+     * 1 个令牌，且一轮之内串行——对那笔「合计不超过 60/min」的账，增量是每分钟至多 maxPerSweep 个。
+     * 它真正贵的不是令牌，是<b>每实例并发许可</b>：一次刷新全程占着那条连接的一个许可（默认共 2 个），
+     * 这段时间里那条连接上的 Agent 查询少一个许可可用。这也是为什么它必须低频、有上限。
+     */
+    @Data
+    public static class SchemaRefresh {
+        /**
+         * 默认开。关掉之后结构漂移只在有人手工点「刷新结构」时才会被发现。
+         * 与 {@link Health#isEnabled()} 互相独立：ping 关了不影响这里，反之亦然。
+         */
+        private boolean enabled = true;
+
+        /**
+         * 快照多少小时没刷新就算到期。
+         *
+         * <p>6 小时是「过期说明书被当成事实注入多久」与「多频繁往客户生产库打 1 + N 次元数据查询」之间的折中：
+         * 表结构变更是按天计的事，按分钟刷只是拿客户库的负载去换早几分钟的发现。
+         *
+         * <p>{@code <= 0} 等同于关掉，<b>不是</b>「每轮都到期」——拿不准的时候往少打客户库的方向落。
+         */
+        private int intervalHours = 6;
+
+        /**
+         * 每次检查最多<b>尝试</b>刷新几条（成功、失败、繁忙都算一次）。一轮之内串行，
+         * 所以同一时刻全平台最多只有一条连接在被定时刷新。{@code <= 0} 等同于关掉。
+         *
+         * <p>按「尝试」而不是「成功」计数：按成功计的话，一串连不上的连接会把一轮检查变成
+         * 把到期的连接挨个撞一遍。
+         */
+        private int maxPerSweep = 3;
+
+        /**
+         * 一轮的时间预算（分钟），同时是跨副本锁的租期。超了就不再开始下一条（正在跑的那条跑完为止）。
+         *
+         * <p>刻意不用 Redisson 看门狗的自动续租：一次卡死的刷新会让锁被续到进程退出，
+         * 于是所有副本的定时刷新<b>一起静默停摆</b>——那正是本功能要消灭的状态。
+         * 租期到了而那条还没跑完，最坏是另一个副本对同一条连接再刷一次，那是安全的
+         * （撞车时会发生什么，见 {@code ConnectorHealthJob}）。
+         */
+        private int sweepTimeoutMinutes = 30;
     }
 
     /**

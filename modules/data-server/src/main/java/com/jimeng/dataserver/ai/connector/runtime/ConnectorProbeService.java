@@ -32,6 +32,43 @@ import java.util.Set;
  * <h3>判不出来 = 不通过</h3>
  * {@link ReadOnlyVerdict} 是三态：确认只读 / 确认可写 / <b>判不出来</b>。
  * 只有第一种放行。把「判不出来」当成只读，就等于没验。
+ *
+ * <h3>★ 本类不经 {@link ConnectorGateway}，直接连客户系统——「所有访问必经网关」的两个有文档的例外之一</h3>
+ * {@link #probe} 自己 {@code connector.open()}。一次探测往客户系统发的东西：
+ * <ul>
+ *   <li><b>MySQL</b>：从连接池借连接（必要时先建池）；{@code SELECT 1}（探活）；
+ *       {@code UPDATE <探针表> SET x = 1 WHERE 1 = 0}（验只读——<b>一次写尝试</b>，期望被权限拒绝）；
+ *       一条 {@code information_schema.TABLES ... LIMIT 1}（探自描述能力）。至多三条语句。</li>
+ *   <li><b>HTTP</b>：只有探活那一次对 base_url 的 {@code HEAD}。验只读看的是我们自己的方法白名单、能力是类型写死的，都不发请求。</li>
+ * </ul>
+ * 网关那几道闸这里<b>一道都没有</b>：不写 {@code connector_audit}、不占每租户速率桶、不抢每实例并发许可。
+ * 客户 DBA 在自己库的审计日志里看得到那条 UPDATE 尝试，在我们的审计表里却找不到对应的一行——
+ * 那条 UPDATE 的来历只能是：有人在管理台试连、新建、编辑或测试了这条连接。
+ *
+ * <p><b>为什么不走网关——不是没顾上，是网关无从下手：</b>
+ * <ul>
+ *   <li><b>试连（{@code ConnectorService.dryRun}）根本没有落库的行。</b>它探的是用表单参数现拼的实例，id 是合成的负数。
+ *       网关按名字或 id 去 {@code connection} 表找行、从行上解析配置，找不到任何东西。</li>
+ *   <li><b>新建、编辑要验的是还没落定的配置。</b>新建的行在同一个事务里刚插入、尚未提交；编辑的新参数在探测通过之前刻意不落库。
+ *       网关的契约是「按库里那一行执行」，拿它去验一份没落定的配置，验到的是哪一份取决于事务可见性和 MyBatis 的一级缓存——
+ *       「验过了」这个结论不能押在这种巧合上：押错的表现是旧配置通过了验证、新配置被保存，而且不报错。</li>
+ *   <li><b>网关第 6 步看的 {@code capability_flags} 正是本类的产出。</b>新连接、从旧入口（{@code ConnectionService}）建的连接，
+ *       这一列都是空的；网关对这种行的拒绝文案恰好是「请在管理台点一次『测试连接』」——而「测试连接」就是本类。
+ *       让探测依赖它自己的结果，这些连接就永远探不出能力。</li>
+ * </ul>
+ *
+ * <p><b>为什么可以接受：</b>它只由管理台上四个超管专属的动作触发（试连、新建、编辑、测试连接，见 {@code ConnectorAdminController}），
+ * 是人手点击的频率，每次至多三条语句；结果落在连接行上（健康态、{@code readonly_verified_at}、{@code capability_flags}）。
+ *
+ * <p><b>由此两条不能破的规矩：</b>
+ * <ul>
+ *   <li><b>本类绝不能被定时任务或后台线程调用。</b>那条 UPDATE 尝试点一次无害，每 5 分钟一次就是客户 DBA 找上门——
+ *       定时健康探测为此只调 {@code ping()}，见 {@code ConnectorHealthJob}。上面「可以接受」的理由全部建立在「人手点击」上。</li>
+ *   <li><b>「本类不走网关」不是可以援引的先例。</b>它的理由是「网关无从寻址」；针对已落库连接的读结构、读数据、采样探查不满足这一条，
+ *       一律走网关（后台任务走 {@link ConnectorGateway#executeAsPlatform}）。</li>
+ * </ul>
+ * 例外清单（网关、健康探测、本类）由单测 {@code ConnectorGatewayBypassInventoryTest} 从编译产物里钉住：
+ * 谁在第四个地方调 {@code Connector.open}，那条测试会红。
  */
 @Slf4j
 @Service

@@ -27,6 +27,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.util.List;
@@ -56,7 +57,7 @@ class ConnectorSchemaServiceTest {
             // 下面这几组只跑 diff / 指纹这些纯函数，不碰 refresh()，所以语义层、事务模板与网关
             // 给 mock 就够了。真要跑 refresh() 的那组在 {@link ThroughGateway} 里自己搭一套。
             mock(ConnectorSemanticService.class), mock(PlatformTransactionManager.class),
-            mock(ConnectorGateway.class));
+            mock(ConnectorGateway.class), mock(ObjectProvider.class), mock(org.redisson.api.RedissonClient.class));
 
     private static ObjectDetail table(List<FieldDetail> fields, String comment) {
         return new ObjectDetail("orders", "BASE TABLE", comment, fields, Map.of());
@@ -246,7 +247,7 @@ class ConnectorSchemaServiceTest {
             gateway = mock(ConnectorGateway.class);
             refreshService = new ConnectorSchemaService(connectionMapper, mock(ConnectorSchemaMapper.class),
                     registry, mock(ConnectorSemanticService.class),
-                    mock(PlatformTransactionManager.class), gateway);
+                    mock(PlatformTransactionManager.class), gateway, mock(ObjectProvider.class), mock(org.redisson.api.RedissonClient.class));
             // @PostConstruct 在单测里不会被调用，txTemplate 得自己初始化。
             refreshService.initTx();
 

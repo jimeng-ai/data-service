@@ -41,8 +41,9 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 连接器网关：<b>所有</b>对客户系统的访问必经之路。横切层的九件事都在这里，一次写完，
- * 每个连接器实现白拿。
+ * 连接器网关：本进程里<b>所有</b>对客户系统的访问必经之路。有文档的例外<b>只有两个</b>——
+ * 健康探测的 ping 与接入探测，见下文「两个有文档的例外」。
+ * 横切层的九件事都在这里，一次写完，每个连接器实现白拿。
  *
  * <h3>为什么是一个按固定顺序执行的方法，而不是责任链 / 装饰器</h3>
  * 这九步顺序固定，且没有「按连接器类型增减某一环」的需求。拆成九个 Decorator 只是把一段
@@ -71,13 +72,38 @@ import java.util.concurrent.TimeUnit;
  * （{@code ConnectorSchemaService.refresh} 的注释写着「这是管理面操作，不走网关」）——
  * 那句话如实描述了一个洞，但不是一个设计：限流、并发闸、审计<b>一个都没有</b>，
  * 而这些动作一次要往客户的生产库打上百条查询。抽出第 5～9 步共用，
- * 就是为了让「不走网关」这个选项不再需要存在。
+ * 就是为了让「不走网关」这个选项对<b>已经落库的连接</b>不再需要存在
+ * （接入探测探的是还没落库、或正要改的配置，是另一回事，见下文）。
  *
  * <p>唯一一处「同一步、两种参数」是第 7 步的<b>每租户速率</b>：两条路各记各的计数器
  * （见 {@link #checkTenantRate}）。共用一本账时，一轮语义层采样验证就能把客户当分钟的
  * 问数额度吃干净，表现是「模型说被限流了」而客户一句话都没问过。
  *
-
+ * <h3>两个有文档的例外：它们自己 {@code connector.open()}，不经过这里</h3>
+ * 本进程里调 {@code Connector.open(...)} 的只有三处：本类，和下面这两个例外。清单由单测
+ * {@code ConnectorGatewayBypassInventoryTest} 从编译产物里钉住——谁在第四个地方开会话，那条测试会红：
+ * 要么改走本类，要么把理由写进这一节。两个例外的理由<b>不同</b>，不能互相援引，
+ * 更不是「后台任务可以不走网关」的先例。
+ * <ol>
+ *   <li><b>{@code ConnectorHealthJob} 的 ping——刻意选择。</b>定时健康探测发一句 {@code SELECT 1}
+ *       （HTTP 是对 base_url 的一次 {@code HEAD}），不走这里的九步：走网关的话，每条连接每 5 分钟往
+ *       {@code connector_audit} 写一行、把客户 DBA 真正要查的访问记录淹掉，还要去抢每实例并发许可，
+ *       一条忙而健康的连接抢不到许可就会被记成 UNHEALTHY。这条例外<b>只覆盖 ping 这一个不碰任何数据的动作</b>。
+ *       完整理由在 {@code ConnectorHealthJob} 的类注释里。</li>
+ *   <li><b>{@link ConnectorProbeService#probe} 的接入探测——本类无从下手。</b>管理台上试连、新建、编辑、测试连接时的三步探测：
+ *       探活；验只读，MySQL 上是<b>一次期望被权限拒绝的写尝试</b>（{@code UPDATE <探针表> ... WHERE 1 = 0}）；
+ *       探能力（一条 {@code information_schema} 查询）。没有审计、不占速率桶、不抢并发许可。
+ *       它走不了本类：第 3 步按 {@code connection} 表里<b>已落库</b>的行寻址，而试连的配置根本没落库、
+ *       编辑时要验的新参数在探测通过之前刻意不落库；第 6 步看那一行的 {@code capability_flags}，
+ *       而那一列正是这次探测要写出来的——新连接和从旧入口（{@code ConnectionService}）建的连接这一列是空的，
+ *       本类对它们的拒绝文案恰好是「请在管理台点一次『测试连接』」，而「测试连接」就是这个探测。
+ *       它能被接受，是因为只由超管手点触发、每次至多三条语句；<b>绝不能被定时任务调用</b>。完整理由在它的类注释里。</li>
+ * </ol>
+ * 读结构、读数据、采样探查——凡是针对已落库连接的动作——一律走本类（后台任务走 {@link #executeAsPlatform}）。
+ *
+ * <p><b>「所有」的范围</b>是 data-server 进程里经 {@code Connector} SPI 的访问。沙箱里的代码经 egress 代理调用 HTTP 连接，
+ * 是另一个进程里的另一条链路（凭据由 {@code ConnectionResolver} 随派发载荷交给边车），不经过本类，也不在上面那份清单里。
+ *
  * <h3>★ 三个必须 fail-closed 的地方</h3>
  * <ul>
  *   <li><b>租户为空</b>：不能靠 {@code JimengTenantLineHandler} 的 {@code __no_tenant__} 哨兵。

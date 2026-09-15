@@ -118,6 +118,21 @@ public final class SemanticPrompts {
                   两张表里同名列含义不同。这些正是模型自己看不出来、又最容易出错的地方。
                 - 表很多时，**先写最重要、最容易被误用的**。输出如果被长度截断，靠前的内容才留得下来。
 
+                # 六、表形态（table_shape）只能取四个值之一
+
+                它不是一句描述，是一个**决定怎么聚合**的开关，所以只能写下面四个值里的一个（原样写英文）：
+
+                - `DETAIL`（明细表）：一行 = 一条业务记录或一次事件。SUM / COUNT 可以直接用。
+                - `MULTI_METRIC_PERIOD`（多指标周期表）：一行 = 一个周期（可带维度），多个指标各占一列。
+                  注意快照型指标（余额、库存、在册人数）不能跨周期相加。
+                - `KEY_VALUE`（键值对表）：一行 = **某一个指标的一个值**，指标名在一列、指标值在另一列
+                  （如 `metric_code` + `metric_value`）。**把它当明细表去 SUM 值列，等于把不同单位的指标加在一起，
+                  所有聚合都是错的。**
+                - `OTHER`（其他）：维度表、配置表、关系表、日志表等，或者你判断不了。
+
+                判断不了就写 `OTHER`，不要为了「看起来有判断」而硬选一个。
+                平台之后会对疑似键值对表做数据测量，测出来与你不一致时以测量为准，并保留你的判断作对照。
+
                 # 输出格式
 
                 只输出一个 JSON 对象，不要 markdown 代码围栏，不要任何解释性文字。形状如下：
@@ -127,7 +142,7 @@ public final class SemanticPrompts {
                     {
                       "name": "表名，必须与给你的结构里的表名完全一致",
                       "gloss": "这张表是干什么的，一两句话",
-                      "table_shape": "形态：主表/明细表/维度表/关系表/流水表/日志表/配置表/快照表 等",
+                      "table_shape": "DETAIL | MULTI_METRIC_PERIOD | KEY_VALUE | OTHER",
                       "typical_questions": ["这张表能回答的典型业务问题，业务语言不是 SQL，2-4 条"],
                       "evidence": "COMMENT | DATA | NAME | GUESS",
                       "confidence": 85
@@ -207,6 +222,68 @@ public final class SemanticPrompts {
         s.append(digest);
         s.append("----------------------------------------\n\n");
         s.append("请按系统提示里的约束产出那个 JSON。再强调一遍：没有依据的条目标成 GUESS 或者干脆不写，"
+                + "枚举值含义不要猜，业务口径只提问题。");
+        return s.toString();
+    }
+
+    /**
+     * 增量推导的用户提示词：<b>只为这一批表</b>写说明书，其余已有的表只作参照。
+     *
+     * <h3>这一批表不全是「新出现的」，所以提示词里不这么说</h3>
+     * 这一批有两种来源：刷新时新出现的表，以及一直在库里、却还没有说明书的表（上一次全量推导时超出了摘要上限，
+     * 或者模型当时对它只给得出 GUESS）。在稳定运行的连接上，后一种才是常态。
+     * 对它们说「库里新出现了这张表」是一句假话，而材料里的每一句话都会被模型当成依据——
+     * 它完全可能据此写出「这是一张新建的表」。所以统一说「还没有说明书的表」，这句话对两种来源都成立。
+     *
+     * <h3>为什么已有的表也要给，而且要明说「不要为它们写条目」</h3>
+     * 新表最有价值的那几条恰恰是指向老表的关系（{@code t_new.cust_id → t_customer.id}），
+     * 不给老表的列，这些关系一条都写不出来。但老表的说明书上已经挂着采样验证的结论和值域，
+     * 为它们重写条目在落库时会被丢弃——提示词里说清楚，是为了别让模型把输出预算花在会被扔掉的东西上。
+     *
+     * @param includedNew     本次给出完整结构的新表数
+     * @param totalNew        本批新表总数（摘要放不下的不在 {@code newDigest} 里）
+     * @param gaps            材料缺了什么，原样告诉模型
+     * @param newDigest       新表的完整结构，格式同 {@link #deriveUser}
+     * @param context         已有表的精简列表（表名 + 列名 + 类型）
+     * @param contextComplete 已有表是否全部列出
+     */
+    public static String deriveAddedUser(String connName, String kind,
+                                         int includedNew, int totalNew,
+                                         List<String> gaps, String newDigest,
+                                         String context, boolean contextComplete) {
+        StringBuilder s = new StringBuilder();
+        s.append("这条数据连接的说明书已经生成过，但下面「待补写的表」里的 ").append(totalNew)
+                .append(" 张表**还没有说明书**，请只为它们补写。\n\n");
+        s.append("连接名：").append(connName == null ? "(未命名)" : connName);
+        if (kind != null && !kind.isBlank()) {
+            s.append("    类型：").append(kind);
+        }
+        s.append('\n');
+
+        s.append("\n【这次的范围，请照此行事】\n");
+        s.append("- objects / fields：**只写下面「待补写的表」里的表**。已有的表不要写，写了也会被丢弃。\n");
+        s.append("- joins：只写**至少一端是待补写的表**的关系；两端都是已有表的关系不要写。\n");
+        s.append("- ambiguities：只写和待补写的表有关的口径问题，applies_to 里要包含那张表。\n");
+        if (includedNew < totalNew) {
+            s.append("- 待补写的表里只有 ").append(includedNew).append(" 张给出了结构，其余的这次不要为它写任何条目。\n");
+        }
+        if (!contextComplete) {
+            s.append("- 「已有表」只列出了一部分。没列出的表不要断定它不存在，需要它才能说清的关系就不要写。\n");
+        }
+        if (gaps != null) {
+            for (String g : gaps) {
+                s.append("- ").append(g).append('\n');
+            }
+        }
+
+        s.append("\n格式：每张表一段，首行是 `## 表名 [类型] 表注释`，其后每行一列，"
+                + "以 `|` 分隔：列名 | 类型 | 可空 | 列注释 | 补充。列注释为空表示客户没写注释。\n\n");
+        s.append("======== 待补写的表（为它们写说明书）========\n");
+        s.append(newDigest);
+        s.append("======== 已有表（仅供写关系时参照，不要为它们写条目）========\n");
+        s.append(context == null || context.isBlank() ? "(无)\n" : context);
+        s.append("========================================\n\n");
+        s.append("请按系统提示里的约束产出那个 JSON。没有依据的条目标成 GUESS 或者干脆不写，"
                 + "枚举值含义不要猜，业务口径只提问题。");
         return s.toString();
     }

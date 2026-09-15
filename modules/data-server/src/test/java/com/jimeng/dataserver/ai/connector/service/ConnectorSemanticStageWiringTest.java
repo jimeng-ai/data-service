@@ -67,6 +67,7 @@ class ConnectorSemanticStageWiringTest {
     private ConnectorAuditService auditService;
     private ThreadPoolTaskExecutor streamExecutor;
     private ThreadPoolTaskExecutor semanticStageExecutor;
+    private TableShapeDetector shapeDetector;
     private ConnectorSemanticDeriveService service;
 
     @BeforeEach
@@ -82,9 +83,11 @@ class ConnectorSemanticStageWiringTest {
         auditService = mock(ConnectorAuditService.class);
         streamExecutor = mock(ThreadPoolTaskExecutor.class);
         semanticStageExecutor = mock(ThreadPoolTaskExecutor.class);
+        shapeDetector = mock(TableShapeDetector.class);
         service = new ConnectorSemanticDeriveService(schemaService, semanticService, connectionMapper,
                 claudeService, new ConnectorProperties(), corpusReader, joinValidator, valueProfiler,
-                semanticMapper, auditService, streamExecutor, semanticStageExecutor);
+                semanticMapper, auditService, streamExecutor, semanticStageExecutor, shapeDetector,
+                mock(org.redisson.api.RedissonClient.class));
 
         Connection conn = new Connection();
         conn.setId(CONNECTOR_ID);
@@ -237,8 +240,9 @@ class ConnectorSemanticStageWiringTest {
     /** 让 mock 的验证器把 verdicts 一条条喂回 ProbeProgress，正如真实实现那样。 */
     private void validatorReturns(String outcome, SemanticJoinValidator.JoinVerdict... verdicts) {
         List<SemanticJoinValidator.JoinVerdict> list = List.of(verdicts);
-        when(joinValidator.validate(eq(CONNECTOR_ID), any(), any(), any())).thenAnswer(inv -> {
-            SemanticJoinValidator.ProbeProgress p = inv.getArgument(3);
+        // 五参版本：第 4 个参数是唯一键，回调挪到了第 5 个。接线方调四参版本就等于组合键判定在线上不生效。
+        when(joinValidator.validate(eq(CONNECTOR_ID), any(), any(), any(), any())).thenAnswer(inv -> {
+            SemanticJoinValidator.ProbeProgress p = inv.getArgument(4);
             if (p != null) {
                 for (int i = 0; i < list.size(); i++) {
                     if (!p.onDecided(list.get(i), i + 1, list.size())) {
@@ -439,7 +443,7 @@ class ConnectorSemanticStageWiringTest {
         }
 
         @Test
-        @DisplayName("★「没探查」（V_NONE）一个字都不写：写了会抹掉这条关系唯一的来源线索")
+        @DisplayName("★「没探查」（V_NONE）又没有结构判定时一个字都不写：写了会抹掉这条关系唯一的来源线索")
         void notProbedVerdictWritesNothing() {
             defaultSnapshot();
             valueProfilerDisabled();
@@ -475,7 +479,7 @@ class ConnectorSemanticStageWiringTest {
             assertTrue(r.isOk());
             assertEquals(0, r.getJoinCandidates());
             // 不过滤的话，每点一次「验证表关系」就把客户的库重新扫一遍，而结论一条都不会变。
-            verify(joinValidator, never()).validate(anyLong(), any(), any(), any());
+            verify(joinValidator, never()).validate(anyLong(), any(), any(), any(), any());
         }
 
         @Test
@@ -490,7 +494,7 @@ class ConnectorSemanticStageWiringTest {
             ConnectorSemanticDeriveService.ValidationResult r = service.validate(CONNECTOR_ID);
 
             assertEquals(0, r.getJoinCandidates());
-            verify(joinValidator, never()).validate(anyLong(), any(), any(), any());
+            verify(joinValidator, never()).validate(anyLong(), any(), any(), any(), any());
             verify(semanticMapper, never()).updateById(any());
         }
 
@@ -643,7 +647,10 @@ class ConnectorSemanticStageWiringTest {
             assertEquals(ConnectorSemanticService.EV_DATA, row.getEvidence());
             assertEquals(ConnectorSemanticService.ANCHOR_FIELD, row.getAnchorKind());
             assertNotNull(row.getAnchorHash());
-            assertTrue(row.getGloss().contains("0、1、2、3"));
+            // ★ K-3：取值只进 value_domain，gloss 一个取值都不复述——那句话没有档位闸。
+            assertFalse(row.getGloss().contains("0、1"), row.getGloss());
+            assertEquals("value_profile", detailOf(row).get("origin"));
+            assertTrue(String.valueOf(detailOf(row).get(SemanticValueProfiler.DETAIL_KEY)).contains("3"));
         }
 
         @Test

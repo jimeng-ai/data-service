@@ -46,6 +46,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
+import java.util.regex.Pattern;
 
 /**
  * 连接器能力工具：把模型发出的 {@code conn_*} 工具调用路由到 {@link ConnectorGateway}。
@@ -84,18 +86,62 @@ import java.util.Set;
  * 已经按这个形状写好了模型侧指引。<b>不要改这两个 key 的名字</b>：改名的表现不是报错，
  * 而是模型把一条「已提交待审批」的操作，向用户报告成「已完成修改」。
  *
- * <h3>conn_describe 里 joins 的四种状态，四句不同的话</h3>
+ * <h3>conn_describe 里的关系分两个桶：joins 与 unreliable_relations</h3>
  * P1 时期每条关系都写着「未经数据验证」，因为那时确实没有验证这回事。S3 之后一条关系的
  * {@code verified} 是 {@code CONFIRMED / WEAK / UNDECIDABLE / NONE} 之一
- * （{@code REJECTED} <b>整条不注入</b>——它是被数据验过、验错了的那一条）。
- * 这四种<b>必须说成四句不同的话</b>：模型只有读到不同的话，才可能做不同的事。
- * 说成同一句的代价是双向的——验证通过的关系照样被要求再跑一次 COUNT（白花客户的资源），
+ * （{@code REJECTED} <b>两个桶都不进</b>——它是被数据验过、验错了的那一条）。
+ *
+ * <p>{@code joins} <b>只收</b>单列关系（{@code join_kind} 缺省或 {@code SIMPLE}）里的
+ * {@code CONFIRMED / UNDECIDABLE / NONE}，三种状态<b>必须说成三句不同的话</b>：模型只有读到不同的话，
+ * 才可能做不同的事。说成同一句的代价是双向的——验证通过的关系照样被要求再跑一次 COUNT（白花客户的资源），
  * 而「查过了但判不出来」被当成「没查过」（再查一次，结论还是判不出来）。
- * 还要额外说一件 basis 回答不了的事：一条<b>成立</b>的 1:N / N:N 关系，直接 join 会把行数放大，
+ *
+ * <p>{@code WEAK} 与<b>全部</b>多态外键 / 复合键进 {@code unreliable_relations}。这里曾经的做法是
+ * 把 WEAK 留在 joins 里挂一句「部分成立」，那是错的：包含率落在 0.5~0.9 的常见成因<b>正是</b>多态外键
+ * 或复合键，而这两种情况下按单列 join 不是「部分正确」——另一种 {@code resource_type} 里恰好同号的 id
+ * 会被连上，产出看起来合理的<b>错行</b>。包含率量不出这件事，事后拿 COUNT 对行数也核不出来
+ * （错连上的行照样计数）。和可直接用的关系放在同一个数组里、只靠一句附注区分，模型读到 joins 就会去连。
+ * 所以这一桶的每条都带 {@code care_reason}（为什么要小心）和 {@code condition}（要用它必须满足的确切条件）。
+ *
+ * <p>还要额外说一件 basis 回答不了的事：一条<b>成立</b>的 1:N / N:N 关系，直接 join 会把行数放大，
  * {@code SUM} 出来的金额凭空变大<b>且不报错</b>——这就是 {@code fanout_warning} 那个 key。
  *
+ * <h3>conn_describe 顶层的表级说明</h3>
+ * OBJECT 行的 gloss <b>完整</b>地放在响应顶层的 {@code semantic}，与顶层 {@code comment} 并排、永不合并；
+ * {@code conn_catalog} 里那句是它截到 80 字的短版。{@code table_shape} 同在顶层：它一个值就决定了
+ * 这张表该怎么聚合，而键值对表被当成明细表时<b>所有</b>聚合都是错的，所以 {@code KEY_VALUE}
+ * 额外带一条 {@code table_shape_warning}。
+ *
+ * <p>{@code table_shape} <b>只认契约写出来的样子</b>：四个枚举名原样，并且同一行带着 {@code table_shape_source}。
+ * 上线那一版的推导提示词让模型写自由文本（主表 / 明细表 / 维度表 / 关系表 / 流水表 / 其他……），那批老行没有
+ * {@code table_shape_source}。老词表和新枚举<b>字面撞车、含义不同</b>：老的「明细表」指订单行项目那种表，
+ * 不是契约的 DETAIL；老的「其他」只是模型没归好类，映射成 OTHER 却等于断言「不是键值对表」、把聚合告警压掉。
+ * 所以没有来源的一律当老行，形态不出——不出是「平台没有可靠判断」，映射错了是「平台替它下了一个结论」。
+ *
+ * <p>{@code MODEL} 的键值对表，告警措辞按测量留痕（{@code table_shape_measurement}）分：只有<b>没有任何留痕</b>
+ * 才准说「没实测」。平台测过、结果还不支持模型时仍说「没实测」，那句话不但是假的，还把唯一的反证藏起来了。
+ *
+ * <h3>★ 第 3 档的取值，在注入这一刻再问一次档位</h3>
+ * {@code discriminator_value} 与 {@code value_domain} 是客户库里的真实取值，只有第 3 档才采得到。
+ * 但<b>写入时的档位不等于现在的档位</b>：编辑连接时表单没把档位回填，连接就会被静默降回第 2 档（设计文档 5.10），
+ * 而库里已经存下的取值不会跟着消失。只在写入侧设闸，这些值会继续流进模型上下文、再被全量落进
+ * {@code ai_model_call_content}——正是降档要阻止的那件事，而且安静得没人发现。
+ * 所以读出侧按 {@link ConnectorSemanticService#allowsSampleValues} 再判一次，<b>判不了就当不允许</b>。
+ * 被挡下时判别列照给（它是结构，第 1 档就有），取值、拿取值拼出的 {@code condition} 都不给，并且明说是档位没开放——
+ * 不说，模型会把「没给」读成「没采到」，甚至「这一列没有取值」。
+ *
+ * <p>多态外键存着的那句 {@code care_reason} 在第 3 档之下<b>只在它不可能嵌着取值时</b>原样给
+ * （{@code probed_with_sample_values} 不是 true、且没有 {@code discriminator_value}），否则按结构重拼——理由见 {@link #careReason}。
+ * 默认档上存着的正是不可能嵌着取值的那一类，而且带着「只是疑似、可能只是分类列」的保留：一律重拼会把这句保留丢掉。
+ *
+ * <p>还有第三条出口：值域阶段补写的 FIELD 行。档位没开放时这类行的 {@code semantic} 一律不给，
+ * <b>不看 {@code value_domain} 此刻还剩什么</b>。认这类行只用 {@link ConnectorSemanticService#isValueProfileRow}——
+ * 清理第 3 档取值用的也是它，理由见 {@link #valueProfileGlossWithheld}。
+ * 档位是<b>懒着问</b>的：只有真碰到这几类东西才打一次库，一次 describe 至多一次。
+ *
  * <h3>★ 没有语义行时，返回的 JSON 必须和这套特性不存在时一模一样</h3>
- * 所有语义相关的 key（{@code semantic} / {@code joins} / {@code value_domain} /
+ * 所有语义相关的 key（{@code semantic} / {@code semantic_status} / {@code semantic_note} /
+ * {@code table_shape*} / {@code kv_*} / {@code joins} / {@code unreliable_relations} / {@code value_domain} /
  * {@code glossary} / {@code ambiguities} / {@code semantic_hint}）<b>一律缺省即不出现</b>，
  * 既不给 null 也不给空数组。原因不是洁癖：{@code "joins": []} 读起来是「这张表没有关联」，
  * {@code "value_domain": {}} 读起来是「这列没有枚举值」——而事实是我们根本没有这条信息。
@@ -199,6 +245,106 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             "平台没有这一列的完整取值集合。这不等于它没有枚举值——不要据此写死查询条件，"
                     + "需要确切取值时自己查一次，或向用户确认。";
 
+    // ------------------------------------------------------------------ detail_json 里的约定键
+    // ★ 键名刻意写成字面量，不去引用产出方（SemanticJoinValidator / 推导服务）的常量：
+    //   契约是【落进库里的那几个字节】，不是某个 Java 常量。产出方哪天把常量改了名而库里的老行没变，
+    //   引用常量的读取方会跟着"改对"然后静默读不到老行；字面量至少在这一侧钉住了库里真实存的样子。
+
+    /** JOIN 行：关系形态。缺省（老行）按 {@link #JK_SIMPLE} 处理。 */
+    private static final String KEY_JOIN_KIND = "join_kind";
+    private static final String KEY_DISCRIMINATOR_COLUMN = "discriminator_column";
+    /** 只有第 3 档且过了 PII 筛查才会存在；缺省是常态，不是故障。 */
+    private static final String KEY_DISCRIMINATOR_VALUE = "discriminator_value";
+    private static final String KEY_COMPOSITE_COLUMNS = "composite_columns";
+    private static final String KEY_CARE_REASON = "care_reason";
+
+    /**
+     * 验证侧 {@code compositeCare} 那句话里点名组合键的那一截，形如 {@code orders_p.id 只是组合唯一键 (id, create_time)}。
+     *
+     * <p>★ 多态外键<b>同时</b>是组合键时，验证侧不写 {@code composite_columns}（按约定只在 COMPOSITE 上出现），
+     * 组合键那一半只活在 {@code care_reason} 里——而第 3 档之下那句话可能整句不能用（见 {@link #careReason}）。
+     * 这里只从中<b>读出键列名</b>（逐个过标识符白名单），不改写、不转发那句话，所以认错的后果只可能是
+     * 「少一段组合键提醒」，不可能是「多出一个取值」。措辞由 {@code ConnectorToolExecutorSemanticTest}
+     * 拿验证侧的真实产出（公开的 {@code structureOnly}）钉住：那边改一个字，这边的用例先红，而不是静默少一段提醒。
+     */
+    private static final String COMPOSITE_CARE_MARKER = " 只是组合唯一键 (";
+    /** 与 {@code SemanticJoinValidator.IDENT_RE} / {@code MySqlSession.IDENT_RE} 同形：键列名只可能长这样。 */
+    private static final Pattern IDENT = Pattern.compile("^[A-Za-z0-9_$]{1,64}$");
+
+    /**
+     * 多态外键决出结论那一轮，第 3 档的分组探查真的跑了没有（K-2，推导侧写）。嵌着判别值的那句 {@code care_reason}
+     * 只出自那次探查，所以它是「存着的那句话可不可能嵌着取值」的结构判据，见 {@link #storedCareCannotHoldValues}。
+     */
+    private static final String KEY_PROBED_WITH_SAMPLE_VALUES = "probed_with_sample_values";
+
+    static final String JK_SIMPLE = "SIMPLE";
+    static final String JK_POLYMORPHIC = "POLYMORPHIC";
+    static final String JK_COMPOSITE = "COMPOSITE";
+
+    /** OBJECT 行：表的形态。 */
+    private static final String KEY_TABLE_SHAPE = "table_shape";
+    private static final String KEY_TABLE_SHAPE_SOURCE = "table_shape_source";
+    private static final String KEY_KV_NAME_COLUMN = "kv_name_column";
+    private static final String KEY_KV_VALUE_COLUMN = "kv_value_column";
+    /** 测量留痕：{@code outcome / name_column / value_column / basis}。这个键在，就说明平台对这张表<b>动过手</b>。 */
+    private static final String KEY_TABLE_SHAPE_MEASUREMENT = "table_shape_measurement";
+
+    static final String SHAPE_KEY_VALUE = "KEY_VALUE";
+    /**
+     * 只认契约的四个枚举名，<b>原样</b>：不忽略大小写，也不认中文名。
+     * 推导侧写的永远是 {@code TableShape.name()}，凡是长得不一样的都不是它写的；而上线那一版留下的自由文本
+     * 和新枚举字面撞车、含义不同（理由见类注释「表级说明」），任何宽松匹配都是在替老行下一个它没下过的结论。
+     */
+    private static final Set<String> TABLE_SHAPES = Set.of("DETAIL", "MULTI_METRIC_PERIOD", SHAPE_KEY_VALUE, "OTHER");
+    private static final String SHAPE_SOURCE_MEASURED = "MEASURED";
+    /** 来源同样原样匹配。没有来源 = 老行，形态整个不出。 */
+    private static final Set<String> TABLE_SHAPE_SOURCES = Set.of("MODEL", SHAPE_SOURCE_MEASURED);
+
+    /** 测量结论：实测没有支持「是键值对表」。{@code KEY_VALUE} 只会和 {@code MEASURED} 一起写，走另一条路。 */
+    private static final String MEASURE_NOT_KEY_VALUE = "NOT_KEY_VALUE";
+    /** 测量结论：动过手但没结论。{@code UNDECIDABLE} 里还包括「本轮被中断、这张表没测到」。 */
+    private static final Set<String> MEASURE_UNDECIDED = Set.of("INCONCLUSIVE", "UNDECIDABLE");
+
+    /**
+     * 键值对表：实测过、但记下的列与本次返回的结构对不上。<b>此时不点名</b>——
+     * 点一个已经不存在的列名，模型会照着写出一条引用它的 SQL。
+     */
+    private static final String KV_MEASURED_UNRESOLVED_WARNING =
+            "平台实测过这是一张键值对表，但记下的指标名列 / 值列和本次返回的结构对不上（结构可能变过），所以这里不点名。"
+                    + "这类表一行只存一个指标，值那一列里混着不同指标的值：不按指标名过滤就直接 SUM / AVG，"
+                    + "是把不相干的指标加在一起——不报错，但数是错的。先从 fields 里认清哪列是指标名、哪列是值，"
+                    + "按指标名过滤出一个指标之后再聚合。";
+
+    /** 「如果它真是键值对表」那半句。几种 MODEL 情形共用，免得同一条聚合规矩被写出几个彼此漂移的版本。 */
+    private static final String KV_IF_TRUE =
+            "如果属实：一行只存一个指标，值那一列里混着不同指标的值，跨指标名直接 SUM / AVG 没有意义——不报错，但数是错的。"
+                    + "聚合之前先认清哪列是指标名、哪列是值，按指标名过滤出一个指标再算；认不清就先查几行数据看一眼。";
+
+    /**
+     * 键值对表：只有模型的判断，<b>而且没有任何测量留痕</b>。必须说出"没实测"，否则它和实测结论读起来一样硬；
+     * 反过来，<b>只有这一种情况</b>准说"没实测"——有留痕时说这句就是假话，见 {@link #kvModelWarning}。
+     */
+    private static final String KV_UNMEASURED_WARNING =
+            "平台推断这是一张键值对表，但没有实测过（只是看结构判断的）。" + KV_IF_TRUE;
+
+    /** 键值对表：留痕在，但结论认不出（手工改过、或者更新版本写下的新结论）。既不说没测，也不引依据。 */
+    private static final String KV_MEASUREMENT_UNREADABLE_WARNING =
+            "平台推断这是一张键值对表（只是看结构判断的）。这张表有测量记录，但记录里的结论认不出来，按未经证实处理。"
+                    + KV_IF_TRUE;
+
+    /**
+     * 值域：这条连接此刻没有确认开放第 3 档。<b>措辞必须在两种情况下都成立</b>：档位真的被调低了，
+     * 以及读档位那一趟出错、按不允许兜底——后一种说成「档位不允许」就是假话，所以说「没有确认开放」。
+     */
+    private static final String VALUE_DOMAIN_WITHHELD_NOTE =
+            "这条连接当前没有确认开放第 3 档（样本值），平台记下的这一列取值不向你展示。"
+                    + "这不等于这一列没有枚举值——不要据此写死查询条件，需要确切取值时自己查一次，或向用户确认。";
+
+    private static final Set<String> KNOWN_VERIFIED = Set.of(
+            ConnectorSemanticService.V_CONFIRMED, ConnectorSemanticService.V_WEAK,
+            ConnectorSemanticService.V_REJECTED, ConnectorSemanticService.V_UNDECIDABLE,
+            ConnectorSemanticService.V_NONE);
+
     /**
      * {@code connector_semantic.term} 的列宽。191 不是随手定的：唯一键
      * {@code uk_connector_semantic} 含这一列，InnoDB 单索引上限 3072 字节、utf8mb4 每字符 4 字节，
@@ -214,7 +360,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     /** 只用来把模型给的连接名换成 {@code connection.id}（语义层按 id 存）。租户过滤由拦截器注入。 */
     private final ConnectionMapper connectionMapper;
     /**
-     * 只为 conn_catalog 那一次「按 scope 取 CAVEAT」而注入，理由见 {@link #ambiguityPayload}。
+     * 两处按 scope 精确取行：conn_catalog 取 CAVEAT（理由见 {@link #ambiguityPayload}），
+     * conn_describe 取这张表的 OBJECT 行（理由见 {@link #objectSemanticRow}）。
      * 裸 {@code BaseMapper}，过得了上面那条「能不能走回 ProviderRegistry」的判据。
      */
     private final ConnectorSemanticMapper semanticMapper;
@@ -337,7 +484,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                 m.put("comment", e.comment());
                 ConnectorSemantic s = objects.get(e.name());
                 if (s != null && s.getGloss() != null && !s.getGloss().isBlank()) {
-                    // 这里给【短】版本：选表那一刻需要的就是一句话，完整版在 conn_describe 给。
+                    // 这里给【短】版本：选表那一刻需要的就是一句话。完整版由 conn_describe 放在响应顶层的
+                    // semantic（与顶层 comment 并排），见 objectSemanticPayload。
                     // 没有语义行时这两个 key 干脆不出现——注入 null 只是把噪声塞进模型上下文。
                     m.put("semantic", ConnectorSemanticService.shortGloss(s.getGloss()));
                     m.put("semantic_status", s.getStatus());
@@ -391,15 +539,22 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         // 查不到语义只是"少注入一点"，但对齐了就能少一类"明明有说明书却没出现"的怪事。
         String objectName = detail == null || detail.name() == null ? object : detail.name();
         Long connectorId = resolveConnectorId(connector);
+        // ★ 档位懒着问：只有真碰到第 3 档才有的东西（判别值、值域）才打一次库，一次 describe 至多一次。
+        //   没有语义行的连接器一次都不问——每轮都调的工具，多一趟查询就是每轮多一趟。理由见类注释。
+        SampleValueGate sampleValues = new SampleValueGate(connectorId);
         Map<String, ConnectorSemantic> fieldSemantics = Map.of();
-        List<Map<String, Object>> joins = List.of();
+        Relations relations = new Relations();
+        ConnectorSemantic objectRow = null;
         if (connectorId != null) {
             ConnectorSemanticService.ObjectSemantics sem = semanticService.forObject(connectorId, objectName);
             if (sem.getFields() != null) fieldSemantics = sem.getFields();
-            joins = joinPayload(sem.getJoins());
+            relations = relationPayload(sem.getJoins(), sampleValues);
+            objectRow = objectSemanticRow(connectorId, objectName);
         }
+        // 表级说明要拿【本次实时返回的列】去核对它点名的列，所以在拿到 detail 之后才拼。
+        Map<String, Object> objectLevel = objectSemanticPayload(objectRow, liveColumns(detail));
 
-        boolean anySemantic = !joins.isEmpty();
+        boolean anySemantic = !objectLevel.isEmpty() || !relations.joins.isEmpty() || !relations.unreliable.isEmpty();
         List<Map<String, Object>> fields = new ArrayList<>();
         if (detail != null && detail.fields() != null) {
             for (FieldDetail f : detail.fields()) {
@@ -413,8 +568,10 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                 ConnectorSemantic s = fieldSemantics.get(f.name());
                 if (s != null) {
                     boolean stale = ConnectorSemanticService.ST_STALE.equals(s.getStatus());
-                    if (s.getGloss() != null && !s.getGloss().isBlank()) {
-                        // 这里给【完整】gloss，不截断。catalog 截到 80 字是为了选表那一刻不刷屏，
+                    Map<String, Object> fieldDetail = readDetail(s);
+                    if (s.getGloss() != null && !s.getGloss().isBlank()
+                            && !valueProfileGlossWithheld(s, sampleValues)) {
+                        // 这里给【完整】gloss，不截断。字段说明只在 describe 出现（catalog 里只有表级那句短版），
                         // describe 本来就是"要看细节"的地方，再截就把该看的那半句截没了。
                         m.put("semantic", s.getGloss().trim());
                         if (stale) {
@@ -425,7 +582,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                     // ★ 值域和 gloss 【互相独立】，不能绑在一起判：S4 可能给一列采到了完整取值集合，
                     //   而 S2 压根没给这一列写出一句说明（反过来也一样）。写成 else / 嵌套在 gloss 里，
                     //   表现是"这列的取值集合凭空不见了"，而且没有任何报错。
-                    Map<String, Object> domain = valueDomainPayload(readDetail(s), stale);
+                    Map<String, Object> domain = valueDomainPayload(fieldDetail, stale, sampleValues);
                     if (domain != null) {
                         m.put("value_domain", domain);
                         anySemantic = true;
@@ -439,11 +596,18 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         out.put("object", detail == null ? object : detail.name());
         out.put("type", detail == null ? null : detail.type());
         out.put("comment", detail == null ? null : detail.comment());
+        // ★ 表级 semantic 紧挨着 comment 放：两个 key、两句话，模型一眼就能对照「客户自己怎么说」和
+        //   「平台怎么理解」。合成一个字段，冲突时它就分不清该信谁。
+        out.putAll(objectLevel);
         if (anySemantic) {
             out.put("semantic_hint", SEMANTIC_HINT);
         }
-        if (!joins.isEmpty()) {
-            out.put("joins", joins);
+        if (!relations.joins.isEmpty()) {
+            out.put("joins", relations.joins);
+        }
+        // 与 joins 同一条纪律：没有就不出现。"unreliable_relations": [] 读起来是「所有关系都可靠」。
+        if (!relations.unreliable.isEmpty()) {
+            out.put("unreliable_relations", relations.unreliable);
         }
         out.put("fields", fields);
         out.put("extra", detail == null ? null : detail.extra());
@@ -748,27 +912,243 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     }
 
     /**
-     * 表关系。{@code REJECTED} 的关系<b>不注入</b>——它是被数据验过、验错了的那一条。
+     * 这张表的 OBJECT 行（表用途 + 表形态），查不到或出错一律返回 null。
      *
-     * <p>其余四种状态各出一条<b>不同的句子</b>，并且各自带一个不同的动作，理由见
-     * {@link #verificationSentence}。{@code verified} 这一列同时<b>原样</b>给出去：
+     * <h4>为什么直接走 mapper，而不是 {@code ConnectorSemanticService.forObject}</h4>
+     * {@code forObject} 只取 FIELD / JOIN 两类，表级那一行根本不在它的返回里——这正是
+     * 「catalog 截到 80 字、完整版在 describe 给」这句话长期落空的原因。按
+     * {@code (connector_id, scope, object_name)} 取正好命中 {@code idx_connector_semantic_conn_scope}，
+     * 与 {@link #ambiguityPayload} 同一种写法；等 service 长出一个带 OBJECT 的注入用方法，这里应当换过去。
+     *
+     * <p>失败返回 null 而不是抛：表级说明是叠加的注解，用它的故障去否决"看结构"这个必要功能是错的。
+     */
+    private ConnectorSemantic objectSemanticRow(Long connectorId, String objectName) {
+        if (connectorId == null || objectName == null || objectName.isBlank()) return null;
+        try {
+            List<ConnectorSemantic> rows = semanticMapper.selectList(new LambdaQueryWrapper<ConnectorSemantic>()
+                    .eq(ConnectorSemantic::getConnectorId, connectorId)
+                    .eq(ConnectorSemantic::getScope, ConnectorSemanticService.SCOPE_OBJECT)
+                    .eq(ConnectorSemantic::getObjectName, objectName));
+            if (rows == null) return null;
+            for (ConnectorSemantic r : rows) {
+                if (r != null) return r;
+            }
+            return null;
+        } catch (Exception e) {
+            log.warn("读取表级语义失败，本次不注入 connectorId={} object={}", connectorId, objectName, e);
+            return null;
+        }
+    }
+
+    /**
+     * 表级那几个顶层 key。没有可给的内容时返回<b>空 map</b>（调用方 {@code putAll} 之后一个 key 都不多）。
+     *
+     * <p>gloss 与 table_shape <b>互相独立</b>，理由同字段上 gloss 与 value_domain：推导侧可能给一张表
+     * 判出了形态却没写出一句说明（反过来也一样），绑在一起判，表现是其中一个凭空消失、而且不报错。
+     *
+     * @param liveColumns 本次实时返回的列（小写 → 原样）。用来核对键值对表点名的两列还在不在
+     */
+    private Map<String, Object> objectSemanticPayload(ConnectorSemantic row, Map<String, String> liveColumns) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (row == null) return out;
+        Map<String, Object> d = readDetail(row);
+        // ★ 形态和来源必须同时是契约里的值才出。没有来源的是上线那一版写下的老行（自由文本词表）：
+        //   它的「其他」「明细表」和新枚举字面撞车、含义不同，映射过来就是替它断言了一个结论。理由见类注释「表级说明」。
+        String source = tableShapeSource(d.get(KEY_TABLE_SHAPE_SOURCE));
+        String shape = source == null ? null : tableShape(d.get(KEY_TABLE_SHAPE));
+        boolean hasGloss = row.getGloss() != null && !row.getGloss().isBlank();
+        if (!hasGloss && shape == null) return out;
+
+        if (hasGloss) {
+            // 完整版，不截断：catalog 那句是为选表截的，到了 describe 再截就把该看的那半句截没了。
+            out.put("semantic", row.getGloss().trim());
+        }
+        if (row.getStatus() != null && !row.getStatus().isBlank()) {
+            out.put("semantic_status", row.getStatus());
+        }
+        if (ConnectorSemanticService.ST_STALE.equals(row.getStatus())) {
+            // 与字段上同一个 key、同一句话：表级和字段级的"结构变了"是同一件事，模型不该学两套读法。
+            out.put("semantic_note", DRIFT_NOTE);
+        }
+        if (shape == null) return out;
+
+        // 走到这里 source 一定非空：没有来源的行在上面已经连形态一起丢掉了。
+        out.put("table_shape", shape);
+        out.put("table_shape_source", source);
+        if (!SHAPE_KEY_VALUE.equals(shape)) return out;
+
+        // ★ 键值对表必须带一条聚合告警：值那一列混着不同指标的值，跨指标名 SUM 出来的数没有意义，
+        //   而且不报错、数量级可能还像样——这是"表形态"这个字段存在的全部理由。
+        //   只有实测结论才点名。MODEL 的那条按测量留痕分几种说法（见 kvModelWarning）：
+        //   宁可说软也不能说硬，但"说软"不等于可以说一句假的"没实测"。
+        if (!SHAPE_SOURCE_MEASURED.equals(source)) {
+            out.put("table_shape_warning", kvModelWarning(d.get(KEY_TABLE_SHAPE_MEASUREMENT), liveColumns));
+            return out;
+        }
+        String nameColumn = liveColumn(liveColumns, d.get(KEY_KV_NAME_COLUMN));
+        String valueColumn = liveColumn(liveColumns, d.get(KEY_KV_VALUE_COLUMN));
+        if (nameColumn != null && valueColumn != null && !nameColumn.equalsIgnoreCase(valueColumn)) {
+            out.put("kv_name_column", nameColumn);
+            out.put("kv_value_column", valueColumn);
+            out.put("table_shape_warning", kvMeasuredWarning(nameColumn, valueColumn));
+        } else {
+            out.put("table_shape_warning", KV_MEASURED_UNRESOLVED_WARNING);
+        }
+        return out;
+    }
+
+    /**
+     * 模型判为键值对表（{@code MODEL}）时的告警。<b>按测量留痕分四种说法</b>：
+     * <ul>
+     *   <li>没有留痕 → 没实测。<b>只有这一种</b>准说"没实测"。</li>
+     *   <li>{@code NOT_KEY_VALUE} → 测了、结果不支持模型。带上依据，要求先核实再当键值对表用。
+     *       形态本身不撤：测量用的两列是按结构挑的，挑错列测出的"不是"证明不了它不是
+     *       （推导侧也因此不改模型的判断，只留痕）。</li>
+     *   <li>{@code INCONCLUSIVE / UNDECIDABLE} → 动过手但没结论。说"尝试过"而不说"测过"：
+     *       {@code UNDECIDABLE} 也包括「本轮被中断、这张表没测到」，说"测过"就是假话，依据里会写清是哪种。</li>
+     *   <li>留痕在、结论认不出 → 既不说没测，也不引依据：一条认不出结论的依据，读起来可能正好和告警相反。</li>
+     * </ul>
+     * 留痕是 JSON {@code null} 按"没有"处理；是个认不出形状的东西按"认不出"处理——
+     * 那说明有人写过它，"没实测"这句话已经不能保证是真的。
+     */
+    private static String kvModelWarning(Object measurement, Map<String, String> liveColumns) {
+        if (measurement == null) return KV_UNMEASURED_WARNING;
+        Map<?, ?> m = measurement instanceof Map<?, ?> map ? map : Map.of();
+        String outcome = stringOrNull(m.get("outcome"));
+        if (MEASURE_NOT_KEY_VALUE.equals(outcome)) {
+            return "平台推断这是一张键值对表（只是看结构判断的），但用数据实测的结果不支持这个判断"
+                    + basisClause(measurementBasis(m, liveColumns))
+                    + "。实测用哪两列是按结构挑的，所以这个结果也证明不了它一定不是键值对表。"
+                    + "把它当键值对表用之前，先查几行数据确认是不是一列放指标名、一列放值：确认是，就按指标名过滤出一个指标再聚合"
+                    + "（值那一列混着不同指标的值，跨指标名直接 SUM / AVG 不报错，但数是错的）；确认不是，就按普通的表处理。";
+        }
+        // Set.of(...).contains(null) 会抛 NPE，所以先判空。
+        if (outcome != null && MEASURE_UNDECIDED.contains(outcome)) {
+            return "平台推断这是一张键值对表（只是看结构判断的），也尝试过用数据测量，但没有得出结论"
+                    + basisClause(measurementBasis(m, liveColumns)) + "，所以它仍然只是推断。" + KV_IF_TRUE;
+        }
+        return KV_MEASUREMENT_UNREADABLE_WARNING;
+    }
+
+    /**
+     * 测量依据（检测器写给人看的那句：用了哪两列、测到什么数，不含业务取值）。
+     * 它记下的列在本次实时结构里对不上就不引：理由同 {@code kv_name_column}——
+     * 点一个已经不存在的列名，模型会照着写出一条引用它的 SQL。拿不到实时结构时无从核对，照引。
+     */
+    private static String measurementBasis(Map<?, ?> measurement, Map<String, String> liveColumns) {
+        String basis = stringOrNull(measurement.get("basis"));
+        if (basis == null || liveColumns.isEmpty()) return basis;
+        for (String key : List.of("name_column", "value_column")) {
+            String column = stringOrNull(measurement.get(key));
+            if (column != null && !liveColumns.containsKey(column.toLowerCase(Locale.ROOT))) return null;
+        }
+        return basis;
+    }
+
+    private static String basisClause(String basis) {
+        return basis == null ? "" : "（测量依据：" + basis + "）";
+    }
+
+    /** 实测过的键值对表：两列都点名，并把"先过滤再聚合"写成它能照抄的形状。 */
+    private static String kvMeasuredWarning(String nameColumn, String valueColumn) {
+        return "这是一张键值对表（平台实测过）：一行只存一个指标，指标名在 " + nameColumn + "，值在 " + valueColumn + "。"
+                + valueColumn + " 这一列里混着不同指标的值，不按 " + nameColumn + " 过滤就 SUM / AVG / MAX，"
+                + "是把不相干的指标加在一起——不报错，数量级也可能像样，但数是错的。"
+                + "先用 " + nameColumn + " = 某一个指标名 过滤出一个指标再聚合；要几个指标就按 " + nameColumn + " 分组。"
+                + "指标名有哪些、各是什么意思拿不准，就先查一次或问用户，不要猜。";
+    }
+
+    /**
+     * 契约四个枚举名之一，<b>原样</b>（只去首尾空白）；其余一律 null——认不出的形态不出。
+     * 不忽略大小写、不认中文名，理由见 {@link #TABLE_SHAPES}。
+     */
+    private static String tableShape(Object raw) {
+        String s = stringOrNull(raw);
+        return s != null && TABLE_SHAPES.contains(s) ? s : null;
+    }
+
+    /** {@code MODEL} / {@code MEASURED}，原样；认不出返回 null，调用方把整行当老行、形态不出。 */
+    private static String tableShapeSource(Object raw) {
+        String s = stringOrNull(raw);
+        return s != null && TABLE_SHAPE_SOURCES.contains(s) ? s : null;
+    }
+
+    /** 本次实时返回的列名，小写 → 原样。拿不到结构时是空 map，调用方据此跳过核对。 */
+    private static Map<String, String> liveColumns(ObjectDetail detail) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (detail == null || detail.fields() == null) return out;
+        for (FieldDetail f : detail.fields()) {
+            if (f == null || f.name() == null || f.name().isBlank()) continue;
+            out.putIfAbsent(f.name().trim().toLowerCase(Locale.ROOT), f.name().trim());
+        }
+        return out;
+    }
+
+    /**
+     * 记下的列名 → 本次实时结构里的那一列。<b>对不上返回 null</b>：点一个已经不存在的列名，
+     * 模型会照着写出一条引用它的 SQL。拿不到实时结构（空 map）时无从核对，按记下的原样用。
+     * 大小写不敏感：MySQL 的列名本来就不分大小写。
+     */
+    private static String liveColumn(Map<String, String> liveColumns, Object stored) {
+        String s = stringOrNull(stored);
+        if (s == null) return null;
+        if (liveColumns.isEmpty()) return s;
+        return liveColumns.get(s.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 表关系，分成两个桶。{@code REJECTED}（以及本版本认不出的 {@code verified}）<b>两个桶都不进</b>。
+     *
+     * <ul>
+     *   <li>{@code joins}：单列关系里的 {@code CONFIRMED / UNDECIDABLE / NONE}——可以照 basis 的指示直接用；</li>
+     *   <li>{@code unreliable_relations}：{@code WEAK}，以及<b>任何</b>验证结论下的多态外键 / 复合键——
+     *       按单列连它们会连出错的行，每条都带 {@code care_reason} 和 {@code condition}。</li>
+     * </ul>
+     * 理由见类注释「关系分两个桶」。{@code verified} 这一列同时原样给出去：
      * 中文句子是给模型读的，枚举值是给它照着分支的——措辞改写不会让分支跟着变。
      */
-    private List<Map<String, Object>> joinPayload(List<ConnectorSemantic> joins) {
-        if (joins == null || joins.isEmpty()) return List.of();
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (ConnectorSemantic j : joins) {
+    private Relations relationPayload(List<ConnectorSemantic> rows, BooleanSupplier sampleValues) {
+        Relations out = new Relations();
+        if (rows == null || rows.isEmpty()) return out;
+        for (ConnectorSemantic j : rows) {
             if (j == null) continue;
-            if (ConnectorSemanticService.V_REJECTED.equals(j.getVerified())) continue;
+            String verified = normalizedVerified(j.getVerified());
+            // 认不出的 verified 按"不注入"处理而不是按 NONE：它可能是一个比 NONE 更坏的结论，
+            // 而 S3 的取向是 P 优先于 R——漏一条关系的代价远小于把一条错关系交给模型。
+            // 大小写归一也是为了这一点：小写的 "rejected" 以前会绕过 equals、以"未经验证"的身份被注入。
+            if (verified == null || ConnectorSemanticService.V_REJECTED.equals(verified)) continue;
             Map<String, Object> d = readDetail(j);
-            Object toObject = d.get("to_object");
-            Object toColumn = d.get("to_column");
+            String toObject = stringOrNull(d.get("to_object"));
+            String toColumn = stringOrNull(d.get("to_column"));
             // 缺了任一端就不是一条能用的关系，给出去只会让模型拿它去拼一条编出来的 JOIN。
             if (toObject == null || toColumn == null) continue;
+
+            String kind = joinKind(d);
+            boolean reliable = JK_SIMPLE.equals(kind) && !ConnectorSemanticService.V_WEAK.equals(verified);
+            // ★ 只有多态外键会带第 3 档的取值（判别值，以及验证侧嵌着它写的那句 care_reason），档位只在这里问。
+            //   为什么落库之后还要在读出侧再问一次，见类注释「第 3 档的取值，在注入这一刻再问一次档位」。
+            boolean polymorphic = JK_POLYMORPHIC.equals(kind);
+            boolean valuesAllowed = polymorphic && sampleValues.getAsBoolean();
+            // ★ 多态外键只有第 3 档的分组探查判得出 CONFIRMED（第 1、2 档不分条件的包含率只给 UNDECIDABLE，见验证侧 decide）。
+            //   没确认的不许说成「必须按类型过滤」：它可能只是分类列，按一个类型过滤会把其余类型的行静默漏掉。
+            boolean confirmed = ConnectorSemanticService.V_CONFIRMED.equals(verified);
+
             Map<String, Object> e = new LinkedHashMap<>();
             e.put("column", j.getFieldName());
-            e.put("to_object", String.valueOf(toObject));
-            e.put("to_column", String.valueOf(toColumn));
+            e.put("to_object", toObject);
+            e.put("to_column", toColumn);
+            if (!reliable) {
+                // ★ 为什么要小心、要用必须满足什么，排在最前面：模型从上往下读，
+                //   先读到 cardinality / confidence 这些"像是可以用"的数字，后面的条件就容易被当成附注。
+                // ★ 组合键这一半对多态外键也要认：两者都命中时验证侧只记 POLYMORPHIC，组合键那一半丢了，
+                //   模型加上判别条件照样按单列连，一行连出对面多行，SUM 被放大且不报错。
+                Composite composite = compositeOf(d, kind, toObject, toColumn);
+                e.put("join_kind", kind);
+                e.put("care_reason", careReason(d, kind, valuesAllowed, confirmed, composite, toObject, toColumn));
+                e.put("condition", relationCondition(j.getFieldName(), d, kind, toObject, toColumn,
+                        valuesAllowed, confirmed, composite));
+                putKindKeys(e, d, kind, valuesAllowed);
+            }
             String cardinality = stringOrNull(d.get("cardinality"));
             if (cardinality != null) {
                 e.put("cardinality", cardinality);
@@ -782,9 +1162,9 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                 e.put("confidence", j.getConfidence());
             }
             if (j.getVerified() != null && !j.getVerified().isBlank()) {
-                e.put("verified", j.getVerified());
+                e.put("verified", verified);
             }
-            e.put("basis", joinBasis(j, d));
+            e.put("basis", joinBasis(j, d, verified, reliable));
             // ★ fan-out 单独一个 key，不并进 basis：basis 回答"这条关系成不成立"，
             //   它回答"就算成立，这么连也会把数算错"。一条已验证通过的 1:N 关系两句话都要说，
             //   而合成一句之后，模型看到"验证通过"就会把后半句当成附注读过去。
@@ -797,16 +1177,322 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             if (ConnectorSemanticService.ST_STALE.equals(j.getStatus())) {
                 e.put("stale_note", DRIFT_NOTE);
             }
-            out.add(e);
+            (reliable ? out.joins : out.unreliable).add(e);
         }
         return out;
+    }
+
+    /** 已知的五种之一（大小写不敏感）；空 = 没验过（{@code NONE}）；认不出 = null。 */
+    private static String normalizedVerified(String raw) {
+        if (raw == null || raw.isBlank()) return ConnectorSemanticService.V_NONE;
+        String v = raw.trim().toUpperCase(Locale.ROOT);
+        return KNOWN_VERIFIED.contains(v) ? v : null;
+    }
+
+    /** 缺省（契约之前的老行）按单列关系处理；其余原样大写，认不出的形态也【不】当成单列。 */
+    private static String joinKind(Map<String, Object> detail) {
+        String k = stringOrNull(detail.get(KEY_JOIN_KIND));
+        return k == null ? JK_SIMPLE : k.toUpperCase(Locale.ROOT);
+    }
+
+    /** 形态特有的键原样给出去：condition 是给模型读的句子，这几个是给它照抄进 SQL 的字面量。 */
+    private static void putKindKeys(Map<String, Object> e, Map<String, Object> detail, String kind,
+                                    boolean valuesAllowed) {
+        if (JK_POLYMORPHIC.equals(kind)) {
+            String column = stringOrNull(detail.get(KEY_DISCRIMINATOR_COLUMN));
+            if (column == null) return;
+            // 判别列是结构（第 1 档就能下的结论），无论档位都给。
+            e.put("discriminator_column", column);
+            // ★ 取值是客户库里的真实数据。写入侧只在第 3 档且过了 PII 才写，但写入时的档位不等于现在的档位——
+            //   连接被静默降档后，这里不再判一次，存着的取值就会继续进模型上下文。所以只在档位此刻仍开放时给。
+            // 没有判别列的取值是无主的——不知道加在哪一列上，给出去只会被拼进一条编出来的条件。
+            if (!valuesAllowed) return;
+            String value = stringOrNull(detail.get(KEY_DISCRIMINATOR_VALUE));
+            if (value != null) {
+                e.put("discriminator_value", value);
+            }
+        } else if (JK_COMPOSITE.equals(kind)) {
+            List<String> columns = lenientStringList(detail.get(KEY_COMPOSITE_COLUMNS));
+            if (!columns.isEmpty()) {
+                e.put("composite_columns", columns);
+            }
+        }
+    }
+
+    /**
+     * 为什么这条关系要小心。契约要求这一桶的<b>每一条</b>都带它，缺一条就等于这一条没说清为什么被挪出 joins。
+     * 优先用验证侧写下的那句；缺了就按形态兜底——多态外键在第 3 档之下另有一道判断，见下。
+     *
+     * <h4>★ 多态外键：第 3 档之下，存着的那句只在「不可能嵌着取值」时原样给</h4>
+     * 验证侧记下判别值时，那句话是<b>把取值嵌进去</b>写的（形如 {@code 列 = '取值' 时才指向…}），这类句子只出自第 3 档的分组探查。
+     * 所以判据是那次探查留下的<b>结构痕迹</b>，不是那句话的内容，见 {@link #storedCareCannotHoldValues}。
+     * 只看「{@code discriminator_value} 在不在」不够：清理第 3 档取值（{@code purgeSampleValues}）删的正是这个键。
+     * 清理同时把 {@code probed_with_sample_values} 置回 false，但只在它已经换掉那句话里的取值之后——两个键一起看才站得住。
+     * 也<b>不做字符串手术去抠掉取值</b>：措辞在别人的文件里，手术哪天静默失效，失效的表现就是真实取值出库。
+     *
+     * <h4>★ 为什么不能一律重拼（上一版就是这么做的）</h4>
+     * 默认档（第 1、2 档）上多态外键的那句话，全出自结构判定（{@code structureOnly}）或不分条件的包含率，不带取值，
+     * 却带着最要紧的一句保留：只是<b>疑似</b>，要是每个取值都指向目标表，这一列只是分类列、条件可以不加。
+     * 一律换成「按类型指向不同的表」这种断言，模型就按一个类型过滤，其余类型的行被静默漏掉——少算，不报错。
+     *
+     * <h4>★ 重拼的那句也要分确认过没有</h4>
+     * 只有分组探查确认过（{@code verified=CONFIRMED}）才说「按类型指向不同的表」；判不出来 / WEAK / 没验的说「疑似」，
+     * 与 {@link #polymorphicCondition} 同一个口径。探查跑过却判不出来，常见原因之一正是「这一列只是分类列」。
+     *
+     * <h4>★ 组合键那一半不能跟着丢</h4>
+     * 多态外键同时是组合键时，组合键的提醒只写在那句 {@code care_reason} 里。整句换掉时由 {@link #compositeOf}
+     * 认出键列、重拼进兜底句——不然降档之后模型读到的只剩「加判别条件」，照着按单列连，一行连出对面多行。
+     */
+    private static String careReason(Map<String, Object> detail, String kind, boolean valuesAllowed, boolean confirmed,
+                                     Composite composite, String toObject, String toColumn) {
+        String stored = stringOrNull(detail.get(KEY_CARE_REASON));
+        if (JK_POLYMORPHIC.equals(kind)) {
+            if (stored != null && (valuesAllowed || storedCareCannotHoldValues(detail))) return stored;
+            String s = confirmed
+                    ? "多态外键：这一列按另一列的类型取值指向不同的表。包含率只能说明这个 id 在对面存在，"
+                    + "说明不了连上的是不是同一类行"
+                    : "疑似多态外键：这一列指向哪张表可能由另一列的类型取值决定，平台没有确认——那一列也可能只是分类列，"
+                    + "每个取值都指向同一张表。包含率只能说明这个 id 在对面存在，说明不了连上的是不是同一类行";
+            return composite == null ? s : s + "。另外，" + compositeCare(composite, toObject, toColumn);
+        }
+        if (stored != null) return stored;
+        if (JK_COMPOSITE.equals(kind)) {
+            return compositeCare(composite, toObject, toColumn);
+        }
+        if (JK_SIMPLE.equals(kind)) {
+            return "采样验证只有一部分取值能在对面找到";
+        }
+        return "平台给这条关系标了本版本认不出的形态";
+    }
+
+    /**
+     * 多态外键存着的那句 {@code care_reason} 是不是<b>不可能</b>嵌着第 3 档的取值：两个键都得说「没有」。
+     * <ul>
+     *   <li>{@code probed_with_sample_values} 不是 true——嵌着取值的句子只出自第 3 档的分组探查，探查一带回结果推导侧就记成 true；</li>
+     *   <li>{@code discriminator_value} 这个键不在——记下判别值的那一句正是嵌着它写的。</li>
+     * </ul>
+     * 认不准一律往「可能嵌着」那边判：键在就算在（值是 null 也算），布尔认不出来就算探查跑过。
+     * 错往这边的代价是少几句验证侧的细节，错往那边就是真实取值出库。
+     */
+    private static boolean storedCareCannotHoldValues(Map<String, Object> detail) {
+        Object probed = detail.get(KEY_PROBED_WITH_SAMPLE_VALUES);
+        boolean probeMayHaveRun = probed != null && !Boolean.FALSE.equals(booleanOrNull(probed));
+        return !probeMayHaveRun && !detail.containsKey(KEY_DISCRIMINATOR_VALUE);
+    }
+
+    /**
+     * 组合键那一句「为什么要小心」：只陈述，动作交给 condition。
+     * 刻意<b>不说</b>「只用一列定位不到唯一的一行」：索引只说明这一列没有唯一<b>约束</b>，
+     * 分区表主键里的自增 id 实际上往往就是一行一个，那句话在最常见的情形下是假的。
+     */
+    private static String compositeCare(Composite composite, String toObject, String toColumn) {
+        List<String> key = namedKey(composite, toColumn);
+        String target = toObject + "." + toColumn;
+        return (key == null
+                ? target + " 只是某个多列唯一键的一部分（平台没记下完整的键列）"
+                : target + " 只是组合唯一键 (" + String.join(", ", key) + ") 的一部分")
+                + "，单独没有唯一约束：只按这一列关联，可能一行连出对面多行，SUM / COUNT 被放大且不报错";
+    }
+
+    /**
+     * 要用这条关系必须满足的<b>确切</b>条件。
+     *
+     * <h4>★ 为什么多态外键的判别值要带引号</h4>
+     * 判别列是字符型时，{@code resource_type = order} 会被当成列名、报错——那还算好的；
+     * 更糟的是写成数字：{@code varchar 列 = 1} 在 MySQL 里走数值比较，{@code '1'}、{@code '01'}、
+     * {@code '1abc'} 全部命中，<b>不报错</b>。而 {@code int 列 = '1'} 是安全的（常量被转成数字）。
+     * 所以一律单引号，这是两边都对的那一种写法。
+     *
+     * <h4>★ 复合键只说平台确知的那一对，别的键列一个都不替它配</h4>
+     * 上一版写的是「必须用全部键列一起 join，本表对应的列要逐一对上」，而验证侧的 care_reason 说的是
+     * 「只知道这一对、其余要先确认」——同一条关系上两句话相反，模型照着 condition 做。MySQL 要求分区表的每个唯一键
+     * 都包含分区列，于是按时间分区的订单表主键常是 {@code (id, create_time)}；照「逐一对上」写出
+     * {@code order_item.create_time = orders_p.create_time}，而明细自己的时间和订单头的时间几乎从不相等。
+     * 本地 MySQL 8.0.46 实测（按年分区的 orders_p 3 行 + 明细 4 行）：只按 {@code order_id = id} 连出 4 行，全对；
+     * 加上同名的 create_time 只剩 1 行——不报错，数少了四分之三。
+     * 平台真正知道的只有候选自己那一对；其余键列在本表对应哪一列是一个没人验过的猜测，不能写成条件。
+     * 能不能只按这一对连，{@code COUNT(*)} 对 {@code COUNT(DISTINCT to_column)} 一查就知道：同一份数据上是 3 = 3，
+     * 只按这一对连是对的；再插一行同 id、不同时间，变成 4 ≠ 3，同样的 join 连出 5 行。
+     *
+     * @param confirmed 分组探查确认过这条多态外键（{@code verified=CONFIRMED}）；只影响多态外键那一段的措辞，见 {@link #polymorphicCondition}
+     * @param composite 对面是不是组合键（{@link #compositeOf}）；{@code null} = 不是或不知道
+     */
+    private static String relationCondition(String column, Map<String, Object> detail, String kind,
+                                            String toObject, String toColumn, boolean valuesAllowed,
+                                            boolean confirmed, Composite composite) {
+        String from = column == null || column.isBlank() ? "这一列" : column;
+        if (JK_POLYMORPHIC.equals(kind)) {
+            String polymorphic = polymorphicCondition(from, detail, toObject, valuesAllowed, confirmed);
+            // 同时是组合键：两段都是必须满足的条件。判别条件管「连的是不是这一类」，组合键管「会不会一行连出多行」，
+            // 只照一段做，另一种错数照样出、照样不报错。
+            return composite == null ? polymorphic
+                    : polymorphic + "。另外，" + compositeCondition(column, composite, toObject, toColumn);
+        }
+        if (JK_COMPOSITE.equals(kind)) {
+            return compositeCondition(column, composite, toObject, toColumn);
+        }
+        if (JK_SIMPLE.equals(kind)) {
+            // 只剩 WEAK 会走到这里（单列里的其余三种进了 joins）。
+            String measured = measuredSentence(detail);
+            return (measured == null ? "采样只有一部分取值对得上" : measured)
+                    + "：数据只部分支持，常见成因是多态外键或复合键。那两种情况下按单列 join 连上的行本身就可能是错的，"
+                    + "不是「少连了一部分」。要用先查清本表有没有类型列、" + toObject
+                    + " 是不是复合键，带上完整条件再自己跑 COUNT 核对；查不清就不要用";
+        }
+        return "平台给这条关系标了本版本认不出的形态（" + kind + "），不能当成普通的单列关联直接 join；"
+                + "要用先查清它还缺什么条件，查不清就不要用";
+    }
+
+    /**
+     * 多态外键那一段条件：判别列、判别值（只在档位此刻开放时给），以及「没有取值」时按确认过没有说成不同的话。
+     *
+     * <h4>★ 没确认的多态外键，条件只能是「先核，再决定加不加」</h4>
+     * 结构判定、第 1、2 档的包含率、分组探查判不出来，都只说明「疑似」。这时说「不加它的条件就会连错」、让模型挑出对应的那个取值，
+     * 模型就按一个类型过滤；而这一列要是只是分类列、每个取值都指向目标表，其余类型的行被静默漏掉——少算，不报错。
+     * 验证侧存着的那句 care_reason 带着同样的保留，这里不能和它说反。
+     * 确认过的（{@code verified=CONFIRMED}）照旧说必须加：分组探查可能正是在几类行都对得上时按表名选定了一个，
+     * 这时让模型自己去看「是不是每个取值都指向目标表」，反而会把该加的条件丢掉。
+     */
+    private static String polymorphicCondition(String from, Map<String, Object> detail, String toObject,
+                                               boolean valuesAllowed, boolean confirmed) {
+        String dc = stringOrNull(detail.get(KEY_DISCRIMINATOR_COLUMN));
+        // 档位此刻不开放时，存着的取值当作不存在：拼进 condition 和直接给出 discriminator_value 是同一次出库。
+        String dv = dc == null || !valuesAllowed ? null : stringOrNull(detail.get(KEY_DISCRIMINATOR_VALUE));
+        if (dv != null) {
+            return "必须同时加上 " + dc + " = " + sqlLiteral(dv) + " 条件。只按 " + from
+                    + " 一列 join，别的类型里恰好同号的行也会被连上，数不报错但是错的";
+        }
+        if (dc != null && !confirmed) {
+            // 两种「没有取值」的说法与下面确认过的那一支同一个分法，理由见那里。
+            String why = valuesAllowed
+                    ? "平台没有记下它的取值"
+                    : "这条连接当前没有确认开放第 3 档（样本值），平台不提供判别列的取值";
+            // 「指向哪张表」不能拿 join 连不连得上来判：几张目标表的自增 id 常常重叠，别的类型的 id 照样连得上。
+            return "疑似多态外键：" + from + " 指向哪张表可能由判别列 " + dc + " 决定，平台没有确认；" + why + "。"
+                    + "要用就先查出 " + dc + " 有哪些取值、各自代表什么（不要拿 join 连不连得上来判断，几张表的自增 id 常常重叠）："
+                    + "只有其中一个取值对应 " + toObject + " 时，才必须加上这个取值的条件，否则别的类型里恰好同号的行也会被连上；"
+                    + "每个取值都指向 " + toObject + " 时它只是分类列，不要加这个条件，加了会把其余取值的行静默漏掉。"
+                    + "拿不准就问用户，不要猜";
+        }
+        if (dc != null) {
+            // ★ 两种「没有取值」说成两句话。档位开着却没记下（确认了、但 PII 挡了取值 / 达标的是判别列为空的那一类）
+            //   时再说「需第 3 档」是假话——它此刻就在第 3 档。档位没开放时说「没有确认开放」，
+            //   这句话不管库里存没存过取值、也不管是真降档还是读档位失败兜底，都成立。
+            String why = valuesAllowed
+                    ? "平台没有记下哪个取值对应 " + toObject
+                    : "这条连接当前没有确认开放第 3 档（样本值），平台不提供判别列的取值";
+            return "存在判别列 " + dc + "，不加它的条件就 join 会匹配到别的类型的行；" + why + "。"
+                    + "要用就先查出 " + dc + " 有哪些取值，哪一个对应 " + toObject + " 拿不准就问用户，不要猜";
+        }
+        return "这是多态外键，但平台没记下判别列是哪一列：不加类型条件就 join 会匹配到别的类型的行。"
+                + "先从本表结构里找出类型列、确认哪个取值对应 " + toObject + "，确认不了就不要用";
+    }
+
+    /**
+     * 组合键那一段条件，按这个顺序说三件事：平台确知的只有哪一对；其余键列在本表对应哪一列平台不知道、不许按同名去配；
+     * 怎样用一条 COUNT 判断能不能只按这一对连。<b>任何一处都不出现按名字推出来的本表列</b>，理由见 {@link #relationCondition}。
+     */
+    private static String compositeCondition(String column, Composite composite, String toObject, String toColumn) {
+        String target = toObject + "." + toColumn;
+        String pair = (column == null || column.isBlank() ? "本表这一列" : "本表 " + column) + " → " + target;
+        List<String> key = namedKey(composite, toColumn);
+        StringBuilder s = new StringBuilder();
+        if (key == null) {
+            s.append(target).append(" 只是某个多列唯一键的一部分（平台没记下完整的键列），单独没有唯一约束。")
+                    .append("平台只确认了 ").append(pair).append(" 这一对；键里其余的列是哪几列、在本表对应哪一列，平台都不知道。");
+        } else {
+            List<String> rest = key.stream().filter(k -> !k.equalsIgnoreCase(toColumn)).toList();
+            s.append(target).append(" 只是组合唯一键 (").append(String.join(", ", key)).append(") 的一部分，单独没有唯一约束。")
+                    .append("平台只确认了 ").append(pair).append(" 这一对；其余键列 ").append(String.join(", ", rest))
+                    .append(" 在本表对应哪一列，平台不知道。");
+        }
+        return s.append("不要按同名列去配，也不要没确认就把它们写进关联条件：同名列不一定是同一件事")
+                .append("（分区表被迫放进主键的时间列，在本表往往是本表自己的时间，照着连会把行静默连丢）。")
+                .append("要用先查 ").append(toObject).append(" 的 COUNT(*) 与 COUNT(DISTINCT ").append(toColumn).append(")：")
+                .append("相等说明 ").append(toColumn).append(" 实际一行一个，可以只按这一对关联；")
+                .append("不相等时只按这一对关联会一行连出多行、SUM / COUNT 被放大，")
+                .append("要先向用户确认其余键列在本表对应哪一列，确认不了就不要用")
+                .toString();
+    }
+
+    /**
+     * 能点名的完整键：至少两列、且含 {@code to_column} 本身；否则 null。
+     * 记录和这条关系对不上时不点名——点一组可能是错的键列，模型会照着去配本表的列。
+     */
+    private static List<String> namedKey(Composite composite, String toColumn) {
+        if (composite == null || toColumn == null || composite.columns().size() < 2) return null;
+        for (String c : composite.columns()) {
+            if (c.equalsIgnoreCase(toColumn)) return composite.columns();
+        }
+        return null;
+    }
+
+    /**
+     * 对面是不是组合键。只对 COMPOSITE 与 POLYMORPHIC 问：
+     * <ol>
+     *   <li>行上存着 {@code composite_columns} → 用它；</li>
+     *   <li>否则从验证侧那句 {@code care_reason} 里认键列（{@link #compositeInCareReason}）——
+     *       多态外键同时是组合键时，只有那句话记着这件事；</li>
+     *   <li>都没有：COMPOSITE 仍是组合键、只是不知道完整键列；POLYMORPHIC 按不是组合键处理。</li>
+     * </ol>
+     */
+    private static Composite compositeOf(Map<String, Object> detail, String kind, String toObject, String toColumn) {
+        boolean polymorphic = JK_POLYMORPHIC.equals(kind);
+        if (!polymorphic && !JK_COMPOSITE.equals(kind)) return null;
+        List<String> stored = lenientStringList(detail.get(KEY_COMPOSITE_COLUMNS));
+        if (!stored.isEmpty()) return new Composite(stored);
+        Composite said = compositeInCareReason(stringOrNull(detail.get(KEY_CARE_REASON)), toObject, toColumn);
+        if (said != null) return said;
+        return polymorphic ? null : new Composite(List.of());
+    }
+
+    /**
+     * 从验证侧那句 care_reason 里认出「对面是组合键」以及键列名。认不出返回 null；认出了组合键、键列却读不干净时返回空列表
+     * （仍然提醒是组合键，只是不点名）。
+     *
+     * <p>只读 {@link #COMPOSITE_CARE_MARKER} 后面那对括号里的内容，每个名字都要过标识符白名单；那句话本身<b>永远不被转发</b>。
+     * 所以就算前半段嵌着判别值，能从这里出去的也只有标识符形状的名字，而且还要含 {@code to_column} 才会被点名（{@link #namedKey}）。
+     * 取<b>最后一次</b>出现：验证侧把组合键那一句接在多态外键那一句的后面。
+     * 忽略大小写地找：增量推导可能按新快照改了 {@code to_object} 的大小写，而那句话是按当初的写法拼的。
+     */
+    private static Composite compositeInCareReason(String careReason, String toObject, String toColumn) {
+        if (careReason == null || toObject == null || toColumn == null) return null;
+        String marker = toObject + "." + toColumn + COMPOSITE_CARE_MARKER;
+        int at = lastIndexOfIgnoreCase(careReason, marker);
+        if (at < 0) return null;
+        int open = at + marker.length();
+        int close = careReason.indexOf(')', open);
+        if (close < 0) return new Composite(List.of());
+        List<String> columns = new ArrayList<>();
+        for (String part : careReason.substring(open, close).split(",", -1)) {
+            String name = part.trim();
+            if (!IDENT.matcher(name).matches()) return new Composite(List.of());
+            columns.add(name);
+        }
+        return new Composite(List.copyOf(columns));
+    }
+
+    /** {@code regionMatches} 逐字符比较，不先整体转小写：转小写可能改变字符串长度，下标就对不上了。 */
+    private static int lastIndexOfIgnoreCase(String s, String part) {
+        for (int i = s.length() - part.length(); i >= 0; i--) {
+            if (s.regionMatches(true, i, part, 0, part.length())) return i;
+        }
+        return -1;
+    }
+
+    /** 单引号字面量，内部单引号按 SQL 标准写成两个。 */
+    private static String sqlLiteral(String value) {
+        return "'" + value.replace("'", "''") + "'";
     }
 
     /**
      * 一条关系的依据。<b>分界线是"有没有外部依据"，不是"模型自己说它有多确定"</b>，
      * 所以这里先说依据来源（注释 / 数据 / 名字），再说验没验过。
+     *
+     * @param reliable 进 joins 的给带动作的那句；进 unreliable_relations 的只陈述事实，
+     *                 动作交给 condition——否则同一条里一边写「可以直接使用」、一边写「必须加条件」
      */
-    private static String joinBasis(ConnectorSemantic j, Map<String, Object> detail) {
+    private static String joinBasis(ConnectorSemantic j, Map<String, Object> detail, String verified, boolean reliable) {
         String evidence;
         if (ConnectorSemanticService.EV_COMMENT.equals(j.getEvidence())) {
             evidence = "客户库自己的注释";
@@ -817,24 +1503,25 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         } else {
             evidence = "常识推测，没有外部依据";
         }
-        return "依据：" + evidence + "；" + verificationSentence(j.getVerified(), detail);
+        return "依据：" + evidence + "；"
+                + (reliable ? verificationSentence(verified, detail) : verificationFact(verified, detail));
     }
 
     /**
-     * 验证结论那半句。<b>四种状态必须是四句不同的话，而且各自带一个不同的动作。</b>
+     * 进 joins 的那三种状态的验证结论。<b>三句不同的话，各自带一个不同的动作。</b>
      *
      * <p>P1 时期只有"未经数据验证"一种说法，因为那时根本没有验证这回事。S3 之后
-     * 一条关系可能是<b>验过且成立</b>、<b>验过但只部分成立</b>、<b>验过但判不出来</b>、
-     * <b>压根没验</b>——把它们说成同一句话，模型对四种情况就只能做同一件事，
-     * 那等于白验：CONFIRMED 也要再跑一次 COUNT（白花客户的资源），
-     * UNDECIDABLE 却被当成"没验过"（它其实已经花过一次探查，而且结论是"这张表太空，判不出来"，
-     * 再跑一次 COUNT 得到的还是判不出来）。
+     * 一条单列关系可能是<b>验过且成立</b>、<b>验过但判不出来</b>、<b>压根没验</b>——
+     * 把它们说成同一句话，模型对三种情况就只能做同一件事，那等于白验：
+     * CONFIRMED 也要再跑一次 COUNT（白花客户的资源），UNDECIDABLE 却被当成"没验过"
+     * （它其实已经花过一次探查，而且结论是"这张表太空，判不出来"，再跑一次 COUNT 得到的还是判不出来）。
+     * {@code WEAK} 不在这里：它进 unreliable_relations，见 {@link #verificationFact}。
      *
      * <p>★ {@code V_NONE} 是"没探查过"，{@code V_UNDECIDABLE} 是"探查过、判不出来"。
      * 这两个<b>永远不许说成同一句</b>——它们对下一步的指示不同。
      *
      * @param detail 语义行的 {@code detail_json}，S3 往里写了 sample_n / match_n / containment /
-     *               verify_note；缺了它们只是少一句量化说明，不影响这四句话本身的区分度
+     *               verify_note；缺了它们只是少一句量化说明，不影响这几句话本身的区分度
      */
     private static String verificationSentence(String verified, Map<String, Object> detail) {
         String measured = measuredSentence(detail);
@@ -842,17 +1529,39 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         if (ConnectorSemanticService.V_CONFIRMED.equals(verified)) {
             return "已用真实数据采样验证通过" + suffix + "，可以直接使用，不必再为它单跑一次 COUNT 自验";
         }
-        if (ConnectorSemanticService.V_WEAK.equals(verified)) {
-            return "已用真实数据采样验证，但数据只能【部分】支持这条关系" + suffix
-                    + "，说明有一部分取值在对面根本找不到。依赖它之前先自己跑一条 COUNT 核一次，"
-                    + "并在结论里说明这条关联只是部分成立";
-        }
         if (ConnectorSemanticService.V_UNDECIDABLE.equals(verified)) {
-            String why = stringOrNull(detail.get("verify_note"));
-            return "已经用真实数据查过了，但判不出来（" + (why == null ? "样本不足或探查未能完成" : why)
+            return "已经用真实数据查过了，但判不出来（" + undecidableWhy(detail)
                     + "）。这不等于这条关系不成立，只是这次没能判定；依赖它之前先自己跑一条 COUNT 核一次";
         }
         return "未经数据验证，依赖它之前先跑一条 COUNT 自验";
+    }
+
+    /**
+     * 进 unreliable_relations 的验证结论：<b>只陈述量到了什么，不给动作</b>。
+     *
+     * <p>这里刻意不说「先跑一条 COUNT 核一次」：对多态外键，拿 join 前后行数对账是核不出错的——
+     * 别的类型里恰好同号的 id 照样连得上、照样被计数。该做什么只由 condition 说。
+     * CONFIRMED 还要多说半句「包含率说明不了连上的对不对」，否则"验证通过"四个字会压过 condition。
+     */
+    private static String verificationFact(String verified, Map<String, Object> detail) {
+        String measured = measuredSentence(detail);
+        String suffix = measured == null ? "" : "（" + measured + "）";
+        if (ConnectorSemanticService.V_CONFIRMED.equals(verified)) {
+            return "已用真实数据采样验证，取值基本都能在对面找到" + suffix
+                    + "。但包含率只说明这些取值在对面存在，说明不了连上的是不是对的那一行";
+        }
+        if (ConnectorSemanticService.V_WEAK.equals(verified)) {
+            return "已用真实数据采样验证，但只有一部分取值能在对面找到" + suffix;
+        }
+        if (ConnectorSemanticService.V_UNDECIDABLE.equals(verified)) {
+            return "已经用真实数据查过，但判不出来（" + undecidableWhy(detail) + "）";
+        }
+        return "没有用数据验证过";
+    }
+
+    private static String undecidableWhy(Map<String, Object> detail) {
+        String why = stringOrNull(detail.get("verify_note"));
+        return why == null ? "样本不足或探查未能完成" : why;
     }
 
     /**
@@ -913,8 +1622,10 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
      *
      * @param stale 这一行挂着的列结构已经变过。此时<b>连取值都不给</b>：
      *              当初采到的那一组值属于一个已经不存在的列形状，照着它写死条件比不给更糟
+     * @param sampleValues 这条连接此刻是否仍开放第 3 档。懒求值：没有值域片段、或已经因 stale 不给取值时不去问
      */
-    private static Map<String, Object> valueDomainPayload(Map<String, Object> detail, boolean stale) {
+    private static Map<String, Object> valueDomainPayload(Map<String, Object> detail, boolean stale,
+                                                          BooleanSupplier sampleValues) {
         Object raw = detail.get(SemanticValueProfiler.DETAIL_KEY);
         if (!(raw instanceof Map<?, ?> fragment) || fragment.isEmpty()) return null;
 
@@ -922,6 +1633,15 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         if (stale) {
             out.put("complete", false);
             out.put("note", VALUE_DOMAIN_STALE_NOTE);
+            return out;
+        }
+        // ★ 值域整段都是第 3 档那次采集的产物（档位不够时推导侧一行都不写），所以档位此刻没开放时<b>整段</b>不给：
+        //   取值不给，distinct_count 和采集时那句 note 也不给——它们出自同一次授权，而那次授权已经不作数了。
+        //   只留 complete=false 和一句说清原因的话：什么都不给，这一列会被读成「平台对它没有记录」，
+        //   「不要写死条件」这句最要紧的话就没人说了。为什么要在读出侧再判一次，见类注释。
+        if (!sampleValues.getAsBoolean()) {
+            out.put("complete", false);
+            out.put("note", VALUE_DOMAIN_WITHHELD_NOTE);
             return out;
         }
 
@@ -938,6 +1658,36 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         }
         out.put("note", valueDomainNote(fragment, claimsComplete, complete));
         return out;
+    }
+
+    /**
+     * 这一列的 gloss 此刻要不要挡下：是值域阶段补写的行（{@link ConnectorSemanticService#isValueProfileRow}），且档位此刻没开放。
+     *
+     * <h4>★ 为什么不自己认这类行</h4>
+     * 清理第 3 档取值（{@code purgeSampleValues}）改写的正是这类行的 gloss，两边必须是同一个判据。本类曾经留着自己的一份，
+     * 和清理那边在「人写的行带着值域阶段标记」「老行没带 value_domain 这个键」上各判各的——不一致时两个方向都不出声：
+     * 本类窄了，清理还没跑到的那一刻带着取值的 gloss 照旧出库；本类宽了，清理不碰的说明在这里无声消失。
+     *
+     * <h4>★ 为什么挡了 value_domain 还不够</h4>
+     * 值域阶段给「没有 FIELD 行、但采到了完整取值集合」的列补写一行时，上线那一版的 gloss 就是把取值原样列出来的一句话
+     * （取值只有这几种：……）。档位此刻不开放时只挡 {@code value_domain}，同一批真实取值会从这一列的 {@code semantic} 流出去。
+     *
+     * <h4>★ 为什么不看 value_domain 此刻还剩什么</h4>
+     * 上一版的条件是「值域里还列着取值」。可补写那一行的 gloss 是在<b>补写那一刻</b>定下的，之后没有任何写入会改它：
+     * 再剖析一次没拿到完整集合（取值变多了、查询超时），{@code value_domain} 被覆盖成不带取值的片段，gloss 却原样还是
+     * 「取值只有这 2 种：华东大区、华南大区」——判据说没有取值，闸打开，取值照旧出库，而且没有任何信号。清理第 3 档取值时
+     * 删掉取值列表是同样的效果。gloss 出自那一次第 3 档采集，那次授权不作数了，它就和 {@code distinct_count}、采集时那句 note
+     * 一样整句不给，与它此刻嵌没嵌取值无关——新行的 gloss 按契约不再嵌取值，照样挡：由出处决定，不由内容决定。
+     * <b>不去匹配那句话长什么样</b>：措辞在别人的文件里，按措辞认的闸哪天静默失效，失效的表现就是取值出库。
+     *
+     * <h4>★ 为什么只挡这一类行</h4>
+     * 模型写的字段说明（S2）后来被值域阶段并进了 {@code value_domain}，那句说明仍是模型看结构写的，不带取值；
+     * 降档时跟着挡掉，是让一句有用的注解无声消失。人写的（HUMAN / IMPORTED）没带值域阶段的标记时同样不挡。
+     *
+     * <p>档位照样懒着问：认不出是这一类行时不打库。
+     */
+    private static boolean valueProfileGlossWithheld(ConnectorSemantic row, BooleanSupplier sampleValues) {
+        return ConnectorSemanticService.isValueProfileRow(row) && !sampleValues.getAsBoolean();
     }
 
     /**
@@ -1198,6 +1948,71 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             return out;
         }
         throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "参数 applies_to 必须是字符串数组");
+    }
+
+    /**
+     * {@code detail_json} 里的字符串数组。与 {@link #stringListOrEmpty} 的区别是<b>永不抛</b>：
+     * 那个读的是模型入参，读不懂就该明确报错；这个读的是我们自己存的行，一条坏行不该让整次 describe 失败。
+     */
+    private static List<String> lenientStringList(Object v) {
+        if (v instanceof String s) {
+            return s.isBlank() ? List.of() : List.of(s.trim());
+        }
+        if (!(v instanceof List<?> list)) return List.of();
+        List<String> out = new ArrayList<>();
+        for (Object o : list) {
+            String s = stringOrNull(o);
+            if (s != null) out.add(s);
+        }
+        return out;
+    }
+
+    /**
+     * 「这条连接此刻允不允许把真实取值给模型」，一次 describe 内懒求值、至多问一次库。
+     *
+     * <p><b>判不了就是不允许</b>：往宽的方向兜底，出错的那一次就是真实取值出库的那一次，而且没有任何信号。
+     * {@link ConnectorSemanticService#allowsSampleValues} 契约上自己就 fail-closed、不抛；这里再兜一层，
+     * 是因为它一旦抛出来会让整次 describe 失败——语义层是叠加的注解，不该否决「看结构」这个必要功能。
+     *
+     * <p>不是新的构造器依赖：它只借用已经注入的 {@code semanticService}（只碰我们自己的库，过得了类注释那条判据）。
+     */
+    private final class SampleValueGate implements BooleanSupplier {
+        private final Long connectorId;
+        private Boolean allowed;
+
+        private SampleValueGate(Long connectorId) {
+            this.connectorId = connectorId;
+        }
+
+        @Override
+        public boolean getAsBoolean() {
+            if (allowed == null) {
+                allowed = connectorId != null && ask();
+            }
+            return allowed;
+        }
+
+        private boolean ask() {
+            try {
+                return semanticService.allowsSampleValues(connectorId);
+            } catch (Exception e) {
+                log.warn("读取连接的数据出库档位失败，本次按不开放样本值处理 connectorId={}", connectorId, e);
+                return false;
+            }
+        }
+    }
+
+    /** conn_describe 的两个关系桶。缺省即空，调用方判空后才放进返回值。 */
+    private static final class Relations {
+        private final List<Map<String, Object>> joins = new ArrayList<>();
+        private final List<Map<String, Object>> unreliable = new ArrayList<>();
+    }
+
+    /**
+     * 对面那一列是某个组合唯一键的一部分。{@code columns} 为空 = 知道是组合键、但没记下（或读不干净）完整键列。
+     * 「不是组合键」用 {@code null} 表达而不是空列表：两者要对模型说的话完全不同。纯内部形状，从不序列化。
+     */
+    private record Composite(List<String> columns) {
     }
 
     private static List<String> lowerCaseCapabilities(Set<Capability> caps) {

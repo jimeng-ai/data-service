@@ -84,7 +84,8 @@ class ConnectorSemanticDeriveServiceTest {
                 mock(SemanticSqlCorpusReader.class), mock(SemanticJoinValidator.class),
                 mock(SemanticValueProfiler.class), mock(ConnectorSemanticMapper.class),
                 mock(ConnectorAuditService.class),
-                mock(ThreadPoolTaskExecutor.class), mock(ThreadPoolTaskExecutor.class));
+                mock(ThreadPoolTaskExecutor.class), mock(ThreadPoolTaskExecutor.class),
+                mock(TableShapeDetector.class), mock(org.redisson.api.RedissonClient.class));
 
         Connection conn = new Connection();
         conn.setId(CONNECTOR_ID);
@@ -760,7 +761,7 @@ class ConnectorSemanticDeriveServiceTest {
             defaultSnapshot();
             modelOutputs("""
                     {"objects":[{"name":"orders","gloss":"订单主表","evidence":"COMMENT","confidence":0.9,
-                                 "table_shape":"事实表","typical_questions":["本月订单数"]}]}
+                                 "table_shape":"DETAIL","typical_questions":["本月订单数"]}]}
                     """);
             run();
 
@@ -769,7 +770,33 @@ class ConnectorSemanticDeriveServiceTest {
             assertEquals(ConnectorSemanticService.ANCHOR_NONE, row.getAnchorKind());
             assertNull(row.getAnchorHash());
             assertEquals(Integer.valueOf(90), row.getConfidence(), "0.9 这种小数要归一到 0-100");
-            assertEquals("事实表", detailOf(row).get("table_shape"));
+            assertEquals("DETAIL", detailOf(row).get("table_shape"));
+            // 推导只看结构：来源必须标 MODEL，注入层据此说「未经数据测量」。
+            assertEquals("MODEL", detailOf(row).get("table_shape_source"));
+        }
+
+        /**
+         * ★ 表形态只认四个枚举值。「事实表」这种自由文本从前原样落库，读它的模型没法据此决定怎么聚合；
+         * 更糟的是把认不出来的写成 OTHER——那等于替模型编了一个它没说过的判断。
+         */
+        @Test
+        void 表形态只认四个枚举_中文标签归一_认不出来的不写() {
+            defaultSnapshot();
+            modelOutputs("""
+                    {"objects":[
+                      {"name":"orders","gloss":"订单主表","evidence":"COMMENT","table_shape":"键值对表"},
+                      {"name":"users","gloss":"用户表","evidence":"COMMENT","table_shape":"事实表"},
+                      {"name":"shops","gloss":"门店表","evidence":"NAME","table_shape":"multi_metric_period"}]}
+                    """);
+            run();
+
+            List<ConnectorSemantic> objects = scoped(persisted(), ConnectorSemanticService.SCOPE_OBJECT);
+            Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
+            objects.forEach(o -> byName.put(o.getObjectName(), detailOf(o)));
+            assertEquals("KEY_VALUE", byName.get("orders").get("table_shape"));
+            assertEquals("MULTI_METRIC_PERIOD", byName.get("shops").get("table_shape"));
+            assertFalse(byName.get("users").containsKey("table_shape"), "认不出来的表形态不落成任何值");
+            assertFalse(byName.get("users").containsKey("table_shape_source"));
         }
 
         @Test
@@ -1429,7 +1456,7 @@ class ConnectorSemanticDeriveServiceTest {
                 mock(SemanticSqlCorpusReader.class), mock(SemanticJoinValidator.class),
                 mock(SemanticValueProfiler.class), mock(ConnectorSemanticMapper.class),
                 mock(ConnectorAuditService.class),
-                executor, mock(ThreadPoolTaskExecutor.class));
+                executor, mock(ThreadPoolTaskExecutor.class), mock(TableShapeDetector.class), mock(org.redisson.api.RedissonClient.class));
 
         s.deriveAsync(CONNECTOR_ID);
 
