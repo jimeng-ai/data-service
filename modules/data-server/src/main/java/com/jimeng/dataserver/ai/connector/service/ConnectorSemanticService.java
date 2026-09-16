@@ -1496,6 +1496,60 @@ public class ConnectorSemanticService {
         return sha256(fieldAnchor(left) + ">" + fieldAnchor(right));
     }
 
+    // ================================================================ 结构指纹（按表）
+
+    /**
+     * 一张表的结构指纹：表名 + 按快照列顺序的每列锚点指纹。64 位十六进制 sha256，不截短。
+     *
+     * <h4>★ 为什么由 {@link #fieldAnchor} 拼，而不是直接用 {@code connector_schema.content_hash}</h4>
+     * {@code content_hash} 在落库前由 {@code ObjectDetail} 算出，含对象类型、拼的是原始列文本；
+     * 锚点则由推导类 {@code parseFields} 从 {@code detail_json} 解析回来的 {@link FieldDetail} 计算
+     * （{@code nullable} 缺失按可空）。指纹必须与锚点<b>同源</b>，才能保证
+     * 「指纹没变 ⇒ 这张表上 FIELD 行写入时算的锚点在新快照上照样成立」——两边各算各的，
+     * 就会出现指纹说没变、锚点却对不上（或反过来）的静默分叉。
+     *
+     * <h4>为什么按表，不再只有整份快照一个值</h4>
+     * 语义层生成 agent 逐表提交、按表对账、续跑时按表判「已覆盖」。整份快照一个指纹时，
+     * 任何一张无关表被刷新都会作废整轮已生成的表；按表比，只有本表结构真的变了才重来。
+     *
+     * <p>列顺序算进指纹（按 {@code cols} 的迭代顺序，即快照里的列顺序）：{@code SELECT *} 与按位置的写法依赖它。
+     *
+     * @param cols 取自 {@code parseFields}，不为 null；没有列的表是空 map
+     */
+    public static String tableStamp(String objectName, Map<String, FieldDetail> cols) {
+        StringBuilder b = new StringBuilder(objectName).append('|');
+        for (FieldDetail f : cols.values()) {
+            b.append(fieldAnchor(f)).append(',');
+        }
+        return sha256(b.toString());
+    }
+
+    /** 表名 → {@link #tableStamp}。保持入参的迭代顺序。 */
+    public static Map<String, String> tableStamps(Map<String, Map<String, FieldDetail>> fieldsByObject) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Map<String, FieldDetail>> e : fieldsByObject.entrySet()) {
+            out.put(e.getKey(), tableStamp(e.getKey(), e.getValue()));
+        }
+        return out;
+    }
+
+    /**
+     * 整份快照的结构指纹，由按表指纹拼成：表名排序后逐表 {@code name=tableStamp;}，再 sha256。
+     *
+     * <p>增量补写（{@code ConnectorSemanticDeriveService.deriveAdded}）用它判断「推导期间结构变没变」。
+     * <b>不含 synced_at</b>——一次什么都没变的刷新不该让一批增量作废。
+     * 它从不落库、只在一次推导内做内存比较，所以从旧算法（逐表直接拼列锚点）换成由按表指纹拼成，数值变化没有兼容性问题。
+     */
+    public static String structureStamp(Map<String, Map<String, FieldDetail>> fieldsByObject) {
+        // 排序：parseFields 按快照行的顺序给表，而调用方拿到的快照可能是字母序也可能是重要性序，指纹不能跟着变。
+        List<String> names = fieldsByObject.keySet().stream().sorted().toList();
+        StringBuilder b = new StringBuilder();
+        for (String n : names) {
+            b.append(n).append('=').append(tableStamp(n, fieldsByObject.get(n))).append(';');
+        }
+        return sha256(b.toString());
+    }
+
     static String sha256(String s) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");

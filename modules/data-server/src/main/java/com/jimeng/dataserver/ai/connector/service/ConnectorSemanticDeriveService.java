@@ -1186,7 +1186,8 @@ public class ConnectorSemanticDeriveService {
         try {
             List<ConnectorSchema> rows = schemaService.currentRows(connectorId);
             Map<String, Map<String, FieldDetail>> fieldsByObject = parseFields(rows);
-            String structure = structureStamp(fieldsByObject);
+            // 结构指纹（不含 synced_at）：「指纹没变」恰好等于「这批行的锚点在新快照上照样成立」。按表指纹与锚点同源，见 tableStamp。
+            String structure = ConnectorSemanticService.structureStamp(fieldsByObject);
 
             Set<String> requestedFolded = new HashSet<>();
             for (String r : requested) {
@@ -1255,7 +1256,7 @@ public class ConnectorSemanticDeriveService {
                 }
             }
 
-            if (!structure.equals(structureStamp(parseFields(schemaService.currentRows(connectorId))))) {
+            if (!structure.equals(ConnectorSemanticService.structureStamp(parseFields(schemaService.currentRows(connectorId))))) {
                 String note = restoreReady(connectorId, prevPrefix,
                         "补写说明书期间结构又变了，本批作废并用新结构重推", false, claimAt);
                 restored = true;
@@ -1444,24 +1445,6 @@ public class ConnectorSemanticDeriveService {
             b.append(line);
         }
         return new AddedContext(b.toString(), complete);
-    }
-
-    /**
-     * 结构指纹：表名 + 每列的锚点指纹。<b>不含 synced_at</b>——一次什么都没变的刷新不该让一批增量作废；
-     * 列指纹与锚点同形，所以「指纹没变」恰好等于「这批行的锚点在新快照上照样成立」。
-     */
-    private static String structureStamp(Map<String, Map<String, FieldDetail>> fieldsByObject) {
-        List<String> names = new ArrayList<>(fieldsByObject.keySet());
-        Collections.sort(names);
-        StringBuilder b = new StringBuilder();
-        for (String n : names) {
-            b.append(n).append('|');
-            for (FieldDetail f : fieldsByObject.get(n).values()) {
-                b.append(ConnectorSemanticService.fieldAnchor(f)).append(',');
-            }
-            b.append(';');
-        }
-        return ConnectorSemanticService.sha256(b.toString());
     }
 
     /**
