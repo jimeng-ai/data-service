@@ -270,6 +270,9 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
         String finish = str(choice == null ? null : choice.get("finish_reason"));
 
         List<Map<String, Object>> blocks = new ArrayList<>();
+        // ★ 只取 content，刻意不碰 reasoning_content：推理模型（deepseek-flash / reasoner）把思考过程放在
+        //   message.reasoning_content、与正文分开下发。拼进 text 的话，按 content[].text 抽文本再解析 JSON 的调用方
+        //  （语义层推导）会拿到「一段思考 + JSON」而解析失败；对话侧则会把思考过程当成回答落库、喂回下一轮。
         String text = str(message == null ? null : message.get("content"));
         if (text != null && !text.isEmpty()) {
             blocks.add(Map.of("type", "text", "text", text));
@@ -292,7 +295,7 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
         out.put("role", "assistant");
         out.put("model", str(resp.get("model")));
         out.put("content", blocks);
-        out.put("stop_reason", "tool_calls".equals(finish) ? "tool_use" : "end_turn");
+        out.put("stop_reason", stopReasonOf(finish));
         Map<String, Object> usage = asMap(resp.get("usage"));
         out.put("usage", Map.of(
                 "input_tokens", usage == null ? 0 : intOf(usage.get("prompt_tokens")),
@@ -403,6 +406,24 @@ public class AnthropicOverOpenAiAdapter implements AiProtocolAdapter {
     }
 
     // ================================================================ 小工具
+
+    /**
+     * 非流式响应的 finish_reason → anthropic 的 stop_reason。
+     *
+     * <p>{@code length} 必须映射成 {@code max_tokens}，不能和 {@code stop} 一起落成 {@code end_turn}：
+     * 推理模型的思考 token 也计入 completion_tokens、吃 max_tokens 的额度，被截断时正文可能只有半截甚至为空。
+     * 报成 end_turn 等于告诉调用方「模型说完了」，被截断这件事就在协议转换这一层静默消失了。
+     * 其余取值（stop / content_filter / 缺失）维持原来的 end_turn。流式累加器不走这里，行为不变。
+     */
+    private static String stopReasonOf(String finish) {
+        if ("tool_calls".equals(finish)) {
+            return "tool_use";
+        }
+        if ("length".equals(finish)) {
+            return "max_tokens";
+        }
+        return "end_turn";
+    }
 
     private static String flattenSystem(Object system) {
         if (system == null) return null;

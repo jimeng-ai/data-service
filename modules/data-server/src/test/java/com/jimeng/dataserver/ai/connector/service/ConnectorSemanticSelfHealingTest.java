@@ -178,13 +178,13 @@ class ConnectorSemanticSelfHealingTest {
         Map<String, Object> block = new LinkedHashMap<>();
         block.put("type", "text");
         block.put("text", text);
-        when(claudeService.messages(any())).thenReturn(Map.of("content", List.of(block)));
+        when(claudeService.messagesInternal(any(), any())).thenReturn(Map.of("content", List.of(block)));
     }
 
     @SuppressWarnings("unchecked")
     private List<String> prompts() {
         ArgumentCaptor<Map<String, Object>> cap = ArgumentCaptor.forClass(Map.class);
-        verify(claudeService, atLeastOnce()).messages(cap.capture());
+        verify(claudeService, atLeastOnce()).messagesInternal(cap.capture(), any());
         List<String> out = new ArrayList<>();
         for (Map<String, Object> body : cap.getAllValues()) {
             List<Map<String, Object>> messages = (List<Map<String, Object>>) body.get("messages");
@@ -309,14 +309,14 @@ class ConnectorSemanticSelfHealingTest {
             Map<String, Object> block = new LinkedHashMap<>();
             block.put("type", "text");
             block.put("text", "{\"objects\":[{\"name\":\"kv_x\",\"gloss\":\"猜的\",\"evidence\":\"GUESS\"}]}");
-            when(claudeService.messages(any())).thenAnswer(inv -> {
+            when(claudeService.messagesInternal(any(), any())).thenAnswer(inv -> {
                 service.deriveAddedAsync(CONNECTOR_ID, List.of());
                 return Map.of("content", List.of(block));
             });
 
             enqueueAndDrain(List.of());
 
-            verify(claudeService, times(1)).messages(any());
+            verify(claudeService, times(1)).messagesInternal(any(), any());
             assertTrue(pending().isEmpty(), "转完补的那一圈就停，不留尾巴");
         }
 
@@ -370,7 +370,7 @@ class ConnectorSemanticSelfHealingTest {
 
             enqueueAndDrain(List.of("users"));
 
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             verify(redisson, never()).getBucket(anyString());
             verify(connectionMapper, never()).update(any(), any());
             assertTrue(pending().isEmpty());
@@ -399,7 +399,7 @@ class ConnectorSemanticSelfHealingTest {
 
             enqueueAndDrain(List.of());
 
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             verify(connectionMapper, times(1)).update(any(), any());
             verify(bucket("users"), never()).set(any(), anyLong(), any(TimeUnit.class));
         }

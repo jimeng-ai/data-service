@@ -16,6 +16,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -44,6 +45,25 @@ public class ClaudeService {
         applyAgentContext(requestBody);
         ChatClient client = modelResolver.resolve(requestBody, EXPECTED_PROTOCOL);
         return client.chat(requestBody, extractTraceId());
+    }
+
+    /**
+     * 平台<b>自己</b>发起的单轮调用（语义层推导等），与 {@link #messages} 的区别：
+     * <ul>
+     *   <li><b>不 applyAgentContext</b>：推导线程没有 agent_id，也不该有。Agent 的 system_prompt、
+     *       知识库检索护栏（要求模型先调 rag_search）、默认模型参数都是给「用户在和这个 Agent 对话」准备的，
+     *       混进平台内部调用只会污染提示词、还可能诱导模型去要一个根本不存在的工具。
+     *       调用方也不要往 body 里放 agent_id / agent_preview——这里不会解释它们。</li>
+     *   <li>走 {@link ChatClient#chatInternal}：不注入技能与内置工具、不执行工具、只调一轮，读超时按这一次给。
+     *       理由见 {@code AiConversationLoop#runInternal}。</li>
+     * </ul>
+     * 模型路由与 {@link #messages} 相同：{@link ModelResolver#resolve}，未命中 ai_model 表即回落全局 provider。
+     *
+     * @param readTimeout 这一次调用的读超时；null = 沿用全局 okhttp.read-timeout
+     */
+    public Object messagesInternal(Map<String, Object> requestBody, Duration readTimeout) {
+        ChatClient client = modelResolver.resolve(requestBody, EXPECTED_PROTOCOL);
+        return client.chatInternal(requestBody, extractTraceId(), readTimeout);
     }
 
     public void messagesStream(Map<String, Object> requestBody, String connectionId, String traceId) {

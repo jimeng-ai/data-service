@@ -132,7 +132,7 @@ class ConnectorSemanticAddedDeriveTest {
         Map<String, Object> block = new LinkedHashMap<>();
         block.put("type", "text");
         block.put("text", text);
-        when(claudeService.messages(any())).thenReturn(Map.of("content", List.of(block)));
+        when(claudeService.messagesInternal(any(), any())).thenReturn(Map.of("content", List.of(block)));
     }
 
     private static final String MODEL_OUTPUT = """
@@ -164,7 +164,7 @@ class ConnectorSemanticAddedDeriveTest {
     private static String prompt(ClaudeService claude) {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<String, Object>> cap = ArgumentCaptor.forClass(Map.class);
-        verify(claude).messages(cap.capture());
+        verify(claude).messagesInternal(cap.capture(), any());
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> messages = (List<Map<String, Object>>) cap.getValue().get("messages");
         return String.valueOf(messages.get(0).get("content"));
@@ -225,6 +225,18 @@ class ConnectorSemanticAddedDeriveTest {
             verify(semanticStageExecutor).execute(any(Runnable.class));
         }
 
+        /** 增量与全量共用 sendToModel：同样必须是不带工具的内部调用、同样带夹紧后的超时。 */
+        @Test
+        @DisplayName("★ 增量推导同样走 messagesInternal 并带上超时，不走 messages")
+        void usesInternalCallWithTimeout() {
+            modelOutputs(MODEL_OUTPUT);
+
+            service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
+
+            verify(claudeService).messagesInternal(any(), eq(java.time.Duration.ofSeconds(900)));
+            verify(claudeService, never()).messages(any());
+        }
+
         /** FAILED 上写一批行再写 READY，会把「全量没生成出来」盖成「可用」。 */
         @Test
         @DisplayName("★ 说明书没生成成功时不跑：不认领、不叫模型、不写库")
@@ -235,7 +247,7 @@ class ConnectorSemanticAddedDeriveTest {
 
             assertFalse(out.result().isOk());
             verify(connectionMapper, never()).update(any(), any());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             verify(semanticService, never()).upsertInferred(any(), any(), any());
         }
 
@@ -246,7 +258,7 @@ class ConnectorSemanticAddedDeriveTest {
 
             service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
 
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             verify(semanticService, never()).upsertInferred(any(), any(), any());
         }
 
@@ -268,7 +280,7 @@ class ConnectorSemanticAddedDeriveTest {
         @Test
         @DisplayName("失败回到 READY、不盖 synced_at，原因写进 note")
         void failureRestoresReadyWithoutStamp() {
-            when(claudeService.messages(any())).thenThrow(new RuntimeException("上游超时"));
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new RuntimeException("上游超时"));
 
             service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
 

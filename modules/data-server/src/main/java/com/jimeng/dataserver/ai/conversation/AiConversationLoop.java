@@ -33,6 +33,7 @@ import okhttp3.sse.EventSourceListener;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -191,6 +192,78 @@ public class AiConversationLoop {
                 safeRecordException(logId, e, elapsed(start));
                 throw e;
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ internal（平台自己发起的单轮调用）
+
+    /**
+     * 平台<b>自己</b>发起的单轮模型调用：没有用户在对话、没有 Agent，平台只是要模型产出一段文本
+     * （典型：语义层推导让模型对着客户库的结构写一份 JSON 说明书）。
+     *
+     * <h3>和 {@link #runBlocking} 的区别：不带任何工具，只调一轮</h3>
+     * {@code runBlocking} 是为「用户在对话」设计的：无条件 {@code applySkillContext}（把技能目录混进 system、
+     * 加 activate_skills），内置工具开着时再注入 web_search / web_fetch / skill_search / skill_install /
+     * generate_image 并置 tool_choice=auto；模型回 tool_use 就<b>真的去执行</b>，再叫下一轮。
+     * 查库确认过：失败的推导请求体里就带着这 6 个工具和混进来的技能目录。平台内部调用走那条路有两个真实问题：
+     * <ol>
+     *   <li><b>客户结构外泄</b>：推导的用户消息是客户库的表名、列名、注释。模型一旦决定调 web_search / web_fetch，
+     *       这些内容就会作为搜索词发到公网搜索服务——那是第三方，不在客户授权过的范围里，而且事后无从撤回。</li>
+     *   <li><b>多轮不可控</b>：每多一轮就多一次完整的非流式生成，耗时与 token 成倍放大，轮数还由模型决定；
+     *       调用方给的超时、推导认领的时限都是按「一次调用」算的，工具循环会把这笔账整个打穿。</li>
+     * </ol>
+     * 所以这里<b>不</b> applySkillContext、<b>不</b> injectBuiltinTools、<b>不</b>执行任何工具、<b>不</b>进循环。
+     * 调用方自己在 body 里放了 tools / tool_choice 的，原样发出去、不增不减；模型回来的 tool_use 块
+     * 原样返回给调用方，这里一个都不执行。
+     *
+     * <h3>和 runBlocking 单轮分支保持一致的部分</h3>
+     * 熔断（acquirePermission / recordFailure / recordGuardOutcome）、调用记录（safeRecordRequest / Response /
+     * Exception —— 调用日志与计费都靠它们）、trace 埋点（recordUserMessage / recordLlm，与无工具短路径同样的标题与入参）、
+     * adapter 的 toUpstreamBody / fromUpstreamResponse 转换。返回值与 runBlocking 无工具短路径同形：
+     * <b>入口协议</b>形状的响应；上游非 2xx 时同样不抛，原样返回（转换后的）错误体。
+     *
+     * <h3>为什么超时单独给</h3>
+     * 非流式调用要等上游把整条生成完才回响应头。全局 {@code okhttp.read-timeout} 是按交互式对话调的（dev 180 秒），
+     * 一次几十张表的推导必然超过它——OkHttp 在等响应头时抛 {@code SocketTimeoutException}，说明书一行都出不来。
+     * 把全局值调大会让所有对话调用在上游挂死时多等同样久，所以由调用方按自己的时限传进来，
+     * 只作用于这一次调用，见 {@link RequestService#post(String, Map, Map, Map, Duration)}。
+     *
+     * @param readTimeout 这一次调用的读超时；null = 沿用全局 okhttp.read-timeout
+     */
+    public Object runInternal(Map<String, Object> body, AiProtocolAdapter adapter,
+                              Map<String, String> headers, String url,
+                              String traceId, CallRecordConfig rc, Duration readTimeout) {
+        traceRecorder.recordUserMessage(latestUserMessage(body));
+
+        llmCallGuard.acquirePermission();
+        long start = System.currentTimeMillis();
+        Long logId = safeRecordRequest(body, headers, rc);
+        try {
+            RequestService.HttpResp resp;
+            try {
+                // 跨协议 adapter 在这里把 body 转成上游形状；同协议的 adapter 恒等返回。
+                resp = requestService.post(url, headers, Collections.emptyMap(),
+                        adapter.toUpstreamBody(body), readTimeout);
+            } catch (RuntimeException callEx) {
+                llmCallGuard.recordFailure();
+                throw callEx;
+            }
+            int latency = elapsed(start);
+            safeRecordResponse(logId, resp.getStatusCode(), resp.getBody(), latency);
+            recordGuardOutcome(resp.getStatusCode());
+            log.info("{} 内部调用接口返回: {}", rc.provider(), resp.getBody());
+
+            // 与 runBlocking 同一个转换点：调用方按【入口协议】解析返回值。
+            Object rawParsed = tryParseJson(resp.getBody());
+            Map<String, Object> rawMap = asMapOrNull(rawParsed);
+            Object parsed = rawMap == null ? rawParsed : adapter.fromUpstreamResponse(rawMap);
+            boolean ok = isSuccess(resp.getStatusCode());
+            traceRecorder.recordLlm(logId, "推理·生成回答", modelOf(body, rc),
+                    null, null, null, latency, ok, ok ? null : resp.getBody());
+            return parsed;
+        } catch (Exception e) {
+            safeRecordException(logId, e, elapsed(start));
+            throw e;
         }
     }
 

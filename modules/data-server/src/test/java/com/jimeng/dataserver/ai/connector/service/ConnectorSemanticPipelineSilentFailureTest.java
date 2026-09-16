@@ -237,7 +237,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
         Map<String, Object> block = new LinkedHashMap<>();
         block.put("type", "text");
         block.put("text", text);
-        when(claudeService.messages(any())).thenReturn(Map.of("content", List.of(block)));
+        when(claudeService.messagesInternal(any(), any())).thenReturn(Map.of("content", List.of(block)));
     }
 
     @SuppressWarnings("unchecked")
@@ -719,7 +719,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
             ConnectorSemanticDeriveService.AddedOutcome out = service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
 
             assertTrue(out.result().isOk(), out.result().getNote());
-            verify(claudeService).messages(any());
+            verify(claudeService).messagesInternal(any(), any());
             Connection last = lastStatusWrite();
             assertEquals(ConnectorSemanticDeriveService.SEM_READY, last.getSemanticStatus());
             assertTrue(last.getSemanticNote().contains("已接管"), last.getSemanticNote());
@@ -733,7 +733,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
 
             enqueueAndDrain(List.of());
 
-            verify(claudeService).messages(any());
+            verify(claudeService).messagesInternal(any(), any());
         }
 
         @Test
@@ -744,7 +744,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
             service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
 
             verify(connectionMapper, never()).update(any(), any());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
         }
 
         @Test
@@ -755,13 +755,13 @@ class ConnectorSemanticPipelineSilentFailureTest {
             service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
 
             verify(connectionMapper, never()).update(any(), any());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
         }
 
         @Test
         @DisplayName("★ 认领之后抛出 catch 接不住的 Error：状态照样回到 READY")
         void errorAfterClaimStillRestoresReady() {
-            when(claudeService.messages(any())).thenThrow(new StackOverflowError());
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new StackOverflowError());
 
             assertThrows(StackOverflowError.class, () -> service.deriveAdded(CONNECTOR_ID, Set.of("t_refund")));
 
@@ -974,7 +974,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
 
             enqueueAndDrain(List.of("t_new"));
 
-            verify(claudeService, times(1)).messages(any());
+            verify(claudeService, times(1)).messagesInternal(any(), any());
             assertEquals(List.of("t_new"), new ArrayList<>(updatableArgs().get(0)));
         }
 
@@ -989,11 +989,11 @@ class ConnectorSemanticPipelineSilentFailureTest {
             modelOutputs("{\"objects\":[{\"name\":\"t_new\",\"gloss\":\"新表\",\"evidence\":\"NAME\"}]}");
 
             enqueueAndDrain(List.of("t_new"));
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
 
             enqueueAndDrain(List.of());
 
-            verify(claudeService, times(1)).messages(any());
+            verify(claudeService, times(1)).messagesInternal(any(), any());
             assertEquals(List.of("t_new"), new ArrayList<>(updatableArgs().get(0)));
         }
     }

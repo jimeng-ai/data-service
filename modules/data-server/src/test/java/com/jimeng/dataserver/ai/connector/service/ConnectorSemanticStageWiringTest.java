@@ -143,7 +143,7 @@ class ConnectorSemanticStageWiringTest {
         block.put("text", text);
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("content", List.of(block));
-        when(claudeService.messages(any())).thenReturn(resp);
+        when(claudeService.messagesInternal(any(), any())).thenReturn(resp);
     }
 
     private static SemanticSqlCorpusReader.CorpusJoin corpusJoin(String lo, String lc, String ro, String rc,

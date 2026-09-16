@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.connector.service;
 
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
+import com.jimeng.common.core.service.RequestService;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
@@ -47,7 +49,7 @@ import static org.mockito.Mockito.when;
  * <h3>为什么走 {@code derive()} 这个公开入口，而不是去反射那几个 private 方法</h3>
  * {@code buildDigest / parseJson / toRows} 都是 private 实例方法，但它们的<b>全部</b>输入都来自
  * 构造器里的协作者：结构快照来自 {@code schemaService.currentRows}，模型那一段文本来自
- * {@code claudeService.messages}，而产出唯一的出口是 {@code semanticService.replaceInferred} 的入参。
+ * {@code claudeService.messagesInternal}，而产出唯一的出口是 {@code semanticService.replaceInferred} 的入参。
  * 把这三个 mock 掉、再用 {@code ArgumentCaptor} 接住入参，等于拿到了这三个私有方法的真实输入输出，
  * 而且<b>不用为了测试放宽任何一处可见性</b>。整条链上没有 Spring、没有库、没有网络。
  *
@@ -149,7 +151,7 @@ class ConnectorSemanticDeriveServiceTest {
         block.put("text", text);
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("content", List.of(block));
-        when(claudeService.messages(any())).thenReturn(resp);
+        when(claudeService.messagesInternal(any(), any())).thenReturn(resp);
     }
 
     private ConnectorSemanticDeriveService.DeriveResult run() {
@@ -192,7 +194,7 @@ class ConnectorSemanticDeriveServiceTest {
     private String promptSent() {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<String, Object>> cap = ArgumentCaptor.forClass(Map.class);
-        verify(claudeService).messages(cap.capture());
+        verify(claudeService).messagesInternal(cap.capture(), any());
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> messages = (List<Map<String, Object>>) cap.getValue().get("messages");
         return String.valueOf(messages.get(0).get("content"));
@@ -227,6 +229,80 @@ class ConnectorSemanticDeriveServiceTest {
     /** 空但形状完整的产出：四个键都在、都是空数组。提示词明确要求「键必须都在」。 */
     private static final String EMPTY_BUT_WELL_FORMED =
             "{\"objects\":[],\"fields\":[],\"joins\":[],\"ambiguities\":[]}";
+
+    // ================================================================ 模型调用：内部调用 + 夹紧后的超时
+
+    /**
+     * 推导必须走 {@code messagesInternal}（不带工具、不套 Agent 上下文），并把<b>夹紧后</b>的超时交下去。
+     *
+     * <p>走 {@code messages} 的后果是真实发生过的：请求体里被塞进 web_search 等 6 个工具（客户的表名列名可能被拿去公网搜索），
+     * 而且只能用全局 180 秒读超时，41 张表的推导必然超时。夹紧的上限必须小于认领过期的 30 分钟，
+     * 否则模型还没回来，认领就被另一次推导抢走。
+     */
+    @Nested
+    @DisplayName("模型调用：走 messagesInternal，超时夹紧后交下去")
+    class ModelCallTimeout {
+
+        private Duration timeoutSent() {
+            ArgumentCaptor<Duration> cap = ArgumentCaptor.forClass(Duration.class);
+            verify(claudeService).messagesInternal(any(), cap.capture());
+            verify(claudeService, never()).messages(any());
+            return cap.getValue();
+        }
+
+        @Test
+        @DisplayName("★ 默认 900 秒原样交给 messagesInternal，不走 messages")
+        void 默认超时() {
+            defaultSnapshot();
+            modelOutputs(EMPTY_BUT_WELL_FORMED);
+
+            run();
+
+            assertEquals(Duration.ofSeconds(900), timeoutSent());
+        }
+
+        @Test
+        @DisplayName("配得太小夹到 60 秒：个位数的超时等于每一次推导都必然失败")
+        void 太小夹到下限() {
+            properties.getSemantic().setModelTimeoutSeconds(5);
+            defaultSnapshot();
+            modelOutputs(EMPTY_BUT_WELL_FORMED);
+
+            run();
+
+            assertEquals(Duration.ofSeconds(60), timeoutSent());
+        }
+
+        @Test
+        @DisplayName("★ 配得太大夹到 25 分钟：不能追上认领过期的 30 分钟")
+        void 太大夹到上限() {
+            properties.getSemantic().setModelTimeoutSeconds(3600);
+            defaultSnapshot();
+            modelOutputs(EMPTY_BUT_WELL_FORMED);
+
+            run();
+
+            assertEquals(Duration.ofMinutes(25), timeoutSent());
+        }
+
+        @Test
+        @DisplayName("区间内的值原样用；夹紧上限加上 HTTP 层整通调用余量，仍小于认领过期的 30 分钟")
+        void 区间内原样与上限不变式() {
+            ConnectorProperties.Semantic cfg = new ConnectorProperties.Semantic();
+            cfg.setModelTimeoutSeconds(600);
+            assertEquals(Duration.ofSeconds(600), ConnectorSemanticDeriveService.modelTimeout(cfg));
+            cfg.setModelTimeoutSeconds(ConnectorSemanticDeriveService.MODEL_TIMEOUT_MIN_SECONDS);
+            assertEquals(Duration.ofSeconds(60), ConnectorSemanticDeriveService.modelTimeout(cfg));
+            cfg.setModelTimeoutSeconds(ConnectorSemanticDeriveService.MODEL_TIMEOUT_MAX_SECONDS);
+            assertEquals(Duration.ofMinutes(25), ConnectorSemanticDeriveService.modelTimeout(cfg));
+
+            // 30 = CLAIM_STALE_MINUTES（private）= ConnectorHealthJob.DERIVE_CLAIM_LIVE_MINUTES。
+            long worstCaseSeconds = ConnectorSemanticDeriveService.MODEL_TIMEOUT_MAX_SECONDS
+                    + RequestService.CALL_TIMEOUT_GRACE.getSeconds();
+            assertTrue(worstCaseSeconds < 30 * 60,
+                    "模型调用最坏占用 " + worstCaseSeconds + " 秒，追上了推导认领的过期时间");
+        }
+    }
 
     // ================================================================ ★ GUESS 直接丢
 
@@ -970,7 +1046,7 @@ class ConnectorSemanticDeriveServiceTest {
         @Test
         void 模型调用炸了不抛异常且不动已有语义() {
             defaultSnapshot();
-            when(claudeService.messages(any())).thenThrow(new RuntimeException("502 Bad Gateway"));
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new RuntimeException("502 Bad Gateway"));
 
             var r = run();
             assertFalse(r.isOk());
@@ -983,7 +1059,7 @@ class ConnectorSemanticDeriveServiceTest {
         @Test
         void message为null的异常也要留下线索() {
             defaultSnapshot();
-            when(claudeService.messages(any())).thenThrow(new NullPointerException());
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new NullPointerException());
 
             var r = run();
             assertTrue(r.getNote().contains("NullPointerException"), r.getNote());
@@ -998,7 +1074,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
             assertFalse(r.isOk());
             assertTrue(r.getNote().contains("关闭"), r.getNote());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             assertNotNull(lastStatusWrite().getSemanticNote());
             // 不标 FAILED：开关关着不是失败。
             assertNull(lastStatusWrite().getSemanticStatus());
@@ -1011,7 +1087,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
             assertFalse(r.isOk());
             assertTrue(r.getNote().contains("刷新结构"), "提示要说清下一步怎么办：" + r.getNote());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
 
@@ -1022,7 +1098,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
             assertFalse(r.isOk());
             assertEquals("连接不存在", r.getNote());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
         }
 
         /** 单张表的快照 JSON 坏了，这张表没字段可推，其余的照推——不能让整次推导失败。 */
@@ -1308,7 +1384,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             assertFalse(r.isOk());
             assertTrue(r.getNote().contains("已有一次推导在进行中"), r.getNote());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             verify(semanticService, never()).replaceInferred(any(), any());
         }
 
@@ -1387,7 +1463,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             // 恰好一次：补拉是「补一次看看」，不是重试循环。
             verify(schemaService).refresh(CONNECTOR_ID);
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
             Connection wrote = lastStatusWrite();
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, wrote.getSemanticStatus());
             // 「拉过了但一张表都看不见」和「还没拉过」是两回事，提示里得说清下一步做什么。
@@ -1411,7 +1487,7 @@ class ConnectorSemanticDeriveServiceTest {
             Connection wrote = lastStatusWrite();
             assertEquals(ConnectorSemanticDeriveService.SEM_NOT_APPLICABLE, wrote.getSemanticStatus());
             assertTrue(wrote.getSemanticNote().contains("不适用"), wrote.getSemanticNote());
-            verify(claudeService, never()).messages(any());
+            verify(claudeService, never()).messagesInternal(any(), any());
         }
 
         /** 快照已经有了就<b>不碰客户库</b>：重跑对客户侧是零访问，这条不变量不能破。 */
@@ -1521,7 +1597,7 @@ class ConnectorSemanticDeriveServiceTest {
         @Test
         void 推导失败不盖synced_at_上次成功的时间得以保留() {
             defaultSnapshot();
-            when(claudeService.messages(any())).thenThrow(new RuntimeException("上游超时"));
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new RuntimeException("上游超时"));
 
             var r = run();
 

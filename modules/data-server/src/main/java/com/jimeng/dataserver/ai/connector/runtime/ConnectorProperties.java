@@ -257,6 +257,25 @@ public class ConnectorProperties {
          * 但那毕竟是残缺的说明书，宁可这里给够。
          */
         private int maxTokens = 16000;
+
+        /**
+         * 推导那一次模型调用的读超时（秒）。
+         *
+         * <p>为什么单独给、不沿用全局 {@code okhttp.read-timeout}：推导是非流式调用，上游要把整份 JSON 生成完
+         * 才回响应头。全局值是按交互式对话调的（dev 180 秒），几十张表的推导必然超过它，表现是
+         * {@code SocketTimeoutException}、说明书一行都出不来；而调大全局值会让所有对话调用在上游挂死时多等同样久。
+         *
+         * <p><b>★ 它必须小于推导认领的过期时间 30 分钟</b>（{@code ConnectorSemanticDeriveService.CLAIM_STALE_MINUTES}，
+         * 与 {@code ConnectorHealthJob.DERIVE_CLAIM_LIVE_MINUTES} 同值）。模型还没回来、认领却已经被判死，
+         * 另一次推导或定时刷新就会抢进来，两次推导各写各的状态和行——正是认领要防的那件事。
+         * 所以推导侧取值时夹紧到 [60 秒, 25 分钟]，越界打 WARN：上限留出的 5 分钟给 HTTP 层整通调用超时的余量
+         * 和模型调用前后的读快照、写库。
+         *
+         * <p><b>别贴着上限配</b>：认领之后、模型调用之前，快照为空时还会先补拉一次结构（{@code bootstrapSnapshot} →
+         * {@code ConnectorSchemaService.refresh}：一次目录加最多 200 次 describe），这一步<b>没有总时长封顶</b>，
+         * 跨公网可能几十秒。它加上一次贴着上限的模型调用，就可能越过 30 分钟认领。默认 900 秒留有十几分钟余量。
+         */
+        private int modelTimeoutSeconds = 900;
     }
 
     /**

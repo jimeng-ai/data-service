@@ -28,6 +28,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -158,6 +159,21 @@ public class ConnectorSemanticDeriveService {
      * 比并发写坏一次严重得多。推导本身是几十秒的量级，30 分钟是纯余量。
      */
     private static final long CLAIM_STALE_MINUTES = 30L;
+
+    /**
+     * 推导那一次模型调用的超时夹紧区间（秒），配置项见 {@link ConnectorProperties.Semantic#getModelTimeoutSeconds()}。
+     *
+     * <p>上限从 {@link #CLAIM_STALE_MINUTES} 倒推，而不是另写一个数：模型还没回来、认领却已过期，另一次推导就能抢进来，
+     * 两次推导各写各的状态和行。留 5 分钟：HTTP 层在读超时之上还有 {@code RequestService.CALL_TIMEOUT_GRACE}（60 秒）
+     * 的整通调用余量，再加上模型调用之前的读快照、S1 语料挖掘（20 秒封顶）和之后的写库。
+     * 注意这 5 分钟<b>不含</b>快照为空时的 {@code bootstrapSnapshot}（补拉结构，没有总时长封顶），
+     * 所以上限只是护栏，配置值不要贴着它配。
+     *
+     * <p>下限 60 秒：配成个位数的表现不是「快速失败」，而是每一次推导都必然超时、说明书永远出不来。
+     */
+    static final int MODEL_TIMEOUT_MIN_SECONDS = 60;
+
+    static final int MODEL_TIMEOUT_MAX_SECONDS = (int) ((CLAIM_STALE_MINUTES - 5L) * 60L);
 
     /**
      * 采样验证阶段写进度的节奏：每决完这么多条、且距上次至少
@@ -1876,13 +1892,33 @@ public class ConnectorSemanticDeriveService {
         messages.add(userMsg);
         body.put("messages", messages);
 
-        log.info("{} connectorId={} 请求模型={} 对象={}/{} 摘要={}字符 max_tokens={}",
+        Duration timeout = modelTimeout(cfg);
+        log.info("{} connectorId={} 请求模型={} 对象={}/{} 摘要={}字符 max_tokens={} 超时={}秒",
                 what, connectorId,
                 model == null ? "(未配 connector.semantic.infer-model，回落 provider 默认模型)" : model,
-                included, total, digestChars, cfg.getMaxTokens());
+                included, total, digestChars, cfg.getMaxTokens(), timeout.getSeconds());
 
-        Object resp = claudeService.messages(body);
+        // ★ 走 messagesInternal 而不是 messages：不带任何工具（客户的表名列名不能被模型拿去 web_search）、
+        //   只调一轮、不套 Agent 上下文，超时按上面这个给。理由见 AiConversationLoop#runInternal。
+        Object resp = claudeService.messagesInternal(body, timeout);
         return extractText(resp);
+    }
+
+    /**
+     * 取推导模型调用的超时，夹紧到 [{@link #MODEL_TIMEOUT_MIN_SECONDS}, {@link #MODEL_TIMEOUT_MAX_SECONDS}]。
+     *
+     * <p>越界不报错：这是护栏参数，配错不该让推导整个停摆（见 {@link ConnectorProperties} 的类注释）。
+     * 但必须打 WARN——否则「配了 3600 秒却 25 分钟就超时」是查不出原因的。
+     */
+    static Duration modelTimeout(ConnectorProperties.Semantic cfg) {
+        int configured = cfg.getModelTimeoutSeconds();
+        int clamped = Math.max(MODEL_TIMEOUT_MIN_SECONDS, Math.min(MODEL_TIMEOUT_MAX_SECONDS, configured));
+        if (clamped != configured) {
+            log.warn("connector.semantic.model-timeout-seconds={} 越界，按 {} 秒处理（合法区间 [{}, {}] 秒；"
+                            + "上限必须小于推导认领过期的 {} 分钟，否则模型还没回来认领就会被别人抢走）",
+                    configured, clamped, MODEL_TIMEOUT_MIN_SECONDS, MODEL_TIMEOUT_MAX_SECONDS, CLAIM_STALE_MINUTES);
+        }
+        return Duration.ofSeconds(clamped);
     }
 
     /** 从 Anthropic messages 响应里抽 content[].text。与 {@code SkillEvalService.extractText} 同形。 */

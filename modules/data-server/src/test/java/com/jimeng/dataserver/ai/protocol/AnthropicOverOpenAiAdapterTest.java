@@ -365,6 +365,68 @@ class AnthropicOverOpenAiAdapterTest {
         }
     }
 
+    /**
+     * 推理模型（deepseek-flash）的<b>非流式</b>响应：思考过程在 {@code message.reasoning_content}，与正文分开；
+     * 思考 token 计入 completion_tokens、吃 max_tokens 的额度。
+     *
+     * <p>语义层推导按 content[].text 抽文本再解析 JSON——思考文字混进 text 就解析失败；
+     * 被 max_tokens 截断却报成 end_turn，截断这件事就在协议转换这一层静默消失了。
+     * 输入用 {@code JSONUtil.parseObj}：{@code AiConversationLoop} 实际喂给 fromUpstreamResponse 的就是 Hutool 的 JSONObject。
+     */
+    @Nested
+    @DisplayName("推理模型的非流式响应")
+    class 推理模型非流式 {
+
+        private Map<String, Object> resp(String contentJson, String finishReason) {
+            String json = "{\"id\":\"r1\",\"model\":\"deepseek-flash\",\"choices\":[{\"finish_reason\":\"" + finishReason
+                    + "\",\"message\":{\"role\":\"assistant\",\"content\":" + contentJson + ","
+                    + "\"reasoning_content\":\"先看 orders 表的外键，再想想 cid 指向哪\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":900,"
+                    + "\"completion_tokens_details\":{\"reasoning_tokens\":700}}}";
+            return JSONUtil.parseObj(json);
+        }
+
+        @Test
+        @DisplayName("★ reasoning_content 不进 text：正文原样是那段 JSON，一个思考字都不多")
+        void 思考过程不进正文() {
+            Map<String, Object> out = adapter.fromUpstreamResponse(resp("\"{\\\"objects\\\":[]}\"", "stop"));
+
+            List<Object> blocks = list(out.get("content"));
+            assertEquals(1, blocks.size(), "content 里多出了块：" + blocks);
+            assertEquals("text", map(blocks.get(0)).get("type"));
+            assertEquals("{\"objects\":[]}", map(blocks.get(0)).get("text"));
+            assertFalse(JSONUtil.toJsonStr(out).contains("orders 表的外键"), "思考过程混进了转换结果：" + out);
+            assertEquals("end_turn", out.get("stop_reason"));
+            // 思考 token 计入 completion_tokens，output_tokens 必须照实给——计费按它算。
+            assertEquals(900, map(out.get("usage")).get("output_tokens"));
+        }
+
+        @Test
+        @DisplayName("★ finish_reason=length 映射成 stop_reason=max_tokens，不再报成 end_turn")
+        void length映射max_tokens() {
+            Map<String, Object> out = adapter.fromUpstreamResponse(
+                    resp("\"{\\\"objects\\\":[{\\\"name\\\":\\\"ord\"", "length"));
+
+            assertEquals("max_tokens", out.get("stop_reason"));
+            assertEquals("{\"objects\":[{\"name\":\"ord", map(list(out.get("content")).get(0)).get("text"));
+        }
+
+        @Test
+        @DisplayName("思考把 max_tokens 吃光、正文为 null：没有 text 块（不是字符串 \"null\"），stop_reason=max_tokens")
+        void 思考吃光额度() {
+            Map<String, Object> out = adapter.fromUpstreamResponse(resp("null", "length"));
+
+            assertTrue(list(out.get("content")).isEmpty(), "content 应为空：" + out.get("content"));
+            assertEquals("max_tokens", out.get("stop_reason"));
+        }
+
+        @Test
+        @DisplayName("其余 finish_reason 维持原来的映射：content_filter 仍是 end_turn")
+        void 其余取值不变() {
+            assertEquals("end_turn", adapter.fromUpstreamResponse(resp("\"好\"", "content_filter")).get("stop_reason"));
+        }
+    }
+
     @Test
     @DisplayName("默认的三个转换点在同协议 adapter 上是恒等的")
     void 同协议adapter不受影响() {

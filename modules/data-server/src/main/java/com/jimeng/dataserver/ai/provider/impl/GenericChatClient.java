@@ -13,6 +13,7 @@ import com.jimeng.dataserver.ai.provider.spi.ChatCapabilities;
 import com.jimeng.dataserver.ai.provider.spi.ChatClient;
 import lombok.extern.slf4j.Slf4j;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -84,6 +85,17 @@ public class GenericChatClient implements ChatClient {
             return;
         }
         conversationLoop.runStream(body, adapter(), buildHeaders(), buildUrl(), connectionId, traceId, recordConfig());
+    }
+
+    /**
+     * 平台内部的单轮调用。请求体默认值（prepareBody）、adapter 选择、URL 与鉴权头都与 {@link #chat} 相同，
+     * 区别只在委托给 {@link AiConversationLoop#runInternal}：不带工具、不进工具循环、超时按调用给。
+     */
+    @Override
+    public Object chatInternal(Map<String, Object> requestBody, String traceId, Duration readTimeout) {
+        Map<String, Object> body = prepareBody(requestBody, false);
+        return conversationLoop.runInternal(body, adapter(), buildHeaders(), buildUrl(), traceId, recordConfig(),
+                readTimeout);
     }
 
     @Override
