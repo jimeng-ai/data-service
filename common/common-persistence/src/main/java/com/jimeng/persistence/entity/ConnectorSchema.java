@@ -70,6 +70,23 @@ public class ConnectorSchema extends BaseEntity {
     @TableField("content_hash")
     private String contentHash;
 
+    /**
+     * 本次刷新时这张表在连接器目录里的位置，从 1 开始，越小越重要。
+     *
+     * <p>从前「重要性」只在连接器拉目录时现算（MySQL：估算行数数量级降序 → 被外键引用次数降序 → 表名升序），
+     * 不落库，快照读回按表名字母序。语义层生成要按重要性切片，所以落快照时把位置一起存下来。
+     * 只存位置、不存档位与引用数：位置已经完整表达了三级排序的结果，而改目录条目模型的改动面太大。
+     *
+     * <p><b>NULL = 本列上线之前落的快照</b>，读取时按 id 升序回退（同一份快照单线程依次插入，雪花 id 升序即目录顺序），
+     * 下一次刷新自动补上。
+     *
+     * <p>⚠ 迁移 {@code V20260917__connector_semantic_generation.sql} 必须先于部署映射了本列的后端：
+     * 列不存在时，所有读 connector_schema 的查询（结构刷新、conn_catalog、推导）一律 Unknown column。
+     */
+    @Schema(description = "刷新时在连接器目录里的位置，从 1 开始，越小越重要；NULL 为旧快照")
+    @TableField("importance_rank")
+    private Integer importanceRank;
+
     @Schema(description = "本行的同步时间")
     @TableField("synced_at")
     private Date syncedAt;

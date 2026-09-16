@@ -287,6 +287,31 @@ public class ConnectorSchemaService {
                 .orderByAsc(ConnectorSchema::getObjectName));
     }
 
+    /**
+     * 按重要性读快照行：语义层生成 agent 按它对账、切片（先生成最重要的表）。
+     *
+     * <p>排序 {@code importance_rank IS NULL, importance_rank ASC, id ASC}：
+     * <ul>
+     *   <li>有排名的按排名。排名是刷新时这张表在连接器目录里的位置（{@link #pullDetails} 写入）。</li>
+     *   <li>本列上线之前落的旧快照整份都是 NULL，退回按 {@code id} 升序：一份快照的行由 {@code fresh.forEach(insert)}
+     *       按目录顺序在单线程里依次插入，雪花 id 单调递增，所以 id 顺序复现的就是那次刷新的目录顺序。
+     *       2026-09-16 在 dev「本地测试」连接上只读核对过：41 行旧快照的 id 升序，与按同一规则
+     *       （数量级降序 → 被引用数降序 → 表名升序）现算的目录顺序逐行一致。
+     *       引入重要性排序之前的快照，目录顺序本来就是字母序，回退结果与旧行为一致。</li>
+     *   <li>不能直接 {@code orderByAsc(importanceRank)}：MySQL 升序把 NULL 排在最前，
+     *       混着新旧行时旧行会整批插队到最重要的表前面。</li>
+     * </ul>
+     *
+     * <p><b>不改 {@link #currentRows}</b>：diff、推导摘要与现有单测都依赖它的字母序。
+     * {@code last(...)} 里的 {@code IS NULL} 排序表达式经租户拦截器（JSqlParser 4.6）解析改写后原样保留（离线实测过）。
+     */
+    public List<ConnectorSchema> snapshotRowsByImportance(Long connectorId) {
+        requireRow(connectorId);
+        return schemaMapper.selectList(new LambdaQueryWrapper<ConnectorSchema>()
+                .eq(ConnectorSchema::getConnectorId, connectorId)
+                .last("ORDER BY importance_rank IS NULL, importance_rank ASC, id ASC"));
+    }
+
     /** 对外用：视图 DTO，不含 tenantId，且 detail 已解析好。 */
     public List<ConnectorSchemaView> current(Long connectorId) {
         requireRow(connectorId);
@@ -775,6 +800,9 @@ public class ConnectorSchemaService {
                         MAX_OBJECTS, row.getId(), truncationNote(catalog, MAX_OBJECTS));
                 break;
             }
+            // 截断判断通过之后 n 恰好是这张表在目录里从 1 开始的位置，即重要性排名。
+            // 描述失败的对象同样占一个位置：它在目录里就排在那儿，跳过它会让后面每一张表的排名错一位。
+            int position = n;
             ObjectDetail detail;
             try {
                 detail = describe.describe(e.name());
@@ -786,7 +814,7 @@ public class ConnectorSchemaService {
                 detail = new ObjectDetail(e.name(), e.type(), e.comment(), List.of(),
                         Map.of(DESCRIBE_ERROR_KEY, "结构获取失败：" + ex.getCode().title()));
             }
-            out.add(toRow(row, e, detail, syncedAt));
+            out.add(toRow(row, e, detail, syncedAt, position));
             details.add(detail);
         }
 
@@ -976,7 +1004,12 @@ public class ConnectorSchemaService {
                 + " 个；其余对象没有结构快照，也不在结构漂移检测范围内。";
     }
 
-    private ConnectorSchema toRow(Connection row, CatalogEntry entry, ObjectDetail detail, Date syncedAt) {
+    /**
+     * @param importanceRank 这张表在连接器目录里从 1 开始的位置。只存位置，不存档位与引用数：位置已经完整表达了
+     *                       连接器的排序结果，而把档位塞进 {@link CatalogEntry} 要动所有连接器与 {@code ConnectorToolExecutor}。
+     */
+    private ConnectorSchema toRow(Connection row, CatalogEntry entry, ObjectDetail detail, Date syncedAt,
+                                  int importanceRank) {
         ConnectorSchema s = new ConnectorSchema();
         s.setTenantId(row.getTenantId());
         s.setConnectorId(row.getId());
@@ -989,6 +1022,9 @@ public class ConnectorSchemaService {
         s.setContentHash(sha256(structureFingerprint(detail)));
         // 是拉取开始的时刻，不是描述到这一张的时刻：「旧拉取不许覆盖新快照」按它比。
         s.setSyncedAt(syncedAt);
+        // 语义层生成按它切片（snapshotRowsByImportance）。它不进上面的 content_hash，也不该进：
+        // 位置随估算行数跨档而变，算进去会把「排名挪了一位」报成结构漂移。
+        s.setImportanceRank(importanceRank);
         return s;
     }
 

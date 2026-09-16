@@ -44,6 +44,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
@@ -235,6 +236,7 @@ class ConnectorSchemaServiceTest {
     class ThroughGateway {
 
         private ConnectionMapper connectionMapper;
+        private ConnectorSchemaMapper schemaMapper;
         private ConnectorRegistry registry;
         private ConnectorGateway gateway;
         private Connector connector;
@@ -243,9 +245,10 @@ class ConnectorSchemaServiceTest {
         @BeforeEach
         void setUp() {
             connectionMapper = mock(ConnectionMapper.class);
+            schemaMapper = mock(ConnectorSchemaMapper.class);
             registry = mock(ConnectorRegistry.class);
             gateway = mock(ConnectorGateway.class);
-            refreshService = new ConnectorSchemaService(connectionMapper, mock(ConnectorSchemaMapper.class),
+            refreshService = new ConnectorSchemaService(connectionMapper, schemaMapper,
                     registry, mock(ConnectorSemanticService.class),
                     mock(PlatformTransactionManager.class), gateway, mock(ObjectProvider.class), mock(org.redisson.api.RedissonClient.class));
             // @PostConstruct 在单测里不会被调用，txTemplate 得自己初始化。
@@ -320,6 +323,47 @@ class ConnectorSchemaServiceTest {
                     "管理面的审计名必须带 platform. 前缀，实际: " + op.getValue());
             assertNotEquals("conn_catalog", op.getValue());
             assertNotEquals("conn_describe", op.getValue());
+        }
+
+        /**
+         * ★ 语义层生成按 {@code importance_rank} 切片：先生成最重要的表，生成完一批就能用一批。
+         *
+         * <p>排名必须是<b>目录顺序</b>，而不是表名字母序、也不是「描述成功的第几张」：
+         * <ul>
+         *   <li>目录故意给成非字母序（{@code t_ord_mst} 最重要、{@code a_dict} 垫底）——
+         *       从前快照读回按字母序，拿字母序当重要性，{@code t_} 开头的核心业务表会整片排到最后；</li>
+         *   <li>中间那张描述失败：它在目录里照样占着第 2 位，跳过它会让后面每一张的排名错一位。</li>
+         * </ul>
+         */
+        @Test
+        @DisplayName("快照行 importanceRank 从 1 连续，且与目录顺序一致（描述失败的对象也占位）")
+        @SuppressWarnings("unchecked")
+        void 快照行importanceRank从1连续且按目录顺序() {
+            ConnectorSession session = mock(ConnectorSession.class,
+                    withSettings().extraInterfaces(DescribeCapable.class));
+            DescribeCapable describe = (DescribeCapable) session;
+            List<String> catalogOrder = List.of("t_ord_mst", "m_ord_log", "a_dict");
+            when(describe.catalog()).thenReturn(new CatalogView("TABLE",
+                    catalogOrder.stream().map(n -> new CatalogEntry(n, "BASE TABLE", null)).toList(),
+                    false, catalogOrder.size(), "按估算行数的数量级降序"));
+            when(describe.describe("t_ord_mst")).thenReturn(new ObjectDetail("t_ord_mst", "BASE TABLE", null,
+                    List.of(new FieldDetail("id", "bigint", false, null, null)), Map.of()));
+            when(describe.describe("m_ord_log")).thenThrow(
+                    ConnectorException.of(ConnectorErrorCode.FORBIDDEN, "没有这张表的权限"));
+            when(describe.describe("a_dict")).thenReturn(new ObjectDetail("a_dict", "BASE TABLE", null,
+                    List.of(new FieldDetail("code", "varchar(16)", false, null, null)), Map.of()));
+            when(gateway.executeAsPlatform(eq(100L), eq(Capability.DESCRIBE), anyString(), any()))
+                    .thenAnswer(inv -> ((ConnectorGateway.Op<Object>) inv.getArgument(3)).apply(session));
+
+            refreshService.refresh(100L);
+
+            ArgumentCaptor<ConnectorSchema> inserted = ArgumentCaptor.forClass(ConnectorSchema.class);
+            verify(schemaMapper, times(3)).insert(inserted.capture());
+            List<ConnectorSchema> rows = inserted.getAllValues();
+            assertEquals(catalogOrder, rows.stream().map(ConnectorSchema::getObjectName).toList(),
+                    "快照行按目录顺序插入——旧快照的 id 回退依赖这一点");
+            assertEquals(List.of(1, 2, 3), rows.stream().map(ConnectorSchema::getImportanceRank).toList(),
+                    "排名从 1 开始连续，等于目录位置；描述失败的 m_ord_log 仍是第 2 名");
         }
 
         /**
