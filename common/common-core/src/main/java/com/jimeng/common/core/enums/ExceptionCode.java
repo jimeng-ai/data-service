@@ -23,6 +23,12 @@ public enum ExceptionCode {
     SSE_NOT_FOUND("5008","SSE连接不存在"),
     SSE_SEND_ERROR("5009","SSE消息发送异常"),
     CONVERSATION_GENERATING("5010","该会话正在生成回复，请稍候"),
+    /**
+     * 语义层 agent 回调（{@code /data/internal/semantic-agent/**}）发现批次已不是 RUNNING，或 current_run_id 已换成别的尝试。
+     * 业务异常照常是 HTTP 200 + success=false；边车的 semantic 工具按这个 respCode 判为 fatal，让模型立即停手——
+     * 批次结束、换片或被主动 cancel 之后，在途回调一律失效，不需要吊销列表。
+     */
+    SEMANTIC_GENERATION_CLOSED("4090", "语义层生成批次已结束或已换片"),
     INVALID_REQUEST("5007","无效请求");
 
     private final String resultCode;

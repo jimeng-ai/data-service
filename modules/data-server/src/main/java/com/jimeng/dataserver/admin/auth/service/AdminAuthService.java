@@ -43,6 +43,18 @@ public class AdminAuthService {
     /** Token 过期时间（毫秒），12h 友好。 */
     public static final long ADMIN_TOKEN_EXPIRE_MS = 12L * 60 * 60 * 1000;
 
+    /** 语义层 agent 回调 token 的 {@code purpose} claim。回调前缀上的过滤器只认带这个值的 token，带它的 token 也只能访问回调前缀。 */
+    public static final String PURPOSE_SEMANTIC_AGENT = "semantic-agent";
+
+    /**
+     * 语义层 agent 回调 token 在本片墙钟之外多给的秒数，与 RAG 回调 token 同一口径（{@code AgentExecService} 按
+     * wallClockSec + 120 秒签发）。一片从签发到结束，除了墙钟本身还有边车准入排队（最长 30 秒）和容器启动，
+     * token 不能赶在运行结束之前先过期，否则最后几次提交会在网关上 401、白跑一片。
+     * 多给的这段不扩大重放窗口：回调前缀的过滤器每次查库，批次一结束、换片或被 cancel（{@code current_run_id} 置空）
+     * token 就提前失效。
+     */
+    public static final int SEMANTIC_AGENT_TOKEN_GRACE_SEC = 120;
+
     private final SysUserMapper sysUserMapper;
     private final SysEnterpriseMapper sysEnterpriseMapper;
     private final BCryptPasswordEncoder passwordEncoder;
@@ -172,6 +184,55 @@ public class AdminAuthService {
         payload.put("id", userId);
         payload.put("tenant_id", tenantId);
         payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
+    }
+
+    /**
+     * 语义层 agent 一片运行的回调 token 有效期（毫秒）= (本片墙钟秒数 + {@link #SEMANTIC_AGENT_TOKEN_GRACE_SEC}) × 1000。
+     * 口径集中在这里，派发方不各自重算。
+     */
+    public static long semanticAgentTokenTtlMs(int sliceWallClockSec) {
+        return (sliceWallClockSec + (long) SEMANTIC_AGENT_TOKEN_GRACE_SEC) * 1000L;
+    }
+
+    /**
+     * 为语义层 agent 的<b>一片、一次尝试</b>签发窄权限回调 token。与 {@link #mintInternalToken} 同密钥、同 hutool 写法，
+     * 网关照常验签并据 {@code tenant_id} 注入租户；范围限定由 data-server 回调前缀上的过滤器执行。
+     *
+     * <h3>claims</h3>
+     * <ul>
+     *   <li>{@code id}：触发人（建连或点「重新生成」的超管，批次行 {@code triggered_by}），字符串，与登录签发、
+     *       {@link #mintInternalToken} 一致。<b>网关要求非空</b>，缺了直接 401。</li>
+     *   <li>{@code tenant_id}：批次的租户，网关据此注入 {@code X-Tenant-Id}。</li>
+     *   <li>{@code realm}：ENTERPRISE，同上两处。</li>
+     *   <li>{@code purpose}：{@link #PURPOSE_SEMANTIC_AGENT}。</li>
+     *   <li>{@code gen} / {@code cid}：批次 id、连接 id，<b>字符串</b>——雪花 id 超出 JS 安全整数，
+     *       按数字写进 JWT 会在任何 JS 端解析时被静默改值。</li>
+     *   <li>{@code slice} / {@code rid}：片号与本次尝试的 runId。只校验片号挡不住「同一片的上一次尝试」：
+     *       编排器每次派发前写 {@code current_run_id}、运行一结束就置空，被杀掉的旧尝试若还有在途回调，
+     *       rid 对不上就进不来。</li>
+     * </ul>
+     *
+     * <p>token 只进 payload 的 {@code semanticContext.accessToken}，由边车宿主进程里的 MCP 服务闭包持有；
+     * 不进容器 env、不进 prompt，也不回显在工具结果与错误文案里。调用方不要把它打进日志。
+     *
+     * @param ttlMs 用 {@link #semanticAgentTokenTtlMs(int)} 算
+     */
+    public String mintSemanticAgentToken(Long triggeredBy, String tenantId, Long generationId, Long connectorId,
+                                         int sliceNo, String runId, long ttlMs) {
+        Date now = new Date();
+        Map<String, Object> payload = new HashMap<>();
+        payload.put(JWTPayload.ISSUED_AT, now);
+        payload.put(JWTPayload.NOT_BEFORE, now);
+        payload.put(JWTPayload.EXPIRES_AT, new Date(now.getTime() + ttlMs));
+        payload.put("id", String.valueOf(triggeredBy));          // 网关要求非空（AuthorizeFilter 缺 id 即 401）
+        payload.put("tenant_id", tenantId);                     // 网关据此注入 X-Tenant-Id
+        payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        payload.put("purpose", PURPOSE_SEMANTIC_AGENT);
+        payload.put("gen", String.valueOf(generationId));       // 字符串：雪花 id 超出 JS 安全整数
+        payload.put("cid", String.valueOf(connectorId));
+        payload.put("slice", sliceNo);
+        payload.put("rid", runId);
         return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }
 }
