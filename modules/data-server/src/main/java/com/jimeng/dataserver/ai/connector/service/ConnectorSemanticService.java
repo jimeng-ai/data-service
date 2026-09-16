@@ -1599,8 +1599,10 @@ public class ConnectorSemanticService {
     /**
      * 按 {@code uk_connector_semantic} 的排序规则（utf8mb4_unicode_ci）折叠：大小写与重音不敏感、尾随空格不计。
      * 是近似，不是逐字符复刻——覆盖不到的字符落到库里撞键，由 {@link #upsertInferred} 单条接住。
+     *
+     * <p>{@code public}：语义层生成的一致性规则（{@code generation.consistency}）按同一个口径判「同一左列」，行为不变。
      */
-    static String ciFold(String s) {
+    public static String ciFold(String s) {
         if (s == null) {
             return "";
         }
