@@ -4,8 +4,10 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.stats.dto.DashboardOverview;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AiModelCallLog;
+import com.jimeng.persistence.entity.SysUser;
 import com.jimeng.persistence.mapper.AgentMapper;
 import com.jimeng.persistence.mapper.AiModelCallLogMapper;
+import com.jimeng.persistence.mapper.SysUserMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -34,12 +36,14 @@ public class DashboardStatsService {
     private static final int MAX_DAYS = 365;
     private static final int TOP_MODELS_LIMIT = 6;
     private static final int TOP_AGENTS_LIMIT = 8;
+    private static final int TOP_USERS_LIMIT = 10;
     private static final int RECENT_CALLS_LIMIT = 8;
     /** 「查看全部」饼图需要全量模型，给一个足够大的上限即可（单租户模型数远小于此）。 */
     private static final int ALL_MODELS_LIMIT = 100;
 
     private final AiModelCallLogMapper callLogMapper;
     private final AgentMapper agentMapper;
+    private final SysUserMapper sysUserMapper;
 
     public DashboardOverview overview(int days) {
         return overview(TenantContext.get(), days);
@@ -100,6 +104,7 @@ public class DashboardStatsService {
             result.setTopModels(List.of());
             result.setAllModels(List.of());
             result.setTopAgents(List.of());
+            result.setTopUsers(List.of());
             result.setRecentCalls(List.of());
             return result;
         }
@@ -115,6 +120,7 @@ public class DashboardStatsService {
                 ? new ArrayList<>(allModels.subList(0, TOP_MODELS_LIMIT))
                 : allModels);
         result.setTopAgents(toAgentUsage(callLogMapper.selectTopAgents(tenantId, start, end, TOP_AGENTS_LIMIT)));
+        result.setTopUsers(toUserUsage(callLogMapper.selectTopUsers(tenantId, start, end, TOP_USERS_LIMIT)));
         result.setRecentCalls(toRecentCalls(callLogMapper.selectRecentCalls(tenantId, RECENT_CALLS_LIMIT)));
         return result;
     }
@@ -233,6 +239,62 @@ public class DashboardStatsService {
             out.add(a);
         }
         return out;
+    }
+
+    private List<DashboardOverview.UserUsage> toUserUsage(List<Map<String, Object>> rows) {
+        List<DashboardOverview.UserUsage> out = new ArrayList<>();
+        if (rows == null || rows.isEmpty()) {
+            return out;
+        }
+        Set<Long> userIds = new HashSet<>();
+        for (Map<String, Object> row : rows) {
+            Long id = parseUserId(row.get("userId"));
+            if (id != null) {
+                userIds.add(id);
+            }
+        }
+        Map<Long, String> names = batchUserNames(userIds);
+        for (Map<String, Object> row : rows) {
+            DashboardOverview.UserUsage u = new DashboardOverview.UserUsage();
+            Object raw = row.get("userId");
+            u.setUserId(raw == null ? null : String.valueOf(raw));
+            Long id = parseUserId(raw);
+            String name = id == null ? null : names.get(id);
+            u.setUserName(name == null || name.isBlank() ? "未归属" : name);
+            u.setCalls(asLong(row.get("calls")));
+            u.setTokens(asLong(row.get("tokens")));
+            u.setCostUsd(asDouble(row.get("costUsd")));
+            out.add(u);
+        }
+        return out;
+    }
+
+    private Long parseUserId(Object v) {
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v).trim();
+        if (s.isEmpty()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(s);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 批量把 user_id 解析成成员显示名（缺 displayName 退用户名）。sys_user 不在租户白名单，PK 查询不受租户拦截影响。 */
+    private Map<Long, String> batchUserNames(Set<Long> userIds) {
+        if (userIds == null || userIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, String> names = new HashMap<>();
+        for (SysUser u : sysUserMapper.selectBatchIds(userIds)) {
+            String dn = u.getDisplayName();
+            names.put(u.getId(), dn == null || dn.isBlank() ? u.getUsername() : dn);
+        }
+        return names;
     }
 
     /** 批量把 agentId 解析成 Agent 名称；agent 已删除或查不到时该 id 不在返回 map 中。 */

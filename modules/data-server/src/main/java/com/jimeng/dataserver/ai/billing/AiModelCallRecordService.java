@@ -5,6 +5,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
+import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
 import com.jimeng.dataserver.ai.billing.pricing.ModelPricing;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
@@ -108,10 +109,14 @@ public class AiModelCallRecordService {
                 // 但 MdcAsyncSupport 已把租户传播到 TenantContext，作为兜底来源。
                 TenantContext.get()
         ));
+        // 流式/异步线程已无 HTTP 请求上下文，但 MdcAsyncSupport 已把发起成员 id 透传到 ASYNC_USER_ID，
+        // 经 AdminRequestContext.findUserIdOrNull() 兜底（与 tenant 走 TenantContext 同源），避免归属丢失。
+        Long asyncUserId = AdminRequestContext.findUserIdOrNull();
         logEntity.setUserId(firstNonBlank(
                 getString(requestBody, "user_id", null),
                 getHeader(request, "user-id"),
-                getHeader(request, "x-user-id")
+                getHeader(request, "x-user-id"),
+                asyncUserId == null ? null : String.valueOf(asyncUserId)
         ));
 
         List<String> toolNames = extractToolNames(requestBody);
@@ -275,7 +280,11 @@ public class AiModelCallRecordService {
                 getHeader(request, "tenant-id"),
                 getHeader(request, "x-tenant-id"),
                 TenantContext.get()));
-        logEntity.setUserId(firstNonBlank(getHeader(request, "user-id"), getHeader(request, "x-user-id")));
+        Long asyncUserId = AdminRequestContext.findUserIdOrNull();
+        logEntity.setUserId(firstNonBlank(
+                getHeader(request, "user-id"),
+                getHeader(request, "x-user-id"),
+                asyncUserId == null ? null : String.valueOf(asyncUserId)));
 
         applyUsage(logEntity, usage, model);
         aiModelCallLogMapper.insert(logEntity);

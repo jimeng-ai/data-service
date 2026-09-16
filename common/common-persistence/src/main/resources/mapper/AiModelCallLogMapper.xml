@@ -123,6 +123,22 @@
         LIMIT #{limit}
     </select>
 
+    <select id="selectTopUsers" resultType="java.util.Map">
+        SELECT
+            user_id                           AS userId,
+            COUNT(*)                          AS calls,
+            COALESCE(SUM(total_tokens), 0)    AS tokens,
+            COALESCE(SUM(cost_usd), 0)        AS costUsd
+        FROM ai_model_call_log
+        WHERE deleted = 0
+          AND tenant_id = #{tenantId}
+          AND create_time &gt;= #{start}
+          AND create_time &lt; #{end}
+        GROUP BY user_id
+        ORDER BY costUsd DESC
+        LIMIT #{limit}
+    </select>
+
     <select id="selectRecentCalls" resultMap="BaseResultMap">
         SELECT <include refid="Base_Column_List"/>
         FROM ai_model_call_log
