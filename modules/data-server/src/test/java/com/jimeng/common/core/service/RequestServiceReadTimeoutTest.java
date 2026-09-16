@@ -34,7 +34,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@link RequestService#post(String, Map, Map, Map, Duration)}：单次读超时只作用于这一次调用。
+ * {@link RequestService#post(String, Map, Map, Map, Duration)} 与 {@link RequestService#get(String, Map, Map, Duration)}：
+ * 单次读超时只作用于这一次调用。
+ *
+ * <p>get 的重载是给语义层 agent 生成探测沙箱边车 healthz / capabilities 用的：探测跑在建连请求线程上，
+ * 不能沿用全局读超时（dev 180 秒）白等。它与 post 共用同一段派生客户端的代码，这里对 get 补一组同样的断言，
+ * 防止两边哪天又各写各的。
  *
  * <p>common-core 没有测试目录，放在 data-server 里测（与 {@code TenantContextTest} 同样的做法）。
  * 上游是本机回环上的假服务：「沉默上游」只收连接、永远不回响应头，模拟非流式 LLM 还在生成；
@@ -278,5 +283,59 @@ class RequestServiceReadTimeoutTest {
         assertEquals(200, rs.post(UNREACHABLE, Map.of(), Map.of(), Map.of(), null).getStatusCode());
         assertEquals(0, probe.callTimeoutMs.get(), "readTimeout=null 被加上了整通调用上限");
         assertEquals(60_000, probe.readTimeoutMs.get());
+    }
+
+    // ================================================================ get(..., Duration)：探活用的单次超时
+
+    @Test
+    @DisplayName("★ get 单次读超时生效：共享客户端 60 秒，探活给 300 毫秒，就按 300 毫秒超时")
+    void get单次读超时生效() throws IOException {
+        RequestService rs = new RequestService(shared(60_000));
+        String url = silentUpstream();
+
+        long t0 = System.nanoTime();
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> rs.get(url, Map.of(), null, Duration.ofMillis(300)));
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+
+        assertInstanceOf(SocketTimeoutException.class, ex.getCause(), "期望读超时，实际：" + ex.getCause());
+        assertTrue(ms < 10_000, "单次超时没生效，等了 " + ms + " 毫秒");
+    }
+
+    @Test
+    @DisplayName("get 给了单次读超时就同时设上 callTimeout = 读超时 + 余量；3 参与 null 不设、沿用共享值")
+    void get单次超时与三参零变化() {
+        TimeoutProbe probe = new TimeoutProbe();
+        OkHttpClient shared = shared(60_000).newBuilder().addInterceptor(probe).build();
+        RequestService rs = new RequestService(shared);
+
+        assertEquals(200, rs.get(UNREACHABLE, Map.of(), null, Duration.ofMillis(2000)).getStatusCode(),
+                "探针没拦住，请求走到了真实网络");
+        assertEquals(2000, probe.readTimeoutMs.get());
+        assertEquals(Duration.ofMillis(2000).plus(RequestService.CALL_TIMEOUT_GRACE).toMillis(), probe.callTimeoutMs.get());
+
+        probe.reset();
+        assertEquals(200, rs.get(UNREACHABLE, Map.of(), null).getStatusCode());
+        assertEquals(0, probe.callTimeoutMs.get(), "3 参版本被加上了整通调用上限");
+        assertEquals(60_000, probe.readTimeoutMs.get());
+
+        probe.reset();
+        assertEquals(200, rs.get(UNREACHABLE, Map.of(), null, null).getStatusCode());
+        assertEquals(0, probe.callTimeoutMs.get(), "readTimeout=null 被加上了整通调用上限");
+        assertEquals(60_000, probe.readTimeoutMs.get());
+
+        assertEquals(60_000, shared.readTimeoutMillis(), "共享客户端被改了");
+        assertEquals(0, shared.callTimeoutMillis(), "共享客户端被改了");
+    }
+
+    @Test
+    @DisplayName("get 非正数超时直接拒绝，与 post 同一条规则")
+    void get非正数拒绝() {
+        RequestService rs = new RequestService(shared(1000));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> rs.get("http://127.0.0.1:1/x", Map.of(), null, Duration.ZERO));
+        assertThrows(IllegalArgumentException.class,
+                () -> rs.get("http://127.0.0.1:1/x", Map.of(), null, Duration.ofSeconds(-1)));
     }
 }

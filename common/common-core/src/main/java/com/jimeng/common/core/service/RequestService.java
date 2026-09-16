@@ -10,6 +10,7 @@ import okhttp3.sse.EventSourceListener;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 
@@ -61,10 +62,7 @@ public class RequestService {
      */
     public HttpResp post(String url, Map<String, String> header, Map<String, Object> params, Map<String, Object> body,
                          Duration readTimeout) {
-        if (readTimeout != null && (readTimeout.isNegative() || readTimeout.isZero())) {
-            // OkHttp 里 0 表示「不限时」，负数直接抛——两者都不是调用方想要的「给这一次单独一个上限」。
-            throw new IllegalArgumentException("readTimeout 必须为正数，实际=" + readTimeout);
-        }
+        OkHttpClient client = clientFor(readTimeout);
         MediaType mediaType = MediaType.parse("application/json");
         String bodyStr = JSONUtil.toJsonStr(body);
         String paramsStr = JSONUtil.toJsonStr(params);
@@ -76,12 +74,6 @@ public class RequestService {
                 .method("POST", requestBody);
         addHeaders(post, header);
         Request request = post.build();
-        OkHttpClient client = readTimeout == null
-                ? okHttpClient
-                : okHttpClient.newBuilder()
-                        .readTimeout(readTimeout)
-                        .callTimeout(readTimeout.plus(CALL_TIMEOUT_GRACE))
-                        .build();
         try (Response response = client.newCall(request).execute()) {
             String respBody = response.body() == null ? null : response.body().string();
             log.info("发送http:{} -> 请求体：{}  请求参数：{} 响应码：{}", requestUrl, bodyStr, paramsStr, response.code());
@@ -92,12 +84,29 @@ public class RequestService {
     }
 
     public HttpResp get(String url, Map<String, String> header, Map<String, Object> params) {
+        return get(url, header, params, null);
+    }
+
+    /**
+     * 同 {@link #get(String, Map, Map)}，但可以给<b>这一次</b>调用单独指定读超时；派生客户端与 callTimeout 的规则
+     * 与 {@link #post(String, Map, Map, Map, Duration)} 完全相同（同一个 {@link #clientFor(Duration)}）。
+     *
+     * <h3>为什么要有它</h3>
+     * 语义层生成的选择器要在<b>建连 / 点「重新生成」的请求线程上</b>探一次沙箱边车的 {@code /healthz} 与
+     * {@code /sandbox/capabilities}。3 参版本用的是共享客户端的全局读超时（dev Nacos {@code okhttp.read-timeout}
+     * 是 180 秒）：边车若只收连接不回话，这次建连请求就要白等三分钟。探活要的是「2 秒内答不上来就当不可用」，
+     * 所以超时按调用给，与 post 的理由一样，不动全局。
+     *
+     * @param readTimeout 为 null 时与 3 参版本行为完全一致；非 null 必须为正数
+     */
+    public HttpResp get(String url, Map<String, String> header, Map<String, Object> params, Duration readTimeout) {
+        OkHttpClient client = clientFor(readTimeout);
         String requestUrl = buildUrl(url, params);
         Request.Builder get = new Request.Builder()
                 .url(requestUrl);
         addHeaders(get, header);
         Request request = get.build();
-        try (Response response = okHttpClient.newCall(request).execute()) {
+        try (Response response = client.newCall(request).execute()) {
             String respBody = response.body() == null ? null : response.body().string();
             log.info("发送http:{} -> 请求参数：{} 响应码：{}", requestUrl, JSONUtil.toJsonStr(params), response.code());
             return new HttpResp(response.code(), respBody);
@@ -112,18 +121,48 @@ public class RequestService {
      * <p>返回句柄供编排层在「用户点停止 / 取消」时 {@link EventSource#cancel()} 真正中断上游
      * LLM 调用（对话）或关闭到沙箱边车的上游请求（沙箱据此 docker-kill）。历史调用方忽略返回值即可，
      * 行为不变。
+     *
+     * <h3>★ 日志只打 url 与请求体字节数，绝不打请求体</h3>
+     * 这里的两类调用方，请求体里都带着密钥：派发沙箱边车（{@code SidecarClient.run}）的 payload 里有
+     * {@code llm.authToken}（真实计费的模型 key）、{@code ragContext.accessToken} 与 {@code semanticContext.accessToken}
+     * （能以用户身份回调网关的 JWT）、{@code connections[].token}（客户外部系统凭据）；对话出口
+     * （{@code AiConversationLoop}）的请求体是用户的完整对话。此前这里以 INFO 打整个请求体，data-server 的日志又经
+     * Filebeat 进 ES，等于把这些密钥与对话原文搬进了 Kibana。要排查「发了什么」，由调用方自己记非敏感的标识
+     * （如 {@code SidecarClient.run} 记 runId 与 runProfile），不要在这里加回请求体，也不要改成 DEBUG 级——
+     * 级别是配置，一次临时调低就又漏出去了。
      */
     public EventSource postStream(String url, Map<String, String> header, String requestBody, EventSourceListener eventSourceListener) {
-        log.info("发送流式http请求: {} -> {}", url, requestBody);
         final Request.Builder requestBuilder = new Request.Builder();
         requestBuilder.url(url);
         if (header != null && header.size() > 0) {
             header.forEach(requestBuilder::header);
         }
+        // 字节数按 UTF-8 算：application/json 没声明 charset 时 OkHttp 正是按 UTF-8 编码请求体（并补上 charset=utf-8）。
+        // 不用 RequestBody.contentLength()：它在 Java 侧声明了受检的 IOException。
+        log.info("发送流式http请求: {} -> 请求体 {} 字节", url, requestBody.getBytes(StandardCharsets.UTF_8).length);
         Request request = requestBuilder.post(RequestBody.create(MediaType.get("application/json"), requestBody)).build();
         RealEventSource realEventSource = new RealEventSource(request, eventSourceListener);
         realEventSource.connect(okHttpClient);
         return realEventSource;
+    }
+
+    /**
+     * 按「这一次」的读超时选客户端：null 用共享客户端本身；非 null 从共享客户端 {@code newBuilder} 派生，
+     * 共享连接池与 Dispatcher，只改读超时并补 callTimeout（= 读超时 + {@link #CALL_TIMEOUT_GRACE}）。理由见
+     * {@link #post(String, Map, Map, Map, Duration)}。
+     */
+    private OkHttpClient clientFor(Duration readTimeout) {
+        if (readTimeout == null) {
+            return okHttpClient;
+        }
+        if (readTimeout.isNegative() || readTimeout.isZero()) {
+            // OkHttp 里 0 表示「不限时」，负数直接抛——两者都不是调用方想要的「给这一次单独一个上限」。
+            throw new IllegalArgumentException("readTimeout 必须为正数，实际=" + readTimeout);
+        }
+        return okHttpClient.newBuilder()
+                .readTimeout(readTimeout)
+                .callTimeout(readTimeout.plus(CALL_TIMEOUT_GRACE))
+                .build();
     }
 
     private String buildUrl(String url, Map<String, Object> params) {
