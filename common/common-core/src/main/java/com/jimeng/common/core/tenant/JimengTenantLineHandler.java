@@ -42,6 +42,10 @@ public class JimengTenantLineHandler implements TenantLineHandler {
             "connector_audit",
             "connector_pending_write",
             "connector_semantic",
+            // 语义层生成 agent 的批次 / 批次内每表 / 重新生成暂存：存的同样是客户的表名、列名和对它们的说明
+            "connector_semantic_generation",
+            "connector_semantic_generation_table",
+            "connector_semantic_staged",
             "skill_eval_run",
             "chat_conversation",
             "chat_message",

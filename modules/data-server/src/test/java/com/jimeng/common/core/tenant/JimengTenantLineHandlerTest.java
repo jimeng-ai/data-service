@@ -53,6 +53,12 @@ class JimengTenantLineHandlerTest {
         // 语义层：存的是客户的表名、字段名和业务口径，比自描述缓存更敏感——
         // 漏登记的后果不只是泄露，还会让 A 租户的口径注入到 B 租户的问数里，答案静默出错。
         assertFalse(handler.ignoreTable("connector_semantic"));
+        // 语义层生成 agent 的三张表：批次（进度与原因）、批次内每表（表名与退回原因）、重新生成暂存（整份新说明书）。
+        // 漏登记同样不报错：按 generation_id / connector_id 走 BaseMapper 的查询与 CAS 不带租户条件，
+        // 传错一个 id 就读到、甚至改到别的租户的批次和暂存行。
+        assertFalse(handler.ignoreTable("connector_semantic_generation"));
+        assertFalse(handler.ignoreTable("connector_semantic_generation_table"));
+        assertFalse(handler.ignoreTable("connector_semantic_staged"));
         assertFalse(handler.ignoreTable("knowledge_base"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));
