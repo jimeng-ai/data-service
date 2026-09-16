@@ -15,7 +15,6 @@ public class DashboardSummary {
     @Data
     public static class Assets {
         private Counts agents = new Counts();
-        private Counts plugins = new Counts();
         private SkillCounts skills = new SkillCounts();
         private KbCounts kb = new KbCounts();
     }

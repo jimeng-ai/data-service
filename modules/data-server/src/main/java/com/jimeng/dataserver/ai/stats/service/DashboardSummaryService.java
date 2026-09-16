@@ -8,7 +8,6 @@ import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.KbDocument;
 import com.jimeng.persistence.entity.KnowledgeBase;
-import com.jimeng.persistence.entity.Plugin;
 import com.jimeng.persistence.entity.SysRole;
 import com.jimeng.persistence.entity.SysUser;
 import com.jimeng.persistence.mapper.AgentMapper;
@@ -17,7 +16,6 @@ import com.jimeng.persistence.mapper.ChatConversationMapper;
 import com.jimeng.persistence.mapper.ChatMessageMapper;
 import com.jimeng.persistence.mapper.KbDocumentMapper;
 import com.jimeng.persistence.mapper.KnowledgeBaseMapper;
-import com.jimeng.persistence.mapper.PluginMapper;
 import com.jimeng.persistence.mapper.SysRoleMapper;
 import com.jimeng.persistence.mapper.SysUserMapper;
 import lombok.RequiredArgsConstructor;
@@ -31,7 +29,7 @@ import java.util.List;
 /**
  * 看板计数：资产 / 组织 / 互动量。
  *
- * <p>白名单表（agent / plugin / ai_skill / knowledge_base / chat_conversation / chat_message）
+ * <p>白名单表（agent / ai_skill / knowledge_base / chat_conversation / chat_message）
  * 由多租户拦截器自动按 tenant_id 过滤、并自动带 deleted=0；非白名单表（sys_user / sys_role）显式带 tenant_id；
  * kb_document 无 tenant_id，经本租户 kb_id 间接隔离。
  */
@@ -40,7 +38,6 @@ import java.util.List;
 public class DashboardSummaryService {
 
     private final AgentMapper agentMapper;
-    private final PluginMapper pluginMapper;
     private final AiSkillMapper aiSkillMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
     private final KbDocumentMapper kbDocumentMapper;
@@ -58,12 +55,6 @@ public class DashboardSummaryService {
         agents.setPublished(agentMapper.selectCount(new QueryWrapper<Agent>().eq("status", "PUBLISHED")));
         agents.setDraft(agentMapper.selectCount(new QueryWrapper<Agent>().eq("status", "DRAFT")));
         s.getAssets().setAgents(agents);
-
-        DashboardSummary.Counts plugins = new DashboardSummary.Counts();
-        plugins.setTotal(pluginMapper.selectCount(new QueryWrapper<>()));
-        plugins.setPublished(pluginMapper.selectCount(new QueryWrapper<Plugin>().eq("status", "PUBLISHED")));
-        plugins.setDraft(pluginMapper.selectCount(new QueryWrapper<Plugin>().eq("status", "DRAFT")));
-        s.getAssets().setPlugins(plugins);
 
         DashboardSummary.SkillCounts skills = new DashboardSummary.SkillCounts();
         skills.setTotal(aiSkillMapper.selectCount(new QueryWrapper<>()));
