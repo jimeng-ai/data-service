@@ -28,7 +28,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <b>就地跑在调用线程上</b>。对一个几秒钟的 SSE 流，那只是慢一次；对一个以<b>分钟</b>计的后台作业，
  * 那是把几十分钟直接加到某次 HTTP 请求的响应时间上——网关早就读超时了，而调用方看到的是
  * 「建连接超时」，没有任何线索指向真凶是一个后台剖析任务。
- * 长作业要自己的池、自己的队列，见 {@link #semanticStageExecutor()}。
+ * 长作业要自己的池、自己的队列，见 {@link #semanticStageExecutor()}、{@link #semanticGenerationExecutor()}。
  */
 @Configuration
 public class StreamExecutorConfig {
@@ -111,6 +111,49 @@ public class StreamExecutorConfig {
         // 关停时不等这半小时：阶段内部按 Thread.interrupted() 主动收手，已经落库的结论一条不丢
         //（每决完一条就写一条，见 ConnectorSemanticDeriveService 的 ProbeProgress 回调）。
         executor.setWaitForTasksToCompleteOnShutdown(false);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * 语义层 <b>agent 生成</b>的编排线程池：一条线程排空库里的 {@code QUEUED} 批次，逐片派发沙箱运行并等待。
+     *
+     * <h3>为什么上面三个池都不能用</h3>
+     * <ul>
+     *   <li>{@code streamExecutor}：{@code queueCapacity=0} + {@code CallerRunsPolicy}。池满时一次几十分钟的生成
+     *       会就地跑在建连的 HTTP 请求线程上；它最多 200 线程，也做不到「全平台同时只跑 1 个生成」。</li>
+     *   <li>{@code semanticStageExecutor}：只有 4 条线程，由采样验证与增量补写共用。一个生成长期占一个槽会饿死它们，
+     *       同样做不到全局 1 个。</li>
+     *   <li>{@code runPumpExecutor}：续播泵专用，同样是 CallerRunsPolicy。</li>
+     * </ul>
+     *
+     * <h3>参数为什么这么选</h3>
+     * <ul>
+     *   <li><b>core = max = 1</b>：本进程内同时只有一个排空循环。跨副本的「全局 1 个」另由 Redis 租约与批次行的
+     *       {@code owner_token} CAS 保证，这里只管本进程。</li>
+     *   <li><b>队列 1</b>：<b>真正的队列在库里</b>（批次行 {@code status=QUEUED}）。push main 即部署，内存队列每次发版都清零，
+     *       所以这里只放一次「开始排空」的信号；排空循环自己会一直取到库里没有可跑的批次。</li>
+     *   <li><b>{@link ThreadPoolExecutor.AbortPolicy}</b>：满了就拒，<b>绝不就地跑</b>（那正是 CallerRunsPolicy 的坑）。
+     *       被拒不丢活——行还在库里；但派发方必须接住 {@code TaskRejectedException} 并把自己的「排空中」标志复位，
+     *       否则之后所有唤醒都会被当成重复信号合并掉，直到进程重启。</li>
+     *   <li><b>不等任务结束就关停</b>：关停时中断等待线程，编排器据此 cancel 在途的沙箱运行（边车 docker kill），
+     *       批次写 INTERRUPTED；写不成由孤儿批次兜底按心跳过期处理。等一片最长 20 分钟才关停，发版就卡住了。</li>
+     * </ul>
+     *
+     * <p>注入点的字段必须叫 {@code semanticGenerationExecutor}：容器里有多个 {@code ThreadPoolTaskExecutor}，
+     * 仓库里线程池的注入点一律靠字段名（构造参数名）消歧，不用 {@code @Qualifier}。
+     */
+    @Bean("semanticGenerationExecutor")
+    public ThreadPoolTaskExecutor semanticGenerationExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(1);          // 真正的队列在库里（批次行 QUEUED），这里只放一次「开始排空」的信号
+        executor.setKeepAliveSeconds(300);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setThreadNamePrefix("semantic-gen-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(false);   // 关停时中断等待线程，走 cancel 路径
         executor.initialize();
         return executor;
     }

@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.runtime;
 
 import lombok.Data;
+import lombok.ToString;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -276,6 +277,144 @@ public class ConnectorProperties {
          * 跨公网可能几十秒。它加上一次贴着上限的模型调用，就可能越过 30 分钟认领。默认 900 秒留有十几分钟余量。
          */
         private int modelTimeoutSeconds = 900;
+
+        /**
+         * agent 生成（{@code connector.semantic.agent.*}）：data-service 编排多次短沙箱运行、逐片逐表生成语义层。
+         * 与上面几项（单次推导）互相独立；总开关默认关，见 {@link SemanticAgent#enabled}。
+         */
+        private SemanticAgent agent = new SemanticAgent();
+    }
+
+    /**
+     * 语义层 agent 生成的参数（Nacos {@code data-server.yml} 的 {@code connector.semantic.agent.*}）。
+     *
+     * <p>放在顶层而不是嵌进 {@link Semantic}，与这个类其它分组的写法一致；宽松绑定照样把
+     * {@code connector.semantic.agent.llm.base-url} 映射进来。
+     *
+     * <h3>这里只给默认值，不夹紧</h3>
+     * 越界值由<b>使用方</b>在每片派发前读实时值时夹紧并打 WARN（写法同 {@code ConnectorSemanticDeriveService.modelTimeout}）。
+     * 下面注释里写的区间就是使用方的夹紧区间。建批次时落库的 {@code config_json} 只作留痕，不参与任何判定——
+     * 人调大某个上限后点「重新生成」，续跑批次立即按新值执行。
+     *
+     * <h3>沙箱地址与 service token 不在这里</h3>
+     * 复用 {@code agent.sandbox.base-url} 与 {@code agent.sandbox.service-token}（{@code AgentSandboxProperties}），
+     * 不重复定义。<b>LLM 却刻意不复用</b> {@code agent.sandbox.llm.*}：那是全局对话 agent 的模型（Claude 系），
+     * 语义层必须用 {@code deepseek-flash}，见 {@link SemanticAgentLlm}。
+     */
+    @Data
+    public static class SemanticAgent {
+        /**
+         * 总开关，默认<b>关</b>。关闭时建连与「重新生成」一律走现有单次推导，不建批次行。
+         *
+         * <p>默认关的理由就是本类开头那条纪律的另一面：push main 即部署生产，代码合入那一刻行为必须与现状一致，
+         * 在 Nacos 打开才生效。关闭时正在跑的批次在片边界停下（转 INTERRUPTED），不会半片中断。
+         */
+        private boolean enabled = false;
+
+        /**
+         * 按运行下发给沙箱的回调根地址，含 {@code /data}：dev {@code http://localhost:10011/data}；
+         * 生产推断为 {@code http://localhost:20011/data}（未核实）。
+         *
+         * <p><b>故意没有默认值，留空即 agent 路径不可用</b>（前置条件不通过、走单次推导并写原因）。
+         * 沙箱 :8088 是单进程、dev 与生产可能共用，回调地址一旦给了默认值，某个平面漏配就会把运行回调到另一个平面的网关。
+         * 沙箱的 MCP 工具跑在宿主进程里，所以这里填回环地址，不经 egress。
+         */
+        private String callbackBaseUrl = "";
+
+        /** agent 专用模型四件套，见 {@link SemanticAgentLlm}。 */
+        private SemanticAgentLlm llm = new SemanticAgentLlm();
+
+        /** 每片最多几张表。夹紧 [1, 20]。上限 20 是已确认决策（方案 A）的硬约束，不是调优项。 */
+        private int sliceMaxTables = 20;
+
+        /**
+         * 每片元数据渲染文本的字符上限。夹紧 [4000, 40000]。上限同样来自已确认决策：
+         * 一片发给模型的结构文本不超过 40000 字符。单表超过它时独占一片。
+         */
+        private int sliceMaxChars = 40000;
+
+        /**
+         * 单片墙钟（秒），夹紧 [120, 1200]。边车不夹紧 payload 里的 limits，到点直接 docker kill、不能续，
+         * 已提交的表已经落库，没提交的回到待派发。900 是按「一片 20 张表约 6 分钟」留约 2.5 倍余量的推断值，
+         * 端到端实跑后校准。本片回调 token 的有效期 = 本值 + 120 秒。
+         */
+        private int sliceWallClockSec = 900;
+
+        /** 单片 maxTurns = min(120, 20 + 本片表数 × 本值)。夹紧 [2, 6]。轮次到顶是静默截断：给多了没代价，给少了白跑一片。 */
+        private int sliceMaxTurnsPerTable = 3;
+
+        /**
+         * 传给 CLI 的 maxBudgetUsd，只要求<b>不误杀</b>，不是成本闸。须大于 0。
+         * CLI 用内置价目表估费，对 deepseek-flash 怎么计价未核实；真正的成本闸是 {@link #maxTokensPerTable}。
+         */
+        private double sliceMaxBudgetUsd = 50;
+
+        /** 连续无进展的片数上限，到了就降级或中断。夹紧 [1, 10]。 */
+        private int sliceMaxRetries = 3;
+
+        /** 同一片连续繁忙（边车 503 带 Retry-After、或还没收到事件就断）的重派上限。夹紧 [1, 20]。 */
+        private int busyMaxRetries = 6;
+
+        /**
+         * 退避基数（秒），第 k 次等 min(本值 × 2^(k-1), 300) 秒。夹紧 [1, 300]。
+         * 沙箱的 3 个准入槽与用户对话共用，退避也是在给用户对话让路。
+         */
+        private int retryBackoffSec = 15;
+
+        /** 单表被退回的提交次数上限，到了就放弃这张表。夹紧 [1, 10]。 */
+        private int tableMaxSubmits = 3;
+
+        /** 单表被派发却没提交的次数上限，到了就放弃这张表。夹紧 [1, 10]。 */
+        private int tableMaxDispatches = 3;
+
+        /**
+         * 成本闸：本轮 token 上限 = 批次表数 × 本值（本轮用量不计 cache_read，续跑重新计额）。
+         * {@code <= 0} 按默认值处理，<b>不允许关闭</b>——CLI 侧的预算闸对 DeepSeek 不可观测，这是唯一的费用上限。
+         * 300000 是推断值，待校准。
+         */
+        private long maxTokensPerTable = 300000L;
+
+        /**
+         * 重新生成（STAGED）收尾时放弃表比例的上限，夹紧 [0, 1]。
+         *
+         * <p><b>默认 0 = 有任何放弃表就不替换</b>，批次转中断、暂存保留，与已确认决策「新一轮全部覆盖完才替换旧的机器生成行」
+         * 原文一致（用户已确认取 0）。调大是对这条决策的放宽，必须先经用户确认，不是运维可以自行调的旋钮。
+         */
+        private double maxGaveUpRatio = 0.0;
+
+        /**
+         * 沙箱 healthz 与 capabilities 探测的单次超时（毫秒），夹紧 [200, 10000]。
+         * 探测跑在建连 / 点「重新生成」的请求线程上，这是那次请求可接受的最坏附加延迟。
+         */
+        private int healthTimeoutMs = 2000;
+    }
+
+    /**
+     * agent 专用模型（{@code connector.semantic.agent.llm.*}），按运行下发给沙箱，不动沙箱的全局 LLM 配置。
+     *
+     * <h3>★ model 不得是 Claude 系名字</h3>
+     * 实测：把 {@code claude-opus-4-7} 发给 DeepSeek 的 anthropic 兼容端点，实际跑的是 {@code deepseek-v4-pro}、
+     * <b>按 Pro 计费且不报错</b>。所以使用方把「转小写后含 claude / opus / sonnet / haiku」视为未配置、不走 agent。
+     */
+    @Data
+    public static class SemanticAgentLlm {
+        /** 如 {@code https://api.deepseek.com/anthropic}。留空即 agent 路径不可用。 */
+        private String baseUrl = "";
+
+        /**
+         * DeepSeek key，真实计费。留空即 agent 路径不可用。可以在 Nacos 里写占位符引用已有的
+         * {@code providers.deepseek.api-key}，避免同一把 key 两处各配一份（占位符能否解析未实测，启动后确认非空）。
+         *
+         * <p>{@link ToString.Exclude}：{@code @Data} 的 toString 会把整个配置对象打进日志。
+         */
+        @ToString.Exclude
+        private String authToken = "";
+
+        /** 必须显式给出；默认 {@code deepseek-flash}。 */
+        private String model = "deepseek-flash";
+
+        /** 边车的鉴权方案：{@code api-key}（容器变量 ANTHROPIC_API_KEY）或 {@code bearer}。实测 DeepSeek 两种都认。 */
+        private String authScheme = "api-key";
     }
 
     /**
