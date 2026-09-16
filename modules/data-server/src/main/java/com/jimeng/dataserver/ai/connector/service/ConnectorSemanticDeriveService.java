@@ -18,6 +18,7 @@ import com.jimeng.persistence.entity.ConnectorSchema;
 import com.jimeng.persistence.entity.ConnectorSemantic;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticMapper;
+import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.AssemblyReport;
 import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -46,6 +47,24 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.DETAIL_TEXT_MAX;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.GLOSS_MAX;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.NAME_MAX;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.answeredTerms;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.base;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.clip;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.dedupKey;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.fold;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.len;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.lookup;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.nz;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.parseFields;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.renderObject;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.str;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.strList;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.toJson;
+import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.toRows;
 
 /**
  * 语义层<b>推导</b>：拿已经快照下来的结构，叫一次模型，把产出落成语义行。
@@ -120,33 +139,8 @@ public class ConnectorSemanticDeriveService {
      */
     static final int SCHEMA_SNAPSHOT_CAP = 200;
 
-    /** gloss 列是 varchar(1000)。超了严格模式下报错、非严格模式下<b>静默截断</b>，两种都不能接受。 */
-    private static final int GLOSS_MAX = 1000;
-
-    /**
-     * {@code object_name} / {@code field_name} / {@code term} 三列都是 varchar(<b>191</b>)。
-     *
-     * <p>191 不是随手写的：这三列进 {@code uk_connector_semantic}，utf8mb4 每字符 4 字节，
-     * 按 255 建索引会超过 InnoDB 单索引 3072 字节的上限，<b>整张表建不出来</b>
-     * （mysql:8.0 实测 ERROR 1071）。改这个数之前先去读那条迁移里的注释。
-     *
-     * <p>这三列<b>只丢不截</b>：它们全都要拿去做<b>精确匹配</b>（表名/列名要对上快照才算得出锚点，
-     * 词条要对上才注入得了）。截短的名字一个都匹配不上，却长得和一条真的一模一样——
-     * 那是比少一条更糟的东西。
-     */
-    private static final int NAME_MAX = 191;
-
-    /**
-     * detail_json 里那些<b>模型自由发挥</b>的文本的上限。
-     *
-     * <p>detail_json 是 TEXT（64KB）。模型返回什么由不得我们，而超长写不进去的后果不是「少一行」：
-     * {@code replaceInferred} 是一个事务，插到一半报错就整批回滚、旧行已经删了——
-     * 和撞唯一键是同一个坑（见 {@link #dedupKey}）。所以进 detail 之前统一收口。
-     */
-    private static final int DETAIL_TEXT_MAX = 500;
-
-    /** 同上：typical_questions 这类数组也得有个头，不然 10 条变 1000 条一样能把 TEXT 撑爆。 */
-    private static final int DETAIL_LIST_MAX = 10;
+    // GLOSS_MAX / NAME_MAX / DETAIL_TEXT_MAX / DETAIL_LIST_MAX / CARDINALITIES 连同 toRows、parseFields、renderObject 与那批小工具
+    // 已原样迁到 SemanticRowAssembler（静态导入），本类只委托：语义层生成 agent 的逐表提交要走同一套过滤，两份实现迟早分叉。
 
     /** semantic_note 列是 varchar(512)，留点余量。 */
     private static final int NOTE_MAX = 500;
@@ -519,7 +513,7 @@ public class ConnectorSemanticDeriveService {
         // 「这份材料不完整」那一段变成噪音，而那一段恰恰是要模型当真的。
         List<String> notes = new ArrayList<>();
         List<String> gaps = new ArrayList<>();
-        Stats st = new Stats();
+        AssemblyReport st = new AssemblyReport();
         try {
             List<ConnectorSchema> rows = schemaService.currentRows(connectorId);
             Integer sourceTotal = null;
@@ -599,10 +593,10 @@ public class ConnectorSemanticDeriveService {
                 log.warn("语义层推导产出为空，已保留上一版 connectorId={}：{}", connectorId, refusal);
                 writeStatus(connectorId, SEM_FAILED, refusal, true, claimAt);
                 return DeriveResult.builder().ok(false)
-                        .droppedGuess(st.droppedGuess)
-                        .droppedUnknown(st.droppedUnknown)
-                        .droppedTooLong(st.droppedTooLong)
-                        .skippedAnswered(st.droppedAnswered)
+                        .droppedGuess(st.getDroppedGuess())
+                        .droppedUnknown(st.getDroppedUnknown())
+                        .droppedTooLong(st.getDroppedTooLong())
+                        .skippedAnswered(st.getDroppedAnswered())
                         .truncated(digest.includedObjects() < digest.totalObjects())
                         .note(refusal).build();
             }
@@ -627,18 +621,18 @@ public class ConnectorSemanticDeriveService {
 
             log.info("语义层推导完成 connectorId={} 写入 {} 行：表用途 {} / 字段 {} / 关系 {} / 待确认口径 {}；"
                             + "丢弃：无依据 {}、名字对不上 {}、重复 {}、超长 {}；已答过的口径跳过 {}",
-                    connectorId, n, st.objects, st.fields, st.joins, st.caveats,
-                    st.droppedGuess, st.droppedUnknown, st.droppedDup, st.droppedTooLong, st.droppedAnswered);
+                    connectorId, n, st.getObjects(), st.getFields(), st.getJoins(), st.getCaveats(),
+                    st.getDroppedGuess(), st.getDroppedUnknown(), st.getDroppedDup(), st.getDroppedTooLong(), st.getDroppedAnswered());
             return DeriveResult.builder()
                     .ok(true)
-                    .objectCount(st.objects)
-                    .fieldCount(st.fields)
-                    .joinCount(st.joins)
-                    .caveatCount(st.caveats)
-                    .droppedGuess(st.droppedGuess)
-                    .droppedUnknown(st.droppedUnknown)
-                    .droppedTooLong(st.droppedTooLong)
-                    .skippedAnswered(st.droppedAnswered)
+                    .objectCount(st.getObjects())
+                    .fieldCount(st.getFields())
+                    .joinCount(st.getJoins())
+                    .caveatCount(st.getCaveats())
+                    .droppedGuess(st.getDroppedGuess())
+                    .droppedUnknown(st.getDroppedUnknown())
+                    .droppedTooLong(st.getDroppedTooLong())
+                    .skippedAnswered(st.getDroppedAnswered())
                     .truncated(digest.includedObjects() < digest.totalObjects())
                     .note(note)
                     .build();
@@ -1242,7 +1236,7 @@ public class ConnectorSemanticDeriveService {
                     digest.includedObjects(), targets.size(), digest.text().length() + ctx.text().length());
             Map<String, Object> parsed = parseJson(raw, notes);
 
-            Stats st = new Stats();
+            AssemblyReport st = new AssemblyReport();
             // 写库之前的已有行：既用来挑掉人答过的口径，也用来算「这批真的多出了哪些行」（决定验证派给谁）。
             List<ConnectorSemantic> existing = existingRows(connectorId);
             List<ConnectorSemantic> fresh = toRows(parsed, fieldsByObject, answeredTerms(existing), st, List.of());
@@ -1287,8 +1281,8 @@ public class ConnectorSemanticDeriveService {
             int[] c = countByScope(scoped);
             return new AddedOutcome(DeriveResult.builder().ok(true)
                     .objectCount(c[0]).fieldCount(c[1]).joinCount(c[2]).caveatCount(c[3])
-                    .droppedGuess(st.droppedGuess).droppedUnknown(st.droppedUnknown)
-                    .droppedTooLong(st.droppedTooLong).skippedAnswered(st.droppedAnswered)
+                    .droppedGuess(st.getDroppedGuess()).droppedUnknown(st.getDroppedUnknown())
+                    .droppedTooLong(st.getDroppedTooLong()).skippedAnswered(st.getDroppedAnswered())
                     .truncated(digest.includedObjects() < targets.size())
                     .note(note).build(), false, sent);
         } catch (Exception e) {
@@ -1454,7 +1448,7 @@ public class ConnectorSemanticDeriveService {
      * @param added 其中报过 ADDED 的表数；其余是一直在库里、此前没有说明书的
      */
     private static String addedSummary(int included, int total, int added, List<ConnectorSemantic> scoped,
-                                       ConnectorSemanticService.UpsertResult w, Stats st, int outOfScope,
+                                       ConnectorSemanticService.UpsertResult w, AssemblyReport st, int outOfScope,
                                        List<String> notes) {
         int[] c = countByScope(scoped);
         int uncovered = Math.max(0, total - added);
@@ -1481,9 +1475,9 @@ public class ConnectorSemanticDeriveService {
         if (w.conflicts() > 0) {
             b.append("、撞键跳过 ").append(w.conflicts()).append(" 条");
         }
-        if (st.droppedGuess > 0 || st.droppedUnknown > 0 || outOfScope > 0) {
-            b.append("；已丢弃：无外部依据 ").append(st.droppedGuess).append("、名字对不上结构 ")
-                    .append(st.droppedUnknown).append("、超出本次范围 ").append(outOfScope);
+        if (st.getDroppedGuess() > 0 || st.getDroppedUnknown() > 0 || outOfScope > 0) {
+            b.append("；已丢弃：无外部依据 ").append(st.getDroppedGuess()).append("、名字对不上结构 ")
+                    .append(st.getDroppedUnknown()).append("、超出本次范围 ").append(outOfScope);
         }
         for (String n : notes) {
             b.append("；").append(n);
@@ -1719,46 +1713,6 @@ public class ConnectorSemanticDeriveService {
 
     // ================================================================ 结构摘要
 
-    /** 从快照的 detail_json 里把字段还原成 {@link FieldDetail}——算锚点要用它，拼摘要也要用它。 */
-    @SuppressWarnings("unchecked")
-    private Map<String, Map<String, FieldDetail>> parseFields(List<ConnectorSchema> rows) {
-        Map<String, Map<String, FieldDetail>> out = new LinkedHashMap<>();
-        for (ConnectorSchema r : rows) {
-            Map<String, FieldDetail> cols = new LinkedHashMap<>();
-            out.put(r.getObjectName(), cols);
-            if (r.getDetailJson() == null || r.getDetailJson().isBlank()) {
-                continue;
-            }
-            try {
-                Map<String, Object> m = CommonUtil.getObjectMapper().readValue(r.getDetailJson(), Map.class);
-                Object f = m.get("fields");
-                if (!(f instanceof List<?> list)) {
-                    continue;
-                }
-                for (Object o : list) {
-                    if (!(o instanceof Map<?, ?> fm)) {
-                        continue;
-                    }
-                    Object name = fm.get("name");
-                    if (name == null) {
-                        continue;
-                    }
-                    // nullable 缺失时按「可空」处理：宁可让锚点多算一次不一致，也不要把一个未知说成 NOT NULL。
-                    cols.put(String.valueOf(name), new FieldDetail(
-                            String.valueOf(name),
-                            asString(fm.get("type")),
-                            !Boolean.FALSE.equals(fm.get("nullable")),
-                            asString(fm.get("comment")),
-                            asString(fm.get("extra"))));
-                }
-            } catch (Exception e) {
-                // 单张表的快照 JSON 坏了不该让整次推导失败：这张表没字段可推，其余的照推。
-                log.warn("解析结构快照失败，本次跳过该对象的字段 objectName={}", r.getObjectName(), e);
-            }
-        }
-        return out;
-    }
-
     /**
      * 拼摘要。<b>截断按整张表，绝不截半张表。</b>
      *
@@ -1805,33 +1759,6 @@ public class ConnectorSemanticDeriveService {
         }
         int total = rows.size() + Math.max(0, beyondSnapshot);
         return new Digest(sb.toString(), included, total, beyondIsLowerBound && beyondSnapshot > 0, notes);
-    }
-
-    /**
-     * 一张表一段。列注释为空时照样留出那一格——「客户没写注释」本身就是模型要知道的事实
-     * （没有 COMMENT 这一档依据可用），不能让它看起来像是我们没给。
-     */
-    private String renderObject(ConnectorSchema r, Map<String, FieldDetail> cols) {
-        StringBuilder b = new StringBuilder();
-        b.append("## ").append(r.getObjectName())
-                .append(" [").append(r.getObjectType() == null ? "TABLE" : r.getObjectType()).append("] ")
-                .append(blank(r.getObjectComment()) ? "(无表注释)" : r.getObjectComment())
-                .append('\n');
-        if (cols == null || cols.isEmpty()) {
-            // 账号权限只到部分表时，ConnectorSchemaService 会存一条只有名字的行。
-            // 如实说出来，别让模型把「没取到」读成「这是张空表」。
-            b.append("(本表字段未取到，不要为它写字段或关系)\n");
-        } else {
-            for (FieldDetail f : cols.values()) {
-                b.append(f.name()).append('|')
-                        .append(nz(f.type())).append('|')
-                        .append(f.nullable() ? "NULL" : "NOT NULL").append('|')
-                        .append(nz(f.comment())).append('|')
-                        .append(nz(f.extra())).append('\n');
-            }
-        }
-        b.append('\n');
-        return b.toString();
     }
 
     // ================================================================ 模型调用
@@ -2021,308 +1948,6 @@ public class ConnectorSemanticDeriveService {
         return b.toString();
     }
 
-    // ================================================================ 落成语义行
-
-    /**
-     * 把模型产出摊成 {@link ConnectorSemantic} 行。<b>三道过滤，一道都不能省：</b>
-     * <ol>
-     *   <li><b>GUESS 直接丢</b>——没有外部依据的断言不该进说明书。分界线是「有没有依据」，
-     *       不是「模型说它确不确定」。</li>
-     *   <li><b>名字对不上快照的丢</b>——模型发明出来的表/列既算不出锚点，本身也就是幻觉。</li>
-     *   <li><b>撞唯一键的丢</b>——{@code uk_connector_semantic} 是
-     *       (租户,连接,scope,表,字段,词条)。JOIN 行的键里只有左侧列，同一列指向两张表就会撞；
-     *       撞了不是报一条错，而是 {@code replaceInferred} 那个事务整个回滚、一行都写不进去。
-     *       所以必须在进库之前先合并掉。</li>
-     * </ol>
-     *
-     * @param answeredTerms 人已经在对话里答过的口径词条（折叠过大小写）。已经有答案的问题不再重提，
-     *                      理由见下面 ambiguities 那一段。
-     * @param corpusJoins   S1 从客户自己写的视图 / 存储过程里挖出来的关系，已经按快照对齐过大小写。
-     *                      它们和模型产出走<b>同一套去重</b>（否则一样会在 replaceInferred 里撞唯一键），
-     *                      但在撞键时<b>压过</b>模型那条，见 {@link #putCorpusJoin}。
-     */
-    private List<ConnectorSemantic> toRows(Map<String, Object> parsed,
-                                           Map<String, Map<String, FieldDetail>> fieldsByObject,
-                                           Set<String> answeredTerms,
-                                           Stats st,
-                                           List<ConnectorSemantic> corpusJoins) {
-        Map<String, ConnectorSemantic> byKey = new LinkedHashMap<>();
-
-        // ── OBJECT：不锚结构。connector_schema.content_hash 覆盖每一列，客户加一个无关列它就变，
-        //    而加一列并不改变「这张表是订单主表」这句话——锚上去等于给自己造一堆假 STALE。
-        for (Map<String, Object> o : arr(parsed, "objects")) {
-            String name = str(o, "name");
-            String gloss = str(o, "gloss");
-            if (name == null || gloss == null) {
-                continue;
-            }
-            if (!fieldsByObject.containsKey(name)) {
-                st.droppedUnknown++;
-                continue;
-            }
-            String ev = evidence(o, ConnectorSemanticService.EV_GUESS);
-            if (ConnectorSemanticService.EV_GUESS.equals(ev)) {
-                st.droppedGuess++;
-                continue;
-            }
-            Map<String, Object> detail = new LinkedHashMap<>();
-            // ★ 只认四个枚举值。认不出来的不写——落成 OTHER 等于替模型编了一个判断。
-            //   来源标 MODEL：这是模型看结构的推测；验证阶段会对疑似键值对表做数据测量。
-            TableShape.parse(str(o, "table_shape")).ifPresent(shape -> {
-                detail.put(TableShape.KEY_SHAPE, shape.name());
-                detail.put(TableShape.KEY_SOURCE, TableShape.SOURCE_MODEL);
-            });
-            detail.put("typical_questions", detailList(strList(o, "typical_questions")));
-
-            ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_OBJECT, name, "", "");
-            row.setGloss(clip(gloss, GLOSS_MAX));
-            row.setDetailJson(toJson(detail));
-            row.setEvidence(ev);
-            row.setConfidence(confidence(o));
-            row.setAnchorKind(ConnectorSemanticService.ANCHOR_NONE);
-            row.setAnchorHash(null);
-            put(byKey, row, st);
-        }
-
-        // ── FIELD：锚这一列自己的指纹，改别的列不影响它。
-        for (Map<String, Object> f : arr(parsed, "fields")) {
-            String obj = str(f, "object");
-            String col = str(f, "name");
-            String gloss = str(f, "gloss");
-            if (obj == null || col == null || gloss == null) {
-                continue;
-            }
-            FieldDetail fd = lookup(fieldsByObject, obj, col);
-            if (fd == null) {
-                st.droppedUnknown++;
-                continue;
-            }
-            String ev = evidence(f, ConnectorSemanticService.EV_GUESS);
-            if (ConnectorSemanticService.EV_GUESS.equals(ev)) {
-                st.droppedGuess++;
-                continue;
-            }
-            ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_FIELD, obj, col, "");
-            row.setGloss(clip(gloss, GLOSS_MAX));
-            row.setEvidence(ev);
-            row.setConfidence(confidence(f));
-            row.setAnchorKind(ConnectorSemanticService.ANCHOR_FIELD);
-            row.setAnchorHash(ConnectorSemanticService.fieldAnchor(fd));
-            put(byKey, row, st);
-        }
-
-        // ── JOIN：P1 <b>没有</b>采样验证（那是 P2），所以每一条都是未经验证的推测。
-        //    verified=NONE + basis 写死「未经数据验证」，注入层据此照实告诉模型，
-        //    而不是让它看到一条关系就当外键用。
-        for (Map<String, Object> j : arr(parsed, "joins")) {
-            String obj = str(j, "object");
-            String col = str(j, "column");
-            String toObj = str(j, "to_object");
-            String toCol = str(j, "to_column");
-            if (obj == null || col == null || toObj == null || toCol == null) {
-                continue;
-            }
-            FieldDetail left = lookup(fieldsByObject, obj, col);
-            FieldDetail right = lookup(fieldsByObject, toObj, toCol);
-            if (left == null || right == null) {
-                st.droppedUnknown++;
-                continue;
-            }
-            // 关系缺依据标签时默认按 NAME 处理，与 OBJECT/FIELD 的「缺标签即 GUESS」刻意不对称：
-            // 一条关系带着 verified=NONE 和「未经数据验证」的 basis 一起注入，读它的模型知道要自己核；
-            // 而一条字段含义是被当成事实读的，错了没有任何地方看得出来。
-            // 前者失手的代价有边界，后者没有——不对称的处置对应的是不对称的代价。
-            String ev = evidence(j, ConnectorSemanticService.EV_NAME);
-            if (ConnectorSemanticService.EV_GUESS.equals(ev)) {
-                st.droppedGuess++;
-                continue;
-            }
-            String card = str(j, "cardinality");
-            card = card == null ? null : card.toUpperCase(Locale.ROOT);
-            if (card != null && !CARDINALITIES.contains(card)) {
-                card = null;
-            }
-            String note = clip(str(j, "note"), DETAIL_TEXT_MAX);
-
-            Map<String, Object> detail = new LinkedHashMap<>();
-            detail.put("to_object", toObj);
-            detail.put("to_column", toCol);
-            detail.put("cardinality", card);
-            detail.put("basis", "未经数据验证");
-            if (note != null) {
-                detail.put("note", note);
-            }
-
-            ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_JOIN, obj, col, "");
-            row.setGloss(clip("关联 " + toObj + "." + toCol
-                    + (card == null ? "" : "（" + card + "）")
-                    + (note == null ? "" : "。" + note)
-                    + "。本条未经数据验证，join 前建议先看该列的取值分布。", GLOSS_MAX));
-            row.setDetailJson(toJson(detail));
-            row.setEvidence(ev);
-            row.setConfidence(confidence(j));
-            row.setAnchorKind(ConnectorSemanticService.ANCHOR_JOIN);
-            row.setAnchorHash(ConnectorSemanticService.joinAnchor(left, right));
-            row.setVerified(ConnectorSemanticService.V_NONE);
-            put(byKey, row, st);
-        }
-
-        // ── S1：客户自己写的 SQL 里的关系。★ 放在模型的 joins 【之后】灌进来，
-        //    这样撞键时 putCorpusJoin 能看到模型那条并把它顶掉（顺序反过来就顶不掉了）。
-        for (ConnectorSemantic row : corpusJoins) {
-            putCorpusJoin(byKey, row, st);
-        }
-
-        // ── 歧义 → CAVEAT，<b>不是 METRIC</b>。METRIC 的含义是「已经澄清的口径」，只能由人在对话里
-        //    回答出来（{@code ConnectorSemanticService.defineMetric}）。把一个还没人回答的问题写成
-        //    METRIC，等于平台自己编了一条口径——这正是整套设计最不许发生的那件事。
-        for (Map<String, Object> c : arr(parsed, "ambiguities")) {
-            String term = str(c, "term");
-            String question = str(c, "question");
-            if (term == null || question == null) {
-                continue;
-            }
-            // ★ 人已经答过的口径不再作为「待确认」重提。否则 conn_catalog 会把【答案】和【同一个问题】
-            //   一起注入，模型只能二选一——那是我们自己制造的矛盾，而且是在「已经花过一次人力澄清」
-            //   之后制造的。注入层另有一道同样的抑制（那边归另一个人管），这里也拦一道：
-            //   重新推导不该把一个已经有答案的问题复活。
-            if (answeredTerms.contains(fold(term))) {
-                st.droppedAnswered++;
-                continue;
-            }
-            Map<String, Object> detail = new LinkedHashMap<>();
-            detail.put("applies_to", detailList(strList(c, "applies_to")));
-
-            // term 不截断：超长的整条丢（在 put 里），理由见 NAME_MAX。
-            ConnectorSemantic row = base(ConnectorSemanticService.SCOPE_CAVEAT, "", "", term);
-            row.setGloss(clip(question, GLOSS_MAX));
-            row.setDetailJson(toJson(detail));
-            // evidence 留空：歧义不是一条断言，它恰恰是「没有依据、必须问人」的那一类。
-            // 给它贴任何一个依据标签都是把话说反了。
-            row.setEvidence(null);
-            row.setAnchorKind(ConnectorSemanticService.ANCHOR_NONE);
-            put(byKey, row, st);
-        }
-
-        // 计数按实际留下来的行数来，而不是在循环里累加——去重会把已经计过的行换掉。
-        for (ConnectorSemantic r : byKey.values()) {
-            switch (r.getScope()) {
-                case ConnectorSemanticService.SCOPE_OBJECT -> st.objects++;
-                case ConnectorSemanticService.SCOPE_FIELD -> st.fields++;
-                case ConnectorSemanticService.SCOPE_JOIN -> st.joins++;
-                default -> st.caveats++;
-            }
-        }
-        return new ArrayList<>(byKey.values());
-    }
-
-    private ConnectorSemantic base(String scope, String objectName, String fieldName, String term) {
-        ConnectorSemantic row = new ConnectorSemantic();
-        row.setScope(scope);
-        // 这三列是 NOT NULL DEFAULT ''：写 null 会让它们在唯一键上「不参与去重」，务必给空串。
-        row.setObjectName(objectName);
-        row.setFieldName(fieldName);
-        row.setTerm(term);
-        row.setStatus(ConnectorSemanticService.ST_DRAFT);
-        row.setVerified(ConnectorSemanticService.V_NONE);
-        return row;
-    }
-
-    /** 按唯一键合并，撞了留 confidence 高的那条。两条都留不是多一行，是整批插入回滚、一行都不剩。 */
-    private void put(Map<String, ConnectorSemantic> byKey, ConnectorSemantic row, Stats st) {
-        if (tooLong(row, st)) {
-            return;
-        }
-        String key = dedupKey(row);
-        ConnectorSemantic old = byKey.get(key);
-        if (old == null) {
-            byKey.put(key, row);
-            return;
-        }
-        st.droppedDup++;
-        int a = old.getConfidence() == null ? -1 : old.getConfidence();
-        int b = row.getConfidence() == null ? -1 : row.getConfidence();
-        if (b > a) {
-            byKey.put(key, row);
-        }
-        log.debug("语义层推导产出撞唯一键，已合并 key={}", key);
-    }
-
-    /**
-     * S1 产出的关系行入表。与 {@link #put} 的唯一区别：撞键时<b>不比 confidence，直接顶掉</b>模型那条。
-     *
-     * <h3>为什么不能比 confidence</h3>
-     * 两边的 confidence 根本不是一把尺子。模型那个数是它<b>自己报的把握</b>（而且它对
-     * {@code cid → users.id} 这种名字像的关系报 90 是常态）；S1 那个数是
-     * <b>「这条 join 在客户自己写的 SQL 里出现过几处」</b>。拿两个不同量纲的数比大小，
-     * 结果是一条人真的写过的关系被一条模型猜出来的关系挤掉——而 JOIN 行的唯一键里只有左侧列
-     *（{@code (scope, 左表, 左列)}），同一列指向两张不同的表就会撞，所以这不是罕见情形。
-     *
-     * <p>判据回到那条老分界线：<b>有没有外部依据</b>。视图里的 {@code a.x = b.y} 是客户写在自己库里的
-     * 一句话（{@code EV_COMMENT}），模型的 {@code EV_NAME} 是「名字像」。前者压后者。
-     *
-     * <p>两条都来自语料时才比 confidence——那时两个数同量纲，比的是「几处见过它」。
-     */
-    private void putCorpusJoin(Map<String, ConnectorSemantic> byKey, ConnectorSemantic row, Stats st) {
-        if (tooLong(row, st)) {
-            return;
-        }
-        String key = dedupKey(row);
-        ConnectorSemantic old = byKey.get(key);
-        if (old == null) {
-            byKey.put(key, row);
-            return;
-        }
-        st.droppedDup++;
-        if (ConnectorSemanticService.EV_COMMENT.equals(old.getEvidence())) {
-            int a = old.getConfidence() == null ? -1 : old.getConfidence();
-            int b = row.getConfidence() == null ? -1 : row.getConfidence();
-            if (b > a) {
-                byKey.put(key, row);
-            }
-            return;
-        }
-        log.debug("语料关系顶掉了模型推测的同键关系 key={}", key);
-        byKey.put(key, row);
-    }
-
-    /**
-     * ★ 去重键<b>必须按唯一键的排序规则折叠大小写</b>。
-     *
-     * <p>{@code uk_connector_semantic} 落在 utf8mb4_unicode_ci 上，{@code ord_id} 和 {@code ORD_ID}
-     * 在库里<b>是同一个键</b>（mysql:8.0 实测：{@code ERROR 1062 Duplicate entry
-     * 't1-100-JOIN-t_ord_dtl-ORD_ID-'}），而模型完全可能一条写小写、一条写大写。
-     * 用大小写敏感的键去重，这两条会双双通过这道闸，然后在 {@code replaceInferred} 里撞唯一键——
-     * 那是个 {@code @Transactional} 方法，撞一次不是少一行，是<b>旧行已删、新行一条没插</b>，
-     * 整条连接的语义层当场清空。
-     *
-     * <p>折叠只用在<b>键</b>上；行里存的仍然是模型原样给的大小写，因为表名列名要和快照对得上。
-     * 尾随空格不用管：所有取值都在 {@link #str} 里 trim 过，而 utf8mb4_unicode_ci 是 PAD SPACE。
-     */
-    private static String dedupKey(ConnectorSemantic row) {
-        return fold(row.getScope()) + '/' + fold(row.getObjectName()) + '/'
-                + fold(row.getFieldName()) + '/' + fold(row.getTerm());
-    }
-
-    /**
-     * 三个键列超过 varchar(191) 的整行丢掉，<b>不截</b>。
-     *
-     * <p>它们全都要拿去做精确匹配：表名列名对不上快照就算不出锚点，词条对不上就永远注入不了。
-     * 一条被截短的行既起不了作用，看起来又和真的一模一样——比少一条糟得多。
-     * 落库那一侧同样不能指望：非严格模式下 MySQL 会<b>静默</b>截断，严格模式下整批插入报错回滚。
-     */
-    private static boolean tooLong(ConnectorSemantic row, Stats st) {
-        if (len(row.getObjectName()) > NAME_MAX || len(row.getFieldName()) > NAME_MAX
-                || len(row.getTerm()) > NAME_MAX) {
-            st.droppedTooLong++;
-            log.warn("语义层推导产出的键列超过 {} 字符，整条丢弃 scope={} object={} field={} term={}",
-                    NAME_MAX, row.getScope(), abbrev(row.getObjectName()),
-                    abbrev(row.getFieldName()), abbrev(row.getTerm()));
-            return true;
-        }
-        return false;
-    }
-
     // ================================================================ 状态与摘要
 
     /**
@@ -2458,22 +2083,6 @@ public class ConnectorSemanticDeriveService {
         }
     }
 
-    /** 人已经答过的口径词条（{@code METRIC} + {@code CONFIRMED}），折叠大小写后用于比对。 */
-    private static Set<String> answeredTerms(List<ConnectorSemantic> existing) {
-        Set<String> out = new HashSet<>();
-        if (existing == null) {
-            return out;
-        }
-        for (ConnectorSemantic r : existing) {
-            if (ConnectorSemanticService.SCOPE_METRIC.equals(r.getScope())
-                    && ConnectorSemanticService.ST_CONFIRMED.equals(r.getStatus())
-                    && r.getTerm() != null && !r.getTerm().isBlank()) {
-                out.add(fold(r.getTerm()));
-            }
-        }
-        return out;
-    }
-
     /**
      * ★ <b>拒绝用「什么都没有」去替换上一版说明书。</b>
      *
@@ -2486,7 +2095,7 @@ public class ConnectorSemanticDeriveService {
      */
     private String refuseEmptyReplace(Map<String, Object> parsed, List<ConnectorSemantic> fresh,
                                       List<ConnectorSemantic> corpusJoins,
-                                      List<ConnectorSemantic> existing, Stats st) {
+                                      List<ConnectorSemantic> existing, AssemblyReport st) {
         if (!hasAnyExpectedKey(parsed)) {
             return "模型返回里 objects / fields / joins / ambiguities 一个键都没有，"
                     + "本次不替换，上一版说明书原样保留";
@@ -2514,8 +2123,8 @@ public class ConnectorSemanticDeriveService {
         if (!hadInferred) {
             return null;
         }
-        return "本次模型一条语义都没能留下（无外部依据 " + st.droppedGuess + "、名字对不上结构 "
-                + st.droppedUnknown + "、超长 " + st.droppedTooLong + "）"
+        return "本次模型一条语义都没能留下（无外部依据 " + st.getDroppedGuess() + "、名字对不上结构 "
+                + st.getDroppedUnknown() + "、超长 " + st.getDroppedTooLong() + "）"
                 + (corpusJoins.isEmpty() ? "" : "，客户 SQL 语料里的 " + corpusJoins.size() + " 条关系也一并作废")
                 + "，为免抹掉上一版说明书，本次不替换";
     }
@@ -2533,24 +2142,24 @@ public class ConnectorSemanticDeriveService {
     }
 
     /** 管理台上那一行字。<b>丢了什么、漏了什么必须出现在里面</b>——只报成功数等于谎报覆盖面。 */
-    private String summarize(Stats st, Digest d, List<String> notes) {
+    private String summarize(AssemblyReport st, Digest d, List<String> notes) {
         StringBuilder b = new StringBuilder();
         // 总数是估出来的下界时写成 ">200"，不写成一个假的确数：这一行是给人读的，
         // 「覆盖 200/200」会被读成全覆盖，而事实是「至少还有一批表根本没进过快照」。
         String total = d.totalIsLowerBound() ? ">" + (d.totalObjects() - 1) : String.valueOf(d.totalObjects());
         b.append("覆盖 ").append(d.includedObjects()).append('/').append(total).append(" 个对象：")
-                .append("表用途 ").append(st.objects)
-                .append("、字段含义 ").append(st.fields)
-                .append("、关系 ").append(st.joins).append("（均未经数据验证）")
-                .append("、待确认口径 ").append(st.caveats).append(" 条。");
-        if (st.droppedGuess > 0 || st.droppedUnknown > 0 || st.droppedDup > 0 || st.droppedTooLong > 0) {
-            b.append("已丢弃：无外部依据 ").append(st.droppedGuess)
-                    .append("、名字对不上结构 ").append(st.droppedUnknown)
-                    .append("、重复 ").append(st.droppedDup)
-                    .append("、超长 ").append(st.droppedTooLong).append(" 条。");
+                .append("表用途 ").append(st.getObjects())
+                .append("、字段含义 ").append(st.getFields())
+                .append("、关系 ").append(st.getJoins()).append("（均未经数据验证）")
+                .append("、待确认口径 ").append(st.getCaveats()).append(" 条。");
+        if (st.getDroppedGuess() > 0 || st.getDroppedUnknown() > 0 || st.getDroppedDup() > 0 || st.getDroppedTooLong() > 0) {
+            b.append("已丢弃：无外部依据 ").append(st.getDroppedGuess())
+                    .append("、名字对不上结构 ").append(st.getDroppedUnknown())
+                    .append("、重复 ").append(st.getDroppedDup())
+                    .append("、超长 ").append(st.getDroppedTooLong()).append(" 条。");
         }
-        if (st.droppedAnswered > 0) {
-            b.append("另有 ").append(st.droppedAnswered).append(" 条口径人已经答过，不再重复提问。");
+        if (st.getDroppedAnswered() > 0) {
+            b.append("另有 ").append(st.getDroppedAnswered()).append(" 条口径人已经答过，不再重复提问。");
         }
         for (String n : notes) {
             b.append(n).append("。");
@@ -4102,7 +3711,7 @@ public class ConnectorSemanticDeriveService {
     }
 
     /**
-     * 候选与结论的对照键。<b>折叠大小写</b>，与 {@link #dedupKey} 同一条理由：
+     * 候选与结论的对照键。<b>折叠大小写</b>，与 {@link SemanticRowAssembler#dedupKey} 同一条理由：
      * 这两头的名字一头来自语义行、一头来自验证器的回声，大小写敏感地比对会让一部分结论
      * <b>对不上任何一行</b>——表现是「验证跑完了，但一行都没改」。
      */
@@ -4160,95 +3769,6 @@ public class ConnectorSemanticDeriveService {
 
     // ================================================================ 小工具
 
-    private static FieldDetail lookup(Map<String, Map<String, FieldDetail>> byObject, String obj, String col) {
-        Map<String, FieldDetail> cols = byObject.get(obj);
-        return cols == null ? null : cols.get(col);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static List<Map<String, Object>> arr(Map<String, Object> m, String key) {
-        Object o = m == null ? null : m.get(key);
-        if (!(o instanceof List<?> list)) {
-            return List.of();
-        }
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (Object e : list) {
-            if (e instanceof Map<?, ?> em) {
-                out.add((Map<String, Object>) em);
-            }
-        }
-        return out;
-    }
-
-    private static String str(Map<String, Object> m, String key) {
-        Object o = m == null ? null : m.get(key);
-        if (o == null) {
-            return null;
-        }
-        String s = String.valueOf(o).trim();
-        return s.isEmpty() ? null : s;
-    }
-
-    private static List<String> strList(Map<String, Object> m, String key) {
-        Object o = m == null ? null : m.get(key);
-        if (!(o instanceof List<?> list)) {
-            return List.of();
-        }
-        List<String> out = new ArrayList<>();
-        for (Object e : list) {
-            if (e != null) {
-                out.add(String.valueOf(e));
-            }
-        }
-        return out;
-    }
-
-    /** 认不出来的依据标签一律当 GUESS。宁可少一条，也不要一条来路不明的。 */
-    private static String evidence(Map<String, Object> m, String whenMissing) {
-        String e = str(m, "evidence");
-        if (e == null) {
-            return whenMissing;
-        }
-        String up = e.toUpperCase(Locale.ROOT);
-        return switch (up) {
-            case ConnectorSemanticService.EV_COMMENT,
-                 ConnectorSemanticService.EV_DATA,
-                 ConnectorSemanticService.EV_NAME,
-                 ConnectorSemanticService.EV_GUESS -> up;
-            default -> ConnectorSemanticService.EV_GUESS;
-        };
-    }
-
-    /**
-     * 置信度归一到 0-100。模型有时给 0.8，有时给 80，两种都得认。
-     *
-     * <p>{@code <= 1} 一律当小数放大：「置信度 1 分」不是任何人会想表达的意思，
-     * 而把 0.8 存成 1，会让一条中等把握的断言在界面上看起来完全不可信。
-     */
-    private static Integer confidence(Map<String, Object> m) {
-        String raw = str(m, "confidence");
-        if (raw == null) {
-            return null;
-        }
-        double d;
-        try {
-            d = Double.parseDouble(raw);
-        } catch (NumberFormatException e) {
-            return null;
-        }
-        long v = d <= 1.0d ? Math.round(d * 100) : Math.round(d);
-        return (int) Math.max(0, Math.min(100, v));
-    }
-
-    private String toJson(Object o) {
-        try {
-            return CommonUtil.getObjectMapper().writeValueAsString(o);
-        } catch (Exception e) {
-            log.warn("序列化语义 detail 失败", e);
-            return null;
-        }
-    }
-
     /** 异常摘要带上类名：NPE 这类 message 为 null 的异常，否则在界面上只剩一个孤零零的 "null"。 */
     private static String describe(Throwable e) {
         if (e == null) {
@@ -4258,54 +3778,8 @@ public class ConnectorSemanticDeriveService {
         return e.getClass().getSimpleName() + (m == null || m.isBlank() ? "" : ": " + m);
     }
 
-    private static String clip(String s, int max) {
-        if (s == null) {
-            return null;
-        }
-        String t = s.trim();
-        return t.length() <= max ? t : t.substring(0, max - 1) + "…";
-    }
-
-    /** detail_json 里的数组：条数和每条长度都要收口，理由见 {@link #DETAIL_TEXT_MAX}。 */
-    private static List<String> detailList(List<String> in) {
-        if (in == null || in.isEmpty()) {
-            return List.of();
-        }
-        List<String> out = new ArrayList<>();
-        for (String s : in) {
-            if (out.size() >= DETAIL_LIST_MAX) {
-                break;
-            }
-            out.add(clip(s, DETAIL_TEXT_MAX));
-        }
-        return out;
-    }
-
-    /** 折叠大小写，用于按 utf8mb4_unicode_ci 的口径比对键与词条。 */
-    private static String fold(String s) {
-        return s == null ? "" : s.trim().toLowerCase(Locale.ROOT);
-    }
-
-    private static int len(String s) {
-        return s == null ? 0 : s.length();
-    }
-
-    /** 日志里带上超长值的头一截就够定位了，整段打出来只会把日志刷爆。 */
-    private static String abbrev(String s) {
-        return s == null ? "" : (s.length() <= 40 ? s : s.substring(0, 40) + "…(" + s.length() + ")");
-    }
-
     private static boolean blank(String s) {
         return s == null || s.isBlank();
-    }
-
-    /** 摘要是按行、按竖线分列的，列注释里真出现换行或竖线会把这个格式撑破，就地换掉。 */
-    private static String nz(String s) {
-        return s == null ? "" : s.replace('\n', ' ').replace('\r', ' ').replace('|', '/');
-    }
-
-    private static String asString(Object o) {
-        return o == null ? null : String.valueOf(o);
     }
 
     // ================================================================ 形状
@@ -4329,21 +3803,6 @@ public class ConnectorSemanticDeriveService {
      * @param failure      失败原因；null = 这次补拉成功了
      */
     private record Bootstrap(boolean applicable, Integer totalObjects, String failure) {
-    }
-
-    /** 过程计数器。纯内部可变状态，不序列化。 */
-    private static final class Stats {
-        int objects;
-        int fields;
-        int joins;
-        int caveats;
-        int droppedGuess;
-        int droppedUnknown;
-        int droppedDup;
-        /** 键列超过 varchar(191)，整条丢掉的条数。 */
-        int droppedTooLong;
-        /** 人已经答过、因此没有再提一遍的口径问题条数。 */
-        int droppedAnswered;
     }
 
     /**

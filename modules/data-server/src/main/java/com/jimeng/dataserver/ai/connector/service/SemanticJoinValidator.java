@@ -1310,9 +1310,11 @@ public class SemanticJoinValidator {
      * 剩下认不准的仍然宁可多标：多标的代价是一条关系进了「需要当心」那一栏；漏标的代价是一条静默出错数的 join。
      * 反过来<b>刻意不认</b>没有前缀的 {@code type + id}：那一对几乎每张表都有，全认等于全标。
      *
+     * <p>{@code public} 只是为了让语义层生成的一致性规则（{@code generation.consistency} 包，与这里的判定同源）跨包调用，行为不变。
+     *
      * @return 左表上判别列的原名；认不出为 {@code null}
      */
-    static String discriminatorFor(Map<String, FieldDetail> leftColumns, String fkColumn) {
+    public static String discriminatorFor(Map<String, FieldDetail> leftColumns, String fkColumn) {
         if (leftColumns == null || leftColumns.isEmpty() || fkColumn == null) {
             return null;
         }
@@ -1462,9 +1464,11 @@ public class SemanticJoinValidator {
      * <p>属于好几个组合键时取<b>列数最少</b>的（同样少时按传入顺序，即主键在前）——那是最容易满足的完整条件，
      * 与 {@code MySqlSession} 写在列 extra 上的那一句取法一致。
      *
+     * <p>{@code public} 理由同 {@link #discriminatorFor}：一致性规则要按同一个口径判组合键成员，不另写一份。
+     *
      * @param keys 这张表的唯一键；{@code null} = 不知道，此时<b>不</b>判成组合键
      */
-    static List<String> compositeKeyFor(List<List<String>> keys, String column) {
+    public static List<String> compositeKeyFor(List<List<String>> keys, String column) {
         if (keys == null || column == null) {
             return null;
         }
