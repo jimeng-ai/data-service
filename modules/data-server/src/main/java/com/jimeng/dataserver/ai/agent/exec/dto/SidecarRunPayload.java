@@ -1,12 +1,21 @@
 package com.jimeng.dataserver.ai.agent.exec.dto;
 
 import lombok.Data;
+import lombok.ToString;
 
 import java.util.List;
 
 /**
  * data-service -> 边车 /sandbox/run 的请求体。字段名（camelCase）须与边车 TS 的 RunRequest 一致。
  * 用 Hutool JSONUtil 序列化（数字按数字输出，不受 spring.jackson.write_numbers_as_strings 影响）。
+ *
+ * <p><b>字段名拼错不会报错</b>：边车对未知字段静默忽略。{@link Conn#scheme} 就是现成的例子——边车读的是
+ * {@code authScheme}，api-key 连接被静默当成 bearer。新字段因此有 {@code SidecarRunPayloadJsonTest} 按边车
+ * {@code src/types.ts} 逐字段对拍。
+ *
+ * <p>密钥字段（{@code authToken}、{@code accessToken}、{@code token}）一律 {@link ToString.Exclude}：
+ * {@code @Data} 生成的 toString 会被顺手打进日志（{@code log.info("{}", payload)}），而这些是真实计费的模型 key
+ * 与能以用户身份回调网关的 JWT。
  */
 @Data
 public class SidecarRunPayload {
@@ -50,6 +59,20 @@ public class SidecarRunPayload {
     /** 本次 run 可用的 DOER skill（编排者从 MinIO 列出文件，边车物化到 .claude/skills）。 */
     private List<SkillRef> skills;
 
+    /**
+     * 运行形态。null = 现有文件处理行为（边车的 default profile）；{@code "semantic-layer"} = 语义层生成。
+     *
+     * <p>其他调用方一律不设：Hutool 默认不输出 null 字段（5.8.16 实测），边车也把 null 与缺省同样对待，所以老调用方的请求体零变化。
+     * 边车对未知取值回 400，不会静默当 default 跑。
+     */
+    private String runProfile;
+
+    /**
+     * 只在 {@code runProfile="semantic-layer"} 时下发：边车宿主进程里的 semantic MCP 工具回调 data-service 需要的一切。
+     * 边车的 default profile 收到它直接 400（防新调用方漏写 runProfile 被静默当文件处理 agent 跑）。
+     */
+    private SemanticContext semanticContext;
+
     @Data
     public static class SkillRef {
         private String name;
@@ -70,6 +93,7 @@ public class SidecarRunPayload {
         private Integer topK;
         private Boolean rerank;
         /** 短时效 JWT，边车用它以用户身份回调网关的 /data/rag/search。 */
+        @ToString.Exclude
         private String accessToken;
     }
 
@@ -90,6 +114,7 @@ public class SidecarRunPayload {
     @Data
     public static class Llm {
         private String baseUrl;
+        @ToString.Exclude
         private String authToken;
         private String model;
         private String authScheme;
@@ -99,6 +124,7 @@ public class SidecarRunPayload {
     @Data
     public static class ImageGen {
         private String baseUrl;
+        @ToString.Exclude
         private String authToken;
         private String model;
         private String authScheme;
@@ -112,6 +138,7 @@ public class SidecarRunPayload {
     @Data
     public static class WebSearch {
         private String baseUrl;
+        @ToString.Exclude
         private String authToken;
         private String provider;
         private Integer maxResults;
@@ -123,6 +150,7 @@ public class SidecarRunPayload {
         /** 容器可见标识，也是 $JM_CONN_BASE/<name>/ 里的那一段 */
         private String name;
         private String baseUrl;
+        @ToString.Exclude
         private String token;
         private String scheme;
         /** 允许的方法；空则边车按默认 ["GET"] 处理（只读） */
@@ -136,5 +164,27 @@ public class SidecarRunPayload {
         private Integer wallClockSec;
         private Integer maxTurns;
         private Double maxBudgetUsd;
+    }
+
+    /**
+     * 字段名须与边车 TS 的 {@code SemanticContext}（{@code src/types.ts}）逐字一致。
+     *
+     * <p>两个 id 声明为 {@code String}：雪花 id 超出 JS 安全整数（2^53），按数字下发会被边车的
+     * {@code JSON.parse} <b>静默改值</b>，边车也按十进制字符串校验、传 number 直接 400。
+     * {@code sliceNo} 很小，按数字下发。
+     */
+    @Data
+    public static class SemanticContext {
+        /** 回调根地址，含 /data（connector.semantic.agent.callback-base-url）。边车在其后拼 /internal/semantic-agent/&lt;op&gt;。 */
+        private String callbackBaseUrl;
+        /** 本片窄权限 token，裸 JWT，不带 Bearer（网关取 Authorization 原值验签）。 */
+        @ToString.Exclude
+        private String accessToken;
+        /** 批次 id，十进制字符串。只用于边车日志，服务端以 token 里的 gen 为准。 */
+        private String generationId;
+        /** 连接 id，十进制字符串。只用于边车日志，服务端以 token 里的 cid 为准。 */
+        private String connectorId;
+        /** 本片序号，从 1 开始。 */
+        private Integer sliceNo;
     }
 }
