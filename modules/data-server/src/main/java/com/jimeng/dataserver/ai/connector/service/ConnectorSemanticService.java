@@ -303,6 +303,85 @@ public class ConnectorSemanticService {
         return n;
     }
 
+    /** DIRECT 模式下按 term 合并一条连接级 CAVEAT 的结果。 */
+    public enum CaveatMergeResult {
+        INSERTED,
+        MERGED,
+        SKIPPED_NOT_INFERRED,
+        CONFLICT
+    }
+
+    /**
+     * DIRECT 提交路径合并连接级 CAVEAT。这个方法刻意不加 {@link Transactional}：调用者已经持有提交事务，
+     * 唯一键冲突必须在 mapper 调用这一层被接住，不能穿过事务代理把外层事务标成 rollback-only。
+     *
+     * <p>不存在就插入；已有人工/导入行时不碰；已有 INFERRED 行时只把 {@code detail_json.applies_to}
+     * 按首次出现顺序做大小写不敏感并集（最多 {@link SemanticRowAssembler#DETAIL_LIST_MAX} 张），先到的 gloss
+     * 及其它证据保持原样。更新带 {@link #unchangedSince} 条件，0 行说明并发写者先赢，返回 {@link CaveatMergeResult#CONFLICT}。
+     */
+    public CaveatMergeResult mergeInferredCaveat(Long connectorId, ConnectorSemantic caveat) {
+        Connection conn = requireOwned(connectorId);
+        if (caveat == null || !SCOPE_CAVEAT.equals(caveat.getScope())
+                || caveat.getTerm() == null || caveat.getTerm().isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "只能合并 term 非空的 CAVEAT");
+        }
+        if (caveat.getObjectName() == null) caveat.setObjectName("");
+        if (caveat.getFieldName() == null) caveat.setFieldName("");
+        caveat.setTerm(caveat.getTerm().trim());
+
+        ConnectorSemantic existing = semanticMapper.selectOne(new LambdaQueryWrapper<ConnectorSemantic>()
+                .eq(ConnectorSemantic::getConnectorId, connectorId)
+                .eq(ConnectorSemantic::getScope, SCOPE_CAVEAT)
+                .eq(ConnectorSemantic::getObjectName, "")
+                .eq(ConnectorSemantic::getFieldName, "")
+                .eq(ConnectorSemantic::getTerm, caveat.getTerm())
+                .last("limit 1"));
+        if (existing == null) {
+            caveat.setId(null);
+            caveat.setTenantId(conn.getTenantId());
+            caveat.setConnectorId(connectorId);
+            caveat.setSource(SOURCE_INFERRED);
+            if (caveat.getStatus() == null) caveat.setStatus(ST_DRAFT);
+            if (caveat.getVerified() == null) caveat.setVerified(V_NONE);
+            if (caveat.getAnchorKind() == null) caveat.setAnchorKind(ANCHOR_NONE);
+            try {
+                semanticMapper.insert(caveat);
+                return CaveatMergeResult.INSERTED;
+            } catch (DuplicateKeyException e) {
+                log.info("agent 合并 CAVEAT 时撞上并发插入，本条跳过 connectorId={} term={}",
+                        connectorId, caveat.getTerm());
+                return CaveatMergeResult.CONFLICT;
+            }
+        }
+        if (!SOURCE_INFERRED.equals(existing.getSource())) {
+            return CaveatMergeResult.SKIPPED_NOT_INFERRED;
+        }
+
+        Map<String, Object> mergedDetail = new LinkedHashMap<>(readDetail(existing));
+        LinkedHashMap<String, String> appliesTo = new LinkedHashMap<>();
+        for (String table : stringList(mergedDetail.get("applies_to"))) {
+            appliesTo.putIfAbsent(ciFold(table), table);
+            if (appliesTo.size() == SemanticRowAssembler.DETAIL_LIST_MAX) break;
+        }
+        for (String table : stringList(readDetail(caveat).get("applies_to"))) {
+            appliesTo.putIfAbsent(ciFold(table), table);
+            if (appliesTo.size() == SemanticRowAssembler.DETAIL_LIST_MAX) break;
+        }
+        mergedDetail.put("applies_to", List.copyOf(appliesTo.values()));
+        String detailJson = toJson(mergedDetail);
+        if (detailJson == null) {
+            return CaveatMergeResult.CONFLICT;
+        }
+
+        LambdaUpdateWrapper<ConnectorSemantic> update = new LambdaUpdateWrapper<ConnectorSemantic>()
+                .eq(ConnectorSemantic::getId, existing.getId());
+        unchangedSince(update, existing);
+        update.set(ConnectorSemantic::getDetailJson, detailJson);
+        return semanticMapper.update(null, update) == 1
+                ? CaveatMergeResult.MERGED
+                : CaveatMergeResult.CONFLICT;
+    }
+
     /**
      * ★ 增量写入：<b>原地 UPSERT，不删一行</b>。给「新出现的表只跑 S2」那条路用。
      *
@@ -1611,7 +1690,7 @@ public class ConnectorSemanticService {
     }
 
     /** 唯一键（租户与连接之外的四列）的折叠形态。分隔符用不可打印字符，理由同推导侧的 KEY_SEP。 */
-    static String uniqueKey(ConnectorSemantic r) {
+    public static String uniqueKey(ConnectorSemantic r) {
         return ciFold(r.getScope()) + '' + ciFold(r.getObjectName()) + ''
                 + ciFold(r.getFieldName()) + '' + ciFold(r.getTerm());
     }
@@ -1629,7 +1708,12 @@ public class ConnectorSemanticService {
         return out;
     }
 
-    private Connection requireOwned(Long connectorId) {
+    /**
+     * 确认连接在当前真实租户上下文中可见并返回连接行。
+     *
+     * <p>只有在真实 {@code TenantContext} 下，“查得到”才等于“属于当前租户”；后台系统模式调用者不得把它当越权校验。
+     */
+    public Connection requireOwned(Long connectorId) {
         Connection c = connectionMapper.selectById(connectorId);
         if (c == null) {
             throw new ServiceException(ExceptionCode.NOT_FOUND, "连接不存在");
