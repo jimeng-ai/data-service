@@ -16,8 +16,14 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionInterceptor;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
 
 import java.lang.reflect.Method;
 import java.time.Clock;
@@ -283,6 +289,42 @@ class SemanticConnectionClaimTest {
     }
 
     @Test
+    @DisplayName("事务代理下批次续期 0 行时回滚连接续期")
+    void 事务代理下批次续期0行回滚() {
+        when(connectionMapper.selectById(CONNECTOR_ID)).thenReturn(connection("READY", null));
+        when(connectionMapper.update(any(), any())).thenReturn(1);
+        when(generationMapper.update(any(), any())).thenReturn(0);
+        assertNotNull(claim.claim(CONNECTOR_ID, null, "正在生成"));
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+
+        boolean renewed = transactionalProxy(transactionManager).renew(GENERATION_ID, OWNER);
+
+        assertFalse(renewed);
+        assertEquals(0, transactionManager.commits);
+        assertEquals(1, transactionManager.rollbacks);
+        verify(connectionMapper, times(2)).update(any(), any());
+        verify(generationMapper).update(any(), any());
+    }
+
+    @Test
+    @DisplayName("事务代理下连接与批次续期都成功时提交")
+    void 事务代理下续期成功提交() {
+        when(connectionMapper.selectById(CONNECTOR_ID)).thenReturn(connection("READY", null));
+        when(connectionMapper.update(any(), any())).thenReturn(1);
+        when(generationMapper.update(any(), any())).thenReturn(1);
+        assertNotNull(claim.claim(CONNECTOR_ID, null, "正在生成"));
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+
+        boolean renewed = transactionalProxy(transactionManager).renew(GENERATION_ID, OWNER);
+
+        assertTrue(renewed);
+        assertEquals(1, transactionManager.commits);
+        assertEquals(0, transactionManager.rollbacks);
+        verify(connectionMapper, times(2)).update(any(), any());
+        verify(generationMapper).update(any(), any());
+    }
+
+    @Test
     @DisplayName("存在测试时钟构造器时，生产构造器仍显式声明 Spring 注入入口")
     void 生产构造器显式Autowired() throws Exception {
         assertNotNull(SemanticConnectionClaim.class
@@ -308,6 +350,41 @@ class SemanticConnectionClaimTest {
         row.setSemanticStatus(semanticStatus);
         row.setSemanticClaimAt(claimAt);
         return row;
+    }
+
+    private SemanticConnectionClaim transactionalProxy(RecordingTransactionManager transactionManager) {
+        ProxyFactory factory = new ProxyFactory(claim);
+        factory.setProxyTargetClass(true);
+        TransactionInterceptor interceptor = new TransactionInterceptor();
+        interceptor.setTransactionManager(transactionManager);
+        interceptor.setTransactionAttributeSource(new AnnotationTransactionAttributeSource());
+        factory.addAdvice(interceptor);
+        return (SemanticConnectionClaim) factory.getProxy();
+    }
+
+    private static final class RecordingTransactionManager extends AbstractPlatformTransactionManager {
+        private int commits;
+        private int rollbacks;
+
+        @Override
+        protected Object doGetTransaction() {
+            return new Object();
+        }
+
+        @Override
+        protected void doBegin(Object transaction, TransactionDefinition definition) {
+            // 只记录 Spring 事务边界，不需要真实数据库。
+        }
+
+        @Override
+        protected void doCommit(DefaultTransactionStatus status) {
+            commits++;
+        }
+
+        @Override
+        protected void doRollback(DefaultTransactionStatus status) {
+            rollbacks++;
+        }
     }
 
     static final class MutableClock extends Clock {

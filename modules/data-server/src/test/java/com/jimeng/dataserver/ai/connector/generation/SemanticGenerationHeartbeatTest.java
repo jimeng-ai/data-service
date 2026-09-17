@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -187,10 +188,11 @@ class SemanticGenerationHeartbeatTest {
     }
 
     @Test
-    @DisplayName("每一拍先设置真实租户，任何出路 finally 都清 TenantContext")
-    void 每拍设置并清TenantContext() {
+    @DisplayName("调用方无租户时，每拍设置真实租户并在 finally 恢复为空")
+    void 调用方无租户时心跳恢复为空() {
+        TenantContext.clear();
         when(generationMapper.update(any(), any())).thenAnswer(invocation -> {
-            assertTrue("tenant-a".equals(TenantContext.get()));
+            assertEquals("tenant-a", TenantContext.get());
             throw new IllegalStateException("heartbeat write failed");
         });
 
@@ -201,15 +203,32 @@ class SemanticGenerationHeartbeatTest {
     }
 
     @Test
-    @DisplayName("已 lost 后的定时拍也会设置真实租户并 finally 清理")
-    void lost后的心跳仍清TenantContext() {
+    @DisplayName("心跳临时切到 active 租户，结束后恢复调用方租户")
+    void 心跳恢复调用方TenantContext() {
+        heartbeat.stop();
+        generation.setTenantId("tenant-b");
+        heartbeat.start(generation, "lease-token");
+        TenantContext.set("tenant-a");
+        when(generationMapper.update(any(), any())).thenAnswer(invocation -> {
+            assertEquals("tenant-b", TenantContext.get());
+            return 1;
+        });
+
+        heartbeat.tick();
+
+        assertEquals("tenant-a", TenantContext.get());
+    }
+
+    @Test
+    @DisplayName("已 lost 后的主动拍也恢复调用方租户")
+    void lost后的心跳仍恢复调用方TenantContext() {
         when(generationMapper.update(any(), any())).thenReturn(0);
         heartbeat.tick();
         TenantContext.set("stale-tenant");
 
         heartbeat.tick();
 
-        assertNull(TenantContext.get());
+        assertEquals("stale-tenant", TenantContext.get());
     }
 
     @Test

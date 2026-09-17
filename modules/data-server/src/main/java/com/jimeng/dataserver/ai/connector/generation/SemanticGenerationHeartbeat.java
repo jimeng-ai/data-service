@@ -139,6 +139,7 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
         if (current == null) {
             return;
         }
+        String previousTenant = TenantContext.get();
         TenantContext.set(current.tenantId());
         try {
             if (lost.get()) {
@@ -179,7 +180,11 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
             log.warn("语义层生成心跳失败 generationId={}: {}", current.generationId(),
                     e.getClass().getSimpleName());
         } finally {
-            TenantContext.clear();
+            if (previousTenant == null || previousTenant.isEmpty()) {
+                TenantContext.clear();
+            } else {
+                TenantContext.set(previousTenant);
+            }
         }
     }
 
