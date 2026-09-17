@@ -9,9 +9,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -31,27 +35,34 @@ import static org.mockito.Mockito.verify;
 class SingleCallSemanticGeneratorTest {
 
     private ConnectorSemanticDeriveService deriveService;
+    private AnnotationConfigApplicationContext context;
     private ThreadPoolTaskExecutor semanticGenerationExecutor;
+    private ThreadPoolTaskExecutor semanticFallbackExecutor;
     private SingleCallSemanticGenerator generator;
 
     @BeforeEach
     void setUp() {
         deriveService = mock(ConnectorSemanticDeriveService.class);
-        semanticGenerationExecutor = new StreamExecutorConfig().semanticGenerationExecutor();
-        generator = new SingleCallSemanticGenerator(deriveService, semanticGenerationExecutor);
+        context = new AnnotationConfigApplicationContext();
+        context.register(StreamExecutorConfig.class, SingleCallSemanticGenerator.class);
+        context.registerBean(ConnectorSemanticDeriveService.class, () -> deriveService);
+        context.refresh();
+        semanticGenerationExecutor = context.getBean("semanticGenerationExecutor", ThreadPoolTaskExecutor.class);
+        semanticFallbackExecutor = context.getBean("semanticFallbackExecutor", ThreadPoolTaskExecutor.class);
+        generator = context.getBean(SingleCallSemanticGenerator.class);
     }
 
     @AfterEach
     void tearDown() {
         TenantContext.clear();
         MDC.clear();
-        if (semanticGenerationExecutor != null) {
-            semanticGenerationExecutor.shutdown();
+        if (context != null) {
+            context.close();
         }
     }
 
     @Test
-    void 提交立即返回且推导只在语义生成线程执行并继承调用时上下文() throws Exception {
+    void 提交立即返回且推导只在fallback线程执行并继承调用时上下文() throws Exception {
         CountDownLatch deriveStarted = new CountDownLatch(1);
         CountDownLatch releaseDerive = new CountDownLatch(1);
         CountDownLatch submitReturned = new CountDownLatch(1);
@@ -95,7 +106,7 @@ class SingleCallSemanticGeneratorTest {
         assertTrue(returnedBeforeDeriveFinished, "submit 等待了后台推导完成");
         assertFalse(caller.isAlive(), "模拟 HTTP 请求线程没有退出");
         assertNotEquals(caller.getName(), deriveThread.get(), "推导跑到了 HTTP 请求线程");
-        assertTrue(deriveThread.get().startsWith("semantic-gen-"), deriveThread.get());
+        assertTrue(deriveThread.get().startsWith("semantic-fallback-"), deriveThread.get());
         assertEquals("tenant-http", tenant.get());
         assertEquals("trace-http", traceId.get());
         assertEquals("semantic-fallback-7", connectionId.get());
@@ -124,15 +135,80 @@ class SingleCallSemanticGeneratorTest {
     }
 
     @Test
-    void 线程池满时返回拒绝且不在调用线程推导() throws Exception {
-        CountDownLatch workerStarted = new CountDownLatch(1);
-        CountDownLatch releaseWorker = new CountDownLatch(1);
+    void agent编排池被长任务占用不影响fallback及时提交() throws Exception {
+        CountDownLatch agentStarted = new CountDownLatch(1);
+        CountDownLatch releaseAgent = new CountDownLatch(1);
+        CountDownLatch deriveCalled = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            deriveCalled.countDown();
+            return null;
+        }).when(deriveService).deriveAsync(eq(8L), any());
         semanticGenerationExecutor.execute(() -> {
-            workerStarted.countDown();
-            awaitQuietly(releaseWorker);
+            agentStarted.countDown();
+            awaitQuietly(releaseAgent);
         });
-        assertTrue(workerStarted.await(5, TimeUnit.SECONDS));
-        semanticGenerationExecutor.execute(() -> { });
+        assertTrue(agentStarted.await(5, TimeUnit.SECONDS));
+        TenantContext.set("tenant-a");
+
+        GenerationAck ack;
+        boolean ranWhileAgentBlocked;
+        try {
+            ack = generator.submit(new GenerationRequest(
+                    8L, "tenant-a", 9L, GenerationTrigger.CONNECTOR_CREATED, "agent 不可用"));
+            ranWhileAgentBlocked = deriveCalled.await(5, TimeUnit.SECONDS);
+        } finally {
+            releaseAgent.countDown();
+        }
+
+        assertTrue(ack.accepted(), ack.note());
+        assertTrue(ranWhileAgentBlocked, "fallback 被 agent 编排池的长任务阻塞了");
+    }
+
+    @Test
+    void 未启用agent时多个并发submit不会退化为单线程队列1() throws Exception {
+        int submissions = 3;
+        CountDownLatch derivesStarted = new CountDownLatch(submissions);
+        CountDownLatch releaseDerives = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            derivesStarted.countDown();
+            awaitQuietly(releaseDerives);
+            return null;
+        }).when(deriveService).deriveAsync(any(), any());
+        TenantContext.set("tenant-a");
+        List<GenerationAck> acknowledgements = new ArrayList<>();
+
+        boolean allStartedConcurrently;
+        try {
+            for (long connectorId = 1; connectorId <= submissions; connectorId++) {
+                acknowledgements.add(generator.submit(new GenerationRequest(
+                        connectorId, "tenant-a", 9L, GenerationTrigger.CONNECTOR_CREATED, "agent 未开启")));
+            }
+            allStartedConcurrently = derivesStarted.await(5, TimeUnit.SECONDS);
+        } finally {
+            releaseDerives.countDown();
+        }
+
+        assertTrue(acknowledgements.stream().allMatch(GenerationAck::accepted));
+        assertTrue(allStartedConcurrently, "fallback 退化成了 agent 编排池的单线程 + 队列 1");
+    }
+
+    @Test
+    void fallback池自己饱和时返回拒绝且不在调用线程推导() throws Exception {
+        ThreadPoolExecutor pool = semanticFallbackExecutor.getThreadPoolExecutor();
+        int workers = pool.getCorePoolSize();
+        int queueCapacity = pool.getQueue().remainingCapacity();
+        CountDownLatch workersStarted = new CountDownLatch(workers);
+        CountDownLatch releaseWorkers = new CountDownLatch(1);
+        for (int i = 0; i < workers; i++) {
+            semanticFallbackExecutor.execute(() -> {
+                workersStarted.countDown();
+                awaitQuietly(releaseWorkers);
+            });
+        }
+        assertTrue(workersStarted.await(5, TimeUnit.SECONDS));
+        for (int i = 0; i < queueCapacity; i++) {
+            semanticFallbackExecutor.execute(() -> { });
+        }
         TenantContext.set("tenant-a");
 
         GenerationAck ack;
@@ -140,7 +216,7 @@ class SingleCallSemanticGeneratorTest {
             ack = generator.submit(new GenerationRequest(
                     7L, "tenant-a", 9L, GenerationTrigger.CONNECTOR_CREATED, "sandbox 未配置"));
         } finally {
-            releaseWorker.countDown();
+            releaseWorkers.countDown();
         }
 
         assertEquals(GeneratorKind.SINGLE_CALL, ack.kind());
@@ -148,43 +224,6 @@ class SingleCallSemanticGeneratorTest {
         assertNull(ack.generationId());
         assertTrue(ack.note().startsWith("单次推导提交失败："), ack.note());
         verify(deriveService, never()).deriveAsync(any(), any());
-    }
-
-    @Test
-    void 语义生成线程内提交会入队并在当前任务返回后推导() throws Exception {
-        CountDownLatch submitReturned = new CountDownLatch(1);
-        CountDownLatch allowOuterReturn = new CountDownLatch(1);
-        CountDownLatch deriveCalled = new CountDownLatch(1);
-        AtomicReference<GenerationAck> ack = new AtomicReference<>();
-        AtomicReference<String> tenant = new AtomicReference<>();
-        AtomicReference<String> prefix = new AtomicReference<>();
-        doAnswer(invocation -> {
-            tenant.set(TenantContext.get());
-            prefix.set(invocation.getArgument(1));
-            deriveCalled.countDown();
-            return null;
-        }).when(deriveService).deriveAsync(eq(8L), any());
-
-        semanticGenerationExecutor.execute(() -> {
-            TenantContext.set("tenant-worker");
-            try {
-                ack.set(generator.submit(new GenerationRequest(
-                        8L, "tenant-worker", 9L, GenerationTrigger.CONNECTOR_CREATED, "healthz 异常")));
-                submitReturned.countDown();
-                awaitQuietly(allowOuterReturn);
-            } finally {
-                TenantContext.clear();
-            }
-        });
-
-        assertTrue(submitReturned.await(5, TimeUnit.SECONDS), "worker 内的 submit 没有返回");
-        assertTrue(ack.get().accepted(), ack.get().note());
-        verify(deriveService, never()).deriveAsync(any(), any());
-        allowOuterReturn.countDown();
-
-        assertTrue(deriveCalled.await(5, TimeUnit.SECONDS), "当前 worker 返回后队列任务没有执行");
-        assertEquals("tenant-worker", tenant.get());
-        assertEquals("降级原因：healthz 异常", prefix.get());
     }
 
     private static void awaitQuietly(CountDownLatch latch) {

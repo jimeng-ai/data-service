@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@code semanticGenerationExecutor}（设计文档 6.4）：语义层 agent 生成的编排线程池。
+ * 语义层 agent 编排池与单次降级桥接池的容量、拒绝和关停契约。
  *
  * <p>设计文档对它的验证是「启动无 bean 冲突」，要真起进程。这里先钉住池子自己的三条行为，它们错了都不报错：
  * <ul>
@@ -86,6 +86,50 @@ class StreamExecutorConfigTest {
         executor.shutdown();
 
         assertTrue(interrupted.await(5, TimeUnit.SECONDS), "关停没有中断正在等待的编排线程");
+        executor = null;
+    }
+
+    @Test
+    @DisplayName("★ fallback 独立池：8 线程、队列 64、AbortPolicy，线程名可追踪")
+    void fallback池参数与线程名前缀固定() throws Exception {
+        executor = new StreamExecutorConfig().semanticFallbackExecutor();
+        ThreadPoolExecutor pool = executor.getThreadPoolExecutor();
+        assertEquals(8, pool.getCorePoolSize());
+        assertEquals(8, pool.getMaximumPoolSize(), "有界队列下 core 必须等于 max，避免 max 虚设");
+        assertEquals(64, pool.getQueue().remainingCapacity());
+        assertInstanceOf(ThreadPoolExecutor.AbortPolicy.class, pool.getRejectedExecutionHandler());
+
+        CountDownLatch ran = new CountDownLatch(1);
+        AtomicReference<String> threadName = new AtomicReference<>();
+        executor.execute(() -> {
+            threadName.set(Thread.currentThread().getName());
+            ran.countDown();
+        });
+
+        assertTrue(ran.await(5, TimeUnit.SECONDS));
+        assertTrue(threadName.get().startsWith("semantic-fallback-"),
+                "线程名前缀不对：" + threadName.get());
+    }
+
+    @Test
+    @DisplayName("★ fallback 池关停不等待长任务并中断 worker")
+    void fallback池关停时中断正在跑的任务() throws Exception {
+        executor = new StreamExecutorConfig().semanticFallbackExecutor();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        executor.execute(() -> {
+            started.countDown();
+            try {
+                new CountDownLatch(1).await(60, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+            }
+        });
+        assertTrue(started.await(5, TimeUnit.SECONDS));
+
+        executor.shutdown();
+
+        assertTrue(interrupted.await(5, TimeUnit.SECONDS), "关停没有中断 fallback worker");
         executor = null;
     }
 

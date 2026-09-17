@@ -49,12 +49,13 @@ public class SandboxHealthProbe {
             return seen.result();
         }
         synchronized (this) {
+            now = nowMillis.getAsLong();
             seen = cache;
             if (fresh(seen, now)) {
                 return seen.result();
             }
             ProbeResult result = probeFresh(timeout());
-            cache = new CacheEntry(now, result);
+            cache = new CacheEntry(nowMillis.getAsLong(), result);
             return result;
         }
     }

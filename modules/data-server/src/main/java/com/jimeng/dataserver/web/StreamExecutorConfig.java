@@ -28,7 +28,8 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <b>就地跑在调用线程上</b>。对一个几秒钟的 SSE 流，那只是慢一次；对一个以<b>分钟</b>计的后台作业，
  * 那是把几十分钟直接加到某次 HTTP 请求的响应时间上——网关早就读超时了，而调用方看到的是
  * 「建连接超时」，没有任何线索指向真凶是一个后台剖析任务。
- * 长作业要自己的池、自己的队列，见 {@link #semanticStageExecutor()}、{@link #semanticGenerationExecutor()}。
+ * 长作业要自己的池、自己的队列，见 {@link #semanticStageExecutor()}、{@link #semanticGenerationExecutor()}、
+ * {@link #semanticFallbackExecutor()}。
  */
 @Configuration
 public class StreamExecutorConfig {
@@ -154,6 +155,36 @@ public class StreamExecutorConfig {
         executor.setThreadNamePrefix("semantic-gen-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(false);   // 关停时中断等待线程，走 cancel 路径
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * agent 路径不可用时，单次语义推导的独立桥接池。
+     *
+     * <p>不能复用 {@link #semanticGenerationExecutor()}：agent 编排线程可能等待一片沙箱运行数十分钟，
+     * 它的一条 worker 和一个队列位都被占住时，降级路径仍必须能及时受理，否则「agent 失败后走单次」
+     * 反而会被失败的 agent 自己堵死。
+     *
+     * <p>正常情况下这里的任务只调用一次 {@code deriveAsync}，把作业桥接到 stream 池后立即返回；
+     * 但 stream 池饱和时其 CallerRunsPolicy 会让 fallback worker 承接实际推导。因此并发必须有硬上限，
+     * 不能使用无界线程或无界队列：最多 8 条 worker、排队 64 个请求，满了由 AbortPolicy 明确拒绝。
+     * 有界队列下 {@code core = max}，避免任务先堆满 64 个才扩线程、令 max 配置形同虚设。
+     *
+     * <p>注入点字段必须叫 {@code semanticFallbackExecutor}，按仓库约定靠字段名在多个
+     * {@link ThreadPoolTaskExecutor} bean 间消歧。
+     */
+    @Bean("semanticFallbackExecutor")
+    public ThreadPoolTaskExecutor semanticFallbackExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(8);
+        executor.setQueueCapacity(64);
+        executor.setKeepAliveSeconds(300);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setThreadNamePrefix("semantic-fallback-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(false);
         executor.initialize();
         return executor;
     }

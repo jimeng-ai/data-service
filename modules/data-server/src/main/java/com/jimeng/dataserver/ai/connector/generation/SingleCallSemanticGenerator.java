@@ -15,7 +15,7 @@ public class SingleCallSemanticGenerator implements SemanticGenerator {
 
     private final ConnectorSemanticDeriveService deriveService;
     /** 字段名用于在多个 ThreadPoolTaskExecutor bean 之间消歧。 */
-    private final ThreadPoolTaskExecutor semanticGenerationExecutor;
+    private final ThreadPoolTaskExecutor semanticFallbackExecutor;
 
     @Override
     public GeneratorKind kind() {
@@ -30,7 +30,7 @@ public class SingleCallSemanticGenerator implements SemanticGenerator {
                     ? null
                     : "降级原因：" + reason.trim();
             Long connectorId = request.connectorId();
-            semanticGenerationExecutor.execute(MdcAsyncSupport.wrap(
+            semanticFallbackExecutor.execute(MdcAsyncSupport.wrap(
                     "semantic-fallback-" + connectorId,
                     () -> deriveService.deriveAsync(connectorId, prefix)));
             return new GenerationAck(kind(), true, null, "已提交单次推导");

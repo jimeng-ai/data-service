@@ -22,13 +22,19 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -223,6 +229,67 @@ class SemanticGeneratorSelectorTest {
     }
 
     @Test
+    void 慢探测完成后才开始15秒缓存且锁等待者不会拿旧时间重复探测() throws Exception {
+        SidecarClient slowSidecar = mock(SidecarClient.class);
+        AtomicLong controlledNow = new AtomicLong();
+        AtomicInteger healthCalls = new AtomicInteger();
+        CountDownLatch firstProbeStarted = new CountDownLatch(1);
+        CountDownLatch waiterReadOldTime = new CountDownLatch(1);
+        CountDownLatch releaseFirstProbe = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            if (healthCalls.incrementAndGet() == 1) {
+                firstProbeStarted.countDown();
+                awaitQuietly(releaseFirstProbe);
+            }
+            return HEALTHY;
+        }).when(slowSidecar).healthz(any(Duration.class));
+        when(slowSidecar.capabilities(any(Duration.class))).thenReturn(SEMANTIC_CAPABILITIES);
+        LongSupplier clock = () -> {
+            long sampled = controlledNow.get();
+            if ("health-probe-waiter".equals(Thread.currentThread().getName())) {
+                waiterReadOldTime.countDown();
+            }
+            return sampled;
+        };
+        SandboxHealthProbe slowProbe = new SandboxHealthProbe(slowSidecar, properties, clock);
+        AtomicReference<SandboxHealthProbe.ProbeResult> firstResult = new AtomicReference<>();
+        AtomicReference<SandboxHealthProbe.ProbeResult> waiterResult = new AtomicReference<>();
+        AtomicReference<Throwable> backgroundFailure = new AtomicReference<>();
+        Thread first = new Thread(
+                () -> runProbe(slowProbe, firstResult, backgroundFailure), "health-probe-first");
+        Thread waiter = new Thread(
+                () -> runProbe(slowProbe, waiterResult, backgroundFailure), "health-probe-waiter");
+
+        first.start();
+        try {
+            assertTrue(firstProbeStarted.await(5, TimeUnit.SECONDS));
+            controlledNow.set(5_000L);
+            waiter.start();
+            assertTrue(waiterReadOldTime.await(5, TimeUnit.SECONDS));
+            controlledNow.set(20_000L);
+        } finally {
+            releaseFirstProbe.countDown();
+            first.join(TimeUnit.SECONDS.toMillis(5));
+            waiter.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertFalse(first.isAlive());
+        assertFalse(waiter.isAlive());
+        assertNull(backgroundFailure.get(), () -> "后台探测异常：" + backgroundFailure.get());
+        assertTrue(firstResult.get().healthy());
+        assertTrue(waiterResult.get().healthy());
+        assertEquals(1, healthCalls.get(), "锁等待者应复用刚完成的探测");
+
+        controlledNow.set(34_999L);
+        assertTrue(slowProbe.probe().healthy());
+        assertEquals(1, healthCalls.get(), "完整 15 秒 TTL 应从慢探测完成时开始计算");
+
+        controlledNow.set(35_000L);
+        assertTrue(slowProbe.probe().healthy());
+        assertEquals(2, healthCalls.get(), "完成后满 15 秒才重新探测");
+    }
+
+    @Test
     void 每个探测请求使用当前healthTimeoutMs() {
         properties.getSemantic().getAgent().setHealthTimeoutMs(1500);
 
@@ -245,5 +312,26 @@ class SemanticGeneratorSelectorTest {
                 InterruptedBatchPolicy.SUPERSEDE,
                 InterruptedBatchPolicy.SUPERSEDE,
                 InterruptedBatchPolicy.KEEP), policies);
+    }
+
+    private static void awaitQuietly(CountDownLatch latch) {
+        try {
+            if (!latch.await(30, TimeUnit.SECONDS)) {
+                throw new AssertionError("等待慢探测放行超时");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("等待慢探测时被中断", e);
+        }
+    }
+
+    private static void runProbe(SandboxHealthProbe probe,
+                                 AtomicReference<SandboxHealthProbe.ProbeResult> result,
+                                 AtomicReference<Throwable> failure) {
+        try {
+            result.set(probe.probe());
+        } catch (Throwable error) {
+            failure.compareAndSet(null, error);
+        }
     }
 }
