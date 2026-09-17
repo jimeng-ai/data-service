@@ -153,12 +153,10 @@ public class SemanticGenerationReconciler implements CommandLineRunner {
     private void interruptStale(ConnectorSemanticGeneration observed) {
         transactionTemplate.executeWithoutResult(tx -> {
             connectionClaim.lockRow(observed.getConnectorId());
-            String note = notes.interrupted(observed, HEARTBEAT_REASON);
 
             ConnectorSemanticGeneration update = new ConnectorSemanticGeneration();
             update.setStatus(STATUS_INTERRUPTED);
             update.setReasonCode(GenerationReasonCode.HEARTBEAT_LOST.name());
-            update.setNote(note);
             int generationRows = generationMapper.update(update,
                     new LambdaUpdateWrapper<ConnectorSemanticGeneration>()
                             .set(ConnectorSemanticGeneration::getCurrentRunId, null)
@@ -177,6 +175,34 @@ public class SemanticGenerationReconciler implements CommandLineRunner {
                     .eq(ConnectorSemanticGenerationTable::getGenerationId, observed.getId())
                     .eq(ConnectorSemanticGenerationTable::getStatus, TABLE_DISPATCHED));
 
+            // callback 可以在批次行计数回写前已把若干表置为 DONE。上面的批次 CAS 已与在途提交串行，
+            // 此刻再从每表状态聚合，才是这次中断说明和续跑计数的权威快照。
+            ProgressSnapshot progress = readProgress(observed.getId());
+            observed.setDoneTables(progress.done());
+            observed.setTotalTables(progress.total());
+            observed.setGaveUpTables(progress.gaveUp());
+            observed.setSkippedTables(progress.skipped());
+            observed.setRemovedTables(progress.removed());
+            String note = notes.interrupted(observed, HEARTBEAT_REASON);
+
+            ConnectorSemanticGeneration progressUpdate = new ConnectorSemanticGeneration();
+            progressUpdate.setDoneTables(progress.done());
+            progressUpdate.setTotalTables(progress.total());
+            progressUpdate.setGaveUpTables(progress.gaveUp());
+            progressUpdate.setSkippedTables(progress.skipped());
+            progressUpdate.setRemovedTables(progress.removed());
+            progressUpdate.setNote(note);
+            int progressRows = generationMapper.update(progressUpdate,
+                    new LambdaUpdateWrapper<ConnectorSemanticGeneration>()
+                            .eq(ConnectorSemanticGeneration::getId, observed.getId())
+                            .eq(ConnectorSemanticGeneration::getStatus, STATUS_INTERRUPTED)
+                            .eq(ConnectorSemanticGeneration::getReasonCode,
+                                    GenerationReasonCode.HEARTBEAT_LOST.name()));
+            if (progressRows == 0) {
+                tx.setRollbackOnly();
+                return;
+            }
+
             Connection connectionUpdate = new Connection();
             connectionUpdate.setSemanticStatus(releasedSemanticStatus(observed));
             connectionUpdate.setSemanticNote(note);
@@ -190,6 +216,35 @@ public class SemanticGenerationReconciler implements CommandLineRunner {
                         observed.getId(), observed.getConnectorId());
             }
         });
+    }
+
+    private ProgressSnapshot readProgress(Long generationId) {
+        List<ConnectorSemanticGenerationTable> rows = tableMapper.selectList(
+                new LambdaQueryWrapper<ConnectorSemanticGenerationTable>()
+                        .select(ConnectorSemanticGenerationTable::getStatus)
+                        .eq(ConnectorSemanticGenerationTable::getGenerationId, generationId));
+        int total = 0;
+        int done = 0;
+        int gaveUp = 0;
+        int skipped = 0;
+        int removed = 0;
+        for (ConnectorSemanticGenerationTable row : rows == null
+                ? List.<ConnectorSemanticGenerationTable>of() : rows) {
+            String status = row.getStatus();
+            if ("SKIPPED".equals(status)) {
+                skipped++;
+            } else if ("REMOVED".equals(status)) {
+                removed++;
+            } else {
+                total++;
+                if ("DONE".equals(status)) {
+                    done++;
+                } else if ("GAVE_UP".equals(status)) {
+                    gaveUp++;
+                }
+            }
+        }
+        return new ProgressSnapshot(total, done, gaveUp, skipped, removed);
     }
 
     private void cancelIfConnectionDeleted(ConnectorSemanticGeneration observed, Date now) {
@@ -233,5 +288,8 @@ public class SemanticGenerationReconciler implements CommandLineRunner {
     private static String safeMessage(RuntimeException e) {
         String message = e.getMessage();
         return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
+    }
+
+    private record ProgressSnapshot(int total, int done, int gaveUp, int skipped, int removed) {
     }
 }

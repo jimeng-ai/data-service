@@ -125,7 +125,6 @@ class SemanticGenerationReconcilerTest {
         order.verify(generationMapper).update(generationUpdate.capture(), generationWhere.capture());
         assertEquals("INTERRUPTED", generationUpdate.getValue().getStatus());
         assertEquals("HEARTBEAT_LOST", generationUpdate.getValue().getReasonCode());
-        assertTrue(generationUpdate.getValue().getNote().contains("服务重启或卡住"));
         generationWhere.getValue().getSqlSegment();
         assertTrue(generationWhere.getValue().getParamNameValuePairs().containsValue(101L));
         assertTrue(generationWhere.getValue().getParamNameValuePairs().containsValue("RUNNING"));
@@ -143,6 +142,11 @@ class SemanticGenerationReconcilerTest {
         tableWhere.getValue().getSqlSegment();
         assertTrue(tableWhere.getValue().getParamNameValuePairs().containsValue(101L));
         assertTrue(tableWhere.getValue().getParamNameValuePairs().containsValue("DISPATCHED"));
+
+        ArgumentCaptor<ConnectorSemanticGeneration> progressUpdate =
+                ArgumentCaptor.forClass(ConnectorSemanticGeneration.class);
+        order.verify(generationMapper).update(progressUpdate.capture(), any());
+        assertTrue(progressUpdate.getValue().getNote().contains("服务重启或卡住"));
 
         ArgumentCaptor<Connection> connectionUpdate = ArgumentCaptor.forClass(Connection.class);
         ArgumentCaptor<LambdaUpdateWrapper<Connection>> connectionWhere =
@@ -217,6 +221,34 @@ class SemanticGenerationReconcilerTest {
     }
 
     @Test
+    @DisplayName("中断说明与批次计数以每表状态为准，不使用扫描时已滞后的 done/total")
+    void staleInterruptionUsesAuthoritativeTableProgress() {
+        ConnectorSemanticGeneration row = stale(101L, 41L, "tenant-a", "RUNNING", "DIRECT", null);
+        row.setDoneTables(1);
+        row.setTotalTables(99);
+        scanRows(List.of(row), List.of());
+        when(tableMapper.selectList(any())).thenReturn(List.of(
+                tableStatus("DONE"), tableStatus("DONE"), tableStatus("DONE"),
+                tableStatus("PENDING"), tableStatus("SKIPPED"), tableStatus("REMOVED")));
+
+        reconciler.reconcile();
+
+        ArgumentCaptor<ConnectorSemanticGeneration> generationUpdates =
+                ArgumentCaptor.forClass(ConnectorSemanticGeneration.class);
+        verify(generationMapper, times(2)).update(generationUpdates.capture(), any());
+        ConnectorSemanticGeneration progressUpdate = generationUpdates.getAllValues().get(1);
+        assertEquals(3, progressUpdate.getDoneTables());
+        assertEquals(4, progressUpdate.getTotalTables());
+        assertEquals(1, progressUpdate.getSkippedTables());
+        assertEquals(1, progressUpdate.getRemovedTables());
+        assertTrue(progressUpdate.getNote().contains("3/4"));
+
+        ArgumentCaptor<Connection> connectionUpdate = ArgumentCaptor.forClass(Connection.class);
+        verify(connectionMapper).update(connectionUpdate.capture(), any());
+        assertTrue(connectionUpdate.getValue().getSemanticNote().contains("3/4"));
+    }
+
+    @Test
     @DisplayName("跨租户候选只在系统身份扫描，逐批真实租户写入；单批异常不阻断下一批并恢复调用方上下文")
     void systemScanBatchIsolationAndContextRestore() {
         ConnectorSemanticGeneration a = stale(101L, 41L, "tenant-a", "RUNNING", "DIRECT", null);
@@ -242,7 +274,7 @@ class SemanticGenerationReconcilerTest {
 
         verify(claim).lockRow(41L);
         verify(claim).lockRow(42L);
-        verify(generationMapper).update(any(), any());
+        verify(generationMapper, times(2)).update(any(), any());
         assertEquals(1, txManager.rollbacks);
         assertEquals(1, txManager.commits);
         assertEquals("caller-tenant", TenantContext.get());
@@ -357,6 +389,12 @@ class SemanticGenerationReconcilerTest {
         row.setConnectorId(connectorId);
         row.setStatus("QUEUED");
         row.setNotBefore(notBefore);
+        return row;
+    }
+
+    private static ConnectorSemanticGenerationTable tableStatus(String status) {
+        ConnectorSemanticGenerationTable row = new ConnectorSemanticGenerationTable();
+        row.setStatus(status);
         return row;
     }
 
