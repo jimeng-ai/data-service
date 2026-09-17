@@ -247,6 +247,22 @@ class SemanticAgentScopeFilterTest {
     }
 
     @Test
+    @DisplayName("四千层 percent 包装的回调斜杠仍线性识别并拒绝")
+    void 四千层percent编码斜杠403() throws Exception {
+        String encodedSlash = "%" + "25".repeat(4_000) + "2f";
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent" + encodedSlash + "submit", ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
     @DisplayName("semantic token 签名错误返回 403")
     void 签名错误403() throws Exception {
         MockHttpServletRequest request = request(CALLBACK_PATH,

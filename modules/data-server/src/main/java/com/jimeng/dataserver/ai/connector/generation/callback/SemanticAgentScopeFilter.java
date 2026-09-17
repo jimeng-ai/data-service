@@ -30,8 +30,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Locale;
 import java.util.Objects;
+import java.util.regex.Pattern;
 
 /**
  * 语义层 agent 回调的资源范围过滤器。
@@ -45,6 +45,10 @@ public class SemanticAgentScopeFilter implements Filter {
 
     private static final String STATUS_RUNNING = "RUNNING";
     private static final String BODY_TOO_LARGE_MESSAGE = "请求体超过 256KB";
+    private static final Pattern DANGEROUS_ENCODED_PATH = Pattern.compile(
+            "%(?:25)*(?:2e|2f|5c)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern ENCODED_CALLBACK_BOUNDARY = Pattern.compile(
+            "^%(?:25)*(?:2f|5c)", Pattern.CASE_INSENSITIVE);
 
     private final ConnectorSemanticGenerationMapper generationMapper;
     private final JwtSecretProvider jwtSecretProvider;
@@ -243,26 +247,13 @@ public class SemanticAgentScopeFilter implements Filter {
         if (rawUri == null) {
             return false;
         }
-        String candidate = rawUri.toLowerCase(Locale.ROOT);
-        while (true) {
-            if (containsDangerousPathSequence(candidate)) {
-                return true;
-            }
-            String folded = candidate.replace("%25", "%");
-            if (folded.equals(candidate)) {
-                return false;
-            }
-            // 每个被折叠的 %25 都缩短两个字符；因此即使编码层数来自输入，本循环也必然终止。
-            candidate = folded;
-        }
+        return containsDangerousPathSequence(rawUri);
     }
 
     private static boolean containsDangerousPathSequence(String uri) {
         return uri.contains("..")
                 || uri.contains(";")
-                || uri.contains("%2e")
-                || uri.contains("%2f")
-                || uri.contains("%5c");
+                || DANGEROUS_ENCODED_PATH.matcher(uri).find();
     }
 
     private static boolean rawLooksLikeCallback(String rawUri) {
@@ -279,12 +270,8 @@ public class SemanticAgentScopeFilter implements Filter {
             return true;
         }
 
-        // 只折叠 base 后的 percent 包装；相邻路由名如 semantic-agent-report 不是回调意图。
-        String folded = suffix.toLowerCase(Locale.ROOT);
-        while (folded.startsWith("%25")) {
-            folded = "%" + folded.substring(3);
-        }
-        return folded.startsWith("%2f") || folded.startsWith("%5c");
+        // 一次线性匹配任意层 %25 包装；相邻路由名如 semantic-agent-report 不是回调意图。
+        return ENCODED_CALLBACK_BOUNDARY.matcher(suffix).find();
     }
 
     private static void writeForbidden(HttpServletResponse response, String message) throws IOException {
