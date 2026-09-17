@@ -164,7 +164,9 @@ public class SemanticSliceDispatcher {
                 if (runtime.await(latch, waitMillis)) {
                     break;
                 }
-                if (heartbeat.lost()) {
+                SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
+                if (heartbeat.lost() || (checkpoint != null && (checkpoint.lost()
+                        || checkpoint.connectionDeleted() || checkpoint.connectionDisabled()))) {
                     source.cancel();
                     return SliceRunResult.aborted();
                 }

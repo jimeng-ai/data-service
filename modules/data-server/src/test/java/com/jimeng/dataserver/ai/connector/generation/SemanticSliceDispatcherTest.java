@@ -299,6 +299,21 @@ class SemanticSliceDispatcherTest {
     }
 
     @Test
+    @DisplayName("等待期间连接删除或停用的 heartbeat checkpoint 主动 cancel 并返回 ABORTED")
+    void connectionBoundary取消() {
+        when(heartbeat.checkpoint()).thenReturn(
+                new SemanticGenerationHeartbeat.Checkpoint(false, false, true));
+        when(sidecarClient.run(any(), any())).thenAnswer(invocation -> {
+            setLiveRun(((SidecarRunPayload) invocation.getArgument(0)).getRunId(), 0);
+            return eventSource;
+        });
+
+        assertEquals(SliceRunKind.ABORTED, dispatcher.runSlice(generation, 1, slice, limits).sseKind());
+        verify(eventSource, atLeastOnce()).cancel();
+        verify(usageRecorder, never()).record(any(), anyInt(), any(), any(), any(), anyLong());
+    }
+
+    @Test
     @DisplayName("等待线程中断 cancel、恢复中断位并返回 SHUTDOWN")
     void interrupted取消() {
         runtime.interruptAwait = true;
