@@ -156,10 +156,13 @@ class SliceRunRecorderTest {
     void 上游错误文本日志脱敏() {
         SliceRunRecorder recorder = new SliceRunRecorder("deepseek-flash");
         recorder.listener(new CountDownLatch(1)).onEvent(source, null, "summary",
-                "{\"status\":\"failed\",\"error\":\"upstream exposed sk-secret-value\"}");
+                "{\"status\":\"failed\",\"error\":\"upstream exposed sk-secret-value\","
+                        + "\"usage\":{\"input_tokens\":1,\"access_token\":\"callback-secret\"}}");
 
         assertFalse(recorder.result().toString().contains("sk-secret-value"), recorder.result().toString());
-        assertTrue(recorder.result().toString().contains("<redacted>"), recorder.result().toString());
+        assertEquals("upstream_error", recorder.result().summaryError());
+        assertFalse(recorder.result().usage().getRawJson().contains("callback-secret"),
+                recorder.result().usage().getRawJson());
     }
 
     private SliceRunResult failHttp(int code, String retryAfter) {

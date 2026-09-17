@@ -93,11 +93,11 @@ public final class SliceRunRecorder {
                 if ("summary".equals(type)) {
                     JSONObject summary = parseObject(data);
                     summaryStatus = summary.getStr("status");
-                    summaryError = summary.getStr("error");
+                    summaryError = safeSummaryError(summary.getStr("error"));
                     summaryErrorMessage = bounded(summary.getStr("errorMessage"), 500);
                     toolRounds = summary.getInt("toolRounds", null);
                     JSONObject usageJson = summary.getJSONObject("usage");
-                    usage = usageJson == null ? null : usageExtractor.extract(usageJson);
+                    usage = usageJson == null ? null : safeUsage(usageExtractor.extract(usageJson));
                     // finalText and every other transcript-like field are deliberately ignored.
                     finishLocked(SliceRunKind.COMPLETED);
                 } else if ("error".equals(type)) {
@@ -283,5 +283,30 @@ public final class SliceRunRecorder {
             safe.append(c == ',' || Character.isISOControl(c) ? '_' : c);
         }
         return safe.toString();
+    }
+
+    private static String safeSummaryError(String value) {
+        if (value == null) {
+            return null;
+        }
+        return value.matches("[A-Za-z0-9:_-]{1,120}") ? value : "upstream_error";
+    }
+
+    private static NormalizedUsage safeUsage(NormalizedUsage usage) {
+        JSONObject safe = new JSONObject();
+        putIfNotNull(safe, "input_tokens", usage.getInputTokens());
+        putIfNotNull(safe, "output_tokens", usage.getOutputTokens());
+        putIfNotNull(safe, "total_tokens", usage.getTotalTokens());
+        putIfNotNull(safe, "cache_read_input_tokens", usage.getCacheReadTokens());
+        putIfNotNull(safe, "cache_creation_input_tokens", usage.getCacheWriteTokens());
+        putIfNotNull(safe, "reasoning_tokens", usage.getReasoningTokens());
+        usage.setRawJson(safe.toString());
+        return usage;
+    }
+
+    private static void putIfNotNull(JSONObject target, String key, Object value) {
+        if (value != null) {
+            target.set(key, value);
+        }
     }
 }
