@@ -1,13 +1,16 @@
 package com.jimeng.dataserver.ai.connector.generation;
 
 import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
+import com.jimeng.persistence.entity.ConnectorSemanticGenerationTable;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticGenerationMapper;
+import com.jimeng.persistence.mapper.ConnectorSemanticGenerationTableMapper;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -18,7 +21,9 @@ import org.mockito.ArgumentCaptor;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -36,6 +41,7 @@ import static org.mockito.Mockito.when;
 class SemanticGenerationHeartbeatTest {
 
     private ConnectorSemanticGenerationMapper generationMapper;
+    private ConnectorSemanticGenerationTableMapper tableMapper;
     private ConnectionMapper connectionMapper;
     private SemanticGenerationLease lease;
     private SemanticConnectionClaim claim;
@@ -48,21 +54,25 @@ class SemanticGenerationHeartbeatTest {
         MybatisConfiguration configuration = new MybatisConfiguration();
         TableInfoHelper.initTableInfo(new MapperBuilderAssistant(configuration, ""), Connection.class);
         TableInfoHelper.initTableInfo(new MapperBuilderAssistant(configuration, ""), ConnectorSemanticGeneration.class);
+        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(configuration, ""),
+                ConnectorSemanticGenerationTable.class);
     }
 
     @BeforeEach
     void setUp() {
         generationMapper = mock(ConnectorSemanticGenerationMapper.class);
+        tableMapper = mock(ConnectorSemanticGenerationTableMapper.class);
         connectionMapper = mock(ConnectionMapper.class);
         lease = mock(SemanticGenerationLease.class);
         claim = mock(SemanticConnectionClaim.class);
         clock = new SemanticConnectionClaimTest.MutableClock(Instant.parse("2026-09-17T01:02:03Z"));
-        heartbeat = new SemanticGenerationHeartbeat(generationMapper, connectionMapper, lease, claim,
+        heartbeat = new SemanticGenerationHeartbeat(generationMapper, tableMapper, connectionMapper, lease, claim,
                 new SemanticGenerationNotes(), clock);
         generation = generation();
 
         when(generationMapper.update(any(), any())).thenReturn(1);
         when(generationMapper.selectById(generation.getId())).thenReturn(generation);
+        when(tableMapper.selectList(any())).thenReturn(progressRows(2, 0));
         when(lease.renew("lease-token")).thenReturn(true);
         when(claim.renewIfDue(generation.getId(), generation.getOwnerToken(), Duration.ofMinutes(20))).thenReturn(true);
         when(claim.writeNote(eq(generation.getConnectorId()), anyString())).thenReturn(true);
@@ -134,11 +144,35 @@ class SemanticGenerationHeartbeatTest {
     }
 
     @Test
-    @DisplayName("进度说明只在 k/g 变化且距上次满 20 秒时写入")
+    @DisplayName("进度 k/g 从每表状态权威聚合，不读批次行的旧计数")
+    @SuppressWarnings("unchecked")
+    void 进度从每表状态聚合() {
+        generation.setDoneTables(99);
+        generation.setGaveUpTables(88);
+        when(tableMapper.selectList(any())).thenReturn(progressRows(3, 1));
+
+        heartbeat.tick();
+
+        ArgumentCaptor<String> note = ArgumentCaptor.forClass(String.class);
+        verify(claim).writeNote(eq(generation.getConnectorId()), note.capture());
+        assertTrue(note.getValue().contains("已完成 3/10 张表"), note.getValue());
+        assertTrue(note.getValue().contains("放弃 1 张"), note.getValue());
+        assertFalse(note.getValue().contains("99/10"), note.getValue());
+
+        ArgumentCaptor<LambdaQueryWrapper<ConnectorSemanticGenerationTable>> wrapper =
+                ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tableMapper).selectList(wrapper.capture());
+        wrapper.getValue().getSqlSegment();
+        assertTrue(wrapper.getValue().getParamNameValuePairs().containsValue(generation.getId()),
+                wrapper.getValue().getParamNameValuePairs().toString());
+    }
+
+    @Test
+    @DisplayName("进度说明只在权威 k/g 变化且距上次满 20 秒时写入")
     void 进度按变化与20秒双条件节流() {
         heartbeat.tick();
         clock.advance(Duration.ofSeconds(5));
-        generation.setDoneTables(3);
+        when(tableMapper.selectList(any())).thenReturn(progressRows(3, 0));
         heartbeat.tick();
         clock.advance(Duration.ofSeconds(15));
         heartbeat.tick();
@@ -149,6 +183,7 @@ class SemanticGenerationHeartbeatTest {
         verify(claim, times(2)).writeNote(eq(generation.getConnectorId()), notes.capture());
         assertTrue(notes.getAllValues().get(0).contains("已完成 2/10 张表（第 1/5 片）"));
         assertTrue(notes.getAllValues().get(1).contains("已完成 3/10 张表（第 1/5 片）"));
+        verify(tableMapper, times(4)).selectList(any());
     }
 
     @Test
@@ -204,10 +239,15 @@ class SemanticGenerationHeartbeatTest {
     @DisplayName("片边界可强制写进度，不受 20 秒节流影响")
     void forceProgressNote跳过节流() {
         heartbeat.tick();
+        when(tableMapper.selectList(any())).thenReturn(progressRows(4, 1));
 
         heartbeat.forceProgressNote();
 
-        verify(claim, times(2)).writeNote(eq(generation.getConnectorId()), anyString());
+        ArgumentCaptor<String> notes = ArgumentCaptor.forClass(String.class);
+        verify(claim, times(2)).writeNote(eq(generation.getConnectorId()), notes.capture());
+        assertTrue(notes.getAllValues().get(1).contains("已完成 4/10 张表"), notes.getAllValues().get(1));
+        assertTrue(notes.getAllValues().get(1).contains("放弃 1 张"), notes.getAllValues().get(1));
+        verify(tableMapper, times(2)).selectList(any());
     }
 
     private static ConnectorSemanticGeneration generation() {
@@ -232,6 +272,25 @@ class SemanticGenerationHeartbeatTest {
         row.setId(41L);
         row.setStatus("ACTIVE");
         row.setSemanticStatus("RUNNING");
+        return row;
+    }
+
+    private static List<ConnectorSemanticGenerationTable> progressRows(int done, int gaveUp) {
+        List<ConnectorSemanticGenerationTable> rows = new ArrayList<>();
+        for (int i = 0; i < done; i++) {
+            rows.add(generationTable("DONE"));
+        }
+        for (int i = 0; i < gaveUp; i++) {
+            rows.add(generationTable("GAVE_UP"));
+        }
+        rows.add(generationTable("PENDING"));
+        return rows;
+    }
+
+    private static ConnectorSemanticGenerationTable generationTable(String status) {
+        ConnectorSemanticGenerationTable row = new ConnectorSemanticGenerationTable();
+        row.setGenerationId(9L);
+        row.setStatus(status);
         return row;
     }
 }

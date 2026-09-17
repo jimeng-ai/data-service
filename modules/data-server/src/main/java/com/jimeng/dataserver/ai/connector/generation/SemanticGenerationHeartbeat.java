@@ -1,11 +1,14 @@
 package com.jimeng.dataserver.ai.connector.generation;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
+import com.jimeng.persistence.entity.ConnectorSemanticGenerationTable;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticGenerationMapper;
+import com.jimeng.persistence.mapper.ConnectorSemanticGenerationTableMapper;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,6 +18,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -40,6 +44,7 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
     private static final String FINALIZING = "FINALIZING";
 
     private final ConnectorSemanticGenerationMapper generationMapper;
+    private final ConnectorSemanticGenerationTableMapper tableMapper;
     private final ConnectionMapper connectionMapper;
     private final SemanticGenerationLease lease;
     private final SemanticConnectionClaim claim;
@@ -57,24 +62,27 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
 
     @Autowired
     public SemanticGenerationHeartbeat(ConnectorSemanticGenerationMapper generationMapper,
+                                       ConnectorSemanticGenerationTableMapper tableMapper,
                                        ConnectionMapper connectionMapper,
                                        SemanticGenerationLease lease,
                                        SemanticConnectionClaim claim,
                                        SemanticGenerationNotes notes) {
-        this(generationMapper, connectionMapper, lease, claim, notes, Clock.systemDefaultZone());
+        this(generationMapper, tableMapper, connectionMapper, lease, claim, notes, Clock.systemDefaultZone());
     }
 
     SemanticGenerationHeartbeat(ConnectorSemanticGenerationMapper generationMapper,
+                                ConnectorSemanticGenerationTableMapper tableMapper,
                                 ConnectionMapper connectionMapper,
                                 SemanticGenerationLease lease,
                                 SemanticConnectionClaim claim,
                                 SemanticGenerationNotes notes,
                                 Clock clock) {
-        this(generationMapper, connectionMapper, lease, claim, notes, clock,
+        this(generationMapper, tableMapper, connectionMapper, lease, claim, notes, clock,
                 Executors.newSingleThreadScheduledExecutor(threadFactory()));
     }
 
     SemanticGenerationHeartbeat(ConnectorSemanticGenerationMapper generationMapper,
+                                ConnectorSemanticGenerationTableMapper tableMapper,
                                 ConnectionMapper connectionMapper,
                                 SemanticGenerationLease lease,
                                 SemanticConnectionClaim claim,
@@ -82,6 +90,7 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
                                 Clock clock,
                                 ScheduledExecutorService scheduler) {
         this.generationMapper = generationMapper;
+        this.tableMapper = tableMapper;
         this.connectionMapper = connectionMapper;
         this.lease = lease;
         this.claim = claim;
@@ -184,7 +193,7 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
     }
 
     private void writeProgressIfDue(Active current, ConnectorSemanticGeneration live) {
-        ProgressSnapshot progress = ProgressSnapshot.from(live);
+        ProgressSnapshot progress = readProgress(current.generationId());
         long now = clock.millis();
         boolean first = lastProgress == null;
         boolean changed = !progress.equals(lastProgress);
@@ -207,7 +216,7 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
                 lost.set(true);
                 return;
             }
-            writeProgress(current, live, ProgressSnapshot.from(live), clock.millis());
+            writeProgress(current, live, readProgress(current.generationId()), clock.millis());
         } catch (RuntimeException e) {
             lost.set(true);
             log.warn("强制写语义层生成进度失败 generationId={}: {}", current.generationId(),
@@ -217,13 +226,34 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
 
     private void writeProgress(Active current, ConnectorSemanticGeneration live,
                                ProgressSnapshot progress, long writtenAt) {
-        String note = notes.progress(live);
+        String note = notes.progress(live,
+                new SemanticGenerationNotes.ProgressCounts(progress.doneTables(), progress.gaveUpTables()));
         if (!claim.writeNote(current.connectorId(), note)) {
             lost.set(true);
             return;
         }
         lastProgress = progress;
         lastProgressAt = writtenAt;
+    }
+
+    /** 批次行计数可能落后于片内 callback；进度以每表状态为唯一真相源。 */
+    private ProgressSnapshot readProgress(Long generationId) {
+        List<ConnectorSemanticGenerationTable> rows = tableMapper.selectList(
+                new LambdaQueryWrapper<ConnectorSemanticGenerationTable>()
+                        .select(ConnectorSemanticGenerationTable::getStatus)
+                        .eq(ConnectorSemanticGenerationTable::getGenerationId, generationId));
+        int done = 0;
+        int gaveUp = 0;
+        if (rows != null) {
+            for (ConnectorSemanticGenerationTable row : rows) {
+                if ("DONE".equals(row.getStatus())) {
+                    done++;
+                } else if ("GAVE_UP".equals(row.getStatus())) {
+                    gaveUp++;
+                }
+            }
+        }
+        return new ProgressSnapshot(done, gaveUp);
     }
 
     public Checkpoint checkpoint() {
@@ -268,13 +298,6 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
     }
 
     private record ProgressSnapshot(int doneTables, int gaveUpTables) {
-        private static ProgressSnapshot from(ConnectorSemanticGeneration generation) {
-            return new ProgressSnapshot(number(generation.getDoneTables()), number(generation.getGaveUpTables()));
-        }
-
-        private static int number(Integer value) {
-            return value == null ? 0 : Math.max(0, value);
-        }
     }
 
     public record Checkpoint(boolean lost, boolean connectionDeleted, boolean connectionDisabled) {
