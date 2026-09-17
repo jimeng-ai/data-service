@@ -143,26 +143,38 @@ public final class SemanticRowAssembler {
      * （没有 COMMENT 这一档依据可用），不能让它看起来像是我们没给。
      */
     public static String renderObject(ConnectorSchema r, Map<String, FieldDetail> cols) {
-        StringBuilder b = new StringBuilder();
-        b.append("## ").append(r.getObjectName())
-                .append(" [").append(r.getObjectType() == null ? "TABLE" : r.getObjectType()).append("] ")
-                .append(blank(r.getObjectComment()) ? "(无表注释)" : r.getObjectComment())
-                .append('\n');
+        StringBuilder b = new StringBuilder(renderObjectHeader(r));
         if (cols == null || cols.isEmpty()) {
             // 账号权限只到部分表时，ConnectorSchemaService 会存一条只有名字的行。
             // 如实说出来，别让模型把「没取到」读成「这是张空表」。
             b.append("(本表字段未取到，不要为它写字段或关系)\n");
         } else {
             for (FieldDetail f : cols.values()) {
-                b.append(f.name()).append('|')
-                        .append(nz(f.type())).append('|')
-                        .append(f.nullable() ? "NULL" : "NOT NULL").append('|')
-                        .append(nz(f.comment())).append('|')
-                        .append(nz(f.extra())).append('\n');
+                b.append(renderField(f));
             }
         }
         b.append('\n');
         return b.toString();
+    }
+
+    /**
+     * {@link #renderObject} 的对象头。宽表预算器会把列行预渲染一次后按前缀长度选截断点，必须复用这里，
+     * 否则「完整摘要」和「截断摘要」可能因两份格式代码悄悄分叉。
+     */
+    public static String renderObjectHeader(ConnectorSchema r) {
+        return "## " + r.getObjectName()
+                + " [" + (r.getObjectType() == null ? "TABLE" : r.getObjectType()) + "] "
+                + (blank(r.getObjectComment()) ? "(无表注释)" : r.getObjectComment())
+                + '\n';
+    }
+
+    /** 同一原因，把单列的规范文本也收在唯一实现里；返回值始终以换行结束。 */
+    public static String renderField(FieldDetail f) {
+        return f.name() + '|'
+                + nz(f.type()) + '|'
+                + (f.nullable() ? "NULL" : "NOT NULL") + '|'
+                + nz(f.comment()) + '|'
+                + nz(f.extra()) + '\n';
     }
 
     // ================================================================ 落成语义行

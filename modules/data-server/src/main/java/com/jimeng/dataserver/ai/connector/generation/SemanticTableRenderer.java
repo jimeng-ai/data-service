@@ -68,24 +68,36 @@ public class SemanticTableRenderer {
             return new RenderedTable(hardClip(full, maxChars), false, 0, 0);
         }
 
-        List<Map.Entry<String, FieldDetail>> ordered = new ArrayList<>(fields.entrySet());
-        for (int kept = ordered.size() - 1; kept >= 0; kept--) {
-            Map<String, FieldDetail> prefix = new LinkedHashMap<>();
+        List<String> renderedFields = fields.values().stream()
+                .map(SemanticRowAssembler::renderField)
+                .toList();
+        String header = SemanticRowAssembler.renderObjectHeader(row);
+        String uniqueKeys = uniqueKeyLine(row) + "\n";
+        int fixedLength = header.length() + uniqueKeys.length();
+        int prefixLength = 0;
+        int kept = -1;
+        for (int i = 0; i < renderedFields.size(); i++) {
+            String marker = truncationMarker(renderedFields.size(), i);
+            if (fixedLength + prefixLength + marker.length() <= maxChars) {
+                kept = i;
+            }
+            prefixLength += renderedFields.get(i).length();
+        }
+        // 循环只累计长度，不反复建 Map、拼大字符串或解析整份 detail_json；最后只组装一次命中的前缀。
+        if (kept >= 0) {
+            StringBuilder candidate = new StringBuilder(maxChars);
+            candidate.append(header);
             for (int i = 0; i < kept; i++) {
-                Map.Entry<String, FieldDetail> e = ordered.get(i);
-                prefix.put(e.getKey(), e.getValue());
+                candidate.append(renderedFields.get(i));
             }
-            String marker = truncationMarker(ordered.size(), kept);
-            String candidate = renderWithFields(row, prefix, !prefix.isEmpty()) + marker;
-            if (candidate.length() <= maxChars) {
-                return new RenderedTable(candidate, true, ordered.size(), kept);
-            }
+            candidate.append(uniqueKeys).append(truncationMarker(renderedFields.size(), kept));
+            return new RenderedTable(candidate.toString(), true, renderedFields.size(), kept);
         }
 
         // 极端坏快照（例如表注释或唯一键行自身就超过 16k）：仍严格守住协议上限，并让截断提示完整留在末尾。
-        String marker = "\n" + truncationMarker(ordered.size(), 0);
+        String marker = "\n" + truncationMarker(renderedFields.size(), 0);
         String prefix = renderWithFields(row, Map.of(), false);
-        return new RenderedTable(fitWithSuffix(prefix, marker, maxChars), true, ordered.size(), 0);
+        return new RenderedTable(fitWithSuffix(prefix, marker, maxChars), true, renderedFields.size(), 0);
     }
 
     /** detail_json 是否明确带了 extra.unique_keys；空列表也算「已知」。 */
