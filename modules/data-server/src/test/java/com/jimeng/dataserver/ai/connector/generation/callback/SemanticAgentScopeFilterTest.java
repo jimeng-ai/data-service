@@ -28,6 +28,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
@@ -138,6 +139,65 @@ class SemanticAgentScopeFilterTest {
     }
 
     @Test
+    @DisplayName("普通 token 的原始回调路径即使规范化后离开回调前缀也返回 403")
+    void 普通token的raw回调遍历403() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent/%2e%2e/admin/connectors/1", ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("普通 token 不能用双层编码斜杠隐藏原始回调意图")
+    void 普通token双层编码斜杠403() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent%252fsubmit", ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("semantic token 不能用双层编码点隐藏回调路径遍历")
+    void semantic_token双层编码点403() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent/%252e%252e/admin/connectors/1", semanticToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("普通 token 的正常非回调 URL 不因双层编码被误伤")
+    void 正常非回调双层编码放行() throws Exception {
+        MockHttpServletRequest request = request("/data/public/%252fasset", ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertTrue(reached.get());
+        assertEquals(200, response.getStatus());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
     @DisplayName("semantic token 签名错误返回 403")
     void 签名错误403() throws Exception {
         MockHttpServletRequest request = request(CALLBACK_PATH,
@@ -149,6 +209,20 @@ class SemanticAgentScopeFilterTest {
         });
 
         assertForbidden(request, response);
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("alg=none 的无签名 semantic token 即使 claims 与批次全匹配也返回 403")
+    void 无签名_none算法403() throws Exception {
+        MockHttpServletRequest request = request(CALLBACK_PATH, unsignedNoneToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
         verify(generationMapper, never()).selectById(GENERATION_ID);
     }
 
@@ -372,6 +446,23 @@ class SemanticAgentScopeFilterTest {
             payload.put("rid", runId);
         }
         return JWTUtil.createToken(payload, key);
+    }
+
+    private static String unsignedNoneToken() {
+        String header = "{\"alg\":\"none\",\"typ\":\"JWT\"}";
+        long exp = System.currentTimeMillis() / 1000L + 60;
+        String payload = "{\"exp\":" + exp
+                + ",\"id\":\"" + USER_ID + "\""
+                + ",\"tenant_id\":\"" + TENANT_ID + "\""
+                + ",\"realm\":\"" + PlatformConstant.REALM_ENTERPRISE + "\""
+                + ",\"purpose\":\"semantic-agent\""
+                + ",\"gen\":\"" + GENERATION_ID + "\""
+                + ",\"cid\":\"" + CONNECTOR_ID + "\""
+                + ",\"slice\":" + SLICE_NO
+                + ",\"rid\":\"" + RUN_ID + "\"}";
+        Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
+        return encoder.encodeToString(header.getBytes(StandardCharsets.UTF_8)) + "."
+                + encoder.encodeToString(payload.getBytes(StandardCharsets.UTF_8)) + ".";
     }
 
     private static ConnectorSemanticGeneration generation(String status) {

@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.generation.callback;
 import cn.hutool.jwt.JWT;
 import cn.hutool.jwt.JWTPayload;
 import cn.hutool.jwt.JWTUtil;
+import cn.hutool.jwt.signers.JWTSignerUtil;
 import com.jimeng.common.core.constant.PlatformConstant;
 import com.jimeng.common.core.security.JwtSecretProvider;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
@@ -44,6 +45,7 @@ public class SemanticAgentScopeFilter implements Filter {
 
     private static final String STATUS_RUNNING = "RUNNING";
     private static final String BODY_TOO_LARGE_MESSAGE = "请求体超过 256KB";
+    private static final int MAX_PERCENT_ENCODING_FOLDS = 8;
 
     private final ConnectorSemanticGenerationMapper generationMapper;
     private final JwtSecretProvider jwtSecretProvider;
@@ -78,7 +80,9 @@ public class SemanticAgentScopeFilter implements Filter {
         }
 
         boolean callbackPath = applicationPath.startsWith(SemanticAgentTokens.CALLBACK_PREFIX);
-        if (isSuspiciousRawUri(httpRequest.getRequestURI()) && (callbackPath || credential.semanticAgent())) {
+        boolean rawCallbackIntent = rawLooksLikeCallback(httpRequest.getRequestURI());
+        if (isSuspiciousRawUri(httpRequest.getRequestURI())
+                && (callbackPath || rawCallbackIntent || credential.semanticAgent())) {
             writeForbidden(httpResponse, "回调路径非法");
             return;
         }
@@ -157,7 +161,12 @@ public class SemanticAgentScopeFilter implements Filter {
 
     private boolean validSignatureAndExpiration(String token, JWT jwt) {
         try {
-            if (!JWTUtil.verify(token, jwtSecretProvider.key())) {
+            String[] segments = token.split("\\.", -1);
+            if (segments.length != 3 || !StringUtils.hasText(segments[2])
+                    || !"HS256".equals(jwt.getAlgorithm())) {
+                return false;
+            }
+            if (!JWTUtil.verify(token, JWTSignerUtil.hs256(jwtSecretProvider.key()))) {
                 return false;
             }
             Long expiresAt = longClaim(jwt.getPayload().getClaim(JWTPayload.EXPIRES_AT));
@@ -235,12 +244,26 @@ public class SemanticAgentScopeFilter implements Filter {
         if (rawUri == null) {
             return false;
         }
-        String lower = rawUri.toLowerCase(Locale.ROOT);
-        return lower.contains("..")
-                || lower.contains(";")
-                || lower.contains("%2e")
-                || lower.contains("%2f")
-                || lower.contains("%5c");
+        String candidate = rawUri.toLowerCase(Locale.ROOT);
+        for (int i = 0; i < MAX_PERCENT_ENCODING_FOLDS; i++) {
+            if (containsDangerousPathSequence(candidate)) {
+                return true;
+            }
+            String folded = candidate.replace("%25", "%");
+            if (folded.equals(candidate)) {
+                return false;
+            }
+            candidate = folded;
+        }
+        return containsDangerousPathSequence(candidate);
+    }
+
+    private static boolean containsDangerousPathSequence(String uri) {
+        return uri.contains("..")
+                || uri.contains(";")
+                || uri.contains("%2e")
+                || uri.contains("%2f")
+                || uri.contains("%5c");
     }
 
     private static boolean rawLooksLikeCallback(String rawUri) {
