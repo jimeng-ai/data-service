@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.generation;
 import com.baomidou.mybatisplus.core.MybatisConfiguration;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.exec.service.SidecarClient;
@@ -90,12 +91,14 @@ class SemanticSliceDispatcherTest {
     @AfterEach
     void clearInterrupt() {
         Thread.interrupted();
+        TenantContext.clear();
     }
 
     @Test
     @DisplayName("每 attempt 以 owner/status CAS 写 runId，铸窄 token 并下发固定 payload")
     @SuppressWarnings("unchecked")
     void casToken与payload契约() {
+        generation.setConfigJson("{\"sliceWallClockSec\":1200,\"model\":\"must-not-be-used\"}");
         answerSummary("success", null);
 
         SliceRunResult result = dispatcher.runSlice(generation, 3, slice, limits);
@@ -294,6 +297,21 @@ class SemanticSliceDispatcherTest {
         verify(authService, never()).mintSemanticAgentToken(anyLong(), any(), anyLong(), anyLong(),
                 anyInt(), any(), anyLong());
         verify(sidecarClient, never()).run(any(), any());
+    }
+
+    @Test
+    @DisplayName("后台派发临时切到批次租户，结束后恢复调用方 TenantContext")
+    void tenantContext不泄漏() {
+        TenantContext.set("caller-tenant");
+        when(generationMapper.update(any(), any())).thenAnswer(invocation -> {
+            assertEquals("tenant-a", TenantContext.get());
+            return 1;
+        });
+        answerSummary("success", null);
+
+        dispatcher.runSlice(generation, 1, slice, limits);
+
+        assertEquals("caller-tenant", TenantContext.get());
     }
 
     private void answerSummary(String status, String error) {

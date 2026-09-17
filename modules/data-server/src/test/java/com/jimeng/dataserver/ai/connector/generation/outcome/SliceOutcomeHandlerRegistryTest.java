@@ -108,6 +108,19 @@ class SliceOutcomeHandlerRegistryTest {
         assertEquals(GenerationReasonCode.CLI_BUDGET, budget.reasonCode());
     }
 
+    @Test
+    @DisplayName("NO_PROGRESS 不把任意上游异常文本写进管理台说明")
+    void noProgress原因只接受技术码() {
+        SliceRunResult unsafe = new SliceRunResult(SliceRunKind.ERROR, true, false, null, null,
+                "failed", "connection failed with sk-secret-value", null, 1, Set.of());
+        SliceOutcomeDecision decision = registry.decide(new SliceOutcomeContext(
+                SliceOutcomeKind.NO_PROGRESS, unsafe, 0, 0, 2, 0, 3, 15));
+
+        assertEquals(SliceOutcomeAction.FALLBACK, decision.action());
+        assertFalse(decision.note().contains("sk-secret-value"), decision.note());
+        assertTrue(decision.note().contains("unknown"), decision.note());
+    }
+
     private SliceOutcomeDecision decide(SliceOutcomeKind kind, int doneTables,
                                         int failStreak, int callbackStreak, int maxRetries) {
         return registry.decide(new SliceOutcomeContext(kind, result("timeout"), 0, doneTables,

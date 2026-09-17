@@ -44,6 +44,8 @@ class SliceRunRecorderTest {
         assertTrue(result.started());
         assertEquals("failed", result.summaryStatus());
         assertEquals("result:error_max_turns", result.summaryError());
+        assertEquals("轮次用尽", recorder.summaryErrorMessage());
+        assertEquals(12, recorder.toolRounds());
         NormalizedUsage usage = result.usage();
         assertEquals(11, usage.getInputTokens());
         assertEquals(7, usage.getOutputTokens());
@@ -147,6 +149,17 @@ class SliceRunRecorderTest {
         assertEquals(SliceRunKind.COMPLETED, recorder.result().sseKind());
         assertEquals("success", recorder.result().summaryStatus());
         assertNull(recorder.transportErrorType());
+    }
+
+    @Test
+    @DisplayName("任意上游错误文本不会出现在 SliceRunResult.toString")
+    void 上游错误文本日志脱敏() {
+        SliceRunRecorder recorder = new SliceRunRecorder("deepseek-flash");
+        recorder.listener(new CountDownLatch(1)).onEvent(source, null, "summary",
+                "{\"status\":\"failed\",\"error\":\"upstream exposed sk-secret-value\"}");
+
+        assertFalse(recorder.result().toString().contains("sk-secret-value"), recorder.result().toString());
+        assertTrue(recorder.result().toString().contains("<redacted>"), recorder.result().toString());
     }
 
     private SliceRunResult failHttp(int code, String retryAfter) {

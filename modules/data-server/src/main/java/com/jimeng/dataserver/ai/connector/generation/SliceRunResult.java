@@ -50,4 +50,23 @@ public record SliceRunResult(
     private static SliceRunResult empty(SliceRunKind kind) {
         return new SliceRunResult(kind, false, false, null, null, null, null, null, 0, Set.of());
     }
+
+    /** Avoid accidental logging of arbitrary upstream error text or raw usage JSON. */
+    @Override
+    public String toString() {
+        String safeError = summaryError != null && summaryError.matches("[A-Za-z0-9:_-]{1,120}")
+                ? summaryError : (summaryError == null ? null : "<redacted>");
+        return "SliceRunResult{" +
+                "sseKind=" + sseKind +
+                ", started=" + started +
+                ", timedOut=" + timedOut +
+                ", httpStatus=" + httpStatus +
+                ", retryAfter=" + retryAfter +
+                ", summaryStatus='" + summaryStatus + '\'' +
+                ", summaryError='" + safeError + '\'' +
+                ", hasUsage=" + (usage != null) +
+                ", callbacks=" + callbacks +
+                ", modelsSeen=" + modelsSeen +
+                '}';
+    }
 }

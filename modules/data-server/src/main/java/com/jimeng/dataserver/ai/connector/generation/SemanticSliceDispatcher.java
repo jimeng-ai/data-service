@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.generation;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.exec.service.SidecarClient;
@@ -56,13 +57,26 @@ public class SemanticSliceDispatcher {
                                    SemanticSlice slice,
                                    SemanticDispatchLimits limits) {
         requireArguments(generation, sliceNo, slice, limits);
-        if (heartbeat.lost()) {
-            return SliceRunResult.aborted();
+        String previousTenant = TenantContext.get();
+        TenantContext.set(generation.getTenantId());
+        try {
+            return runSliceOwned(generation, sliceNo, slice, limits);
+        } finally {
+            restoreTenant(previousTenant);
         }
+    }
+
+    private SliceRunResult runSliceOwned(ConnectorSemanticGeneration generation,
+                                         int sliceNo,
+                                         SemanticSlice slice,
+                                         SemanticDispatchLimits limits) {
         int attempt = 0;
         int busyRetries = 0;
         int duplicateRuns = 0;
         while (true) {
+            if (heartbeat.lost()) {
+                return SliceRunResult.aborted();
+            }
             attempt++;
             String runId = "semgen-" + generation.getId() + "-s" + sliceNo + "-a" + attempt;
             if (!beginAttempt(generation, runId, limits.llmModel())) {
@@ -292,6 +306,14 @@ public class SemanticSliceDispatcher {
                 || generation.getTriggeredBy() == null || generation.getOwnerToken() == null
                 || sliceNo < 1 || slice == null || slice.isEmpty() || limits == null) {
             throw new IllegalArgumentException("complete generation, positive sliceNo, non-empty slice and limits required");
+        }
+    }
+
+    private static void restoreTenant(String previousTenant) {
+        if (previousTenant == null || previousTenant.isEmpty()) {
+            TenantContext.clear();
+        } else {
+            TenantContext.set(previousTenant);
         }
     }
 

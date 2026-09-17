@@ -27,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -144,6 +145,21 @@ class SemanticSliceUsageRecorderTest {
         zero.setPriceOutput(BigDecimal.ZERO);
         assertTrue(SemanticSliceUsageRecorder.hasZeroPrice(zero));
         assertTrue(SemanticSliceUsageRecorder.hasZeroPrice(null));
+    }
+
+    @Test
+    @DisplayName("计费明细写失败不回滚已累计用量，也不要求重派模型")
+    void billing失败不重派() {
+        NormalizedUsage usage = usage(1, 2, 0, 0);
+        when(modelRegistry.priceOf("deepseek-flash"))
+                .thenReturn(pricedModel("deepseek", "deepseek-flash"));
+        doThrow(new IllegalStateException("db secret"))
+                .when(callRecordService).recordComputedCall(any(), any(), any(), any(), any(), any(), any(), any());
+
+        assertTrue(recorder.record(generation, 1, "semgen-10-s1-a1",
+                "deepseek-flash", result(usage, Set.of(), 200), 5));
+
+        verify(generationMapper).update(eq(null), any());
     }
 
     private static ConnectorSemanticGeneration generation() {

@@ -37,6 +37,8 @@ public final class SliceRunRecorder {
     private Integer retryAfter;
     private String summaryStatus;
     private String summaryError;
+    private String summaryErrorMessage;
+    private Integer toolRounds;
     private NormalizedUsage usage;
     private int toolErrorCount;
     private String transportErrorType;
@@ -68,7 +70,7 @@ public final class SliceRunRecorder {
 
             @Override
             public void onClosed(EventSource eventSource) {
-                finish(startedSnapshot() ? SliceRunKind.ERROR : SliceRunKind.ERROR);
+                finish(SliceRunKind.ERROR);
             }
 
             @Override
@@ -92,10 +94,11 @@ public final class SliceRunRecorder {
                     JSONObject summary = parseObject(data);
                     summaryStatus = summary.getStr("status");
                     summaryError = summary.getStr("error");
+                    summaryErrorMessage = bounded(summary.getStr("errorMessage"), 500);
+                    toolRounds = summary.getInt("toolRounds", null);
                     JSONObject usageJson = summary.getJSONObject("usage");
                     usage = usageJson == null ? null : usageExtractor.extract(usageJson);
-                    // Parse but deliberately do not retain errorMessage, finalText or any other transcript field.
-                    summary.getStr("errorMessage");
+                    // finalText and every other transcript-like field are deliberately ignored.
                     finishLocked(SliceRunKind.COMPLETED);
                 } else if ("error".equals(type)) {
                     parseObject(data); // Validate the envelope without retaining its message.
@@ -122,7 +125,7 @@ public final class SliceRunRecorder {
         if (actualModel == null || actualModel.isBlank()) {
             return;
         }
-        modelsSeen.add(actualModel);
+        modelsSeen.add(safeModelName(actualModel));
         if (!actualModel.equals(configuredModel)) {
             finishLocked(SliceRunKind.MODEL_MISMATCH);
         }
@@ -215,16 +218,22 @@ public final class SliceRunRecorder {
         }
     }
 
+    public String summaryErrorMessage() {
+        synchronized (monitor) {
+            return summaryErrorMessage;
+        }
+    }
+
+    public Integer toolRounds() {
+        synchronized (monitor) {
+            return toolRounds;
+        }
+    }
+
     private SliceRunResult snapshot() {
         SliceRunKind snapshotKind = kind == null ? SliceRunKind.ERROR : kind;
         return new SliceRunResult(snapshotKind, started, timedOut, httpStatus, retryAfter, summaryStatus,
                 summaryError, usage, 0, modelsSeen);
-    }
-
-    private boolean startedSnapshot() {
-        synchronized (monitor) {
-            return started;
-        }
     }
 
     private void finish(SliceRunKind resultKind) {
@@ -258,5 +267,21 @@ public final class SliceRunRecorder {
         } catch (NumberFormatException ignored) {
             return null;
         }
+    }
+
+    private static String bounded(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, maxLength);
+    }
+
+    private static String safeModelName(String value) {
+        StringBuilder safe = new StringBuilder(Math.min(120, value.length()));
+        for (int i = 0; i < value.length() && safe.length() < 120; i++) {
+            char c = value.charAt(i);
+            safe.append(c == ',' || Character.isISOControl(c) ? '_' : c);
+        }
+        return safe.toString();
     }
 }

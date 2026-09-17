@@ -193,7 +193,7 @@ public final class SliceOutcomeHandlerRegistry {
         if (code == null || code.isBlank()) {
             return context.result().timedOut() ? "timeout" : "unknown";
         }
-        return code.length() <= 120 ? code : code.substring(0, 120);
+        return code.matches("[A-Za-z0-9:_-]{1,120}") ? code : "unknown";
     }
 
     private static String stripTrailingPunctuation(String reason) {
