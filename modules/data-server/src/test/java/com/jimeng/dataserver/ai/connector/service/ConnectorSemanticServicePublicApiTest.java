@@ -1,26 +1,34 @@
 package com.jimeng.dataserver.ai.connector.service;
 
+import com.baomidou.mybatisplus.core.MybatisConfiguration;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
-import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.jimeng.common.core.enums.ExceptionCode;
+import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorSemantic;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticMapper;
+import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.lang.reflect.Modifier;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -59,6 +67,26 @@ class ConnectorSemanticServicePublicApiTest {
         assertEquals("field\u0001t_ord\u0001amt\u0001",
                 ConnectorSemanticService.uniqueKey(row("FIELD", "T_ORD", "Amt", "", null)));
         assertEquals("tenant-a", service.requireOwned(CONNECTOR_ID).getTenantId());
+    }
+
+    @Test
+    @DisplayName("requireOwned 对当前租户不可见的连接返回 NOT_FOUND")
+    void requireOwned不存在() {
+        when(connectionMapper.selectById(CONNECTOR_ID)).thenReturn(null);
+
+        ServiceException error = assertThrows(ServiceException.class, () -> service.requireOwned(CONNECTOR_ID));
+
+        assertEquals(ExceptionCode.NOT_FOUND.getResultCode(), error.getRespCode());
+    }
+
+    @Test
+    @DisplayName("uniqueKey 与库索引一致地折叠大小写、重音和尾随空格")
+    void uniqueKey折叠重音与尾随空格() {
+        ConnectorSemantic accented = row("FÍELD  ", "CafÉ  ", "AMT  ", "RÉSUMÉ  ", null);
+        ConnectorSemantic plain = row("field", "cafe", "amt", "resume", null);
+
+        assertEquals(ConnectorSemanticService.uniqueKey(plain),
+                ConnectorSemanticService.uniqueKey(accented));
     }
 
     @Test
@@ -128,12 +156,52 @@ class ConnectorSemanticServicePublicApiTest {
         ConnectorSemantic old = row("CAVEAT", "", "", "销售额", "{\"applies_to\":[\"t_old\"]}");
         old.setId(2L);
         old.setSource(ConnectorSemanticService.SOURCE_INFERRED);
+        old.setStatus("ACTIVE");
+        old.setVerified("PASS");
+        old.setAnchorHash("anchor-before");
+        old.setGloss("先到的问题");
+        old.setHistoryJson("[{\"before\":true}]");
+        old.setUpdateTime(new Date(1_789_624_496_000L));
         when(semanticMapper.selectOne(any())).thenReturn(old);
         when(semanticMapper.update(isNull(), any())).thenReturn(0);
 
         assertEquals(ConnectorSemanticService.CaveatMergeResult.CONFLICT,
                 service.mergeInferredCaveat(CONNECTOR_ID,
                         row("CAVEAT", "", "", "销售额", "{\"applies_to\":[\"t_new\"]}")));
+
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        ArgumentCaptor<LambdaUpdateWrapper<ConnectorSemantic>> captor =
+                ArgumentCaptor.forClass((Class) LambdaUpdateWrapper.class);
+        verify(semanticMapper).update(isNull(), captor.capture());
+        LambdaUpdateWrapper<ConnectorSemantic> update = captor.getValue();
+        update.getSqlSegment();
+        assertTrue(update.getParamNameValuePairs().containsValue(old.getUpdateTime()));
+        assertTrue(update.getParamNameValuePairs().containsValue("ACTIVE"));
+        assertTrue(update.getParamNameValuePairs().containsValue(ConnectorSemanticService.SOURCE_INFERRED));
+        assertTrue(update.getParamNameValuePairs().containsValue("PASS"));
+        assertTrue(update.getParamNameValuePairs().containsValue("anchor-before"));
+        assertTrue(update.getParamNameValuePairs().containsValue("先到的问题"));
+        assertTrue(update.getParamNameValuePairs().containsValue(old.getDetailJson()));
+        assertTrue(update.getParamNameValuePairs().containsValue(old.getHistoryJson()));
+    }
+
+    @Test
+    @DisplayName("插入撞键在方法内转为 CONFLICT，外层事务仍可提交")
+    void caveat撞键不污染外层事务() {
+        when(semanticMapper.selectOne(any())).thenReturn(null);
+        org.mockito.Mockito.doThrow(new DuplicateKeyException("race"))
+                .when(semanticMapper).insert(any());
+        RecordingTransactionManager transactions = new RecordingTransactionManager();
+
+        new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            assertEquals(ConnectorSemanticService.CaveatMergeResult.CONFLICT,
+                    service.mergeInferredCaveat(CONNECTOR_ID,
+                            row("CAVEAT", "", "", "退款", "{\"applies_to\":[\"t_refund\"]}")));
+            assertFalse(status.isRollbackOnly());
+        });
+
+        assertTrue(transactions.committed);
+        assertFalse(transactions.rolledBack);
     }
 
     private static ConnectorSemantic row(String scope, String object, String field, String term, String detail) {
@@ -147,5 +215,30 @@ class ConnectorSemanticServicePublicApiTest {
         row.setEvidence(ConnectorSemanticService.EV_NAME);
         row.setAnchorKind(ConnectorSemanticService.ANCHOR_NONE);
         return row;
+    }
+
+    private static final class RecordingTransactionManager extends AbstractPlatformTransactionManager {
+        private boolean committed;
+        private boolean rolledBack;
+
+        @Override
+        protected Object doGetTransaction() {
+            return new Object();
+        }
+
+        @Override
+        protected void doBegin(Object transaction, TransactionDefinition definition) {
+            // No resource is needed: this test only observes rollback-only propagation.
+        }
+
+        @Override
+        protected void doCommit(DefaultTransactionStatus status) {
+            committed = true;
+        }
+
+        @Override
+        protected void doRollback(DefaultTransactionStatus status) {
+            rolledBack = true;
+        }
     }
 }

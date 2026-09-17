@@ -7,6 +7,7 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.exec.service.SidecarClient;
+import com.jimeng.dataserver.ai.connector.generation.outcome.SliceOutcomeKind;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
 import com.jimeng.persistence.entity.ConnectorSemanticGenerationTable;
@@ -22,12 +23,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -216,6 +221,27 @@ class SemanticSliceDispatcherTest {
         assertEquals(SliceRunKind.SANDBOX_REJECTED, runHttp(400).sseKind());
         resetSidecar();
         assertEquals(SliceRunKind.SANDBOX_AUTH, runHttp(401).sseKind());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("summaryErrors")
+    @DisplayName("summary 技术错误码经 dispatcher 保真并映射到规定结局")
+    void summary错误码映射(String error, SliceOutcomeKind expected) {
+        answerSummary("failed", error);
+
+        SliceRunResult result = dispatcher.runSlice(generation, 1, slice, limits);
+
+        assertEquals(SliceRunKind.COMPLETED, result.sseKind());
+        assertEquals(error, result.summaryError());
+        assertEquals(expected, SliceOutcomeClassifier.classify(result, 0));
+    }
+
+    static Stream<Arguments> summaryErrors() {
+        return Stream.of(
+                Arguments.of("result:error_max_turns", SliceOutcomeKind.NO_PROGRESS),
+                Arguments.of("result:error_max_budget_usd", SliceOutcomeKind.CLI_BUDGET),
+                Arguments.of("result:error_during_execution", SliceOutcomeKind.NO_PROGRESS),
+                Arguments.of("result:error_max_structured_output_retries", SliceOutcomeKind.NO_PROGRESS));
     }
 
     @Test
