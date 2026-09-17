@@ -16,12 +16,14 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.core.annotation.Order;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,7 +33,9 @@ import java.util.function.LongSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -122,6 +126,84 @@ class SemanticGeneratorSelectorTest {
         assertTrue(selection.verdict().pass());
         assertNull(selection.interruptedBatchPolicy());
         assertNull(selection.degradeReason());
+    }
+
+    @Test
+    void null前置链在构造时failFast() {
+        assertThrows(IllegalArgumentException.class, () -> new SemanticGeneratorSelector(null));
+    }
+
+    @Test
+    void 空前置链在构造时failFast() {
+        assertThrows(IllegalStateException.class, () -> new SemanticGeneratorSelector(List.of()));
+    }
+
+    @Test
+    void 含null前置条件在构造时failFast() {
+        List<AgentPathPrecondition> withNull = new ArrayList<>(preconditions());
+        withNull.set(2, null);
+
+        assertThrows(IllegalArgumentException.class, () -> new SemanticGeneratorSelector(withNull));
+    }
+
+    @Test
+    void 缺少任一预期前置条件在构造时failFast() {
+        List<AgentPathPrecondition> missingHealth = new ArrayList<>(preconditions());
+        missingHealth.remove(missingHealth.size() - 1);
+
+        assertThrows(IllegalStateException.class, () -> new SemanticGeneratorSelector(missingHealth));
+    }
+
+    @Test
+    void 同类型重复不能替代缺失的预期前置条件() {
+        List<AgentPathPrecondition> duplicateInsteadOfDescribe = new ArrayList<>(preconditions());
+        duplicateInsteadOfDescribe.set(1, duplicateInsteadOfDescribe.get(0));
+
+        assertThrows(IllegalStateException.class,
+                () -> new SemanticGeneratorSelector(duplicateInsteadOfDescribe));
+    }
+
+    @Test
+    void 预期六条之外的额外条件在构造时failFast() {
+        List<AgentPathPrecondition> withUnexpected = new ArrayList<>(preconditions());
+        withUnexpected.add(new AgentPathPrecondition() {
+            @Override
+            public PreconditionVerdict check(ConnectorView view) {
+                return PreconditionVerdict.allowed();
+            }
+
+            @Override
+            public InterruptedBatchPolicy onInterruptedBatch() {
+                return InterruptedBatchPolicy.KEEP;
+            }
+        });
+
+        assertThrows(IllegalStateException.class, () -> new SemanticGeneratorSelector(withUnexpected));
+    }
+
+    @Test
+    void 轻量Spring上下文必须扫描到六个具体组件后选择器才能启动() {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean(ConnectorProperties.class, () -> properties);
+            context.registerBean(AgentSandboxProperties.class, () -> sandbox);
+            context.registerBean(SandboxHealthProbe.class, () -> healthProbe);
+            context.scan("com.jimeng.dataserver.ai.connector.generation.precondition");
+            context.register(SemanticGeneratorSelector.class);
+
+            context.refresh();
+
+            Set<Class<?>> actualTypes = context.getBeansOfType(AgentPathPrecondition.class).values().stream()
+                    .map(Object::getClass)
+                    .collect(java.util.stream.Collectors.toSet());
+            assertEquals(Set.of(
+                    SemanticEnabledPrecondition.class,
+                    DescribeCapabilityPrecondition.class,
+                    AgentSwitchPrecondition.class,
+                    SandboxConfiguredPrecondition.class,
+                    AgentConfigPrecondition.class,
+                    SandboxHealthPrecondition.class), actualTypes);
+            assertNotNull(context.getBean(SemanticGeneratorSelector.class));
+        }
     }
 
     @Test

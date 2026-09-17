@@ -1,8 +1,16 @@
 package com.jimeng.dataserver.ai.connector.generation;
 
+import com.jimeng.dataserver.ai.connector.generation.precondition.AgentConfigPrecondition;
+import com.jimeng.dataserver.ai.connector.generation.precondition.AgentSwitchPrecondition;
+import com.jimeng.dataserver.ai.connector.generation.precondition.DescribeCapabilityPrecondition;
+import com.jimeng.dataserver.ai.connector.generation.precondition.SandboxConfiguredPrecondition;
+import com.jimeng.dataserver.ai.connector.generation.precondition.SandboxHealthPrecondition;
+import com.jimeng.dataserver.ai.connector.generation.precondition.SemanticEnabledPrecondition;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
 import org.springframework.core.annotation.AnnotationAwareOrderComparator;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import org.springframework.util.ClassUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -16,13 +24,50 @@ import java.util.List;
 @Component
 public class SemanticGeneratorSelector {
 
+    private static final List<ExpectedPrecondition> EXPECTED_PRECONDITIONS = List.of(
+            new ExpectedPrecondition(SemanticEnabledPrecondition.class, 1),
+            new ExpectedPrecondition(DescribeCapabilityPrecondition.class, 2),
+            new ExpectedPrecondition(AgentSwitchPrecondition.class, 3),
+            new ExpectedPrecondition(SandboxConfiguredPrecondition.class, 4),
+            new ExpectedPrecondition(AgentConfigPrecondition.class, 5),
+            new ExpectedPrecondition(SandboxHealthPrecondition.class, 6));
+
     private final List<AgentPathPrecondition> preconditions;
 
     public SemanticGeneratorSelector(List<AgentPathPrecondition> preconditions) {
-        List<AgentPathPrecondition> sorted = new ArrayList<>(preconditions == null ? List.of() : preconditions);
+        validatePreconditions(preconditions);
+        List<AgentPathPrecondition> sorted = new ArrayList<>(preconditions);
         // Spring 注入 List 本来就按 @Order 排好；再排一次使单测和手工装配也等价。
         AnnotationAwareOrderComparator.sort(sorted);
         this.preconditions = List.copyOf(sorted);
+    }
+
+    private static void validatePreconditions(List<AgentPathPrecondition> candidates) {
+        if (candidates == null) {
+            throw new IllegalArgumentException("agent 前置条件列表不能为 null");
+        }
+        if (candidates.stream().anyMatch(candidate -> candidate == null)) {
+            throw new IllegalArgumentException("agent 前置条件不能包含 null");
+        }
+
+        List<Class<?>> actualTypes = candidates.stream()
+                .map(ClassUtils::getUserClass)
+                .toList();
+        for (ExpectedPrecondition expected : EXPECTED_PRECONDITIONS) {
+            long count = actualTypes.stream().filter(expected.type()::equals).count();
+            if (count != 1) {
+                throw new IllegalStateException("agent 前置条件 " + expected.type().getSimpleName()
+                        + " 必须且只能有一个，实际=" + count);
+            }
+            Order order = expected.type().getAnnotation(Order.class);
+            if (order == null || order.value() != expected.order()) {
+                throw new IllegalStateException("agent 前置条件 " + expected.type().getSimpleName()
+                        + " 的 @Order 必须为 " + expected.order());
+            }
+        }
+        if (candidates.size() != EXPECTED_PRECONDITIONS.size()) {
+            throw new IllegalStateException("agent 前置条件只能包含预期的六个具体类型，实际=" + actualTypes);
+        }
     }
 
     public Selection select(ConnectorView connector) {
@@ -44,5 +89,8 @@ public class SemanticGeneratorSelector {
         public String degradeReason() {
             return kind == GeneratorKind.SINGLE_CALL && !verdict.silent() ? verdict.reason() : null;
         }
+    }
+
+    private record ExpectedPrecondition(Class<? extends AgentPathPrecondition> type, int order) {
     }
 }
