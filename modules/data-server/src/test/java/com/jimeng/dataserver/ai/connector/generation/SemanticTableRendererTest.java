@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.connector.generation;
 
+import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.persistence.entity.ConnectorSchema;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -43,6 +44,27 @@ class SemanticTableRendererTest {
         assertEquals("## max_width_table [TABLE] 业务原注释（本表字段未取到，不要为它写字段或关系）仍须保留\n"
                 + "唯一键（主键在前）：PRIMARY(column_0)\n"
                 + "本表共 1 列，只列出前 0 列；未列出的列不要写说明\n", rendered.text());
+    }
+
+    @Test
+    @DisplayName("极小预算零列分支不误删以字段提示结尾的 ASCII 表注释")
+    void 极小预算零列截断保留精确碰撞注释() {
+        ConnectorSchema row = schemaWithFields(1, 1_000);
+        row.setObjectComment("客户原文(本表字段未取到，不要为它写字段或关系)");
+        SemanticTableRenderer renderer = new SemanticTableRenderer();
+        String marker = "本表共 1 列，只列出前 0 列；未列出的列不要写说明\n";
+        int candidateLength = SemanticRowAssembler.renderObjectHeader(row).length()
+                + SemanticTableRenderer.uniqueKeyLine(row).length() + 1 + marker.length();
+
+        SemanticTableRenderer.RenderedTable rendered =
+                renderer.renderWithin(row, candidateLength - 1);
+
+        assertTrue(rendered.columnsTruncated());
+        assertEquals(0, rendered.renderedColumns());
+        assertTrue(rendered.text().startsWith(
+                "## max_width_table [TABLE] 客户原文(本表字段未取到，不要为它写字段或关系)\n"),
+                rendered.text());
+        assertTrue(rendered.text().endsWith("\n" + marker), rendered.text());
     }
 
     private static ConnectorSchema schemaWithFields(int count, int commentChars) {

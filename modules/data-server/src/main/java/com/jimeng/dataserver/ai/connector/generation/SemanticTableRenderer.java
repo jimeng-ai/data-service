@@ -96,7 +96,7 @@ public class SemanticTableRenderer {
 
         // 极端坏快照（例如表注释或唯一键行自身就超过 16k）：仍严格守住协议上限，并让截断提示完整留在末尾。
         String marker = "\n" + truncationMarker(renderedFields.size(), 0);
-        String prefix = renderWithFields(row, Map.of(), false);
+        String prefix = header + uniqueKeys;
         return new RenderedTable(fitWithSuffix(prefix, marker, maxChars), true, renderedFields.size(), 0);
     }
 
@@ -194,18 +194,7 @@ public class SemanticTableRenderer {
     }
 
     private static String renderWithFields(ConnectorSchema row, Map<String, FieldDetail> fields) {
-        return renderWithFields(row, fields, true);
-    }
-
-    /**
-     * {@code actualFields=false} 只用于「真实表有列但预算连一列也放不下」：删掉 renderObject 对空 map 写的
-     * 「字段未取到」，因为这里不是没取到，而是明确截断为 0 列。
-     */
-    private static String renderWithFields(ConnectorSchema row, Map<String, FieldDetail> fields, boolean actualFields) {
         String base = SemanticRowAssembler.renderObject(row, fields == null ? Map.of() : fields);
-        if (!actualFields && (fields == null || fields.isEmpty())) {
-            base = base.replace("(本表字段未取到，不要为它写字段或关系)\n", "");
-        }
         // renderObject 以空行收尾；唯一键属于同一张表摘要，插在那个空行之前。
         if (base.endsWith("\n")) {
             base = base.substring(0, base.length() - 1);
