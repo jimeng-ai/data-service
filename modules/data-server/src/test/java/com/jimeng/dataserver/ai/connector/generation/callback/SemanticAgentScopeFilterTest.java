@@ -9,8 +9,6 @@ import com.jimeng.dataserver.admin.common.AccountStatusFilter;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
 import com.jimeng.persistence.mapper.ConnectorSemanticGenerationMapper;
 import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletInputStream;
-import jakarta.servlet.ServletRequest;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,22 +24,19 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -420,28 +415,45 @@ class SemanticAgentScopeFilterTest {
     }
 
     @Test
-    @DisplayName("未知长度的分块请求读到超过 256KB 时抛 IOException，且最多向下游交付 256KB")
-    void 分块请求体读超256KB被截断() {
+    @DisplayName("未知长度的请求体即使下游只读完首个 JSON 值，超过 256KB 也返回 5005")
+    void 分块请求体下游提前停读仍能拦截() throws Exception {
         ChunkedMockHttpServletRequest request = new ChunkedMockHttpServletRequest("POST", CALLBACK_PATH);
         addHeaders(request, semanticToken());
-        request.setContent(new byte[SemanticAgentTokens.MAX_BODY_BYTES + 1]);
+        byte[] content = new byte[SemanticAgentTokens.MAX_BODY_BYTES + 1];
+        content[0] = '{';
+        content[1] = '}';
+        Arrays.fill(content, 2, content.length, (byte) ' ');
+        request.setContent(content);
         MockHttpServletResponse response = new MockHttpServletResponse();
-        AtomicLong delivered = new AtomicLong();
-        AtomicReference<ServletRequest> seenRequest = new AtomicReference<>();
+        AtomicBoolean reached = new AtomicBoolean();
 
-        IOException thrown = assertThrows(IOException.class, () -> filter.doFilter(request, response, (req, resp) -> {
-            seenRequest.set(req);
-            ServletInputStream in = req.getInputStream();
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                delivered.addAndGet(read);
-            }
-        }));
+        filter.doFilter(request, response, (req, resp) -> {
+            reached.set(true);
+            assertEquals('{', req.getInputStream().read());
+            assertEquals('}', req.getInputStream().read());
+            // 模拟 Jackson 读完 {} 就停，不 drain 后续空白。
+        });
 
-        assertEquals("请求体超过 256KB", thrown.getMessage());
-        assertNotSame(request, seenRequest.get(), "未知长度请求必须套限流 wrapper");
-        assertEquals(SemanticAgentTokens.MAX_BODY_BYTES, delivered.get());
+        assertFalse(reached.get(), "大小校验必须在 Jackson 提前停读之前完成");
+        assertEquals(200, response.getStatus());
+        assertTrue(response.getContentAsString().contains("\"respCode\":\"5005\""));
+        assertNull(MDC.get(SemanticAgentTokens.MDC_SEMANTIC_GENERATION));
+    }
+
+    @Test
+    @DisplayName("未知长度且未超限的请求体会完整缓存并重放给下游")
+    void 分块请求体未超限可重放() throws Exception {
+        ChunkedMockHttpServletRequest request = new ChunkedMockHttpServletRequest("POST", CALLBACK_PATH);
+        addHeaders(request, semanticToken());
+        request.setContent("{}".getBytes(StandardCharsets.UTF_8));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicReference<String> seenBody = new AtomicReference<>();
+
+        filter.doFilter(request, response, (req, resp) -> seenBody.set(
+                new String(req.getInputStream().readAllBytes(), StandardCharsets.UTF_8)));
+
+        assertEquals("{}", seenBody.get());
+        assertEquals(200, response.getStatus());
         assertNull(MDC.get(SemanticAgentTokens.MDC_SEMANTIC_GENERATION));
     }
 

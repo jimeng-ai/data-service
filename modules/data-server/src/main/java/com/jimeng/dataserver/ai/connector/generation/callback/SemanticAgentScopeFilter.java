@@ -26,6 +26,8 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.util.UrlPathHelper;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
@@ -136,9 +138,15 @@ public class SemanticAgentScopeFilter implements Filter {
                 return;
             }
 
-            HttpServletRequest requestForChain = contentLength < 0
-                    ? new SizeLimitedRequestWrapper(httpRequest)
-                    : httpRequest;
+            HttpServletRequest requestForChain = httpRequest;
+            if (contentLength < 0) {
+                try {
+                    requestForChain = new CachedBodyRequestWrapper(httpRequest);
+                } catch (BodyTooLargeException tooLarge) {
+                    writeChunkedBodyTooLarge(httpResponse);
+                    return;
+                }
+            }
             chain.doFilter(requestForChain, response);
         } finally {
             if (previousSemanticGeneration == null) {
@@ -284,6 +292,11 @@ public class SemanticAgentScopeFilter implements Filter {
         writeEnvelope(response, "4000", BODY_TOO_LARGE_MESSAGE);
     }
 
+    private static void writeChunkedBodyTooLarge(HttpServletResponse response) throws IOException {
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeEnvelope(response, "5005", BODY_TOO_LARGE_MESSAGE);
+    }
+
     private static void writeEnvelope(HttpServletResponse response, String code, String message) throws IOException {
         response.setContentType("application/json;charset=utf-8");
         response.getWriter().write("{\"success\":false,\"respCode\":\"" + code
@@ -300,107 +313,122 @@ public class SemanticAgentScopeFilter implements Filter {
                           int sliceNo, String runId) {
     }
 
-    /** Wrapper 只用于没有 Content-Length 的请求；累计读到第 262145 字节时立即失败。 */
-    private static final class SizeLimitedRequestWrapper extends HttpServletRequestWrapper {
+    /**
+     * Wrapper 只用于没有 Content-Length 的请求。进控制器前有界预读并缓存：
+     * Jackson 可能在完整首个 JSON 值后停读，懒限流 wrapper 会因此放过后缀的数百 KB 空白。
+     */
+    private static final class CachedBodyRequestWrapper extends HttpServletRequestWrapper {
 
-        private ServletInputStream limitedInputStream;
-        private BufferedReader limitedReader;
+        private final byte[] body;
+        private ServletInputStream replayInputStream;
+        private BufferedReader replayReader;
 
-        private SizeLimitedRequestWrapper(HttpServletRequest request) {
+        private CachedBodyRequestWrapper(HttpServletRequest request) throws IOException {
             super(request);
+            this.body = readBounded(request.getInputStream());
         }
 
         @Override
-        public ServletInputStream getInputStream() throws IOException {
-            if (limitedReader != null) {
+        public ServletInputStream getInputStream() {
+            if (replayReader != null) {
                 throw new IllegalStateException("getReader() 已被调用");
             }
-            if (limitedInputStream == null) {
-                limitedInputStream = new LimitedServletInputStream(super.getInputStream());
+            if (replayInputStream == null) {
+                replayInputStream = new CachedServletInputStream(body);
             }
-            return limitedInputStream;
+            return replayInputStream;
         }
 
         @Override
         public BufferedReader getReader() throws IOException {
-            if (limitedReader != null) {
-                return limitedReader;
+            if (replayReader != null) {
+                return replayReader;
             }
-            if (limitedInputStream != null) {
+            if (replayInputStream != null) {
                 throw new IllegalStateException("getInputStream() 已被调用");
             }
-            limitedInputStream = new LimitedServletInputStream(super.getInputStream());
+            replayInputStream = new CachedServletInputStream(body);
             String encoding = getCharacterEncoding();
-            limitedReader = new BufferedReader(new InputStreamReader(limitedInputStream,
+            replayReader = new BufferedReader(new InputStreamReader(replayInputStream,
                     StringUtils.hasText(encoding) ? encoding : StandardCharsets.UTF_8.name()));
-            return limitedReader;
+            return replayReader;
+        }
+
+        @Override
+        public int getContentLength() {
+            return body.length;
+        }
+
+        @Override
+        public long getContentLengthLong() {
+            return body.length;
+        }
+
+        private static byte[] readBounded(ServletInputStream input) throws IOException {
+            ByteArrayOutputStream output = new ByteArrayOutputStream(
+                    Math.min(SemanticAgentTokens.MAX_BODY_BYTES, 8192));
+            byte[] buffer = new byte[8192];
+            while (output.size() <= SemanticAgentTokens.MAX_BODY_BYTES) {
+                int remainingThroughOverflow = SemanticAgentTokens.MAX_BODY_BYTES + 1 - output.size();
+                int read = input.read(buffer, 0, Math.min(buffer.length, remainingThroughOverflow));
+                if (read < 0) {
+                    return output.toByteArray();
+                }
+                output.write(buffer, 0, read);
+                if (output.size() > SemanticAgentTokens.MAX_BODY_BYTES) {
+                    throw new BodyTooLargeException();
+                }
+            }
+            throw new BodyTooLargeException();
         }
     }
 
-    private static final class LimitedServletInputStream extends ServletInputStream {
+    private static final class CachedServletInputStream extends ServletInputStream {
 
-        private final ServletInputStream delegate;
-        private long delivered;
+        private final ByteArrayInputStream delegate;
 
-        private LimitedServletInputStream(ServletInputStream delegate) {
-            this.delegate = delegate;
+        private CachedServletInputStream(byte[] body) {
+            this.delegate = new ByteArrayInputStream(body);
         }
 
         @Override
-        public int read() throws IOException {
-            if (delivered < SemanticAgentTokens.MAX_BODY_BYTES) {
-                int value = delegate.read();
-                if (value != -1) {
-                    delivered++;
-                }
-                return value;
-            }
-            int overflow = delegate.read();
-            if (overflow == -1) {
-                return -1;
-            }
-            throw new IOException(BODY_TOO_LARGE_MESSAGE);
+        public int read() {
+            return delegate.read();
         }
 
         @Override
-        public int read(byte[] bytes, int offset, int length) throws IOException {
-            if (length == 0) {
-                return 0;
-            }
-            long remaining = SemanticAgentTokens.MAX_BODY_BYTES - delivered;
-            if (remaining > 0) {
-                int allowed = (int) Math.min(length, remaining);
-                int read = delegate.read(bytes, offset, allowed);
-                if (read > 0) {
-                    delivered += read;
-                }
-                return read;
-            }
-            int overflow = delegate.read();
-            if (overflow == -1) {
-                return -1;
-            }
-            throw new IOException(BODY_TOO_LARGE_MESSAGE);
+        public int read(byte[] bytes, int offset, int length) {
+            return delegate.read(bytes, offset, length);
         }
 
         @Override
         public boolean isFinished() {
-            return delegate.isFinished();
+            return delegate.available() == 0;
         }
 
         @Override
         public boolean isReady() {
-            return delegate.isReady();
+            return true;
         }
 
         @Override
         public void setReadListener(ReadListener readListener) {
-            delegate.setReadListener(readListener);
+            if (readListener == null) {
+                throw new IllegalArgumentException("readListener 不能为 null");
+            }
+            try {
+                if (!isFinished()) {
+                    readListener.onDataAvailable();
+                }
+                if (isFinished()) {
+                    readListener.onAllDataRead();
+                }
+            } catch (IOException e) {
+                readListener.onError(e);
+            }
         }
+    }
 
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
+    private static final class BodyTooLargeException extends IOException {
     }
 }
