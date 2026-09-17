@@ -269,8 +269,22 @@ public class SemanticAgentScopeFilter implements Filter {
         if (rawUri == null) {
             return false;
         }
-        return rawUri.startsWith(SemanticAgentTokens.CALLBACK_PREFIX)
-                || rawUri.startsWith("/data/internal/semantic-agent");
+        String callbackBase = SemanticAgentTokens.CALLBACK_PREFIX.substring(
+                0, SemanticAgentTokens.CALLBACK_PREFIX.length() - 1);
+        if (!rawUri.startsWith(callbackBase)) {
+            return false;
+        }
+        String suffix = rawUri.substring(callbackBase.length());
+        if (suffix.isEmpty() || suffix.startsWith("/")) {
+            return true;
+        }
+
+        // 只折叠 base 后的 percent 包装；相邻路由名如 semantic-agent-report 不是回调意图。
+        String folded = suffix.toLowerCase(Locale.ROOT);
+        while (folded.startsWith("%25")) {
+            folded = "%" + folded.substring(3);
+        }
+        return folded.startsWith("%2f") || folded.startsWith("%5c");
     }
 
     private static void writeForbidden(HttpServletResponse response, String message) throws IOException {

@@ -199,6 +199,21 @@ class SemanticAgentScopeFilterTest {
     }
 
     @Test
+    @DisplayName("普通 token 的相邻名称路径不能被误判为回调前缀")
+    void 相邻名称非回调路径放行() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent-report/%2fstatus", ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertTrue(reached.get());
+        assertEquals(200, response.getStatus());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
     @DisplayName("普通 token 不能用第 9 层 percent 编码斜杠隐藏原始回调意图")
     void 普通token九层percent编码斜杠403() throws Exception {
         MockHttpServletRequest request = request(
