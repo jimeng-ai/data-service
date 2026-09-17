@@ -57,6 +57,11 @@ public class SemanticAgentCallbackService {
     private static final int COMMENT_MAX = 60;
     private static final int SNAPSHOT_MAX_OBJECTS = 200;
     private static final String ORDERING = "按重要性（估算行数的数量级降序、被外键引用数降序、表名升序）";
+    private static final Set<String> RUN_SCOPE_TABLE_STATUSES = Set.of("DISPATCHED", "DONE", "GAVE_UP");
+    private static final Set<String> HUMAN_KEY_SCOPES = Set.of(
+            ConnectorSemanticService.SCOPE_OBJECT,
+            ConnectorSemanticService.SCOPE_FIELD,
+            ConnectorSemanticService.SCOPE_JOIN);
 
     private static final Comparator<ConnectorSchema> SNAPSHOT_ORDER = Comparator
             .comparing(ConnectorSchema::getImportanceRank, Comparator.nullsLast(Integer::compareTo))
@@ -99,6 +104,7 @@ public class SemanticAgentCallbackService {
 
         List<ConnectorSemanticGenerationTable> currentSlice = batch.stream()
                 .filter(t -> Objects.equals(t.getSliceNo(), principal.sliceNo()))
+                .filter(t -> RUN_SCOPE_TABLE_STATUSES.contains(t.getStatus()))
                 .sorted(BATCH_ORDER)
                 .toList();
         List<RunScopeView.TableItem> tableItems = new ArrayList<>(currentSlice.size());
@@ -367,7 +373,8 @@ public class SemanticAgentCallbackService {
     private static List<String> notes(List<ConnectorSchema> snapshot) {
         List<String> notes = new ArrayList<>();
         if (snapshot.size() >= SNAPSHOT_MAX_OBJECTS) {
-            notes.add("快照只描述了按重要性排前 200 张表");
+            // 快照表本身没有“原始目录总数”字段；恰好 200 时无法区分“刚好 200”与“被上限截断”。
+            notes.add("快照达到 200 张上限，可能只描述了按重要性排前 200 张表");
         }
         if (snapshot.stream().anyMatch(r -> r.getImportanceRank() == null)) {
             notes.add("快照缺少重要性排名，刷新结构后生效");
@@ -420,11 +427,13 @@ public class SemanticAgentCallbackService {
                 .eq(ConnectorSemantic::getTenantId, principal.tenantId())
                 .eq(ConnectorSemantic::getConnectorId, principal.connectorId())
                 .in(ConnectorSemantic::getObjectName, foundNames)
+                .in(ConnectorSemantic::getScope, HUMAN_KEY_SCOPES)
                 .ne(ConnectorSemantic::getSource, ConnectorSemanticService.SOURCE_INFERRED)
                 .orderByAsc(ConnectorSemantic::getId));
         Map<String, List<TableMetadataView.HumanKey>> out = new LinkedHashMap<>();
         for (ConnectorSemantic row : rows == null ? List.<ConnectorSemantic>of() : rows) {
             if (ConnectorSemanticService.SOURCE_INFERRED.equals(row.getSource())
+                    || !HUMAN_KEY_SCOPES.contains(row.getScope())
                     || !foundNames.contains(row.getObjectName())) {
                 continue;
             }

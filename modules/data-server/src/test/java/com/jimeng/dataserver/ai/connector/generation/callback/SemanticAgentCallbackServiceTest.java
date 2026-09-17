@@ -139,6 +139,31 @@ class SemanticAgentCallbackServiceTest {
     }
 
     @Test
+    @DisplayName("run_scope 即使库里有同片脏状态，也只返回 DISPATCHED、DONE、GAVE_UP")
+    void run_scope只返回协议允许的表状态() {
+        List<ConnectorSchema> schemas = List.of(
+                schema("dispatched", "", 1, fields("id", "int", false, "", ""), keys()),
+                schema("done", "", 2, fields("id", "int", false, "", ""), keys()),
+                schema("gave_up", "", 3, fields("id", "int", false, "", ""), keys()),
+                schema("pending", "", 4, fields("id", "int", false, "", ""), keys()),
+                schema("skipped", "", 5, fields("id", "int", false, "", ""), keys()),
+                schema("removed", "", 6, fields("id", "int", false, "", ""), keys()));
+        when(schemaMapper.selectList(any())).thenReturn(schemas);
+        when(tableMapper.selectList(any())).thenReturn(List.of(
+                batch("dispatched", 3, 1, "DISPATCHED"),
+                batch("done", 3, 2, "DONE"),
+                batch("gave_up", 3, 3, "GAVE_UP"),
+                batch("pending", 3, 4, "PENDING"),
+                batch("skipped", 3, 5, "SKIPPED"),
+                batch("removed", 3, 6, "REMOVED")));
+
+        RunScopeView view = service.runScope(PRINCIPAL);
+
+        assertEquals(List.of("dispatched", "done", "gave_up"),
+                view.getTables().stream().map(RunScopeView.TableItem::getName).toList());
+    }
+
+    @Test
     @DisplayName("STAGED 的 openTerms 只读本批暂存行并各自截到 100 条")
     void staged_openTerms读本批暂存行且截断() {
         SemanticAgentPrincipal stagedPrincipal = new SemanticAgentPrincipal(
@@ -330,6 +355,27 @@ class SemanticAgentCallbackServiceTest {
             assertEquals("amt", view.getTables().get(0).getHumanKeys().get(0).getField());
             assertFalse(view.toString().contains("人工机密说明"));
             assertFalse(view.toString().contains("机密值"));
+        }
+
+        @Test
+        @DisplayName("humanKeys 只暴露 OBJECT、FIELD、JOIN 的键，不把 METRIC/CAVEAT 或脏 scope 当表内键")
+        void humanKeys只返回表内语义键() {
+            ConnectorSchema table = schema("t_ord", "订单", 1, fields("amt", "decimal", false, "金额", ""), keys());
+            when(schemaMapper.selectList(any())).thenReturn(List.of(table));
+            ConnectorSemantic field = semantic(ConnectorSemanticService.SCOPE_FIELD, "t_ord", "amt", "", "HUMAN",
+                    "字段说明", null);
+            ConnectorSemantic metric = semantic(ConnectorSemanticService.SCOPE_METRIC, "t_ord", "", "销售额", "HUMAN",
+                    "口径答案", null);
+            ConnectorSemantic caveat = semantic(ConnectorSemanticService.SCOPE_CAVEAT, "t_ord", "", "销售额", "IMPORTED",
+                    "口径问题", null);
+            ConnectorSemantic dirty = semantic("UNKNOWN", "t_ord", "x", "", "HUMAN", "脏数据", null);
+            when(semanticMapper.selectList(any())).thenReturn(List.of(field, metric, caveat, dirty));
+
+            TableMetadataView view = service.tableMetadata(PRINCIPAL, metadataRequest("t_ord"));
+
+            assertEquals(1, view.getTables().get(0).getHumanKeys().size());
+            assertEquals(ConnectorSemanticService.SCOPE_FIELD,
+                    view.getTables().get(0).getHumanKeys().get(0).getScope());
         }
 
         @Test
