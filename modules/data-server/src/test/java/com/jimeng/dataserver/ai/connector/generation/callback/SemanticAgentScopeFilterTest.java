@@ -184,9 +184,10 @@ class SemanticAgentScopeFilterTest {
     }
 
     @Test
-    @DisplayName("普通 token 的正常非回调 URL 不因双层编码被误伤")
-    void 正常非回调双层编码放行() throws Exception {
-        MockHttpServletRequest request = request("/data/public/%252fasset", ordinaryToken());
+    @DisplayName("普通 token 的正常非回调 URL 不因 64 层编码被误伤")
+    void 正常非回调六十四层编码放行() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/public/" + wrapPercentEncoding("%2f", 64) + "asset", ordinaryToken());
         MockHttpServletResponse response = new MockHttpServletResponse();
         AtomicBoolean reached = new AtomicBoolean();
 
@@ -194,6 +195,39 @@ class SemanticAgentScopeFilterTest {
 
         assertTrue(reached.get());
         assertEquals(200, response.getStatus());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("普通 token 不能用第 9 层 percent 编码斜杠隐藏原始回调意图")
+    void 普通token九层percent编码斜杠403() throws Exception {
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent" + wrapPercentEncoding("%2f", 9) + "submit",
+                ordinaryToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
+        verify(generationMapper, never()).selectById(GENERATION_ID);
+    }
+
+    @Test
+    @DisplayName("semantic token 不能用 64 层 percent 编码点隐藏回调路径遍历")
+    void semantic_token六十四层percent编码点403() throws Exception {
+        String encodedDot = wrapPercentEncoding("%2e", 64);
+        MockHttpServletRequest request = request(
+                "/data/internal/semantic-agent/" + encodedDot + encodedDot + "/admin/connectors/1",
+                semanticToken());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean reached = new AtomicBoolean();
+
+        filter.doFilter(request, response, markingChain(reached));
+
+        assertForbidden(request, response);
+        assertFalse(reached.get());
         verify(generationMapper, never()).selectById(GENERATION_ID);
     }
 
@@ -463,6 +497,15 @@ class SemanticAgentScopeFilterTest {
         Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
         return encoder.encodeToString(header.getBytes(StandardCharsets.UTF_8)) + "."
                 + encoder.encodeToString(payload.getBytes(StandardCharsets.UTF_8)) + ".";
+    }
+
+    /** 在已有的 {@code %2f}/{@code %2e} 外再包指定层数的 {@code %25}。 */
+    private static String wrapPercentEncoding(String encodedSequence, int layers) {
+        String value = encodedSequence;
+        for (int i = 0; i < layers; i++) {
+            value = value.replace("%", "%25");
+        }
+        return value;
     }
 
     private static ConnectorSemanticGeneration generation(String status) {

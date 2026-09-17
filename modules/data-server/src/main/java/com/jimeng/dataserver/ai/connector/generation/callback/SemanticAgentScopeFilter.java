@@ -45,7 +45,6 @@ public class SemanticAgentScopeFilter implements Filter {
 
     private static final String STATUS_RUNNING = "RUNNING";
     private static final String BODY_TOO_LARGE_MESSAGE = "请求体超过 256KB";
-    private static final int MAX_PERCENT_ENCODING_FOLDS = 8;
 
     private final ConnectorSemanticGenerationMapper generationMapper;
     private final JwtSecretProvider jwtSecretProvider;
@@ -245,7 +244,7 @@ public class SemanticAgentScopeFilter implements Filter {
             return false;
         }
         String candidate = rawUri.toLowerCase(Locale.ROOT);
-        for (int i = 0; i < MAX_PERCENT_ENCODING_FOLDS; i++) {
+        while (true) {
             if (containsDangerousPathSequence(candidate)) {
                 return true;
             }
@@ -253,9 +252,9 @@ public class SemanticAgentScopeFilter implements Filter {
             if (folded.equals(candidate)) {
                 return false;
             }
+            // 每个被折叠的 %25 都缩短两个字符；因此即使编码层数来自输入，本循环也必然终止。
             candidate = folded;
         }
-        return containsDangerousPathSequence(candidate);
     }
 
     private static boolean containsDangerousPathSequence(String uri) {
