@@ -39,7 +39,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -275,6 +277,118 @@ class SemanticGenerationOrchestratorTest {
         order.verify(singleCall).submit(request.capture());
         assertEquals("连续多片没有进展：upstream_5xx", request.getValue().degradeReason());
         assertNull(TenantContext.get());
+    }
+
+    @Test
+    @DisplayName("首批运行时租约丢失后立即停止 drain，不再扫描第二批")
+    void leaseLossStopsDrainBeforeNextBatch() {
+        ConnectorSemanticGeneration first = generation();
+        ConnectorSemanticGeneration second = generation();
+        second.setId(11L);
+        second.setConnectorId(21L);
+        SemanticGenerationOrchestrator spied = spy(orchestrator);
+
+        when(lease.acquire("lease-1")).thenReturn(true);
+        when(generationMapper.selectList(any())).thenReturn(List.of(first), List.of(second), List.of());
+        when(generationMapper.selectCount(any())).thenReturn(0L);
+        when(heartbeat.checkpoint()).thenReturn(
+                new SemanticGenerationHeartbeat.Checkpoint(true, false, false));
+        org.mockito.Mockito.doReturn(null).when(spied)
+                .runGeneration(any(ConnectorSemanticGeneration.class));
+
+        spied.drainLoop();
+
+        verify(spied, times(1)).runGeneration(any(ConnectorSemanticGeneration.class));
+        verify(generationMapper, times(1)).selectList(any());
+        verify(lease).release("lease-1");
+    }
+
+    @Test
+    @DisplayName("释放全局租约异常仍复位 drain、提交 fallback、恢复租户并重新唤醒")
+    void releaseFailureCannotWedgeDrainOrLoseFallback() {
+        ConnectorSemanticGeneration generation = generation();
+        GenerationRequest fallback = new GenerationRequest(20L, "tenant-a", 30L,
+                GenerationTrigger.MANUAL_REGENERATE, "agent unavailable");
+        SemanticGenerationOrchestrator spied = spy(orchestrator);
+        List<Runnable> submittedDrains = new java.util.ArrayList<>();
+
+        TenantContext.set("caller");
+        when(lease.acquire("lease-1")).thenReturn(true);
+        when(generationMapper.selectList(any())).thenReturn(List.of(generation));
+        when(generationMapper.selectCount(any())).thenReturn(1L);
+        org.mockito.Mockito.doReturn(fallback).when(spied)
+                .runGeneration(any(ConnectorSemanticGeneration.class));
+        doThrow(new IllegalStateException("redis unavailable")).when(lease).release("lease-1");
+        when(singleCall.submit(fallback)).thenReturn(
+                new GenerationAck(GeneratorKind.SINGLE_CALL, true, null, "ok"));
+        doAnswer(invocation -> {
+            submittedDrains.add(invocation.getArgument(0));
+            return null;
+        }).when(executor).execute(any(Runnable.class));
+
+        spied.kick();
+        assertEquals(1, submittedDrains.size());
+        AtomicReference<Throwable> drainFailure = new AtomicReference<>();
+        Thread drainThread = new Thread(submittedDrains.get(0), "semantic-drain-test");
+        drainThread.setUncaughtExceptionHandler((thread, failure) -> drainFailure.set(failure));
+        assertDoesNotThrow(() -> {
+            drainThread.start();
+            drainThread.join();
+        });
+        assertNull(drainFailure.get());
+
+        InOrder order = inOrder(lease, singleCall);
+        order.verify(lease).release("lease-1");
+        order.verify(singleCall).submit(fallback);
+        verify(executor, times(2)).execute(any(Runnable.class));
+        assertEquals(2, submittedDrains.size(), "释放失败后必须复位，才能重新提交 drain");
+        assertEquals("caller", TenantContext.get());
+        assertTrue(spied.isDraining(), "重新 kick 已成功占用 drain 标记");
+    }
+
+    @Test
+    @DisplayName("单批次抛出 Error 也按 INTERNAL_ERROR 隔离，不击穿全局 drain")
+    void throwableFromOneBatchIsIsolated() {
+        ConnectorSemanticGeneration generation = generation();
+        SemanticGenerationOrchestrator spied = spy(orchestrator);
+
+        when(lease.acquire("lease-1")).thenReturn(true);
+        when(generationMapper.selectList(any())).thenReturn(List.of(generation), List.of());
+        when(generationMapper.selectCount(any())).thenReturn(0L);
+        org.mockito.Mockito.doThrow(new AssertionError("linkage-like failure")).when(spied)
+                .runGeneration(any(ConnectorSemanticGeneration.class));
+
+        assertDoesNotThrow(spied::drainLoop);
+
+        assertEquals("INTERRUPTED", generation.getStatus());
+        assertEquals(GenerationReasonCode.INTERNAL_ERROR.name(), generation.getReasonCode());
+        verify(lease).release("lease-1");
+    }
+
+    @Test
+    @DisplayName("新批次先清除上一批保留的 lost checkpoint，启动心跳前异常仍正常中断")
+    void staleLostCheckpointDoesNotMaskPreHeartbeatFailure() {
+        ConnectorSemanticGeneration generation = generation();
+        SemanticGenerationOrchestrator spied = spy(orchestrator);
+        AtomicBoolean staleLost = new AtomicBoolean(true);
+
+        when(lease.acquire("lease-1")).thenReturn(true);
+        when(generationMapper.selectList(any())).thenReturn(List.of(generation), List.of());
+        when(generationMapper.selectCount(any())).thenReturn(0L);
+        when(heartbeat.checkpoint()).thenAnswer(invocation ->
+                new SemanticGenerationHeartbeat.Checkpoint(staleLost.get(), false, false));
+        doAnswer(invocation -> {
+            staleLost.set(false);
+            return null;
+        }).when(heartbeat).resetCheckpointForNextBatch();
+        org.mockito.Mockito.doThrow(new IllegalStateException("connection read failed")).when(spied)
+                .runGeneration(any(ConnectorSemanticGeneration.class));
+
+        spied.drainLoop();
+
+        verify(heartbeat).resetCheckpointForNextBatch();
+        assertEquals("INTERRUPTED", generation.getStatus());
+        assertEquals(GenerationReasonCode.INTERNAL_ERROR.name(), generation.getReasonCode());
     }
 
     @Test

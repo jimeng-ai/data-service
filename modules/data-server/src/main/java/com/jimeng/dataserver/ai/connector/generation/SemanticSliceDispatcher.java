@@ -74,7 +74,7 @@ public class SemanticSliceDispatcher {
         int busyRetries = 0;
         int duplicateRuns = 0;
         while (true) {
-            if (heartbeat.lost()) {
+            if (boundaryLost()) {
                 return SliceRunResult.aborted();
             }
             attempt++;
@@ -164,9 +164,7 @@ public class SemanticSliceDispatcher {
                 if (runtime.await(latch, waitMillis)) {
                     break;
                 }
-                SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
-                if (heartbeat.lost() || (checkpoint != null && (checkpoint.lost()
-                        || checkpoint.connectionDeleted() || checkpoint.connectionDisabled()))) {
+                if (boundaryLost()) {
                     source.cancel();
                     return SliceRunResult.aborted();
                 }
@@ -259,7 +257,7 @@ public class SemanticSliceDispatcher {
         long remaining = totalMillis;
         try {
             while (remaining > 0) {
-                if (heartbeat.lost()) {
+                if (boundaryLost()) {
                     return SliceRunResult.aborted();
                 }
                 long chunk = Math.min(CHECKPOINT_MILLIS, remaining);
@@ -271,6 +269,13 @@ public class SemanticSliceDispatcher {
             Thread.currentThread().interrupt();
             return SliceRunResult.shutdown();
         }
+    }
+
+    private boolean boundaryLost() {
+        SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
+        return checkpoint == null
+                ? heartbeat.lost()
+                : checkpoint.lost() || checkpoint.connectionDeleted() || checkpoint.connectionDisabled();
     }
 
     private static long backoffMillis(int baseSeconds, int retry) {

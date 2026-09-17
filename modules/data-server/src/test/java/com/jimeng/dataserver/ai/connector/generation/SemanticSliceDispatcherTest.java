@@ -302,6 +302,7 @@ class SemanticSliceDispatcherTest {
     @DisplayName("等待期间连接删除或停用的 heartbeat checkpoint 主动 cancel 并返回 ABORTED")
     void connectionBoundary取消() {
         when(heartbeat.checkpoint()).thenReturn(
+                new SemanticGenerationHeartbeat.Checkpoint(false, false, false),
                 new SemanticGenerationHeartbeat.Checkpoint(false, false, true));
         when(sidecarClient.run(any(), any())).thenAnswer(invocation -> {
             setLiveRun(((SidecarRunPayload) invocation.getArgument(0)).getRunId(), 0);
@@ -310,6 +311,26 @@ class SemanticSliceDispatcherTest {
 
         assertEquals(SliceRunKind.ABORTED, dispatcher.runSlice(generation, 1, slice, limits).sseKind());
         verify(eventSource, atLeastOnce()).cancel();
+        verify(usageRecorder, never()).record(any(), anyInt(), any(), any(), any(), anyLong());
+    }
+
+    @Test
+    @DisplayName("繁忙退避期间连接删除或停用时停止重派并返回 ABORTED")
+    void busy退避遇连接边界停止重派() {
+        when(heartbeat.checkpoint()).thenReturn(
+                new SemanticGenerationHeartbeat.Checkpoint(false, false, false),
+                new SemanticGenerationHeartbeat.Checkpoint(false, true, false));
+        when(sidecarClient.run(any(), any())).thenAnswer(invocation -> {
+            SidecarRunPayload payload = invocation.getArgument(0);
+            setLiveRun(payload.getRunId(), 0);
+            ((EventSourceListener) invocation.getArgument(1))
+                    .onFailure(eventSource, null, response(503, "2"));
+            return eventSource;
+        });
+
+        assertEquals(SliceRunKind.ABORTED, dispatcher.runSlice(generation, 1, slice, limits).sseKind());
+        verify(sidecarClient).run(any(), any());
+        assertTrue(runtime.sleeps.isEmpty(), runtime.sleeps.toString());
         verify(usageRecorder, never()).record(any(), anyInt(), any(), any(), any(), anyLong());
     }
 

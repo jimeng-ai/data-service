@@ -282,6 +282,19 @@ public class SemanticGenerationHeartbeat implements AutoCloseable {
         return current != null && !current.isCancelled() && !current.isDone();
     }
 
+    /**
+     * A newly claimed batch must not inherit the previous batch's retained checkpoint.
+     * The orchestrator calls this only between batches, before {@link #start(ConnectorSemanticGeneration)}.
+     */
+    synchronized void resetCheckpointForNextBatch() {
+        if (running()) {
+            throw new IllegalStateException("cannot reset a running semantic heartbeat");
+        }
+        lost.set(false);
+        connectionDeleted.set(false);
+        connectionDisabled.set(false);
+    }
+
     @Override
     @PreDestroy
     public synchronized void close() {

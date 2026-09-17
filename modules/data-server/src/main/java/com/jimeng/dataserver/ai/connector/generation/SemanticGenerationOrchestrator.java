@@ -196,13 +196,20 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
                     continue;
                 }
                 try {
+                    heartbeat.resetCheckpointForNextBatch();
                     setTenant(generation.getTenantId());
                     GenerationRequest fallback = runGeneration(generation);
                     if (fallback != null) {
                         fallbacks.add(fallback);
                         break;
                     }
-                } catch (RuntimeException failure) {
+                    if (generationLeaseLost()) {
+                        break;
+                    }
+                } catch (Throwable failure) {
+                    if (generationLeaseLost()) {
+                        break;
+                    }
                     log.error("语义层批次编排异常 generationId={} error={}", generation.getId(),
                             failure.getClass().getSimpleName(), failure);
                     interruptOwned(generation, GenerationReasonCode.INTERNAL_ERROR, "内部错误，已安全中断");
@@ -212,26 +219,39 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
             }
         } finally {
             if (acquired) {
-                lease.release(token);
-            }
-            draining.set(false);
-            for (GenerationRequest fallback : fallbacks) {
-                String beforeFallback = TenantContext.get();
                 try {
-                    setTenant(fallback.tenantId());
-                    singleCall.submit(fallback);
-                } catch (RuntimeException failure) {
-                    log.warn("语义层单次回落提交失败 connectorId={} error={}", fallback.connectorId(),
+                    lease.release(token);
+                } catch (Throwable failure) {
+                    log.warn("释放语义层全局租约失败，将继续本地清理与唤醒: {}",
                             failure.getClass().getSimpleName());
-                } finally {
-                    restoreTenant(beforeFallback);
                 }
             }
-            restoreTenant(previousTenant);
-            if (acquired && hasRunnableQueued()) {
-                kick();
+            draining.set(false);
+            try {
+                for (GenerationRequest fallback : fallbacks) {
+                    String beforeFallback = TenantContext.get();
+                    try {
+                        setTenant(fallback.tenantId());
+                        singleCall.submit(fallback);
+                    } catch (Throwable failure) {
+                        log.warn("语义层单次回落提交失败 connectorId={} error={}", fallback.connectorId(),
+                                failure.getClass().getSimpleName());
+                    } finally {
+                        restoreTenant(beforeFallback);
+                    }
+                }
+            } finally {
+                restoreTenant(previousTenant);
+                if (acquired && hasRunnableQueued()) {
+                    kick();
+                }
             }
         }
+    }
+
+    private boolean generationLeaseLost() {
+        SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
+        return checkpoint == null ? heartbeat.lost() : checkpoint.lost();
     }
 
     private ConnectorSemanticGeneration oldestRunnableQueued() {

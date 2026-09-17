@@ -40,6 +40,7 @@ public class SemanticGenerationFinalizer {
     private static final String READY = "READY";
     private static final String FAILED = "FAILED";
     private static final String INTERRUPTED = "INTERRUPTED";
+    private static final String CANCELLED = "CANCELLED";
     private static final String STAGED = "STAGED";
     private static final int PRECHECK_PAGE_SIZE = 50;
     private static final int MAX_PROMOTE_ATTEMPTS = 3;
@@ -52,6 +53,7 @@ public class SemanticGenerationFinalizer {
     private final SemanticConnectionClaim connectionClaim;
     private final SemanticGenerationHeartbeat heartbeat;
     private final SemanticGenerationNotes notes;
+    private final ConnectorSemanticService semanticService;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
 
@@ -64,9 +66,10 @@ public class SemanticGenerationFinalizer {
                                        SemanticConnectionClaim connectionClaim,
                                        SemanticGenerationHeartbeat heartbeat,
                                        SemanticGenerationNotes notes,
+                                       ConnectorSemanticService semanticService,
                                        PlatformTransactionManager transactionManager) {
         this(generationMapper, tableMapper, schemaMapper, semanticMapper, stagedMapper, connectionClaim,
-                heartbeat, notes, transactionManager, Clock.systemDefaultZone());
+                heartbeat, notes, semanticService, transactionManager, Clock.systemDefaultZone());
     }
 
     SemanticGenerationFinalizer(ConnectorSemanticGenerationMapper generationMapper,
@@ -77,6 +80,7 @@ public class SemanticGenerationFinalizer {
                                 SemanticConnectionClaim connectionClaim,
                                 SemanticGenerationHeartbeat heartbeat,
                                 SemanticGenerationNotes notes,
+                                ConnectorSemanticService semanticService,
                                 PlatformTransactionManager transactionManager,
                                 Clock clock) {
         this.generationMapper = generationMapper;
@@ -87,12 +91,18 @@ public class SemanticGenerationFinalizer {
         this.connectionClaim = connectionClaim;
         this.heartbeat = heartbeat;
         this.notes = notes;
+        this.semanticService = semanticService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.clock = clock;
     }
 
     public FinishResult finish(ConnectorSemanticGeneration generation, double maxGaveUpRatio) {
         requireOwned(generation);
+        if (settleBoundary(generation, boundary())) {
+            return FinishResult.DONE;
+        }
+        // Finalizer 会在 promote 前先做若干 STAGED 小事务；租户归属必须早于这些写入验证。
+        semanticService.requireOwned(generation.getConnectorId());
         Counts counts = counts(generation.getId());
         applyCounts(generation, counts);
         if (counts.done() == 0) {
@@ -101,6 +111,10 @@ public class SemanticGenerationFinalizer {
         }
         double ratio = clampRatio(maxGaveUpRatio);
         if (STAGED.equals(generation.getMode()) && counts.gaveUp() > ratio * counts.total()) {
+            heartbeat.stop();
+            if (settleBoundary(generation, boundary())) {
+                return FinishResult.DONE;
+            }
             interruptForGaveUp(generation, counts.gaveUp());
             return FinishResult.DONE;
         }
@@ -116,7 +130,11 @@ public class SemanticGenerationFinalizer {
 
     private void failNoOutput(ConnectorSemanticGeneration generation) {
         heartbeat.stop();
+        if (settleBoundary(generation, boundary())) {
+            return;
+        }
         transactionTemplate.executeWithoutResult(tx -> {
+            semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
             String reason = "没有任何表生成成功";
             String note = notes.failed(generation, reason);
@@ -156,7 +174,11 @@ public class SemanticGenerationFinalizer {
 
     private void finishDirect(ConnectorSemanticGeneration generation) {
         heartbeat.stop();
+        if (settleBoundary(generation, boundary())) {
+            return;
+        }
         transactionTemplate.executeWithoutResult(tx -> {
+            semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
             String note = notes.ready(generation, readyStats(generation));
             ConnectorSemanticGeneration update = terminalUpdate(READY, null, note);
@@ -171,6 +193,13 @@ public class SemanticGenerationFinalizer {
         boolean stopped = false;
         for (int attempt = 1; attempt <= MAX_PROMOTE_ATTEMPTS; attempt++) {
             Precheck precheck = precheck(generation);
+            if (settleBoundary(generation, boundary())) {
+                return FinishResult.DONE;
+            }
+            if (precheck.lostOwnership()) {
+                heartbeat.stop();
+                return FinishResult.DONE;
+            }
             if (precheck.requeued()) {
                 return returnToRunning(generation) ? FinishResult.CONTINUE : FinishResult.DONE;
             }
@@ -178,6 +207,9 @@ public class SemanticGenerationFinalizer {
             if (!stopped) {
                 heartbeat.stop();
                 stopped = true;
+            }
+            if (settleBoundary(generation, boundary())) {
+                return FinishResult.DONE;
             }
             PromoteOutcome outcome = promote(generation, precheck.version());
             if (outcome == PromoteOutcome.READY || outcome == PromoteOutcome.LOST) {
@@ -211,7 +243,11 @@ public class SemanticGenerationFinalizer {
         for (ConnectorSemanticGenerationTable table : doneTablesPaged(generation)) {
             String key = ConnectorSemanticService.ciFold(table.getObjectName());
             if (!schemas.containsKey(key)) {
-                invalidateDone(generation, table, "REMOVED", table.getStructureRetries(), null);
+                MutationOutcome outcome = invalidateDone(
+                        generation, table, "REMOVED", table.getStructureRetries(), null);
+                if (outcome == MutationOutcome.LOST) {
+                    return new Precheck(version, false, true);
+                }
                 continue;
             }
             if (!Objects.equals(table.getStructureStamp(), foldedStamps.get(key))) {
@@ -219,13 +255,19 @@ public class SemanticGenerationFinalizer {
                 String status = retries > 2 ? "GAVE_UP" : "PENDING";
                 TableReasonCode reason = retries > 2
                         ? TableReasonCode.STRUCTURE_UNSTABLE : TableReasonCode.STRUCTURE_CHANGED;
-                if (invalidateDone(generation, table, status, retries, reason)) {
+                MutationOutcome outcome = invalidateDone(generation, table, status, retries, reason);
+                if (outcome == MutationOutcome.LOST) {
+                    return new Precheck(version, false, true);
+                }
+                if (outcome == MutationOutcome.CHANGED) {
                     requeued = true;
                 }
             }
         }
-        markInvalidJoinsStale(generation, fields);
-        return new Precheck(version, requeued);
+        if (!markInvalidJoinsStale(generation, fields)) {
+            return new Precheck(version, false, true);
+        }
+        return new Precheck(version, requeued, false);
     }
 
     private List<ConnectorSemanticGenerationTable> doneTablesPaged(ConnectorSemanticGeneration generation) {
@@ -249,12 +291,16 @@ public class SemanticGenerationFinalizer {
         }
     }
 
-    private boolean invalidateDone(ConnectorSemanticGeneration generation,
-                                   ConnectorSemanticGenerationTable table,
-                                   String status,
-                                   Integer retries,
-                                   TableReasonCode reason) {
-        Boolean changed = transactionTemplate.execute(tx -> {
+    private MutationOutcome invalidateDone(ConnectorSemanticGeneration generation,
+                                           ConnectorSemanticGenerationTable table,
+                                           String status,
+                                           Integer retries,
+                                           TableReasonCode reason) {
+        MutationOutcome changed = transactionTemplate.execute(tx -> {
+            if (!guardFinalizingOwner(generation)) {
+                tx.setRollbackOnly();
+                return MutationOutcome.LOST;
+            }
             ConnectorSemanticGenerationTable update = new ConnectorSemanticGenerationTable();
             update.setStatus(status);
             update.setStructureRetries(retries);
@@ -274,17 +320,17 @@ public class SemanticGenerationFinalizer {
                             .eq(ConnectorSemanticGenerationTable::getStatus, "DONE"));
             if (rows == 0) {
                 tx.setRollbackOnly();
-                return false;
+                return MutationOutcome.UNCHANGED;
             }
             stagedMapper.physicalDeleteOwnedRows(generation.getTenantId(), generation.getId(),
                     table.getObjectName());
-            return true;
+            return MutationOutcome.CHANGED;
         });
-        return Boolean.TRUE.equals(changed);
+        return changed == null ? MutationOutcome.LOST : changed;
     }
 
-    private void markInvalidJoinsStale(ConnectorSemanticGeneration generation,
-                                       Map<String, Map<String, FieldDetail>> fields) {
+    private boolean markInvalidJoinsStale(ConnectorSemanticGeneration generation,
+                                          Map<String, Map<String, FieldDetail>> fields) {
         List<ConnectorSemanticStaged> joins = stagedMapper.selectList(
                 new LambdaQueryWrapper<ConnectorSemanticStaged>()
                         .eq(ConnectorSemanticStaged::getTenantId, generation.getTenantId())
@@ -300,14 +346,40 @@ public class SemanticGenerationFinalizer {
             if (anchor != null && anchor.equals(join.getAnchorHash())) {
                 continue;
             }
-            ConnectorSemanticStaged update = new ConnectorSemanticStaged();
-            update.setStatus("STALE");
-            stagedMapper.update(update, new LambdaUpdateWrapper<ConnectorSemanticStaged>()
-                    .eq(ConnectorSemanticStaged::getId, join.getId())
-                    .eq(ConnectorSemanticStaged::getTenantId, generation.getTenantId())
-                    .eq(ConnectorSemanticStaged::getGenerationId, generation.getId())
-                    .eq(ConnectorSemanticStaged::getScope, "JOIN"));
+            Boolean owned = transactionTemplate.execute(tx -> {
+                if (!guardFinalizingOwner(generation)) {
+                    tx.setRollbackOnly();
+                    return false;
+                }
+                ConnectorSemanticStaged update = new ConnectorSemanticStaged();
+                update.setStatus("STALE");
+                stagedMapper.update(update, new LambdaUpdateWrapper<ConnectorSemanticStaged>()
+                        .eq(ConnectorSemanticStaged::getId, join.getId())
+                        .eq(ConnectorSemanticStaged::getTenantId, generation.getTenantId())
+                        .eq(ConnectorSemanticStaged::getGenerationId, generation.getId())
+                        .eq(ConnectorSemanticStaged::getScope, "JOIN"));
+                return true;
+            });
+            if (!Boolean.TRUE.equals(owned)) {
+                return false;
+            }
         }
+        return true;
+    }
+
+    /**
+     * Precheck 的每个小写事务先锁住批次行并确认 owner。这样旧 owner 即使已读到 DONE/JOIN，
+     * 也不能在新 owner 接管后重置表账本或删除/标旧它的暂存成果。
+     */
+    private boolean guardFinalizingOwner(ConnectorSemanticGeneration generation) {
+        ConnectorSemanticGeneration touch = new ConnectorSemanticGeneration();
+        touch.setHeartbeatAt(Date.from(clock.instant()));
+        return generationMapper.update(touch,
+                new LambdaUpdateWrapper<ConnectorSemanticGeneration>()
+                        .eq(ConnectorSemanticGeneration::getId, generation.getId())
+                        .eq(ConnectorSemanticGeneration::getTenantId, generation.getTenantId())
+                        .eq(ConnectorSemanticGeneration::getOwnerToken, generation.getOwnerToken())
+                        .eq(ConnectorSemanticGeneration::getStatus, FINALIZING)) > 0;
     }
 
     private boolean returnToRunning(ConnectorSemanticGeneration generation) {
@@ -333,6 +405,7 @@ public class SemanticGenerationFinalizer {
 
     private PromoteOutcome promote(ConnectorSemanticGeneration generation, SnapshotVersion expectedVersion) {
         PromoteOutcome outcome = transactionTemplate.execute(tx -> {
+            semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
             if (!expectedVersion.equals(versionOf(snapshotRows(generation)))) {
                 tx.setRollbackOnly();
@@ -394,6 +467,7 @@ public class SemanticGenerationFinalizer {
                            String connectionStatus) {
         heartbeat.stop();
         transactionTemplate.executeWithoutResult(tx -> {
+            semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
             String note = notes.failed(generation, reason);
             ConnectorSemanticGeneration update = terminalUpdate(FAILED, code, note);
@@ -415,6 +489,7 @@ public class SemanticGenerationFinalizer {
                                 String reason) {
         heartbeat.stop();
         transactionTemplate.executeWithoutResult(tx -> {
+            semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
             Counts counts = counts(generation.getId());
             applyCounts(generation, counts);
@@ -430,6 +505,54 @@ public class SemanticGenerationFinalizer {
                 tx.setRollbackOnly();
             }
         });
+    }
+
+    private void cancelDeleted(ConnectorSemanticGeneration generation) {
+        heartbeat.stop();
+        transactionTemplate.executeWithoutResult(tx -> {
+            ConnectorSemanticGeneration update = terminalUpdate(CANCELLED,
+                    GenerationReasonCode.CONNECTION_DELETED, "连接已删除，语义层生成已取消");
+            if (updateOwned(generation, update, List.of(RUNNING, FINALIZING)) == 0) {
+                tx.setRollbackOnly();
+                return;
+            }
+            if (STAGED.equals(generation.getMode())) {
+                stagedMapper.physicalDeleteByGeneration(generation.getTenantId(), generation.getId());
+            }
+        });
+    }
+
+    /** Consume the heartbeat fence at every finalizer boundary before deciding any terminal write. */
+    private Boundary boundary() {
+        SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
+        if (checkpoint == null) {
+            if (heartbeat.lost()) return Boundary.LOST;
+            if (heartbeat.connectionDeleted()) return Boundary.DELETED;
+            if (heartbeat.connectionDisabled()) return Boundary.DISABLED;
+            return Boundary.OK;
+        }
+        if (checkpoint.lost()) return Boundary.LOST;
+        if (checkpoint.connectionDeleted()) return Boundary.DELETED;
+        if (checkpoint.connectionDisabled()) return Boundary.DISABLED;
+        return Boundary.OK;
+    }
+
+    private boolean settleBoundary(ConnectorSemanticGeneration generation, Boundary boundary) {
+        return switch (boundary) {
+            case OK -> false;
+            case LOST -> {
+                heartbeat.stop();
+                yield true;
+            }
+            case DELETED -> {
+                cancelDeleted(generation);
+                yield true;
+            }
+            case DISABLED -> {
+                interruptOwned(generation, GenerationReasonCode.CONNECTION_DISABLED, "连接已停用");
+                yield true;
+            }
+        };
     }
 
     private SemanticGenerationNotes.ReadyStats readyStats(ConnectorSemanticGeneration generation) {
@@ -537,7 +660,8 @@ public class SemanticGenerationFinalizer {
         update.setStatus(status);
         update.setReasonCode(reason == null ? null : reason.name());
         update.setNote(note);
-        update.setFinishedAt(READY.equals(status) || FAILED.equals(status) ? Date.from(clock.instant()) : null);
+        update.setFinishedAt(READY.equals(status) || FAILED.equals(status) || CANCELLED.equals(status)
+                ? Date.from(clock.instant()) : null);
         return update;
     }
 
@@ -609,7 +733,20 @@ public class SemanticGenerationFinalizer {
         }
     }
 
-    private record Precheck(SnapshotVersion version, boolean requeued) {
+    private record Precheck(SnapshotVersion version, boolean requeued, boolean lostOwnership) {
+    }
+
+    private enum Boundary {
+        OK,
+        LOST,
+        DELETED,
+        DISABLED
+    }
+
+    private enum MutationOutcome {
+        CHANGED,
+        UNCHANGED,
+        LOST
     }
 
     private enum PromoteOutcome {

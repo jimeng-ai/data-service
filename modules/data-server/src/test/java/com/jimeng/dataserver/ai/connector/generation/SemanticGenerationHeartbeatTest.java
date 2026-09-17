@@ -28,6 +28,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -240,6 +241,29 @@ class SemanticGenerationHeartbeatTest {
 
         assertFalse(heartbeat.running());
         verify(generationMapper, never()).selectList(any());
+    }
+
+    @Test
+    @DisplayName("stop 保留上一批 checkpoint，但新批开始前可显式清空")
+    void resetCheckpointForNextBatch清除遗留边界() {
+        when(generationMapper.update(any(), any())).thenReturn(0);
+        heartbeat.tick();
+        assertTrue(heartbeat.checkpoint().lost());
+
+        heartbeat.stop();
+        heartbeat.resetCheckpointForNextBatch();
+
+        SemanticGenerationHeartbeat.Checkpoint checkpoint = heartbeat.checkpoint();
+        assertFalse(checkpoint.lost());
+        assertFalse(checkpoint.connectionDeleted());
+        assertFalse(checkpoint.connectionDisabled());
+    }
+
+    @Test
+    @DisplayName("运行中的 heartbeat 不允许清空 checkpoint")
+    void resetCheckpointForNextBatch拒绝运行中清空() {
+        assertThrows(IllegalStateException.class, heartbeat::resetCheckpointForNextBatch);
+        assertTrue(heartbeat.running());
     }
 
     @Test
