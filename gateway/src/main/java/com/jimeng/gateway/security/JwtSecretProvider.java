@@ -1,6 +1,8 @@
 package com.jimeng.gateway.security;
 
+import cn.hutool.jwt.JWT;
 import cn.hutool.jwt.JWTUtil;
+import cn.hutool.jwt.signers.JWTSignerUtil;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -37,6 +39,7 @@ import java.util.List;
 public class JwtSecretProvider {
 
     private static final int MIN_LENGTH = 32;
+    private static final String REQUIRED_ALGORITHM = "HS256";
 
     @Value("${jwt.secret:}")
     private String secret;
@@ -74,18 +77,33 @@ public class JwtSecretProvider {
     }
 
     /**
-     * 验签：主密钥优先，其次依次尝试轮转期的附加密钥。
-     * 任一通过即算有效；全部不通过才算失败。
+     * 验签：只接受本系统签发所用的 HS256，主密钥优先，其次尝试轮转期附加密钥。
+     *
+     * <p>不能直接把令牌交给 {@link JWTUtil#verify(String, byte[])}：该重载会按令牌头里的
+     * {@code alg} 自行选择 signer，Hutool 5.8.16 对 {@code alg=none} 的空签名会返回 true。
+     * 算法必须由服务端固定，并显式要求三段式 token 的签名段非空，不能让不可信的 JWT 头决定验签方式。
      */
     public boolean verify(String token) {
-        for (byte[] key : acceptKeys) {
-            try {
-                if (JWTUtil.verify(token, key)) {
+        try {
+            if (token == null || token.isBlank()) {
+                return false;
+            }
+            String[] parts = token.split("\\.", -1);
+            if (parts.length != 3 || parts[0].isEmpty() || parts[1].isEmpty() || parts[2].isEmpty()) {
+                return false;
+            }
+
+            JWT jwt = JWTUtil.parseToken(token);
+            if (!REQUIRED_ALGORITHM.equals(jwt.getAlgorithm())) {
+                return false;
+            }
+            for (byte[] key : acceptKeys) {
+                if (jwt.verify(JWTSignerUtil.hs256(key))) {
                     return true;
                 }
-            } catch (Exception ignored) {
-                // 单个密钥验不过就试下一个；全部失败由调用方按"验签不通过"处理。
             }
+        } catch (Exception ignored) {
+            // 畸形令牌与验签异常统一按失败处理，不把解析细节暴露给调用方。
         }
         return false;
     }
