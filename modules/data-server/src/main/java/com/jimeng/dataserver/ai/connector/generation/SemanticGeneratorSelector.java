@@ -7,10 +7,10 @@ import com.jimeng.dataserver.ai.connector.generation.precondition.SandboxConfigu
 import com.jimeng.dataserver.ai.connector.generation.precondition.SandboxHealthPrecondition;
 import com.jimeng.dataserver.ai.connector.generation.precondition.SemanticEnabledPrecondition;
 import com.jimeng.dataserver.ai.connector.service.ConnectorView;
+import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.core.annotation.AnnotationAwareOrderComparator;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
-import org.springframework.util.ClassUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -51,7 +51,7 @@ public class SemanticGeneratorSelector {
         }
 
         List<Class<?>> actualTypes = candidates.stream()
-                .map(ClassUtils::getUserClass)
+                .map(AopProxyUtils::ultimateTargetClass)
                 .toList();
         for (ExpectedPrecondition expected : EXPECTED_PRECONDITIONS) {
             long count = actualTypes.stream().filter(expected.type()::equals).count();

@@ -16,9 +16,12 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.aop.framework.AopProxyUtils;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.core.annotation.Order;
 
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -182,6 +185,25 @@ class SemanticGeneratorSelectorTest {
     }
 
     @Test
+    void JDK接口代理仍按最终目标类型识别并保持前置顺序() {
+        List<AgentPathPrecondition> proxiedChain = new ArrayList<>(preconditions());
+        ProxyFactory proxyFactory = new ProxyFactory(proxiedChain.get(2));
+        proxyFactory.setProxyTargetClass(false);
+        AgentPathPrecondition agentSwitchProxy = (AgentPathPrecondition) proxyFactory.getProxy();
+        assertTrue(Proxy.isProxyClass(agentSwitchProxy.getClass()), agentSwitchProxy.getClass().getName());
+        proxiedChain.set(2, agentSwitchProxy);
+        Collections.reverse(proxiedChain);
+        properties.getSemantic().getAgent().setEnabled(false);
+        sandbox.setServiceToken("  ");
+
+        SemanticGeneratorSelector.Selection selection = new SemanticGeneratorSelector(proxiedChain).select(connector);
+
+        assertSingleCall(selection, false,
+                "agent 生成未开启，走单次推导", InterruptedBatchPolicy.SUPERSEDE);
+        verifyNoInteractions(sidecar);
+    }
+
+    @Test
     void 轻量Spring上下文必须扫描到六个具体组件后选择器才能启动() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
             context.registerBean(ConnectorProperties.class, () -> properties);
@@ -193,7 +215,7 @@ class SemanticGeneratorSelectorTest {
             context.refresh();
 
             Set<Class<?>> actualTypes = context.getBeansOfType(AgentPathPrecondition.class).values().stream()
-                    .map(Object::getClass)
+                    .map(AopProxyUtils::ultimateTargetClass)
                     .collect(java.util.stream.Collectors.toSet());
             assertEquals(Set.of(
                     SemanticEnabledPrecondition.class,
