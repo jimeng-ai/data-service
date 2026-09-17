@@ -92,7 +92,8 @@ class ConnectorServiceTierChangeTest {
 
         service = new ConnectorService(connectionMapper, mock(AgentConnectionMapper.class),
                 mock(ConnectorSchemaMapper.class), registry, loader, probeService, dataSourceManager, cipher,
-                semanticService, txManager, provider);
+                semanticService, txManager, provider,
+                mock(org.springframework.beans.factory.ObjectProvider.class));
         TenantContext.set("t1");
     }
 

@@ -7,6 +7,7 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
+import com.jimeng.dataserver.ai.connector.generation.SemanticGenerationCleanup;
 import com.jimeng.dataserver.ai.connector.pool.CustomerDataSourceManager;
 import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorInstanceLoader;
@@ -97,6 +98,9 @@ public class ConnectorService {
      * 启动即失败。与 {@code ConnectorSchemaService} 对它的处理同一个办法。
      */
     private final ObjectProvider<ConnectorSemanticDeriveService> semanticDerive;
+
+    /** 删除连接时在同一事务内清理暂存产物并取消未结束批次；放末尾避免位置构造静默错位。 */
+    private final ObjectProvider<SemanticGenerationCleanup> semanticGenerationCleanup;
 
     private volatile TransactionTemplate txTemplate;
 
@@ -444,6 +448,11 @@ public class ConnectorService {
     @Transactional
     public void delete(Long id) {
         Connection row = requireRow(id);
+        SemanticGenerationCleanup cleanup = semanticGenerationCleanup == null
+                ? null : semanticGenerationCleanup.getIfAvailable();
+        if (cleanup != null) {
+            cleanup.onConnectorDeleted(row.getTenantId(), id);
+        }
         // 顺序照抄 ConnectionService.delete 的理由：先摘授权再删连接。反过来的话，
         // 中间失败会留下指向不存在连接的授权行，而解析那一步对这种行只会跳过——又一处静默失效。
         agentConnectionMapper.delete(new LambdaQueryWrapper<AgentConnection>()

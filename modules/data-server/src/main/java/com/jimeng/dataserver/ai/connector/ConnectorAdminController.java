@@ -3,6 +3,9 @@ package com.jimeng.dataserver.ai.connector;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
+import com.jimeng.dataserver.ai.connector.generation.ConnectorSemanticGenerationService;
+import com.jimeng.dataserver.ai.connector.generation.GenerationAck;
+import com.jimeng.dataserver.ai.connector.generation.GenerationTrigger;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditQuery;
 import com.jimeng.dataserver.ai.connector.service.ConnectorAuditView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
@@ -65,6 +68,7 @@ public class ConnectorAdminController {
     private final ConnectorSchemaService connectorSchemaService;
     private final ConnectorSemanticService connectorSemanticService;
     private final ConnectorSemanticDeriveService connectorSemanticDeriveService;
+    private final ConnectorSemanticGenerationService semanticGenerationService;
     private final PendingWriteService pendingWriteService;
     private final GrantScriptService grantScriptService;
     private final SuperAdminGuard superAdminGuard;
@@ -126,33 +130,13 @@ public class ConnectorAdminController {
      * 一句话：推导必须在<b>事务提交之后</b>发生，而这里是唯一一个「提交已经完成、且不在任何事务里」
      * 的位置（{@code create} 的 {@code @Transactional} 代理在返回给本方法之前就已经提交了）。
      *
-     * <h3>★ 这次推导<b>不是零成本的</b></h3>
-     * 建连这条路上谁都没有拉过结构，{@code connector_schema} 此刻是空的，所以<b>首次推导会自己先去
-     * 客户库拉一次结构</b>（1 次 catalog + 最多 200 次 describe），拉完才叫模型。之后手工重跑时快照
-     * 已经在，那时才是只读我们自己的库。
-     * （连接器类型不支持自描述——今天的 HTTP 就是，它只声明 INVOKE / HEALTH——这一步不会发生，
-     * 推导直接落在 {@code NOT_APPLICABLE}。）
-     * <b>这句话必须写在建连入口上</b>：「新建一条连接 = 顺手对客户的生产库发最多两百次 information_schema
-     * 查询」这件事，不写在这里就没有任何一个读代码的人会知道。
+     * <h3>★ 生成不是零成本，且有两条路径</h3>
+     * 两条路径都会在快照为空时先向客户库拉结构（1 次 catalog + 最多 200 次 describe）。agent 路径把表
+     * 分片后做多次短模型调用，结果逐表提交，<b>不会</b>自动派发 S1 SQL 语料、S3 关系探查或 S4 取值采样；
+     * 前置条件不满足时才回落到既有单次推导，后者仍会读 S1，并在成功后自动派发 S3/S4。因此只有回落路径
+     * 才可能继续按节流配置对客户库做最长约半小时的采样验证。
      *
-     * <p><b>但建连接口不等它。</b>派发只是把任务扔进 {@code streamExecutor} 就返回。
-     * 一个例外要认下来：那个池是 SynchronousQueue + CallerRunsPolicy，池打满时任务会<b>就地跑在这条
-     * 请求线程上</b>，于是这次建连的响应要一直等到推导结束。那是
-     * {@code ConnectorSemanticDeriveService.deriveAsync} 上写明的取舍——宁可慢一次（看得见），
-     * 不肯丢一次（看不见）。
-     *
-     * <h3>★ 推导完了还有第二段，它更贵</h3>
-     * 推导写完 READY 之后会自动再派发一段<b>采样验证</b>（S3 表关系包含性验证 + S4 列取值域采集），
-     * 跑在<b>另一个</b>线程池上，<b>不占</b> {@code semanticStatus}。它是这条链路上真正的大头：
-     * <ul>
-     *   <li>S3 对客户库发 {@code LEFT JOIN} 包含性探查，自我节流 30 次/分钟，200 条候选最坏约 20 分钟；</li>
-     *   <li>S4 对够格的列发 {@code COUNT(DISTINCT)} + {@code SELECT DISTINCT}，节流 20 条/分钟，
-     *       200 列最坏约 30 分钟。<b>它取的是真实取值</b>，所以只有数据出库档位开到第 3 档才会跑，
-     *       而那一档默认是关的。</li>
-     * </ul>
-     * 换句话说：<b>一次建连，最坏会在接下来的半小时里陆陆续续打客户的生产库几百条查询。</b>
-     * 这句话必须写在建连入口上——不写在这里，就没有任何一个读代码的人会知道。
-     * 两段都完成后，进度与结论在 {@code semanticNote} 的后半段。
+     * <p><b>建连接口不等生成结果。</b>agent 路径只落库排队并唤醒全局串行排空器；单次路径提交到既有线程池。
      *
      * <p><b>返回体里的 {@code semanticStatus} 恒为 {@code NONE}，这不代表推导没跑。</b>
      * 视图在 {@code create} 里就构造完了（那时行上这一列还是 NULL），派发之后没有人再刷它一次。
@@ -178,12 +162,8 @@ public class ConnectorAdminController {
      *   <li><b>只给落了库的真实 id。</b>试连（{@code /probe}）用的是递减的<b>负数</b>合成 id 且从不落库
      *       （见 {@code ConnectorService.dryRun}）。它走的是另一个端点、返回的也不是 {@code ConnectorView}，
      *       今天到不了这里；但这个前提是别人代码里的，不值得依赖，所以在派发口上再挡一道。</li>
-     *   <li><b>吞掉派发异常。</b>注意<b>不是</b>「线程池满了被拒」——{@code streamExecutor} 挂的是
-     *       CallerRunsPolicy，满了会就地跑而不是拒。真正能从这一行抛出来的是应用关停窗口里的
-     *       {@code TaskRejectedException}。连接已经建好了，不该因此给人一个红色报错。</li>
-     *   <li><b>不等结果。</b>首次推导要先把客户库的结构拉一遍（catalog + 最多 200 次 describe）
-     *       再叫一次模型，几十秒起步；结果本来就写在 {@code semanticStatus} / {@code semanticNote}
-     *       上供界面轮询。</li>
+     *   <li><b>吞掉受理异常。</b>连接已经建好，不能让可选增强的故障推翻成功的新建。</li>
+     *   <li><b>不等结果。</b>agent 只排队，单次路径只提交后台任务；结果由连接详情轮询。</li>
      * </ul>
      */
     private void dispatchSemanticDerive(ConnectorView view) {
@@ -203,7 +183,7 @@ public class ConnectorAdminController {
             return;
         }
         try {
-            connectorSemanticDeriveService.deriveAsync(id);
+            semanticGenerationService.trigger(id, GenerationTrigger.CONNECTOR_CREATED);
         } catch (RuntimeException e) {
             // 只记不抛：这条连接已经落库、已经探测通过，它现在就能用。
             log.warn("语义层推导派发失败，连接照常可用 connectorId={}", id, e);
@@ -299,9 +279,10 @@ public class ConnectorAdminController {
      * <p>接入时是自动跑的，但它<b>会失败</b>（模型超时、模型返回的 JSON 坏了、拉客户库结构那一步没成），
      * 而失败之后没有重试入口就等于永久失败——只能删了连接重建。所以留这个口子。
      *
-     * <p><b>立刻返回，不等推导结束。</b>推导要把整库结构喂给模型跑一次，同步等会直接超时。
+     * <p><b>立刻返回，不等生成结束。</b>前置条件满足时进入 agent 的持久化队列，按表分片做多次短模型调用；
+     * 不满足时回落到既有单次推导。响应额外返回实际选择的 {@code generator}。
      *
-     * <h3>重跑要花多少钱，取决于结构快照在不在</h3>
+     * <h3>重跑要花多少钱，取决于路径和结构快照</h3>
      * <b>已经有快照</b>（正常情况：建连时那次推导已经拉过，或者有人点过「刷新结构」）——只读我们自己库里的
      * {@code connector_schema}，对客户系统零字节访问，代价就是一次模型调用。
      * <b>快照是空的</b>（从没拉成过，或者被清了）——推导会自己先去客户库补拉一次，那是 1 次 catalog +
@@ -309,7 +290,7 @@ public class ConnectorAdminController {
      * <p>两个方向记反了都会误导人：记成「永远要打客户库」，会让人不敢用这个多数时候很便宜的口子；
      * 记成「永远不打」，会让人以为对着一条没快照的连接连点十次也没有客户侧成本。
      *
-     * <h3>★ 但推导之外还有两笔客户侧成本，都<b>不是</b>「只读我们自己的库」</h3>
+     * <h3>★ 下面两笔额外客户侧成本只属于回落的单次推导</h3>
      * <ol>
      *   <li><b>推导之前</b>会同步读一次客户的视图 / 存储过程定义（S1，{@code platform.sql_corpus}）。
      *       纯元数据、不出一个业务值，解析总时长 20 秒封顶——很便宜，但它确实打了客户的库。</li>
@@ -319,7 +300,8 @@ public class ConnectorAdminController {
      *       它们在 {@code connector_audit} 里的动作名分别是 {@code platform.semantic_probe}
      *       和 {@code platform.semantic_values}。</li>
      * </ol>
-     * 所以「重跑一次推导」的真实代价是：一次模型调用 + 一次语料读取 +（异步地）最长约半小时的采样。
+     * 所以回落路径的真实代价是：一次模型调用 + 一次语料读取 +（异步地）最长约半小时的采样；
+     * agent 路径是多次短模型调用且不派发这些采样。
      * 只想重跑采样、不想再花一次模型调用的，走 {@code POST /{id}/semantic/validate}。
      *
      * <p><b>{@code NOT_APPLICABLE} 不是失败，重跑也不会变。</b>连接器类型不支持自描述
@@ -346,8 +328,8 @@ public class ConnectorAdminController {
         // 路径参数里的任意 id 立刻变成一个跨租户触发器。这一行在【还有请求上下文】的地方把边界钉死，
         // 不是「顺手查一下」。
         connectorService.get(id);
-        connectorSemanticDeriveService.deriveAsync(id);
-        return Map.of("started", true);
+        GenerationAck ack = semanticGenerationService.trigger(id, GenerationTrigger.MANUAL_REGENERATE);
+        return Map.of("started", true, "generator", ack.kind().name());
     }
 
     /**

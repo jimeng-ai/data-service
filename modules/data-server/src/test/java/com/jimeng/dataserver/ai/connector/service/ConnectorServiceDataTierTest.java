@@ -93,6 +93,7 @@ class ConnectorServiceDataTierTest {
                 mock(ConnectorSchemaMapper.class), registry, loader, probeService, dataSourceManager, cipher,
                 mock(ConnectorSemanticService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(org.springframework.beans.factory.ObjectProvider.class),
                 mock(org.springframework.beans.factory.ObjectProvider.class));
         TenantContext.set("t1");
     }
