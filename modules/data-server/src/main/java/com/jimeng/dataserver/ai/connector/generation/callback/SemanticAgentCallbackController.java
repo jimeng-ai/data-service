@@ -37,4 +37,10 @@ public class SemanticAgentCallbackController {
                                            @RequestBody(required = false) TableMetadataRequest body) {
         return service.tableMetadata(SemanticAgentTokens.requirePrincipal(request), body);
     }
+
+    @PostMapping("/submit")
+    public SubmitResultView submit(HttpServletRequest request,
+                                   @RequestBody(required = false) SubmitRequest body) {
+        return service.submit(SemanticAgentTokens.requirePrincipal(request), body);
+    }
 }

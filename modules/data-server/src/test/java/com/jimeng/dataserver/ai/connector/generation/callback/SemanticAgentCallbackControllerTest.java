@@ -15,7 +15,7 @@ import static org.mockito.Mockito.when;
 class SemanticAgentCallbackControllerTest {
 
     @Test
-    @DisplayName("三个端点只把过滤器写入的 principal 交给服务，不从请求体或头读取资源 id")
+    @DisplayName("四个端点只把过滤器写入的 principal 交给服务，不从请求体或头读取资源 id")
     void controller只使用principal() {
         SemanticAgentCallbackService service = mock(SemanticAgentCallbackService.class);
         SemanticAgentCallbackController controller = new SemanticAgentCallbackController(service);
@@ -24,20 +24,25 @@ class SemanticAgentCallbackControllerTest {
         request.setAttribute(SemanticAgentTokens.PRINCIPAL_ATTRIBUTE, principal);
         TableListRequest listRequest = new TableListRequest();
         TableMetadataRequest metadataRequest = new TableMetadataRequest();
+        SubmitRequest submitRequest = new SubmitRequest();
         RunScopeView runScope = new RunScopeView();
         TableListView tables = new TableListView();
         TableMetadataView metadata = new TableMetadataView();
+        SubmitResultView submit = new SubmitResultView();
         when(service.runScope(principal)).thenReturn(runScope);
         when(service.listTables(principal, listRequest)).thenReturn(tables);
         when(service.tableMetadata(principal, metadataRequest)).thenReturn(metadata);
+        when(service.submit(principal, submitRequest)).thenReturn(submit);
 
         assertSame(runScope, controller.runScope(request, Map.of(
                 "generationId", "forged", "connectorId", "forged", "tenantId", "forged", "runId", "forged")));
         assertSame(tables, controller.tables(request, listRequest));
         assertSame(metadata, controller.tableMetadata(request, metadataRequest));
+        assertSame(submit, controller.submit(request, submitRequest));
         verify(service).runScope(principal);
         verify(service).listTables(principal, listRequest);
         verify(service).tableMetadata(principal, metadataRequest);
+        verify(service).submit(principal, submitRequest);
     }
 
     @Test

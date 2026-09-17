@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -45,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -65,6 +67,8 @@ class SemanticAgentCallbackServiceTest {
     private ConnectorSemanticMapper semanticMapper;
     private ConnectorSemanticStagedMapper stagedMapper;
     private ConnectorProperties properties;
+    private SemanticSubmissionWriter submissionWriter;
+    private SemanticRunConfirmation runConfirmation;
     private SemanticAgentCallbackService service;
 
     @BeforeEach
@@ -79,6 +83,8 @@ class SemanticAgentCallbackServiceTest {
         schemaMapper = mock(ConnectorSchemaMapper.class);
         semanticMapper = mock(ConnectorSemanticMapper.class);
         stagedMapper = mock(ConnectorSemanticStagedMapper.class);
+        submissionWriter = mock(SemanticSubmissionWriter.class);
+        runConfirmation = new SemanticRunConfirmation(generationMapper);
         properties = new ConnectorProperties();
         SemanticConsistencyRule rule = new SemanticConsistencyRule() {
             @Override public String code() { return "R_ONE"; }
@@ -88,7 +94,7 @@ class SemanticAgentCallbackServiceTest {
         };
         service = new SemanticAgentCallbackService(generationMapper, tableMapper, connectionMapper, schemaMapper,
                 semanticMapper, stagedMapper, properties, new SemanticConsistencyRuleRegistry(List.of(rule)),
-                new SemanticTableRenderer());
+                new SemanticTableRenderer(), submissionWriter, runConfirmation);
 
         when(generationMapper.update(any(), any())).thenReturn(1);
         when(generationMapper.selectOne(any())).thenReturn(generation("DIRECT"));
@@ -97,6 +103,73 @@ class SemanticAgentCallbackServiceTest {
         when(schemaMapper.selectList(any())).thenReturn(List.of());
         when(semanticMapper.selectList(any())).thenReturn(List.of());
         when(stagedMapper.selectList(any())).thenReturn(List.of());
+    }
+
+    @Nested
+    @DisplayName("submit")
+    class Submit {
+
+        @Test
+        @DisplayName("形状错误也先独立确认运行，再在事务写入器之前回 4000")
+        void 形状错误先确认但不进入writer() {
+            SubmitRequest request = new SubmitRequest();
+            request.setStructureStamp("stamp");
+            request.setSubmission(Map.of("table", "t", "fields", "not-an-array"));
+
+            ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(PRINCIPAL, request));
+
+            assertEquals(ExceptionCode.BODY_NOT_MATCH.getResultCode(), ex.getRespCode());
+            verify(submissionWriter, never()).submit(any(), any());
+            verify(generationMapper).update(any(), any());
+        }
+
+        @Test
+        @DisplayName("三个数组分别执行 200/50/20 的请求级上限")
+        void 数组上限() {
+            for (Map.Entry<String, Integer> limit : Map.of(
+                    "fields", 200, "joins", 50, "ambiguities", 20).entrySet()) {
+                SubmitRequest request = new SubmitRequest();
+                request.setStructureStamp("stamp");
+                request.setSubmission(Map.of(
+                        "table", "t",
+                        limit.getKey(), java.util.Collections.nCopies(limit.getValue() + 1, Map.of())));
+                ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(PRINCIPAL, request));
+                assertEquals(ExceptionCode.BODY_NOT_MATCH.getResultCode(), ex.getRespCode());
+            }
+            verify(submissionWriter, never()).submit(any(), any());
+        }
+
+        @Test
+        @DisplayName("空提交必须带 1 到 200 字 skip_reason")
+        void 空提交必须带skipReason() {
+            SubmitRequest missing = new SubmitRequest();
+            missing.setStructureStamp("stamp");
+            missing.setSubmission(Map.of("table", "t"));
+            assertEquals(ExceptionCode.BODY_NOT_MATCH.getResultCode(),
+                    assertThrows(ServiceException.class, () -> service.submit(PRINCIPAL, missing)).getRespCode());
+
+            SubmitRequest tooLong = new SubmitRequest();
+            tooLong.setStructureStamp("stamp");
+            tooLong.setSubmission(Map.of("table", "t", "skip_reason", "x".repeat(201)));
+            assertEquals(ExceptionCode.BODY_NOT_MATCH.getResultCode(),
+                    assertThrows(ServiceException.class, () -> service.submit(PRINCIPAL, tooLong)).getRespCode());
+            verify(submissionWriter, never()).submit(any(), any());
+        }
+
+        @Test
+        @DisplayName("合法请求原样委托事务写入器")
+        void 合法请求委托writer() {
+            SubmitRequest request = new SubmitRequest();
+            request.setStructureStamp("stamp");
+            request.setSubmission(Map.of("table", "t", "skip_reason", "无业务含义"));
+            SubmitResultView expected = new SubmitResultView();
+            when(submissionWriter.submit(PRINCIPAL, request)).thenReturn(expected);
+
+            assertEquals(expected, service.submit(PRINCIPAL, request));
+            InOrder order = inOrder(generationMapper, submissionWriter);
+            order.verify(generationMapper).update(any(), any());
+            order.verify(submissionWriter).submit(PRINCIPAL, request);
+        }
     }
 
     @Test

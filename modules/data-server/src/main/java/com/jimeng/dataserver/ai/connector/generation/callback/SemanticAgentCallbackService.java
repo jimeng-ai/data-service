@@ -1,7 +1,6 @@
 package com.jimeng.dataserver.ai.connector.generation.callback;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connector.generation.SemanticTableRenderer;
@@ -36,7 +35,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * 语义层 agent 的三个只读回调（设计文档 7.5-7.7）。
+ * 语义层 agent 的四个回调（设计文档 7.5-7.8）。
  *
  * <p>本类只注入平台库 mapper、配置和纯函数，刻意不注入 {@code ConnectorSchemaService} / {@code ConnectorGateway}：
  * 回调发生在模型运行中，每次读都必须只读已落库的结构快照，绝不能顺手 refresh、open 或访问客户库。
@@ -79,10 +78,19 @@ public class SemanticAgentCallbackService {
     private final ConnectorProperties properties;
     private final SemanticConsistencyRuleRegistry ruleRegistry;
     private final SemanticTableRenderer tableRenderer;
+    private final SemanticSubmissionWriter submissionWriter;
+    private final SemanticRunConfirmation runConfirmation;
+
+    /** 运行确认独立提交后做形状校验；形状错误不算一次表提交，也不进入逐表写事务。 */
+    public SubmitResultView submit(SemanticAgentPrincipal principal, SubmitRequest request) {
+        runConfirmation.confirm(principal);
+        validateSubmit(request);
+        return submissionWriter.submit(principal, request);
+    }
 
     /** 每个端点的第一步都是原子运行确认；确认成功之后才读任何资源。 */
     public RunScopeView runScope(SemanticAgentPrincipal principal) {
-        confirmRun(principal);
+        runConfirmation.confirm(principal);
         ConnectorSemanticGeneration generation = generation(principal);
         Connection connection = connection(principal);
         List<ConnectorSchema> snapshot = snapshot(principal);
@@ -140,7 +148,7 @@ public class SemanticAgentCallbackService {
 
     /** 表目录只读结构快照；筛选和分页都在内存做（子项目 1 的快照硬上限 200）。 */
     public TableListView listTables(SemanticAgentPrincipal principal, TableListRequest request) {
-        confirmRun(principal);
+        runConfirmation.confirm(principal);
         ListArgs args = validateList(request);
         List<ConnectorSchema> snapshot = snapshot(principal);
         Map<String, Map<String, FieldDetail>> fields = SemanticRowAssembler.parseFields(snapshot);
@@ -185,7 +193,7 @@ public class SemanticAgentCallbackService {
 
     /** 按请求顺序返回最多 5 张表；精确匹配大小写敏感，第一张超宽表按列前缀截到 16k。 */
     public TableMetadataView tableMetadata(SemanticAgentPrincipal principal, TableMetadataRequest request) {
-        confirmRun(principal);
+        runConfirmation.confirm(principal);
         List<String> requested = validateMetadata(request);
         List<ConnectorSchema> snapshot = snapshot(principal);
         Map<String, ConnectorSchema> snapshotByName = new LinkedHashMap<>();
@@ -242,26 +250,6 @@ public class SemanticAgentCallbackService {
             textChars += rendered.text().length();
         }
         return out;
-    }
-
-    /**
-     * 原子运行确认同时给 NO_CALLBACK 计数。刻意不把三个读方法包在同一事务里：请求后续即使因参数错误抛异常，
-     * 这个已经到达服务端的回调也必须留下计数；否则模型连续打来非法请求会被编排器误判成 NO_CALLBACK。
-     */
-    private void confirmRun(SemanticAgentPrincipal principal) {
-        if (principal == null) {
-            throw new ServiceException(ExceptionCode.SEMANTIC_GENERATION_CLOSED);
-        }
-        int changed = generationMapper.update(null, new LambdaUpdateWrapper<ConnectorSemanticGeneration>()
-                .setSql("current_run_callbacks = current_run_callbacks + 1")
-                .eq(ConnectorSemanticGeneration::getId, principal.generationId())
-                .eq(ConnectorSemanticGeneration::getTenantId, principal.tenantId())
-                .eq(ConnectorSemanticGeneration::getConnectorId, principal.connectorId())
-                .eq(ConnectorSemanticGeneration::getStatus, "RUNNING")
-                .eq(ConnectorSemanticGeneration::getCurrentRunId, principal.runId()));
-        if (changed != 1) {
-            throw new ServiceException(ExceptionCode.SEMANTIC_GENERATION_CLOSED);
-        }
     }
 
     private ConnectorSemanticGeneration generation(SemanticAgentPrincipal principal) {
@@ -368,6 +356,49 @@ public class SemanticAgentCallbackService {
         int configured = properties.getSemantic().getAgent().getTableMaxSubmits();
         limits.setMaxSubmitsPerTable(Math.max(1, Math.min(10, configured)));
         return limits;
+    }
+
+    private static void validateSubmit(SubmitRequest request) {
+        if (request == null || request.getStructureStamp() == null
+                || request.getStructureStamp().isBlank() || request.getSubmission() == null) {
+            badShape("structureStamp 和 submission 不能为空");
+        }
+        Map<String, Object> submission = request.getSubmission();
+        if (!(submission.get("table") instanceof String table) || table.isBlank()) {
+            badShape("submission.table 必须是非空字符串");
+        }
+        Object object = submission.get("object");
+        if (object != null && !(object instanceof Map<?, ?>)) {
+            badShape("submission.object 必须是对象");
+        }
+        List<?> fields = submitArray(submission, "fields", SUBMIT_MAX_FIELDS);
+        List<?> joins = submitArray(submission, "joins", SUBMIT_MAX_JOINS);
+        List<?> ambiguities = submitArray(submission, "ambiguities", SUBMIT_MAX_AMBIGUITIES);
+        if (object == null && fields.isEmpty() && joins.isEmpty() && ambiguities.isEmpty()) {
+            Object rawReason = submission.get("skip_reason");
+            if (!(rawReason instanceof String reason) || reason.isBlank() || reason.length() > 200) {
+                badShape("空提交必须提供 1 到 200 字的 skip_reason");
+            }
+        }
+    }
+
+    private static List<?> submitArray(Map<String, Object> submission, String key, int max) {
+        Object raw = submission.get(key);
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            badShape("submission." + key + " 必须是数组");
+            return List.of();
+        }
+        if (list.size() > max) {
+            badShape("submission." + key + " 最多 " + max + " 条");
+        }
+        return list;
+    }
+
+    private static void badShape(String message) {
+        throw new ServiceException(ExceptionCode.BODY_NOT_MATCH, message);
     }
 
     private static List<String> notes(List<ConnectorSchema> snapshot) {
