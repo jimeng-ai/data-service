@@ -1548,9 +1548,9 @@ class ConnectorSemanticDeriveServiceTest {
             defaultSnapshot();
             modelOutputs(EMPTY_BUT_WELL_FORMED);
 
-            runAsync("降级原因：sandbox 未配置；");
+            runAsync("降级原因：sandbox 未配置");
 
-            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：sandbox 未配置；"),
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：sandbox 未配置。"),
                     lastStatusWrite().getSemanticNote());
         }
 
@@ -1569,9 +1569,9 @@ class ConnectorSemanticDeriveServiceTest {
             defaultSnapshot();
             when(claudeService.messagesInternal(any(), any())).thenThrow(new RuntimeException("上游超时"));
 
-            runAsync("降级原因：健康检查失败；");
+            runAsync("降级原因：健康检查失败");
 
-            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：健康检查失败；推导失败："),
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：健康检查失败。推导失败："),
                     lastStatusWrite().getSemanticNote());
         }
 
@@ -1581,9 +1581,9 @@ class ConnectorSemanticDeriveServiceTest {
             when(schemaService.refresh(CONNECTOR_ID)).thenThrow(new ServiceException(
                     ExceptionCode.OPERATION_UNSUPPORTED, "这种连接器类型不支持自描述"));
 
-            runAsync("降级原因：无 DESCRIBE；");
+            runAsync("降级原因：无 DESCRIBE");
 
-            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：无 DESCRIBE；"),
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：无 DESCRIBE。"),
                     lastStatusWrite().getSemanticNote());
             assertEquals(ConnectorSemanticDeriveService.SEM_NOT_APPLICABLE,
                     lastStatusWrite().getSemanticStatus());

@@ -3789,19 +3789,15 @@ public class ConnectorSemanticDeriveService {
     // ================================================================ 小工具
 
     /**
-     * 把降级等调用背景放到最终说明最前面。前缀自己已经带句末标点时一个字都不加；
-     * 没带时补全角句号，避免调用方的文案和推导结论粘在一起。
-     *
-     * <p>空前缀直接返回原文，保证旧入口的返回值与状态文案零变化。
+     * 把降级等调用背景放到最终说明最前面，并固定用全角句号与推导结论分隔。
+     * 空前缀直接返回原文，保证旧入口的返回值与状态文案零变化。
      */
     private static String withNotePrefix(String rawPrefix, String note) {
         if (blank(rawPrefix)) {
             return note;
         }
         String prefix = rawPrefix.trim();
-        char last = prefix.charAt(prefix.length() - 1);
-        String separator = "。；;!！?？，,：:".indexOf(last) >= 0 ? "" : "。";
-        return clip(prefix + separator + (note == null ? "" : note), NOTE_MAX);
+        return clip(prefix + "。" + note, NOTE_MAX);
     }
 
     /** 异常摘要带上类名：NPE 这类 message 为 null 的异常，否则在界面上只剩一个孤零零的 "null"。 */
