@@ -435,6 +435,16 @@ public class ConnectorSemanticDeriveService {
      * 两笔账的大小和落点见那两个方法的 javadoc。
      */
     public void deriveAsync(Long connectorId) {
+        deriveAsync(connectorId, null);
+    }
+
+    /**
+     * 后台推导，并把调用方给出的背景说明稳定放在最终 {@code semantic_note} 最前面。
+     *
+     * <p>这是单次推导作为 agent 路径降级备选时的唯一包装缝：不改认领、补拉、模型调用或
+     * 验证阶段的任何行为。前缀为空时与 {@link #deriveAsync(Long)} 的历史行为逐字一致。
+     */
+    public void deriveAsync(Long connectorId, String notePrefix) {
         if (connectorId == null) {
             return;
         }
@@ -446,7 +456,7 @@ public class ConnectorSemanticDeriveService {
             return;
         }
         streamExecutor.execute(MdcAsyncSupport.wrap("semantic-" + connectorId,
-                () -> runDerive(connectorId, tenantId)));
+                () -> runDerive(connectorId, tenantId, notePrefix)));
     }
 
     /**
@@ -457,10 +467,14 @@ public class ConnectorSemanticDeriveService {
      * 挪到建连的请求线程上，就是让建连接口一直等到客户库跑完才返回——大库上等于必然超时。
      */
     void runDerive(Long connectorId, String tenantId) {
+        runDerive(connectorId, tenantId, null);
+    }
+
+    private void runDerive(Long connectorId, String tenantId, String notePrefix) {
         if (!TenantContext.isSet() && tenantId != null) {
             TenantContext.set(tenantId);
         }
-        derive(connectorId, true);
+        derive(connectorId, true, notePrefix);
     }
 
     /**
@@ -474,19 +488,20 @@ public class ConnectorSemanticDeriveService {
      * 它的事务在 {@link ConnectorSemanticService#replaceInferred} 里。
      */
     public DeriveResult derive(Long connectorId) {
-        return derive(connectorId, false);
+        return derive(connectorId, false, null);
     }
 
     /**
      * @param mayBootstrapSnapshot 快照为空时允不允许先去客户库补拉一次。只有后台线程给 true，
      *                             理由见 {@link #runDerive}。<b>补拉只做一次</b>：补完还是空的，
      *                             才是真的失败。
+     * @param notePrefix 非空时稳定放在本次所有终态说明的最前面；不参与认领或推导判定
      */
-    private DeriveResult derive(Long connectorId, boolean mayBootstrapSnapshot) {
+    private DeriveResult derive(Long connectorId, boolean mayBootstrapSnapshot, String notePrefix) {
         ConnectorProperties.Semantic cfg = properties.getSemantic();
         if (!cfg.isEnabled()) {
             // 不标 FAILED：开关关着不是失败。但也不能什么都不写——「点了没反应」是最难查的一类。
-            String note = "语义层推导已关闭（connector.semantic.enabled=false）";
+            String note = withNotePrefix(notePrefix, "语义层推导已关闭（connector.semantic.enabled=false）");
             log.info("跳过语义层推导，开关已关 connectorId={}", connectorId);
             writeStatus(connectorId, null, note, false, null);
             return DeriveResult.builder().ok(false).note(note).build();
@@ -496,14 +511,14 @@ public class ConnectorSemanticDeriveService {
         if (conn == null) {
             // 存在性校验必须在认领之前：认领是一次写，对一条不存在、或不属于本租户的连接不该发出去。
             log.warn("语义层推导找不到连接（或不属于当前租户） connectorId={}", connectorId);
-            return DeriveResult.builder().ok(false).note("连接不存在").build();
+            return DeriveResult.builder().ok(false).note(withNotePrefix(notePrefix, "连接不存在")).build();
         }
 
         Date claimAt = claim(connectorId);
         if (claimAt == null) {
             // 建连自动推 + 有人同时点「重新生成」是真会发生的。两次并发推导会让 semantic_status
             // 和库里的行各走各的：后完成的那次覆盖状态，先完成的那次的行留在库里，从此对不上。
-            String note = "同一条连接上已有一次推导在进行中，本次跳过";
+            String note = withNotePrefix(notePrefix, "同一条连接上已有一次推导在进行中，本次跳过");
             log.info("语义层推导被跳过：认领不到 connectorId={}", connectorId);
             return DeriveResult.builder().ok(false).note(note).build();
         }
@@ -521,8 +536,8 @@ public class ConnectorSemanticDeriveService {
             if (rows.isEmpty() && mayBootstrapSnapshot) {
                 boot = bootstrapSnapshot(connectorId);
                 if (!boot.applicable()) {
-                    String note = "该连接器不提供结构自描述，语义层不适用"
-                            + (boot.failure() == null ? "" : "（" + boot.failure() + "）");
+                    String note = withNotePrefix(notePrefix, "该连接器不提供结构自描述，语义层不适用"
+                            + (boot.failure() == null ? "" : "（" + boot.failure() + "）"));
                     writeStatus(connectorId, SEM_NOT_APPLICABLE, note, true, claimAt);
                     return DeriveResult.builder().ok(false).note(note).build();
                 }
@@ -546,6 +561,7 @@ public class ConnectorSemanticDeriveService {
                     note = "已自动拉取一次结构，但这个只读账号看不到任何对象，没有结构就没法生成语义层。"
                             + "请确认账号的授权范围后，在管理台点「刷新结构」重试";
                 }
+                note = withNotePrefix(notePrefix, note);
                 writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
                 return DeriveResult.builder().ok(false).note(note).build();
             }
@@ -590,20 +606,22 @@ public class ConnectorSemanticDeriveService {
                 // ★ 空产出【不替换】。replaceInferred 是先物理删再插，拿一份空的去调它等于把上一版
                 //   说明书清空，然后写一个 READY——看起来像「重新生成成功了，只是什么都没生成」，
                 //   而人是不会去查一次成功的操作的。宁可留着旧的并明说这次失败了。
+                String note = withNotePrefix(notePrefix, refusal);
                 log.warn("语义层推导产出为空，已保留上一版 connectorId={}：{}", connectorId, refusal);
-                writeStatus(connectorId, SEM_FAILED, refusal, true, claimAt);
+                writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
                 return DeriveResult.builder().ok(false)
                         .droppedGuess(st.getDroppedGuess())
                         .droppedUnknown(st.getDroppedUnknown())
                         .droppedTooLong(st.getDroppedTooLong())
                         .skippedAnswered(st.getDroppedAnswered())
                         .truncated(digest.includedObjects() < digest.totalObjects())
-                        .note(refusal).build();
+                        .note(note).build();
             }
 
             String nowStamp = snapshotStamp(schemaService.currentRows(connectorId));
             if (!stamp.equals(nowStamp)) {
-                String note = "结构在推导期间已刷新，本批产出锚的是旧结构，已整批作废，请重新生成";
+                String note = withNotePrefix(notePrefix,
+                        "结构在推导期间已刷新，本批产出锚的是旧结构，已整批作废，请重新生成");
                 log.warn("语义层推导期间结构被刷新，本批作废 connectorId={} 开始={} 现在={}",
                         connectorId, stamp, nowStamp);
                 writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
@@ -612,7 +630,7 @@ public class ConnectorSemanticDeriveService {
 
             int n = semanticService.replaceInferred(connectorId, fresh);
 
-            String note = summarize(st, digest, notes);
+            String note = withNotePrefix(notePrefix, summarize(st, digest, notes));
             writeStatus(connectorId, SEM_READY, note, true, claimAt);
 
             // ★ 说明书【已经可用了】才派发验证阶段：READY 已经写下去，关系那一栏如实写着「未经数据验证」。
@@ -640,8 +658,9 @@ public class ConnectorSemanticDeriveService {
             // 这里必须吞掉一切。推导是建连之后顺手做的事，让它把建连整个搞失败是本末倒置。
             String reason = describe(e);
             log.error("语义层推导失败 connectorId={}: {}", connectorId, reason, e);
-            writeStatus(connectorId, SEM_FAILED, "推导失败：" + reason, true, claimAt);
-            return DeriveResult.builder().ok(false).note("推导失败：" + reason).build();
+            String note = withNotePrefix(notePrefix, "推导失败：" + reason);
+            writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
+            return DeriveResult.builder().ok(false).note(note).build();
         }
     }
 
@@ -3768,6 +3787,22 @@ public class ConnectorSemanticDeriveService {
     }
 
     // ================================================================ 小工具
+
+    /**
+     * 把降级等调用背景放到最终说明最前面。前缀自己已经带句末标点时一个字都不加；
+     * 没带时补全角句号，避免调用方的文案和推导结论粘在一起。
+     *
+     * <p>空前缀直接返回原文，保证旧入口的返回值与状态文案零变化。
+     */
+    private static String withNotePrefix(String rawPrefix, String note) {
+        if (blank(rawPrefix)) {
+            return note;
+        }
+        String prefix = rawPrefix.trim();
+        char last = prefix.charAt(prefix.length() - 1);
+        String separator = "。；;!！?？，,：:".indexOf(last) >= 0 ? "" : "。";
+        return clip(prefix + separator + (note == null ? "" : note), NOTE_MAX);
+    }
 
     /** 异常摘要带上类名：NPE 这类 message 为 null 的异常，否则在界面上只剩一个孤零零的 "null"。 */
     private static String describe(Throwable e) {

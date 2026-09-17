@@ -38,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -1513,6 +1514,91 @@ class ConnectorSemanticDeriveServiceTest {
             verify(schemaService, never()).refresh(any());
             assertFalse(r.isOk());
             assertTrue(r.getNote().contains("刷新结构"), r.getNote());
+        }
+    }
+
+    // ================================================================ 后台单次推导的说明前缀
+
+    @Nested
+    @DisplayName("后台单次推导的说明前缀")
+    class AsyncNotePrefix {
+
+        private ConnectorSemanticDeriveService inlineAsyncService() {
+            ThreadPoolTaskExecutor executor = mock(ThreadPoolTaskExecutor.class);
+            doAnswer(invocation -> {
+                invocation.<Runnable>getArgument(0).run();
+                return null;
+            }).when(executor).execute(any(Runnable.class));
+            return new ConnectorSemanticDeriveService(
+                    schemaService, semanticService, connectionMapper, claudeService, properties,
+                    mock(SemanticSqlCorpusReader.class), mock(SemanticJoinValidator.class),
+                    mock(SemanticValueProfiler.class), mock(ConnectorSemanticMapper.class),
+                    mock(ConnectorAuditService.class),
+                    executor, mock(ThreadPoolTaskExecutor.class), mock(TableShapeDetector.class),
+                    mock(org.redisson.api.RedissonClient.class));
+        }
+
+        private void runAsync(String prefix) {
+            TenantContext.set("t1");
+            inlineAsyncService().deriveAsync(CONNECTOR_ID, prefix);
+        }
+
+        @Test
+        void 成功说明稳定以非空前缀开头() {
+            defaultSnapshot();
+            modelOutputs(EMPTY_BUT_WELL_FORMED);
+
+            runAsync("降级原因：sandbox 未配置；");
+
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：sandbox 未配置；"),
+                    lastStatusWrite().getSemanticNote());
+        }
+
+        @Test
+        void 禁用说明稳定以非空前缀开头() {
+            properties.getSemantic().setEnabled(false);
+
+            runAsync("手工前缀");
+
+            assertEquals("手工前缀。语义层推导已关闭（connector.semantic.enabled=false）",
+                    lastStatusWrite().getSemanticNote());
+        }
+
+        @Test
+        void 失败说明稳定以非空前缀开头() {
+            defaultSnapshot();
+            when(claudeService.messagesInternal(any(), any())).thenThrow(new RuntimeException("上游超时"));
+
+            runAsync("降级原因：健康检查失败；");
+
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：健康检查失败；推导失败："),
+                    lastStatusWrite().getSemanticNote());
+        }
+
+        @Test
+        void 不适用说明稳定以非空前缀开头() {
+            when(schemaService.currentRows(CONNECTOR_ID)).thenReturn(List.of());
+            when(schemaService.refresh(CONNECTOR_ID)).thenThrow(new ServiceException(
+                    ExceptionCode.OPERATION_UNSUPPORTED, "这种连接器类型不支持自描述"));
+
+            runAsync("降级原因：无 DESCRIBE；");
+
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：无 DESCRIBE；"),
+                    lastStatusWrite().getSemanticNote());
+            assertEquals(ConnectorSemanticDeriveService.SEM_NOT_APPLICABLE,
+                    lastStatusWrite().getSemanticStatus());
+        }
+
+        @Test
+        void 旧重载委托空前缀且说明不变() {
+            defaultSnapshot();
+            modelOutputs(EMPTY_BUT_WELL_FORMED);
+            TenantContext.set("t1");
+
+            inlineAsyncService().deriveAsync(CONNECTOR_ID);
+
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("覆盖 "),
+                    lastStatusWrite().getSemanticNote());
         }
     }
 
