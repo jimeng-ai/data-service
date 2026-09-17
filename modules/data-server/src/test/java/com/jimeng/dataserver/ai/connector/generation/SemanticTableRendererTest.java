@@ -29,6 +29,22 @@ class SemanticTableRendererTest {
         assertTrue(rendered.text().endsWith("未列出的列不要写说明\n"));
     }
 
+    @Test
+    @DisplayName("预算只能保留零列时不误删表注释里的同名提示")
+    void 零列截断保留表注释原文() {
+        ConnectorSchema row = schemaWithFields(1, 1_000);
+        row.setObjectComment("业务原注释（本表字段未取到，不要为它写字段或关系）仍须保留");
+
+        SemanticTableRenderer.RenderedTable rendered =
+                new SemanticTableRenderer().renderWithin(row, 300);
+
+        assertTrue(rendered.columnsTruncated());
+        assertEquals(0, rendered.renderedColumns());
+        assertEquals("## max_width_table [TABLE] 业务原注释（本表字段未取到，不要为它写字段或关系）仍须保留\n"
+                + "唯一键（主键在前）：PRIMARY(column_0)\n"
+                + "本表共 1 列，只列出前 0 列；未列出的列不要写说明\n", rendered.text());
+    }
+
     private static ConnectorSchema schemaWithFields(int count, int commentChars) {
         StringBuilder fields = new StringBuilder("[");
         for (int i = 0; i < count; i++) {

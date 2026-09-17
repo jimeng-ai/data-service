@@ -139,7 +139,8 @@ public final class SliceOutcomeHandlerRegistry {
     }
 
     private static SliceOutcomeDecision noProgress(SliceOutcomeContext context) {
-        return noProgress(context, context.noCallbackStreak());
+        // 只有完全没有回调才累计 NO_CALLBACK；已收到回调但没有表进展会打断连续计数。
+        return noProgress(context, 0);
     }
 
     private static SliceOutcomeDecision noProgress(SliceOutcomeContext context, int callbackStreak) {

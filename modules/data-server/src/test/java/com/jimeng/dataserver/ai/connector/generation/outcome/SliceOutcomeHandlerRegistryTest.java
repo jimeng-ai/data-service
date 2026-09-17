@@ -56,6 +56,22 @@ class SliceOutcomeHandlerRegistryTest {
     }
 
     @Test
+    @DisplayName("有回调但无进展会打断 NO_CALLBACK 连续计数")
+    void noCallback交错时重新计数() {
+        SliceOutcomeDecision missing = decide(SliceOutcomeKind.NO_CALLBACK, 0, 0, 0, 4);
+        SliceOutcomeDecision callbackWithoutProgress = decide(SliceOutcomeKind.NO_PROGRESS, 0,
+                missing.sliceFailStreak(), missing.noCallbackStreak(), 4);
+
+        assertEquals(SliceOutcomeAction.RETRY, callbackWithoutProgress.action());
+        assertEquals(0, callbackWithoutProgress.noCallbackStreak());
+
+        SliceOutcomeDecision missingAgain = decide(SliceOutcomeKind.NO_CALLBACK, 0,
+                callbackWithoutProgress.sliceFailStreak(), callbackWithoutProgress.noCallbackStreak(), 4);
+        assertEquals(SliceOutcomeAction.RETRY, missingAgain.action());
+        assertEquals(1, missingAgain.noCallbackStreak());
+    }
+
+    @Test
     @DisplayName("option B：已有 DONE 时 degradeOrInterrupt 一律中断")
     void done大于0不回落() {
         for (SliceOutcomeKind kind : Set.of(SliceOutcomeKind.SANDBOX_REJECTED,

@@ -33,6 +33,12 @@ public class SemanticSlicePlanner {
                     .thenComparing(ConnectorSemanticGenerationTable::getId,
                             Comparator.nullsLast(Long::compareTo));
 
+    private static final Comparator<ConnectorSemanticGenerationTable> BY_LEGACY_ID =
+            Comparator.comparing(ConnectorSemanticGenerationTable::getId,
+                            Comparator.nullsLast(Long::compareTo))
+                    .thenComparing(ConnectorSemanticGenerationTable::getObjectName,
+                            Comparator.nullsLast(String::compareTo));
+
     private final ConnectorSemanticGenerationTableMapper tableMapper;
     private final ConnectorSchemaMapper schemaMapper;
     private final SemanticTableRenderer tableRenderer;
@@ -83,10 +89,14 @@ public class SemanticSlicePlanner {
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
-        return rows.stream()
+        List<ConnectorSemanticGenerationTable> pending = rows.stream()
                 .filter(Objects::nonNull)
                 .filter(row -> "PENDING".equals(row.getStatus()))
-                .sorted(BY_PRIORITY)
+                .toList();
+        boolean legacySnapshot = pending.stream()
+                .allMatch(row -> row.getImportanceRank() == null);
+        return pending.stream()
+                .sorted(legacySnapshot ? BY_LEGACY_ID : BY_PRIORITY)
                 .toList();
     }
 

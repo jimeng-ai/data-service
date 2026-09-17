@@ -72,6 +72,21 @@ class SemanticSlicePlannerTest {
     }
 
     @Test
+    @DisplayName("旧快照 rank 全为 NULL 时按批次表行 id 升序")
+    void rank全空按id回退() {
+        ConnectorSemanticGenerationTable laterId = table("a_name", null, "PENDING");
+        laterId.setId(30L);
+        ConnectorSemanticGenerationTable firstId = table("z_name", null, "PENDING");
+        firstId.setId(10L);
+        ConnectorSemanticGenerationTable middleId = table("m_name", null, "PENDING");
+        middleId.setId(20L);
+        stubRows(List.of(laterId, firstId, middleId), 100);
+
+        assertEquals(List.of("z_name", "m_name", "a_name"),
+                names(planner.plan(generation, 20, 40_000)));
+    }
+
+    @Test
     @DisplayName("单片硬上限 20 张，传入更大 cap 也会夹紧")
     void 单片不超过20() {
         List<ConnectorSemanticGenerationTable> rows = new ArrayList<>();
