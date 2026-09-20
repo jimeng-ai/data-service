@@ -191,6 +191,26 @@ public class ConnectorOverviewService {
 
     // ================================================================ 取数
 
+    /**
+     * 这个 Agent 有没有被授权任何外部连接。
+     *
+     * <p>给 {@code SkillRuntimeService} 判定 {@code requires: connections} 用：决定 connector 这个
+     * 平台 Skill 是<b>提升为直接注入</b>还是<b>整个隐藏</b>。
+     *
+     * <h4>为什么单开一个方法，而不是让调用方去看 {@link #buildRequestContext} 返回空</h4>
+     * 那个方法在判授权之前还会被三个开关短路（连接器总开关、概览开关、本轮有没有用户文本），
+     * 拿它的"空"当"没授权"，会让<b>关掉概览注入</b>的部署连带把 conn_* 工具也一起弄丢——
+     * 两件事完全无关。这里只回答授权这一个问题。
+     *
+     * <p>不判 {@code ACTIVE}：连接被停用时工具照常给，调用时由 {@code ConnectorGateway} 明确报错。
+     * 反过来（悄悄抽掉工具）会让模型说"我没有查库的能力"，而真相是"有一条连接被停用了"——
+     * 后者用户能去管理台看见并修，前者只会让人以为功能坏了。
+     */
+    public boolean hasGrantedConnections(Long agentId) {
+        if (agentId == null) return false;
+        return !grantedConnectionIds(agentId).isEmpty();
+    }
+
     /** 与 {@code ConnectorGateway.grantedConnectionIds} 同形：授权只认 {@code agent_connection}。 */
     private Set<Long> grantedConnectionIds(Long agentId) {
         List<AgentConnection> binds = agentConnectionMapper.selectList(new LambdaQueryWrapper<AgentConnection>()

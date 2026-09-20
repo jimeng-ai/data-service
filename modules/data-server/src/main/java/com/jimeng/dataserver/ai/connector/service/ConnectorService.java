@@ -6,10 +6,12 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
+import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.generation.SemanticGenerationCleanup;
 import com.jimeng.dataserver.ai.connector.pool.CustomerDataSourceManager;
 import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorInstanceLoader;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProbeService;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -33,7 +35,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -101,6 +105,16 @@ public class ConnectorService {
 
     /** 删除连接时在同一事务内清理暂存产物并取消未结束批次；放末尾避免位置构造静默错位。 */
     private final ObjectProvider<SemanticGenerationCleanup> semanticGenerationCleanup;
+
+    /**
+     * 只给 {@link #revealCredential} 用。
+     *
+     * <p><b>放在字段列表最末尾</b>，与 {@code semanticService} 那条注释同一个理由：
+     * 本类有三个按位置构造它的测试，往中间插字段会让它们静默错位。
+     *
+     * <p>不会成环：{@code ConnectorAuditService} 只注入两个 mapper，是条叶子。
+     */
+    private final ConnectorAuditService auditService;
 
     private volatile TransactionTemplate txTemplate;
 
@@ -542,20 +556,34 @@ public class ConnectorService {
 
         Map<String, Object> incoming = req.getParams() == null
                 ? new LinkedHashMap<>() : new LinkedHashMap<>(req.getParams());
-        Set<String> secretNames = Set.copyOf(connector.paramSpec().secretNames());
+        // 有序：与 buildSecretPayload / splitSecrets 的遍历顺序一致，多敏感参数时 JSON 键序才稳定。
+        List<String> secretNames = connector.paramSpec().secretNames();
+
+        // 这一次【真的填了新值】的敏感参数。留空 = 沿用原值。
+        //
+        // ★ 必须是「逐个参数」而不是一个布尔开关。原来是一个 reuseSecret 管全部，
+        //   且它是【或】的关系——任意一个留空就跳过整段写密文的代码。单敏感参数时
+        //   「有一个留空」== 「全部留空」，行为恰好正确；两个就会出事：
+        //   用户填了新密码、把 SSL 私钥留空 → 开关被私钥打开 → 新密码被【静默丢弃】。
+        //   而保存前的 probeOrThrow 拿的是没被改过的旧密文，探测成功、保存返回 200，
+        //   用户以为密码换了，实际没换，全程零信号。
+        Set<String> providedSecrets = new LinkedHashSet<>();
+        for (String s : secretNames) {
+            Object v = incoming.get(s);
+            if (!(v == null || (v instanceof String str && str.isBlank()))) {
+                providedSecrets.add(s);
+            }
+        }
+
+        boolean hasExistingCipher = existing != null
+                && existing.getCredentialCipher() != null && !existing.getCredentialCipher().isBlank();
 
         // 编辑时敏感参数留空 = 沿用原值。为了让 validate 通过，先把「原来有值」这件事补进去：
-        // 用一个占位串参与校验，随后再剔除——不能把真实密文或明文放进来，它会流进校验失败的错误文案。
-        boolean reuseSecret = false;
-        if (existing != null) {
+        // 用一个占位串参与校验，随后【不】拿它去建密文——不能把真实密文或明文放进来，
+        // 它会流进校验失败的错误文案。
+        if (hasExistingCipher) {
             for (String s : secretNames) {
-                Object v = incoming.get(s);
-                if (v == null || (v instanceof String str && str.isBlank())) {
-                    if (existing.getCredentialCipher() != null && !existing.getCredentialCipher().isBlank()) {
-                        incoming.put(s, "__KEEP__");
-                        reuseSecret = true;
-                    }
-                }
+                if (!providedSecrets.contains(s)) incoming.put(s, "__KEEP__");
             }
         }
 
@@ -568,9 +596,18 @@ public class ConnectorService {
         Map<String, Object> nonSecret = connector.paramSpec().normalizeNonSecret(incoming);
         row.setConfigJson(toJson(nonSecret));
 
-        // 敏感 → 密文
-        if (!reuseSecret) {
-            String plaintext = buildSecretPayload(secretNames, incoming);
+        // 敏感 → 密文。一个都没填新值就整段不动，原密文原封不动（这是「留空 = 沿用」的落点）。
+        if (!providedSecrets.isEmpty()) {
+            Map<String, Object> merged = new LinkedHashMap<>();
+            // ★ 多敏感参数时先把旧值解出来打底，再让新值覆盖上去——否则没填的那个会丢。
+            //   单敏感参数时不解密：providedSecrets 非空就意味着它被重填了，旧值无用，
+            //   白解一次密只是凭空多一条「密钥轮换后连编辑都做不了」的失败路径。
+            if (hasExistingCipher && secretNames.size() > 1) {
+                merged.putAll(splitSecrets(existing, secretNames));
+            }
+            for (String s : providedSecrets) merged.put(s, incoming.get(s));
+
+            String plaintext = buildSecretPayload(secretNames, merged);
             if (plaintext != null) {
                 if (!cipher.isAvailable()) {
                     throw new ServiceException(ExceptionCode.INVALID_REQUEST,
@@ -590,7 +627,7 @@ public class ConnectorService {
      * <p>单值不套 JSON 是刻意的：现有的 HTTP 连接（沙箱那条路）存的就是裸令牌，
      * {@code ConnectionResolver} 直接把它当 token 下发。套上 JSON 会让所有存量行解不出来。
      */
-    private String buildSecretPayload(Set<String> secretNames, Map<String, Object> incoming) {
+    private String buildSecretPayload(Collection<String> secretNames, Map<String, Object> incoming) {
         if (secretNames.isEmpty()) {
             return null;
         }
@@ -604,6 +641,113 @@ public class ConnectorService {
             if (v != null) m.put(s, v);
         }
         return m.isEmpty() ? null : toJson(m);
+    }
+
+    /**
+     * {@link #buildSecretPayload} 的<b>逆</b>：解开密文、按敏感参数名拆回一张表。
+     *
+     * <h3>两处调用方，必须共用这一份</h3>
+     * <ul>
+     *   <li>{@link #revealCredential}：管理台「查看密码」。</li>
+     *   <li>{@link #apply}：多敏感参数编辑时，先解出旧值打底再让新值覆盖，否则没填的那个会丢。</li>
+     * </ul>
+     * 拆分规则与 {@code buildSecretPayload} 必须<b>逐字对称</b>——单个敏感参数存的是裸值
+     *（不套 JSON，为的是让 HTTP 那条老链路的存量行还能解出来），多个才是 JSON。
+     * 两边一旦分叉，多敏感参数的连接会<b>静默</b>把一整段 JSON 原文当成某一个参数的值：
+     * 不报错，只是填回去连不上。所以这段逻辑只允许存在一份。
+     *
+     * <p><b>解不出来就抛，绝不兜底。</b>返回一个残缺的 map 会让 {@code apply} 把缺的那个参数
+     * 当成「本来就没有」重新加密进去——一次编辑顺手删掉一个凭据，而且没有任何信号。
+     *
+     * @throws ServiceException 密文解不开（密钥轮换）或多敏感参数的密文不是合法 JSON
+     */
+    private Map<String, String> splitSecrets(Connection row, Collection<String> secretNames) {
+        int version = row.getEncryptionVersion() == null ? 0 : row.getEncryptionVersion();
+        // CredentialCipher.decrypt 自己抛的 ServiceException 文案已经脱敏（「可能是密钥已轮换」），
+        // 直接让它穿出去，不要包一层把可操作的信息盖掉。
+        String plaintext = cipher.decrypt(row.getCredentialCipher(), version);
+        if (plaintext == null) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有存凭据");
+        }
+
+        Map<String, String> out = new LinkedHashMap<>();
+        List<String> names = List.copyOf(secretNames);
+        if (names.size() == 1) {
+            out.put(names.get(0), plaintext);
+            return out;
+        }
+        Map<?, ?> parsed;
+        try {
+            parsed = CommonUtil.getObjectMapper().readValue(plaintext, Map.class);
+        } catch (Exception e) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "凭据格式异常，无法解析。请重新录入凭据");
+        }
+        for (String s : names) {
+            Object v = parsed.get(s);
+            if (v != null) out.put(s, String.valueOf(v));
+        }
+        return out;
+    }
+
+    /**
+     * {@link #buildSecretPayload} 的<b>逆</b>：把密文解开并按敏感参数名拆回一张表。
+     *
+     * <h3>这是全系统唯一把凭据明文送出进程的出口</h3>
+     * 别处的纪律是「凭据只存在于一次调用的栈上」（{@code ConnectorInstanceLoader.load}），
+     * {@code ConnectorView} 连占位串都不给（那条注释写着「给了就等于泄露这个字段配没配」）。
+     * 本方法是那条纪律的唯一豁免口，所以它的每一条约束都不是形式主义：
+     *
+     * <ul>
+     *   <li><b>调用方必须先过 {@code superAdminGuard}。</b>本方法不自己判权限——与本类其余方法一致，
+     *       权限在控制器上。但它是唯一一个「漏判权限 = 凭据外泄」的方法，加方法时别顺手复制它。</li>
+     *   <li><b>审计写不进去就不给明文。</b>这与 {@code ConnectorAuditService} 的默认信条
+     *       （「宁可丢一条审计，也不要让客户的查询失败」）<b>相反</b>，是刻意的：
+     *       对一次查询来说，审计是「记下一件反正已经发生、且受写闸与档位约束的事」；
+     *       对一次取回来说，<b>审计行就是唯一的控制</b>——凭据出了平台，后续使用发生在平台之外，
+     *       写闸、出库档位、这张表全都管不着，也不会留下任何痕迹。
+     *       一次没记上的取回，比一次失败的取回坏得多。成本不对称，所以这里反过来。</li>
+     *   <li><b>明文绝不进日志、绝不进异常文案。</b>下面所有 log / 报错都只说结论不带值。</li>
+     * </ul>
+     *
+     * <h3>拆分规则必须与 {@link #buildSecretPayload} 逐字对称</h3>
+     * 单个敏感参数存的是<b>裸值</b>（不套 JSON，为的是让 HTTP 那条老链路的存量行还能解出来），
+     * 多个才是 JSON。两边一旦分叉，多敏感参数的连接器会<b>静默</b>取回一段 JSON 原文当密码——
+     * 不报错，只是填回去连不上。改任一侧都要同时改另一侧。
+     *
+     * @return 敏感参数名 → 明文。该类型没有敏感参数时返回空表
+     */
+    public Map<String, String> revealCredential(Long id) {
+        Connection row = requireRow(id);
+        Connector connector = registry.require(row.getKind());
+        List<String> secretNames = connector.paramSpec().secretNames();
+
+        // 该类型压根没有敏感参数：没有钥匙可拿，也就不存在「谁拿走了钥匙」。不记审计，避免噪声。
+        if (secretNames.isEmpty()) {
+            return Map.of();
+        }
+        if (row.getCredentialCipher() == null || row.getCredentialCipher().isBlank()) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有存凭据");
+        }
+
+        Map<String, String> out;
+        try {
+            out = splitSecrets(row, secretNames);
+        } catch (RuntimeException e) {
+            // 失败也留痕：一串失败的取回尝试本身就是信号。
+            // 文案带 e.getMessage()——那两句（「解密失败，可能是密钥已轮换」/「凭据格式异常」）
+            // 本来就是脱敏过的、给人看的结论，不含任何值，也不含底层异常细节。
+            auditService.recordAdminAction(row.getId(), row.getTenantId(), row.getName(),
+                    ConnectorAuditService.OP_CREDENTIAL_REVEAL,
+                    "取回凭据失败：" + e.getMessage(), false, ConnectorErrorCode.CONFIG_ERROR);
+            throw e;
+        }
+
+        // ★ 审计在返回之前，且不吞异常：写不进去就不给明文。理由见方法注释。
+        auditService.recordAdminAction(row.getId(), row.getTenantId(), row.getName(),
+                ConnectorAuditService.OP_CREDENTIAL_REVEAL,
+                "取回了这条连接的凭据明文（" + String.join("、", out.keySet()) + "）", true, null);
+        return out;
     }
 
     /**

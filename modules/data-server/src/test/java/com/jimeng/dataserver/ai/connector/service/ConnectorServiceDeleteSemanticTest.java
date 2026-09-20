@@ -146,6 +146,7 @@ class ConnectorServiceDeleteSemanticTest {
                 mock(ConnectorInstanceLoader.class), mock(ConnectorProbeService.class),
                 mock(CustomerDataSourceManager.class), mock(CredentialCipher.class),
                 mock(ConnectorSemanticService.class), mock(PlatformTransactionManager.class),
-                mock(ObjectProvider.class), cleanupProvider);
+                mock(ObjectProvider.class), cleanupProvider,
+                mock(com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService.class));
     }
 }

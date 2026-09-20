@@ -1,6 +1,7 @@
 ---
 name: rag-knowledge
 description: 在企业知识库中检索相关资料并回答用户问题。当用户提到"查一下知识库""检索文档""根据资料回答"等场景时使用。需要先确定 kb_id（知识库 ID）。
+requires: knowledge_bases
 ---
 
 # rag-knowledge

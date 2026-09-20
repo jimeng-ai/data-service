@@ -88,7 +88,8 @@ public class HttpConnector implements Connector {
                                         + "签名式鉴权（按请求内容现算 HMAC）尚未支持")
                         .withOptions(List.of("bearer", "api-key")).withDefault("bearer"),
                 ParamField.secret("credential", "凭据", true,
-                        "令牌明文。加密存储，保存后永不回显。编辑时留空表示沿用原值"),
+                        "令牌明文。加密存储。已保存的令牌可以在编辑里查看，每次查看都会记一条使用记录；"
+                                + "不主动更换就不会改动它"),
                 ParamField.of("allowMethods", "允许的方法", ParamType.STRING_LIST, false,
                         "★ 默认只有 GET（只读）。写方法必须在这里显式声明——"
                                 + "这条连接的「只读」完全由这个白名单承重，不像数据库还有客户侧账号权限兜底"),

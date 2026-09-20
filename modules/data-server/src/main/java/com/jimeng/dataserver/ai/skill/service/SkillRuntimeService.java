@@ -10,6 +10,7 @@ import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
+import com.jimeng.dataserver.ai.skill.model.SkillRequirement;
 import com.jimeng.dataserver.ai.skill.model.ToolPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
 import com.jimeng.dataserver.ai.skill.source.ToolPackageRegistry;
@@ -102,9 +103,10 @@ public class SkillRuntimeService {
                 skillOnly.put(e.getKey(), e.getValue());
             }
         }
-        // 平台级 Skill「rag-knowledge」可见性取决于当前 Agent 是否绑定知识库：绑了→提升为直接注入工具；
-        // 没绑→直接摘除（没有库可检索，暴露只会诱导模型盲调 rag.search 失败）。
-        resolveRagSkillVisibility(skillOnly, boundPlugins);
+        // 有前置资源声明（SKILL.md 的 requires:）的平台 Skill：绑了→提升为直接注入工具；
+        // 没绑→直接摘除（没有资源可用，暴露它只会诱导模型盲调一次必然失败的工具）。
+        // 今天 rag-knowledge 声明 knowledge_bases、connector 声明 connections。
+        resolveResourceBoundSkills(skillOnly, boundPlugins);
 
         // 平台级 Skill「connector」在场且 Agent 真的授权了连接器时，把表清单概览 + 这一轮命中的口径
         // 直接注入上下文，省掉模型开口前的那次 conn_catalog 往返。与上面 RAG 那段一样，取决于 Agent 绑了什么。
@@ -194,36 +196,67 @@ public class SkillRuntimeService {
 
     // ------------------------------------------------------------------ internals
 
-    /** 平台级知识检索 Skill 的名称（SKILL.md frontmatter name）。 */
-    private static final String RAG_SKILL_NAME = "rag-knowledge";
-
     /**
-     * 根据当前 Agent 是否绑定知识库，决定平台级 Skill「rag-knowledge」的可见性：
+     * 按 Skill 自己声明的前置资源（SKILL.md 的 {@code requires:}）决定它的可见性：
      * <ul>
-     *   <li><b>绑定了知识库</b>：把它从「待发现」集合移到「直接注入」集合，让 rag.search 像绑定插件一样
-     *       立即可调，省去 discovery→activate_skills 往返；kb_id 已由 system 提示给定 + 执行器兜底。</li>
-     *   <li><b>未绑定知识库</b>：直接从候选里摘除——没有库可检索，暴露 RAG 只会诱导模型盲调一次
-     *       rag.search 失败（执行器无 kb_id 可解析），徒增困惑。</li>
-     *   <li><b>无 Agent 上下文</b>（直接调 Claude 不带 agent_id 的旧用法）：不干预，仍走正常发现流程。</li>
+     *   <li><b>资源已绑</b>：从「待发现」移到「直接注入」，工具立刻在手上，省掉 discovery→activate 往返。</li>
+     *   <li><b>资源未绑</b>：直接从候选里摘除——没有资源可用，暴露它只会诱导模型盲调一次必然失败的工具。</li>
+     *   <li><b>没有声明 {@code requires}</b>：一个字不动，照常走发现。</li>
+     *   <li><b>无 Agent 上下文</b>（直连 {@code /data/claude/messages} 不带 agent_id 的旧用法）：
+     *       同样不干预，仍走正常发现流程——这里不 fail-closed，因为「看不见」和「不能用」是两件事，
+     *       真正的闸在执行侧（{@code ConnectorGateway} / rag 执行器），那里才是 fail-closed 的。</li>
      * </ul>
-     * 其它平台 Skill 一律保持原样走发现。
+     *
+     * <h3>这段代码为什么从「rag 专用」改成「按声明驱动」</h3>
+     * 它原本叫 {@code resolveRagSkillVisibility}，整段只认 {@code "rag-knowledge"} 一个字面量。
+     * 后来 {@code connector} 撞上同一个需求（绑了连接才该直注），<b>而没有人来加第二个 if</b>——
+     * 于是 connector 一直走发现：模型每轮都得先自己调一次 {@code activate_skills} 才拿得到
+     * {@code conn_*}，而表清单概览却在同一轮被无条件塞进了 system。
+     * 实测代价是每轮多两次 LLM 往返（activate + conn_list）+ 重新注入一遍 SKILL.md，
+     * 并且「这个 Agent 能不能查库」从一次管理员配置退化成模型每轮重赌一次。
+     *
+     * <p>同一个形状出现第二次就该抽象。现在新增一个有前置资源的平台 Skill，
+     * <b>只需在它自己的 SKILL.md 里写一行</b>，本方法和运行时一个字都不用改。
      */
-    private void resolveRagSkillVisibility(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
+    private void resolveResourceBoundSkills(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
         AgentRuntimeView agent = AgentContext.get();
         if (agent == null) return;
-        boolean kbBound = agent.getKbIds() != null && !agent.getKbIds().isEmpty();
         for (Iterator<Map.Entry<String, ToolPackage>> it = skillOnly.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, ToolPackage> e = it.next();
-            if (!RAG_SKILL_NAME.equals(e.getValue().getName())) continue;
-            if (kbBound) {
-                boundPlugins.add(e.getValue());
-                log.info("Agent 绑定知识库，rag-knowledge 提升为直接注入工具 kbIds={}", agent.getKbIds());
+            ToolPackage pkg = it.next().getValue();
+            SkillRequirement req = pkg.getRequires();
+            if (req == null) continue;
+            if (isRequirementSatisfied(req, agent)) {
+                boundPlugins.add(pkg);
+                log.info("Agent 已绑定 {}，{} 提升为直接注入工具 agentId={}", req.token(), pkg.getName(), agent.getAgentId());
             } else {
-                log.info("Agent 未绑定知识库，隐藏 rag-knowledge 技能 agentId={}", agent.getAgentId());
+                log.info("Agent 未绑定 {}，隐藏 {} 技能 agentId={}", req.token(), pkg.getName(), agent.getAgentId());
             }
             it.remove();
-            break;
         }
+    }
+
+    /**
+     * 某一类前置资源在当前 Agent 上到底绑没绑。
+     *
+     * <p>两条判据刻意<b>来源不同</b>：知识库读的是 Agent 快照里的 {@code kbIds}（随发布固化），
+     * 连接读的是 {@code agent_connection} 的实时行。后者不能走快照——授权是超管随时可撤的，
+     * 撤销必须立刻生效，而快照要等下一次发布。
+     */
+    private boolean isRequirementSatisfied(SkillRequirement req, AgentRuntimeView agent) {
+        return switch (req) {
+            case KNOWLEDGE_BASES -> agent.getKbIds() != null && !agent.getKbIds().isEmpty();
+            // 与 ConnectorGateway / ConnectorOverviewService 同一个判据：授权只认 agent_connection。
+            // 任何异常都按「没绑」处理：这里判错的代价是少一个工具（吵闹、用户会问），
+            // 而判成「有」的代价是把一堆必然失败的 conn_* 塞给模型（安静、只表现为答得莫名其妙）。
+            case CONNECTIONS -> {
+                try {
+                    yield connectorOverviewService.hasGrantedConnections(agent.getAgentId());
+                } catch (Exception e) {
+                    log.warn("判定 Agent 连接授权失败，本轮按未授权处理 agentId={}", agent.getAgentId(), e);
+                    yield false;
+                }
+            }
+        };
     }
 
     /** 平台级连接器 Skill 的名称（SKILL.md frontmatter name）。 */
@@ -248,10 +281,21 @@ public class SkillRuntimeService {
      * 对话记录里就没有任何材料能复原模型当时读到了什么——而本仓库的审计、trace_id 回溯、
      * 口径变更留痕全都建立在「对话可复核」这个前提上。
      *
+     * <h4>★ 「工具没给却先给了表清单」这个坑，守卫曾经形同虚设</h4>
+     * 下面第一条守卫写的是「connector 这个包在不在工具包视图里」，防的是
+     * <b>「模型没有 conn_* 工具，却先拿到一份表清单，于是被诱导去调不存在的工具」</b>。
+     * 想法是对的，但判据错了：{@code connector} 是<b>磁盘平台技能，对所有 Agent 恒可见</b>，
+     * 这个条件<b>恒为真</b>，所以它一次也没防住——实测过：概览照常注入 system，
+     * 而同一次请求的 tools 数组里只有 {@code activate_skills / skill_search / skill_install}。
+     *
+     * <p>现在真正兑现这条守卫的是 SKILL.md 里的 {@code requires: connections}：
+     * 授权了 → connector 被提升为直接注入，工具和概览<b>同时出现</b>；
+     * 没授权 → 它被整个隐藏，而 {@code buildRequestContext} 同样返回空。两侧同源，不会再分叉。
+     * 下面这条判空<b>保留</b>，作为「有人把 connector 从磁盘上删了」时的兜底。
+     *
      * <p><b>两个前提都满足才注入，缺一不注入一个字节：</b>
      * <ul>
-     *   <li>{@code connector} 这个平台 Skill 在本次请求的工具包视图里——没有它，模型根本没有
-     *       conn_* 工具，给一份表清单只会诱导它去调不存在的工具；</li>
+     *   <li>{@code connector} 这个平台 Skill 在本次请求的工具包视图里；</li>
      *   <li>当前 Agent 真的被授权了连接器（{@code agent_connection} 里有行）——这一条由
      *       {@code ConnectorOverviewService} 自己判，并且和 {@code ConnectorGateway} 一样 fail-closed：
      *       没有 {@code AgentContext} / 没有租户上下文 = 谁也没授权。</li>

@@ -135,6 +135,12 @@ class SkillRuntimeServiceRagVisibilityTest {
                         new SkillToolDefinition("rag_kb_list", "列出可用知识库", Map.of()));
             }
             @Override public String getTenantId() { return null; }
+            // ★ 必须和真实 skills/rag-knowledge/SKILL.md 的 frontmatter 一致：
+            //   可见性现在由 Skill 自己声明的 requires 驱动，假包不声明就退回走发现，
+            //   本用例会以一种和「功能坏了」一模一样的方式失败。
+            @Override public com.jimeng.dataserver.ai.skill.model.SkillRequirement getRequires() {
+                return com.jimeng.dataserver.ai.skill.model.SkillRequirement.KNOWLEDGE_BASES;
+            }
         });
         return map;
     }

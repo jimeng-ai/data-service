@@ -86,7 +86,8 @@ public class MySqlConnector implements Connector {
                         "★ 必须是只读账号（数据库侧只 GRANT SELECT）。保存时平台会实际验证它写不了，"
                                 + "验不过会拒绝保存"),
                 ParamField.secret("password", "密码", true,
-                        "加密存储，保存后永不回显。留空表示沿用原密码"),
+                        "加密存储。已保存的密码可以在编辑里查看，每次查看都会记一条使用记录；"
+                                + "不主动更换就不会改动它"),
                 ParamField.of("useSsl", "启用 SSL", ParamType.BOOL, false,
                         "公网直连建议开启。客户库没配证书时开启会连不上").withDefault("false"),
                 ParamField.of("connectTimeoutSec", "连接超时（秒）", ParamType.INT, false,

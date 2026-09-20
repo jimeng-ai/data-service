@@ -42,6 +42,20 @@ public interface ToolPackage {
     }
 
     /**
+     * 这个工具包需要 Agent 先绑定哪一类资源才生效（SKILL.md frontmatter 的 {@code requires:}）。
+     *
+     * <p>返回 null = 没有前置资源，走正常的 discovery→activate 流程。
+     * 返回非 null 时由 {@code SkillRuntimeService} 判定：
+     * <b>资源已绑 → 提升为直接注入</b>（工具立刻在手上，省掉 activate 往返）；
+     * <b>资源未绑 → 整个摘除</b>（没有资源可用，暴露它只会诱导模型盲调一次必然失败的工具）。
+     *
+     * <p>DB 型技能暂不支持声明前置资源，默认 null。
+     */
+    default SkillRequirement getRequires() {
+        return null;
+    }
+
+    /**
      * 工具包类型：{@link ToolPackageKind#SKILL} 走 discovery→activate 流程；
      * {@link ToolPackageKind#PLUGIN} 直接注入 tool_use。
      * 默认 SKILL，插件实现类覆盖返回 PLUGIN。

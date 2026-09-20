@@ -5,6 +5,7 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
+import com.jimeng.dataserver.ai.skill.model.SkillRequirement;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -175,7 +176,7 @@ public class SkillPackageLoaderService {
         }
 
         List<SkillToolDefinition> tools = loadToolDefinitions(skillDir.resolve(TOOLS_FILE));
-        return new SkillPackage(parsed.name, parsed.description, parsed.body, skillDir, tools);
+        return new SkillPackage(parsed.name, parsed.description, parsed.body, skillDir, tools, parsed.requires);
     }
 
     private List<SkillToolDefinition> loadToolDefinitions(Path toolsFile) {
@@ -223,14 +224,15 @@ public class SkillPackageLoaderService {
         String name = fallbackName;
         String description = "";
         String body = normalized.trim();
+        SkillRequirement requires = null;
 
         if (!normalized.startsWith("---\n")) {
-            return new ParsedSkillMarkdown(name, description, body);
+            return new ParsedSkillMarkdown(name, description, body, requires);
         }
 
         int frontmatterEnd = normalized.indexOf("\n---\n", 4);
         if (frontmatterEnd < 0) {
-            return new ParsedSkillMarkdown(name, description, body);
+            return new ParsedSkillMarkdown(name, description, body, requires);
         }
 
         String frontmatter = normalized.substring(4, frontmatterEnd);
@@ -254,10 +256,16 @@ public class SkillPackageLoaderService {
             if ("description".equalsIgnoreCase(key)) {
                 description = value;
             }
+            // ★ 认不出来的值直接抛，不回落成 null——理由见 SkillRequirement 的类注释：
+            //   静默忽略一个拼错的 requires，后果正是「该直注的 Skill 安静地退回走发现」，
+            //   而那恰好是这个字段被引入来修掉的那个 bug 的形状。
+            if ("requires".equalsIgnoreCase(key)) {
+                requires = SkillRequirement.parse(value);
+            }
         }
 
         body = normalized.substring(frontmatterEnd + 5).trim();
-        return new ParsedSkillMarkdown(name, description, body);
+        return new ParsedSkillMarkdown(name, description, body, requires);
     }
 
     private void validateUploadedSkill(ParsedSkillMarkdown parsed) {
@@ -347,11 +355,14 @@ public class SkillPackageLoaderService {
         private final String name;
         private final String description;
         private final String body;
+        /** frontmatter 的 requires；null = 没有前置资源，走发现。 */
+        private final SkillRequirement requires;
 
-        private ParsedSkillMarkdown(String name, String description, String body) {
+        private ParsedSkillMarkdown(String name, String description, String body, SkillRequirement requires) {
             this.name = name;
             this.description = description;
             this.body = body;
+            this.requires = requires;
         }
     }
 }

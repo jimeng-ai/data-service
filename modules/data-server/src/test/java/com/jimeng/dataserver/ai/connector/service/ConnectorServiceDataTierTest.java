@@ -94,7 +94,8 @@ class ConnectorServiceDataTierTest {
                 mock(ConnectorSemanticService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
                 mock(org.springframework.beans.factory.ObjectProvider.class),
-                mock(org.springframework.beans.factory.ObjectProvider.class));
+                mock(org.springframework.beans.factory.ObjectProvider.class),
+                mock(com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService.class));
         TenantContext.set("t1");
     }
 

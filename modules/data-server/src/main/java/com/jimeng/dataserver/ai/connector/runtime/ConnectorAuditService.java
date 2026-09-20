@@ -116,6 +116,39 @@ public class ConnectorAuditService {
      */
     public static final String OP_SEMANTIC_VALUES = PLATFORM_OP_PREFIX + "semantic_values";
 
+    /**
+     * ★ <b>管理面上人的动作</b>在 {@code operation} 上的保留前缀——这张表里的<b>第三类</b>行。
+     *
+     * <h3>为什么要有第三类，而不是塞进上面两类里</h3>
+     * 上面两类（Agent 问数、平台剖析）有一个共同点：每一行背后都有一次<b>真的打在客户库上的语句</b>。
+     * 这一类没有。{@link #OP_CREDENTIAL_REVEAL} 连客户库的边都没碰到——它动的是<b>我们自己</b>
+     * 存的那份密文。
+     *
+     * <p>混进 {@link #PLATFORM_OP_PREFIX} 会把这张表的语义搞坏，而且坏的方向正是本类反复提防的那个：
+     * 客户的 DBA 按 {@code platform.*} 过滤出来的东西，他会理解成「平台访问我的库的全部记录」。
+     * 往里塞一条其实没访问过的，等于让这张表说了一句假话。所以宁可多一个前缀。
+     *
+     * <p><b>但它必须和那两类同表。</b>「谁在什么时候对这条连接做了什么」只应该有一个地方回答，
+     * 拆成两张表的代价是查的人必须知道要查两处——而他恰恰是在出事之后才第一次查。
+     */
+    public static final String ADMIN_OP_PREFIX = "admin.";
+
+    /**
+     * 取回连接凭据明文（管理台点「查看密码」）。
+     *
+     * <h3>这是全系统唯一一个把凭据明文送出进程的动作，所以它必须留痕</h3>
+     * 其余任何一条路径上，凭据都只在一次调用的栈上存在（{@code ConnectorInstanceLoader.load} 的
+     * javadoc 写了这条纪律），{@code ConnectorView} 连占位串都不给。这个动作是那条纪律的
+     * <b>唯一豁免口</b>。
+     *
+     * <p>豁免口的代价是不对称的：凭据一旦离开平台，此后的使用<b>发生在平台之外</b>——
+     * 写闸、出库档位、这张审计表全部管不着，而且用它连库<b>不会在平台留下任何痕迹</b>。
+     * 所以这里记的不是「平台做了什么」，是<b>「谁拿走了钥匙」</b>——出事时它是唯一能缩小范围的东西。
+     *
+     * <p>失败也要记（密钥轮换过、密文损坏、越权被拦）：一串失败的取回尝试本身就是信号。
+     */
+    public static final String OP_CREDENTIAL_REVEAL = ADMIN_OP_PREFIX + "credential_reveal";
+
     private final ConnectorAuditMapper auditMapper;
     private final AgentMapper agentMapper;
 
@@ -199,6 +232,59 @@ public class ConnectorAuditService {
         } catch (Exception e) {
             log.error("连接器阶段审计写入失败（主流程不受影响） connectorId={} op={} success={} summary={}",
                     connectorId, operation, success, summary, e);
+        }
+    }
+
+    /**
+     * 管理面上<b>人</b>的动作留痕（不涉及任何一次对客户库的访问）。
+     *
+     * <p>动作名必须以 {@link #ADMIN_OP_PREFIX} 开头，理由与 {@link #recordPlatformStage} 同：
+     * 靠约定不行。不合规的<b>拒绝落库</b>——落进去比丢掉更坏，因为它会让按前缀过滤的人得到错的答案。
+     *
+     * <p>三列刻意留空，每一列都有理由：
+     * <ul>
+     *   <li>{@code statement_text}：客户库上什么都没执行过。往「客户执行过的 SQL」列里写我们编的
+     *       字符串，是这张表能犯的最误导人的错。</li>
+     *   <li>{@code capability}：没有用到任何连接器能力。填一个会让能力维度的统计凭空多出来。</li>
+     *   <li>{@code agent_id}：没有对话，也没有 Agent。</li>
+     * </ul>
+     *
+     * <p>{@code elapsed_ms} 同样恒为 0：这里没有「花了多久」这个量，填一个会被当成对客户库的耗时。
+     *
+     * @param summary 给人看的一句话，写进 {@code error_detail}（那一列本来就是「已脱敏的说明文字」）。
+     *                <b>绝不放凭据、也绝不放客户数据。</b>
+     */
+    public void recordAdminAction(Long connectorId, String tenantId, String connectorName,
+                                  String operation, String summary, boolean success,
+                                  ConnectorErrorCode errorCode) {
+        if (operation == null || !operation.startsWith(ADMIN_OP_PREFIX)) {
+            log.error("管理面审计的动作名没有 {} 前缀，本条拒绝落库 connectorId={} op={}",
+                    ADMIN_OP_PREFIX, connectorId, operation);
+            return;
+        }
+        try {
+            ConnectorAudit row = new ConnectorAudit();
+            row.setTenantId(tenantId);
+            row.setConnectorId(connectorId);
+            row.setConnectorName(connectorName);
+            row.setAgentId(null);
+            row.setTraceId(MDC.get(MdcContextFilter.MDC_TRACE_ID));
+            row.setCapability(null);
+            row.setOperation(operation);
+            row.setStatementText(null);
+            row.setRowCount(null);
+            row.setElapsedMs(0);
+            row.setSuccess(success);
+            row.setErrorCode(errorCode == null ? null : errorCode.name());
+            row.setErrorDetail(truncate(summary, ERROR_DETAIL_MAX));
+            auditMapper.insert(row);
+        } catch (Exception e) {
+            // ★ 与 record / recordPlatformStage 的「审计失败不拖垮主流程」不同：这一条的调用方
+            //    （凭据取回）必须把异常往上抛，让整个动作失败。理由见 ConnectorService.revealCredential。
+            //    这里只负责把线索留在日志里，是否放行由调用方决定。
+            log.error("管理面审计写入失败 connectorId={} op={} success={} summary={}",
+                    connectorId, operation, success, summary, e);
+            throw e;
         }
     }
 
