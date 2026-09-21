@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.connector.generation;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.jimeng.dataserver.ai.connector.service.SemanticCoverage;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
 import com.jimeng.persistence.mapper.ConnectionMapper;
@@ -193,6 +194,20 @@ public class SemanticConnectionClaim {
      */
     public synchronized boolean release(Long connectorId, String targetStatus, String note,
                                         boolean stampSemanticSyncedAt) {
+        return release(connectorId, targetStatus, note, stampSemanticSyncedAt, null);
+    }
+
+    /**
+     * 同上，外加本次生成「是不是全本」的判定。
+     *
+     * @param coverage {@code null} = 这条出路不重判覆盖面，{@code semantic_coverage / semantic_gaps}
+     *                 两列原样不动（失败、中断、恢复上一版都走这条：那时库里还是上一版说明书，
+     *                 这两列描述的也该还是上一版）。非 null 时<b>和 note 装在同一个实体里，
+     *                 同一条 UPDATE 落库</b>——分两次写，中间失败就会留下一行「散文说残缺、
+     *                 结构化信号说完整」的记录，那比没有信号更坏：它让人相信一个错的答案。
+     */
+    public synchronized boolean release(Long connectorId, String targetStatus, String note,
+                                        boolean stampSemanticSyncedAt, SemanticCoverage.Verdict coverage) {
         Credential credential = currentCredential.get();
         if (credential == null || !credential.connectorId().equals(connectorId) || lost.get()) {
             lost.set(true);
@@ -204,6 +219,12 @@ public class SemanticConnectionClaim {
             update.setSemanticNote(clip(note));
             if (stampSemanticSyncedAt) {
                 update.setSemanticSyncedAt(now());
+            }
+            if (coverage != null) {
+                // 两列一起装。完整时 gaps 是空串而不是 null——MyBatis-Plus 的 NOT_NULL 策略写不了 null，
+                // 留 null 会把上一轮的成因码留在行上，配出一行「说自己完整却列着缺口」的记录。
+                update.setSemanticCoverage(coverage.code());
+                update.setSemanticGaps(coverage.gapCodes());
             }
             int rows = connectionMapper.update(update, new LambdaUpdateWrapper<Connection>()
                     .eq(Connection::getId, connectorId)

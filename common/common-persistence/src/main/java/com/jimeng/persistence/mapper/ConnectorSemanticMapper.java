@@ -35,6 +35,33 @@ public interface ConnectorSemanticMapper extends BaseMapper<ConnectorSemantic> {
     @Delete("DELETE FROM connector_semantic WHERE connector_id = #{connectorId} AND source = 'INFERRED'")
     int physicalDeleteInferred(@Param("connectorId") Long connectorId);
 
+    /**
+     * 管理台删掉<b>一行</b>语义（任何 scope、任何 source）。
+     *
+     * <h3>★ 为什么必须是物理删除，不能用 BaseMapper.deleteById</h3>
+     * 全局 {@code @TableLogic} 下 {@code deleteById} 是<b>软删</b>，而
+     * {@code uk_connector_semantic (tenant_id, connector_id, scope, object_name, field_name, term)}
+     * <b>不含 deleted</b>。一条软删死行会永久占着那个键位，后果是同一条断言<b>再也写不进去</b>，
+     * 而且现象会伪装成另一回事：{@code defineMetric} 的 selectOne 被 @TableLogic 加上 deleted=0
+     * 读不到死行 → 走插入 → 撞唯一键 → 三轮 attempt 完全相同 → 最后抛出
+     * 「口径『X』正在被同时修改，这一次没有记下来」——把「永远写不进」说成「并发冲突」，
+     * 顺着那句话排查的人永远查不到真因。机器推断侧同样中招：upsertInferred 静默 conflicts++。
+     *
+     * <h3>★ 不要指望租户拦截器兜底</h3>
+     * 与上面 physicalDeleteInferred 同一条理由：{@code runAsSystem} 下 {@code ignoreTable} 直接为 true，
+     * 这条 SQL 上不会有任何自动追加的 tenant_id 条件。所以这里<b>显式写死三列</b>，
+     * 并且<b>调用方必须先 requireOwned</b> 确认这条连接属于当前租户——只按 rowId 定位的话，
+     * 拿 A 连接的路径 id 配 B 连接的 rowId 就能删到同租户另一条连接、甚至跨租户的行，
+     * 而界面上看不出任何异常。
+     *
+     * @return 实际删除的行数；0 表示这行本来就不存在或不属于该连接（调用方据此做幂等，不要抛错）
+     */
+    @Delete("DELETE FROM connector_semantic WHERE tenant_id = #{tenantId} "
+            + "AND connector_id = #{connectorId} AND id = #{id}")
+    int physicalDeleteRow(@Param("tenantId") String tenantId,
+                          @Param("connectorId") Long connectorId,
+                          @Param("id") Long id);
+
     // ================================================================ 语义层生成 agent
     //
     // ★ 下面三条与上面那条的差别：WHERE 里【显式写 tenant_id = #{tenantId}】，不靠租户拦截器兜底。

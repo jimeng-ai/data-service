@@ -4,6 +4,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.SseServiceUtil;
 import com.jimeng.dataserver.ai.conversation.AiConversationLoop;
 import com.jimeng.dataserver.ai.protocol.AiProtocolAdapter;
+import com.jimeng.dataserver.ai.provider.config.AiProviderProperties;
 import com.jimeng.dataserver.ai.provider.config.AiProviderProperties.ProviderConfig;
 import com.jimeng.dataserver.ai.provider.config.AiSelectionProperties;
 import com.jimeng.dataserver.ai.provider.spi.ChatCapabilities;
@@ -54,6 +55,9 @@ class GenericChatClientTest {
         crossAdapter = mock(AiProtocolAdapter.class);
     }
 
+    /** 用例可改这里的配置，验证「改了立即生效、不用重启」。 */
+    private AiProviderProperties props;
+
     private GenericChatClient client(String upstreamProtocol, String entryProtocol) {
         ProviderConfig cfg = new ProviderConfig();
         cfg.setBaseUrl("https://api.deepseek.com/v1/");
@@ -61,8 +65,10 @@ class GenericChatClientTest {
         cfg.getChat().setProtocol(upstreamProtocol);
         cfg.getChat().setEntryProtocol(entryProtocol);
         cfg.getChat().setModel("deepseek-flash");
+        props = new AiProviderProperties();
+        props.getProviders().put("deepseek", cfg);
         return new GenericChatClient("deepseek", cfg, new AiSelectionProperties(), loop,
-                anthropicAdapter, openaiAdapter, crossAdapter, mock(SseServiceUtil.class));
+                anthropicAdapter, openaiAdapter, crossAdapter, mock(SseServiceUtil.class), props);
     }
 
     private static Map<String, Object> body() {
@@ -99,6 +105,36 @@ class GenericChatClientTest {
         assertEquals("推导系统提示", bodyCap.getValue().get("system"));
         assertEquals("Bearer sk-test", headerCap.getValue().get("Authorization"));
         assertEquals("deepseek", rcCap.getValue().provider());
+    }
+
+    @Test
+    @DisplayName("★ Nacos 改了 api-key / model 之后立即生效，不需要重启")
+    @SuppressWarnings("unchecked")
+    void 配置热更新() {
+        GenericChatClient c = client("openai", "anthropic");
+        c.chatInternal(body(), "t", TIMEOUT);
+
+        // 刷新前：用的是原来的 key 与地址
+        ArgumentCaptor<Map<String, String>> h1 = ArgumentCaptor.forClass(Map.class);
+        verify(loop).runInternal(any(), any(), h1.capture(),
+                eq("https://api.deepseek.com/v1/chat/completions"), eq("t"), any(), eq(TIMEOUT));
+        assertEquals("Bearer sk-test", h1.getValue().get("Authorization"));
+
+        // 模拟 Nacos 刷新：@ConfigurationProperties 被重新绑定，值就地更新。
+        // 旧实现把 ProviderConfig 在 bean 创建时固化进字段，这之后依然发旧 key —— 实测表现是
+        // 「Nacos 打了 Refresh keys changed，请求仍然 401」。
+        props.getProviders().get("deepseek").setApiKey("sk-rotated");
+        props.getProviders().get("deepseek").setBaseUrl("https://api.deepseek.com/v2/");
+        props.getProviders().get("deepseek").getChat().setModel("deepseek-next");
+
+        c.chatInternal(body(), "t2", TIMEOUT);
+
+        ArgumentCaptor<Map<String, Object>> b2 = ArgumentCaptor.forClass(Map.class);
+        ArgumentCaptor<Map<String, String>> h2 = ArgumentCaptor.forClass(Map.class);
+        verify(loop).runInternal(b2.capture(), any(), h2.capture(),
+                eq("https://api.deepseek.com/v2/chat/completions"), eq("t2"), any(), eq(TIMEOUT));
+        assertEquals("Bearer sk-rotated", h2.getValue().get("Authorization"));
+        assertEquals("deepseek-next", b2.getValue().get("model"));
     }
 
     @Test

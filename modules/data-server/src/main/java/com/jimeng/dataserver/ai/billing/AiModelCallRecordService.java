@@ -191,11 +191,37 @@ public class AiModelCallRecordService {
                                      int inputTokens, int outputTokens,
                                      String streamEventsJson, Integer latencyMs,
                                      String requestId) {
+        recordStreamResponse(logId, httpStatus, inputTokens, outputTokens,
+                streamEventsJson, latencyMs, requestId, null, null);
+    }
+
+    /**
+     * 同上，额外落上游失败的 {@code error_code} / {@code error_msg}。
+     *
+     * <p><b>为什么必须有这个重载。</b>流式调用的失败信息只在 {@code EventSourceListener.onFailure}
+     * 的那一瞬间存在（它拿得到 {@link okhttp3.Response#code()} 和错误体），调用方过去只把它压成一个
+     * {@code boolean streamFailed}，于是收尾时无从得知状态码，只好写死 200——上游的 503 / 401 在
+     * 日志表里全部长成 {@code http_status=200, call_status=1}。这张表的 http_status / call_status /
+     * error_code / error_msg / retry_count 五个列就是为了回答「今天失败了几次、为什么」，
+     * 而它过去答不出来。所以失败详情必须一路带到这里，而不是在中途退化成一个布尔。
+     *
+     * <p>{@code httpStatus} 为 null 表示连接级失败（压根没拿到响应），按失败记录。
+     */
+    public void recordStreamResponse(Long logId, Integer httpStatus,
+                                     int inputTokens, int outputTokens,
+                                     String streamEventsJson, Integer latencyMs,
+                                     String requestId, String errorCode, String errorMsg) {
         AiModelCallLog logEntity = new AiModelCallLog();
         logEntity.setId(logId);
         logEntity.setHttpStatus(httpStatus);
         logEntity.setLatencyMs(latencyMs);
         logEntity.setCallStatus(isSuccess(httpStatus) ? STATUS_SUCCESS : STATUS_FAILED);
+        if (StrUtil.isNotBlank(errorCode)) {
+            logEntity.setErrorCode(errorCode);
+        }
+        if (StrUtil.isNotBlank(errorMsg)) {
+            logEntity.setErrorMsg(limit(errorMsg, MAX_ERROR_MSG_LEN));
+        }
         if (StrUtil.isNotBlank(requestId)) {
             logEntity.setRequestId(requestId);
         }
@@ -298,6 +324,26 @@ public class AiModelCallRecordService {
         aiModelCallContentMapper.insert(contentEntity);
 
         return logEntity.getId();
+    }
+
+    /**
+     * 标记这一行是第几次重试（0 = 首次尝试，不必调用）。
+     *
+     * <p>与 {@link #recordRequest} 分开，是因为「这是第几次重试」在发请求那一刻才知道，
+     * 而 recordRequest 必须先落行拿到 logId。
+     *
+     * <p><b>口径：一次物理请求一行。</b>重试不是覆盖前一行，而是各记各的——否则前几次的
+     * 失败原因会被最后一次成功覆盖掉，那恰恰是最该留下的证据（「今天 503 了几次」）。
+     * 失败的那几行没有 usage，不影响计费统计。
+     */
+    public void markRetryAttempt(Long logId, int retryCount) {
+        if (logId == null || retryCount <= 0) {
+            return;
+        }
+        AiModelCallLog logEntity = new AiModelCallLog();
+        logEntity.setId(logId);
+        logEntity.setRetryCount(retryCount);
+        aiModelCallLogMapper.updateById(logEntity);
     }
 
     public void recordException(Long logId, Throwable throwable, Integer latencyMs) {

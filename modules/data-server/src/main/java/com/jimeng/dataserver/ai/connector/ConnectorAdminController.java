@@ -24,6 +24,8 @@ import com.jimeng.dataserver.ai.connector.service.ConnectorView;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaView;
 import com.jimeng.dataserver.ai.connector.service.PendingWriteView;
 import com.jimeng.dataserver.ai.connector.spi.GrantScript;
+import com.jimeng.persistence.entity.Connection;
+import com.jimeng.persistence.entity.ConnectorSemantic;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -397,6 +399,109 @@ public class ConnectorAdminController {
         connectorService.get(id);
         connectorSemanticDeriveService.validateAsync(id);
         return Map.of("started", true);
+    }
+
+    /**
+     * 删掉<b>一行</b>语义（企业超管）。
+     *
+     * <h3>为什么要有这个口子</h3>
+     * 一条口径一旦记下，之后所有人问到这个词都会被<b>悄悄</b>按它算。在这个端点之前，
+     * 纠正的唯一办法是在对话里让模型用同一个 {@code term} 再答一次覆盖它——
+     * 而那条路对「整条记错了、根本不该存在」的行无能为力：覆盖只能改 gloss，删不掉词条本身。
+     * 机器推断出来的错行同理，重新生成只会把它原样再推一遍。
+     *
+     * <h3>★ 它是物理删除，删了就真没了</h3>
+     * 不能用 {@code BaseMapper.deleteById}：全局 {@code @TableLogic} 下那是软删，而
+     * {@code uk_connector_semantic} <b>不含 deleted</b>，一条软删死行会永久占住键位，
+     * 此后同一条断言再也写不进去，而且现象会伪装成「口径正在被同时修改」这种并发错。
+     * 理由写在 {@code ConnectorSemanticMapper#physicalDeleteRow} 上，别在这里绕开它。
+     *
+     * <h3>★ 审计摘要里绝不放 gloss 与 detail</h3>
+     * {@code connector_audit.error_detail} 那一列是<b>会被展示给客户看</b>的脱敏说明文字，
+     * 而第 3 档采到的客户库真实取值就嵌在 {@code gloss}（「care_reason 里带着 {@code = '取值'}」）
+     * 和 {@code detail_json}（判别值、取值域样本）里面。把它们抄进审计摘要，等于把刚从语义层删掉的
+     * 真实取值原样换个地方再存一份——而且存进了一张<b>保留期更长、更公开</b>的表。
+     * 所以摘要只放定位信息：scope / 对象 / 字段 / 词条 / 来源。
+     *
+     * @return {@code deleted} = 这次有没有真的删掉东西；{@code removed} = 实际删除行数（0 表示这行本来就不在）
+     */
+    @Operation(summary = "语义层：删掉一行（企业超管；物理删除，不可恢复）")
+    @DeleteMapping("/{id}/semantic/{rowId}")
+    public Map<String, Object> deleteSemanticRow(@PathVariable Long id, @PathVariable Long rowId) {
+        superAdminGuard.requireSuperAdmin();
+        // 归属校验也在 requireOwned 里做一遍（租户不可见 ⇒ NOT_FOUND）；这里取它是为了拿 tenantId / name 写审计。
+        Connection conn = connectorSemanticService.requireOwned(id);
+        // ★ 必须在删之前读：物理删除之后没有任何地方能回答「删掉的是哪一条」。
+        //   走 all(id) 是因为本类只能用语义服务的公共读接口；一条连接的语义行是管理台量级，不值得为它多开一个 API。
+        ConnectorSemantic target = findSemanticRow(id, rowId);
+        int removed = connectorSemanticService.deleteRow(id, rowId);
+        if (removed > 0) {
+            recordSemanticRowDelete(conn, rowId, target);
+        }
+        return Map.of("deleted", removed > 0, "removed", removed);
+    }
+
+    private ConnectorSemantic findSemanticRow(Long connectorId, Long rowId) {
+        if (rowId == null) {
+            return null;
+        }
+        for (ConnectorSemantic r : connectorSemanticService.all(connectorId)) {
+            if (r != null && rowId.equals(r.getId())) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 写删除留痕。
+     *
+     * <h3>★ 这里吞异常，而凭据取回那边不吞——差别在于「还来不来得及不做」</h3>
+     * {@code revealCredential} 的审计写在<b>送出明文之前</b>，写不进去就不给明文，是一道真的闸。
+     * 这里的删除<b>已经发生了</b>：再把异常抛上去，前端会显示「删除失败」，而行其实已经没了——
+     * 人多半会去查「为什么删不掉」，或者重试（第二次 {@code removed=0}，连这条审计都不会再试写）。
+     * 用一个已经无法挽回的动作换一次误报，只会让排查更难。所以这里只把足以重建这条记录的信息
+     * 留进日志（{@code recordAdminAction} 自己也会打一条 ERROR），照常返回真实结果。
+     */
+    private void recordSemanticRowDelete(Connection conn, Long rowId, ConnectorSemantic target) {
+        try {
+            connectorAuditService.recordAdminAction(conn.getId(), conn.getTenantId(), conn.getName(),
+                    ConnectorAuditService.OP_SEMANTIC_ROW_DELETE, semanticDeleteSummary(rowId, target), true, null);
+        } catch (RuntimeException e) {
+            log.error("语义行删除留痕写入失败（行已删除，本次照常返回） connectorId={} rowId={}",
+                    conn.getId(), rowId, e);
+        }
+    }
+
+    /**
+     * 审计摘要：<b>只有定位信息</b>。
+     *
+     * <p>不放 {@code gloss}、不放 {@code detail}，理由见 {@link #deleteSemanticRow} 的第三节——
+     * 客户库的真实取值就嵌在那两处。往这里加字段之前先回答一个问题：这个值会不会出现在客户的数据里。
+     */
+    private static String semanticDeleteSummary(Long rowId, ConnectorSemantic r) {
+        if (r == null) {
+            // 删之前就读不到（并发里被别人先删了，或者这个 rowId 本来就不属于这条连接）。
+            // 如实写「读不到」，不要编一条看起来完整的摘要。
+            return "删除语义行 id=" + rowId + "：删除前已读不到这一行";
+        }
+        StringBuilder sb = new StringBuilder("删除语义行 id=").append(rowId)
+                .append(" scope=").append(blankToDash(r.getScope()))
+                .append(" 来源=").append(blankToDash(r.getSource()));
+        if (r.getObjectName() != null && !r.getObjectName().isBlank()) {
+            sb.append(" 对象=").append(r.getObjectName().trim());
+        }
+        if (r.getFieldName() != null && !r.getFieldName().isBlank()) {
+            sb.append(" 字段=").append(r.getFieldName().trim());
+        }
+        if (r.getTerm() != null && !r.getTerm().isBlank()) {
+            sb.append(" 词条=").append(r.getTerm().trim());
+        }
+        return sb.toString();
+    }
+
+    private static String blankToDash(String s) {
+        return s == null || s.isBlank() ? "—" : s.trim();
     }
 
     @Operation(summary = "使用记录（分页；可按连接、Agent、能力、成败、时间筛选）")

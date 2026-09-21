@@ -16,6 +16,7 @@ import com.jimeng.dataserver.ai.run.RunEventTee;
 import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.run.RunHandle;
 import com.jimeng.dataserver.ai.run.RunRegistry;
+import com.jimeng.dataserver.ai.run.ToolDescDisplay;
 import com.jimeng.dataserver.ai.skill.model.ActivationResult;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
@@ -42,6 +43,8 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 @RequiredArgsConstructor
@@ -66,6 +69,45 @@ public class AiConversationLoop {
     private boolean skillInstallEnabled;
 
     public record CallRecordConfig(String provider, String endpoint, String defaultModel) {}
+
+    /**
+     * 一次调用的上游目标：打到哪个地址、带什么头、用哪个协议适配器、按什么记账、模型叫什么。
+     * 这几样合起来才完整描述「打给谁」——failover 就是换一个 target 把同一个请求再发一遍。
+     *
+     * <p>{@code model} / {@code maxTokens} 为 null 表示「沿用 body 里已有的」（单目标调用即此情形）；
+     * 非 null 时在发请求前覆盖进 body——不同供应商同一个模型的<b>名字</b>常常不一样
+     * （DeepSeek 官网叫 {@code deepseek-chat}，火山引擎叫 {@code deepseek-v3-…}），
+     * 切了地址不改名字，换来的是一个 400 而不是一次成功的兜底。
+     */
+    public record UpstreamTarget(String providerName, String url, Map<String, String> headers,
+                                 AiProtocolAdapter adapter, CallRecordConfig rc,
+                                 String model, Integer maxTokens) {}
+
+    /**
+     * 一次流式调用的失败详情。
+     *
+     * <p><b>为什么不能是 {@code AtomicBoolean}。</b>{@code onFailure} 那一刻手里有
+     * {@link Response#code()} 和错误体，这是全链路唯一能知道「上游到底回了什么」的地方。
+     * 过去这些信息被压成一个布尔，于是收尾时只能给日志表写死 200——上游的 503 / 401
+     * 在表里全都长成成功。状态码还决定了「这次该不该重试」，压成布尔等于把两个判断一起丢掉。
+     *
+     * <p>{@code httpStatus} 为 null = 连接级失败（TCP 断了 / DNS 挂了，压根没有响应）。
+     */
+    private record StreamFailure(Integer httpStatus, String errorCode, String errorMsg) {}
+
+    /**
+     * 单次模型调用的最大尝试次数（含首次）。3 = 首次 + 2 次重试。
+     *
+     * <p>上限不是越大越好：每多一次重试，用户就多等一个退避周期，而 5xx 持续存在时
+     * 重试只是把「快速失败」拖成「慢速失败」。熔断器（{@link LlmCallGuard}）负责更长时间尺度的保护。
+     * 设为 1 即关闭重试。
+     */
+    @Value("${ai.retry.max-attempts:3}")
+    private int maxCallAttempts;
+
+    /** 重试退避基数（毫秒），实际等待 = base << (attempt-1)，默认即 1s / 2s。 */
+    @Value("${ai.retry.backoff-base-ms:1000}")
+    private long retryBackoffBaseMs;
 
     /**
      * 注入内置工具定义（web_search/web_fetch、skill.search/skill.install、generate_image），对所有 Agent
@@ -272,6 +314,35 @@ public class AiConversationLoop {
     public void runStream(Map<String, Object> body, AiProtocolAdapter adapter,
                           Map<String, String> headers, String url,
                           String connectionId, String traceId, CallRecordConfig rc) {
+        // 单目标（无备用）：等价于只有一个 UpstreamTarget 的 failover 链。
+        // model/maxTokens 传 null = 沿用 body 里已经 prepare 好的值，行为与改造前完全一致。
+        runStream(body, List.of(new UpstreamTarget(rc.provider(), url, headers, adapter, rc, null, null)),
+                connectionId, traceId);
+    }
+
+    /**
+     * 流式对话主循环，支持 provider 级 failover。
+     *
+     * <p>{@code targets} 的第一个是主 provider，其后按顺序是备用。每个 target 内部先按
+     * {@link #shouldRetryStream} 重试若干次；一家彻底不行了（且这一轮还没往前端吐过字）
+     * 才换下一家。换家之后<b>粘住不回切</b>：本轮剩下的工具轮次继续用它——主既然刚挂，
+     * 下一轮大概率还是挂，来回横跳只会让日志和 body.model 反复变形。下一条用户消息
+     * 会重新从主 provider 开始，主恢复后自动回归，不需要任何人工干预。
+     *
+     * <p><b>入口协议必须一致</b>：技能与内置工具是在循环外按第一个 target 的 adapter 注入进
+     * {@code body} 的，切换 target 只换「发给上游时怎么转」，不重注入。所以备用 provider 的
+     * {@code entry-protocol} 必须与主一致（本项目统一为 anthropic），上游协议可以不同。
+     */
+    public void runStream(Map<String, Object> body, List<UpstreamTarget> targets,
+                          String connectionId, String traceId) {
+        if (targets == null || targets.isEmpty()) {
+            throw new IllegalArgumentException("runStream 至少需要一个 UpstreamTarget");
+        }
+        int targetIdx = 0;
+        UpstreamTarget target = targets.get(targetIdx);
+        AiProtocolAdapter adapter = target.adapter();
+        CallRecordConfig rc = target.rc();
+
         // 在追加 tool_result 轮次前捕获用户原始问题，写入 trace 头表。
         traceRecorder.recordUserMessage(latestUserMessage(body));
         SkillApplyResult skillApplyResult = skillRuntimeService.applySkillContext(body, adapter);
@@ -294,58 +365,59 @@ public class AiConversationLoop {
 
         try {
             while (true) {
-                llmCallGuard.acquirePermission();
                 long start = System.currentTimeMillis();
-                Long logId = safeRecordRequest(body, headers, rc);
-                AiStreamAccumulator accumulator = adapter.createStreamAccumulator();
-                CountDownLatch latch = new CountDownLatch(1);
-                AtomicBoolean streamFailed = new AtomicBoolean(false);
+                // try 外声明：下面两个 catch 要用 logId 记异常，而它在 try 内才拿得到。
+                Long logId = null;
 
                 try {
-                    EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch, streamFailed);
-                    EventSource upstream = requestService.postStream(url, headers,
-                            JSONUtil.toJsonStr(adapter.toUpstreamBody(body)), listener);
-                    // 发布上游句柄到 run 注册表，使「停止」能真正中断本次 LLM 调用（无 run 句柄=调试台直连，忽略）。
-                    RunHandle handle = runRegistry.get(connectionId);
-                    if (handle != null) handle.setUpstream(upstream);
+                    // 一次 LLM 调用 = 「本家重试若干次」，不行就换下一家（failover）。
+                    StreamAttempt call = callStreamWithRetry(body, target, connectionId);
+                    while (call.canFailover() && targetIdx + 1 < targets.size()) {
+                        UpstreamTarget next = targets.get(++targetIdx);
+                        log.warn("provider={} 已重试用尽，切换到备用 provider={} connectionId={} 末次错误={}",
+                                target.providerName(), next.providerName(), connectionId,
+                                call.failure() == null ? "-" : call.failure().errorMsg());
+                        target = next;
+                        adapter = target.adapter();
+                        rc = target.rc();
+                        call = callStreamWithRetry(body, target, connectionId);
+                    }
+                    logId = call.logId();
+                    AiStreamAccumulator accumulator = call.accumulator();
+                    int latency = call.latencyMs();
 
-                    boolean completed = latch.await(5, TimeUnit.MINUTES);
-                    int latency = elapsed(start);
-
-                    if (!completed) {
-                        llmCallGuard.recordFailure();
-                        RuntimeException timeout = new RuntimeException("流式请求超时");
-                        safeRecordException(logId, timeout, latency);
+                    if (call.timedOut()) {
                         sendError(connectionId, "timeout", "流式请求超时（5分钟）");
                         runFinalizer.complete(connectionId);
                         return;
                     }
 
-                    if (streamFailed.get()) {
-                        llmCallGuard.recordFailure();
-                    } else {
-                        llmCallGuard.recordSuccess();
+                    // 重试用尽仍失败：到这一步才告知前端（重试期间刻意不推 error，见 buildListener）。
+                    // 排除 cancelled：用户点「停止」同样经 EventSource.cancel() 走 onFailure，
+                    // 但那不是故障，要落到下面的「推理·已停止」而不是报错。
+                    if (call.failure() != null && !call.cancelled()) {
+                        sendError(connectionId, "stream_failure", call.failure().errorMsg());
+                        runFinalizer.complete(connectionId);
+                        return;
                     }
 
-                    safeRecordStreamResponse(logId, 200,
-                            accumulator.getInputTokens(), accumulator.getOutputTokens(),
-                            accumulator.toJson(), latency, accumulator.getRequestId());
                     totalIn += accumulator.getInputTokens();
                     totalOut += accumulator.getOutputTokens();
 
                     Map<String, Object> responseMap = accumulator.buildResponseMap();
                     List<ToolUseCall> toolCalls = adapter.extractToolUseCalls(responseMap);
                     boolean hasTools = (skillApplyResult.isEnabled() || builtinToolsEnabled) && !toolCalls.isEmpty();
-                    // 用户主动停止：上游流被 EventSource.cancel() 中断（streamFailed=true），但这不是错误。
+                    // 用户主动停止：上游流被 EventSource.cancel() 中断，也会走 onFailure，但这不是错误。
                     // 记成 CANCELLED 而非 ERROR，使 trace 头表落成「用户停止」、不计入错误率（详见 TraceRecorder）。
-                    boolean cancelled = handle != null && handle.isCancelled();
+                    RunHandle handle = runRegistry.get(connectionId);
+                    boolean cancelled = call.cancelled() || (handle != null && handle.isCancelled());
                     if (cancelled) {
                         traceRecorder.recordLlmCancelled(logId, "推理·已停止", modelOf(body, rc),
                                 accumulator.getInputTokens(), accumulator.getOutputTokens(), latency);
                     } else {
                         traceRecorder.recordLlm(logId, hasTools ? "推理·决定调用工具" : "推理·生成回答",
                                 modelOf(body, rc), accumulator.getInputTokens(), accumulator.getOutputTokens(),
-                                null, latency, !streamFailed.get(), null);
+                                null, latency, true, null);
                     }
 
                     if ((!skillApplyResult.isEnabled() && !builtinToolsEnabled) || toolCalls.isEmpty()) {
@@ -486,7 +558,9 @@ public class AiConversationLoop {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", call.getToolUseId());
             item.put("name", call.getToolName());
-            String desc = descMap.get(call.getToolName());
+            // ★ 只下发首句：description 是写给模型的负向约束（conn_describe 一条 2457 字），
+            // 原样下发等于把内部提示词渲染给客户企业管理员，还要按条落进 segments。详见 ToolDescDisplay。
+            String desc = ToolDescDisplay.firstSentence(descMap.get(call.getToolName()));
             if (StrUtil.isNotBlank(desc)) item.put("desc", desc);
             item.put("input", call.getInput());
             item.put("status", "running");
@@ -577,7 +651,8 @@ public class AiConversationLoop {
 
     private EventSourceListener buildListener(String connectionId, AiProtocolAdapter adapter,
                                                AiStreamAccumulator accumulator, CountDownLatch latch,
-                                               AtomicBoolean streamFailed) {
+                                               AtomicReference<StreamFailure> failureRef,
+                                               AtomicInteger forwardedFrames) {
         return new EventSourceListener() {
             @Override
             public void onOpen(EventSource eventSource, Response response) {
@@ -591,6 +666,10 @@ public class AiConversationLoop {
                 String forward = adapter.transformDeltaFrame(data);
                 if (forward != null) {
                     tee.tee(connectionId, adapter.getDeltaEventType(), forward);
+                    // ★ 计的是【已经发给前端的帧】，不是累积器里的 token。重试是否安全只取决于
+                    // 「用户那边有没有看到字」——tee 出去的 delta 收不回来，重试会让同一段话说两遍。
+                    // 用已转发帧数当判据，是因为它是「用户看到了什么」的直接证据，而不是间接推断。
+                    forwardedFrames.incrementAndGet();
                 }
                 accumulator.accumulateEvent(type, data);
                 if (adapter.isDoneSignal(data)) latch.countDown();
@@ -604,13 +683,176 @@ public class AiConversationLoop {
 
             @Override
             public void onFailure(EventSource eventSource, Throwable t, Response response) {
-                streamFailed.set(true);
+                Integer code = response == null ? null : response.code();
                 String errorMsg = buildStreamErrorMsg(t, response);
+                // ★ 这里【不】直接 sendError：这一次失败可能会被重试掉，提前把 error 推给前端，
+                // 用户会先看到一次报错、随后又冒出正常回答。是否告知用户，由调用方在放弃重试时决定。
+                failureRef.set(new StreamFailure(code, streamErrorCode(code, t), errorMsg));
                 log.error("流式连接失败, connectionId={}, error={}", connectionId, errorMsg);
-                sendError(connectionId, "stream_failure", errorMsg);
                 latch.countDown();
             }
         };
+    }
+
+    /**
+     * 一次 LLM 调用（含重试）的结果。
+     *
+     * @param logId       最后一次物理尝试的调用日志行 id
+     * @param accumulator 最后一次尝试的流累积器（成功时即本轮回答）
+     * @param failure     最后一次失败详情；null = 成功
+     * @param timedOut    等待 5 分钟仍未收到 done 信号
+     * @param cancelled   用户主动点了「停止」（不是故障，不重试、不报错）
+     */
+    private record StreamAttempt(Long logId, AiStreamAccumulator accumulator, int latencyMs,
+                                 StreamFailure failure, boolean timedOut, boolean cancelled,
+                                 int forwardedFrames) {
+
+        /**
+         * 这次失败能不能换一家再试。
+         *
+         * <p>和重试同源的判据，只是尺度更大：超时不换（已经等了 5 分钟）、用户叫停不换、
+         * <b>已经往前端吐过字就绝不换</b>——换一家重发会让用户把同一段话看两遍。
+         * 至于「是不是 5xx」这里刻意不问：能走到 failover 说明本家的重试已经用尽，
+         * 无论 401（key 废了）还是 503（忙），换一家都是对的。
+         */
+        boolean canFailover() {
+            return failure != null && !timedOut && !cancelled && forwardedFrames == 0;
+        }
+    }
+
+    /**
+     * 发起流式 LLM 调用，失败时按 {@link #shouldRetryStream} 决定是否重试。
+     *
+     * <p><b>为什么这件事值得单独存在。</b>过去这条路一次重试都没有：上游一个 503
+     * 「Service is too busy」就让整轮报废——哪怕模型已经跑完 5 步工具、数据全拿到了，
+     * 就差最后一次总结。而 503 恰恰是最该重试的那一类：它说的是「现在忙」，不是「你错了」。
+     *
+     * <p>每次物理尝试各记一行调用日志，口径见
+     * {@link AiModelCallRecordService#markRetryAttempt}——失败的那几次必须自己留证据，
+     * 否则「今天 503 了几次」依然答不出来。
+     */
+    private StreamAttempt callStreamWithRetry(Map<String, Object> body, UpstreamTarget target,
+                                              String connectionId)
+            throws InterruptedException {
+        AiProtocolAdapter adapter = target.adapter();
+        Map<String, String> headers = target.headers();
+        String url = target.url();
+        CallRecordConfig rc = target.rc();
+        // 换了供应商就得换模型名：同一个模型在两家的叫法常常不同，切了地址不改名字只会换来 400。
+        retargetBody(body, target);
+
+        StreamFailure lastFailure = null;
+        Long logId = null;
+        AiStreamAccumulator accumulator = null;
+        int latency = 0;
+        int forwardedFrames = 0;
+
+        for (int attempt = 1; attempt <= maxCallAttempts; attempt++) {
+            llmCallGuard.acquirePermission();
+            long start = System.currentTimeMillis();
+            logId = safeRecordRequest(body, headers, rc);
+            safeMarkRetryAttempt(logId, attempt - 1);
+            accumulator = adapter.createStreamAccumulator();
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<StreamFailure> failureRef = new AtomicReference<>();
+            AtomicInteger forwarded = new AtomicInteger();
+
+            EventSourceListener listener = buildListener(connectionId, adapter, accumulator, latch,
+                    failureRef, forwarded);
+            EventSource upstream = requestService.postStream(url, headers,
+                    JSONUtil.toJsonStr(adapter.toUpstreamBody(body)), listener);
+            // 发布上游句柄到 run 注册表，使「停止」能真正中断本次 LLM 调用（无 run 句柄=调试台直连，忽略）。
+            RunHandle handle = runRegistry.get(connectionId);
+            if (handle != null) handle.setUpstream(upstream);
+
+            boolean completed = latch.await(5, TimeUnit.MINUTES);
+            latency = elapsed(start);
+
+            if (!completed) {
+                llmCallGuard.recordFailure();
+                RuntimeException timeout = new RuntimeException("流式请求超时");
+                safeRecordException(logId, timeout, latency);
+                // 超时【不】重试：已经等了 5 分钟，再来一轮只是让用户等 10 分钟。
+                return new StreamAttempt(logId, accumulator, latency, null, true, false, forwarded.get());
+            }
+
+            StreamFailure f = failureRef.get();
+            if (f == null) {
+                llmCallGuard.recordSuccess();
+                safeRecordStreamResponse(logId, 200,
+                        accumulator.getInputTokens(), accumulator.getOutputTokens(),
+                        accumulator.toJson(), latency, accumulator.getRequestId(), null, null);
+                return new StreamAttempt(logId, accumulator, latency, null, false, false, forwarded.get());
+            }
+
+            llmCallGuard.recordFailure();
+            // ★ 真实状态码落库：这里过去写死 200，于是上游的 503 / 401 在日志表里全长成了成功。
+            safeRecordStreamResponse(logId, f.httpStatus(),
+                    accumulator.getInputTokens(), accumulator.getOutputTokens(),
+                    accumulator.toJson(), latency, accumulator.getRequestId(),
+                    f.errorCode(), f.errorMsg());
+            lastFailure = f;
+
+            // 用户主动停止同样触发 onFailure（EventSource.cancel()）。这不是上游故障，
+            // 绝不能重试——那等于把用户刚叫停的请求又发一遍。
+            RunHandle h = runRegistry.get(connectionId);
+            if (h != null && h.isCancelled()) {
+                return new StreamAttempt(logId, accumulator, latency, f, false, true, forwarded.get());
+            }
+
+            forwardedFrames = forwarded.get();
+            if (attempt < maxCallAttempts && shouldRetryStream(f, forwardedFrames)) {
+                long backoff = retryBackoffBaseMs << (attempt - 1);
+                log.warn("模型流式调用失败，{}ms 后重试（第 {}/{} 次）connectionId={} error={}",
+                        backoff, attempt, maxCallAttempts - 1, connectionId, f.errorMsg());
+                Thread.sleep(backoff);
+                continue;
+            }
+            break;
+        }
+        return new StreamAttempt(logId, accumulator, latency, lastFailure, false, false, forwardedFrames);
+    }
+
+    /**
+     * 把目标的模型名 / max_tokens 覆盖进请求体。两者为 null 时原样不动
+     * （单目标调用即此情形——body 已由各自的 ChatClient prepare 过）。
+     */
+    private static void retargetBody(Map<String, Object> body, UpstreamTarget target) {
+        if (body == null) return;
+        if (StrUtil.isNotBlank(target.model())) {
+            body.put("model", target.model());
+        }
+        if (target.maxTokens() != null && target.maxTokens() > 0) {
+            body.put("max_tokens", target.maxTokens());
+        }
+    }
+
+    /** 失败归类：有 HTTP 响应用 {@code HTTP_<code>}，否则用异常类名，都没有时 UNKNOWN_ERROR。 */
+    private static String streamErrorCode(Integer httpStatus, Throwable t) {
+        if (httpStatus != null) return "HTTP_" + httpStatus;
+        if (t != null) return t.getClass().getSimpleName();
+        return "UNKNOWN_ERROR";
+    }
+
+    /**
+     * 这次失败该不该重试。
+     *
+     * <p><b>两个前提缺一不可。</b>
+     *
+     * <p><b>一是错误本身可重试</b>：429 / 5xx / 连接级异常（无响应）。其余 4xx 是请求自身的问题，
+     * 重试多少次都一样——401 重试只是把一次失败变成三次失败，还白烧两个退避周期。
+     *
+     * <p><b>二是这一轮还没往前端吐过字。</b>这条比第一条更硬：SSE 的 delta 一旦 tee 出去就收不回来，
+     * 此时重试会让用户看到同一段话说两遍——比直接报错更糟，因为它静默地产出了错误内容。
+     *
+     * <p>这个限制几乎不影响要救的那个场景：503「Service is too busy」是上游在<b>接收</b>阶段
+     * 就拒绝的，一个字都还没吐，正落在可重试区间里。
+     */
+    private static boolean shouldRetryStream(StreamFailure f, int forwardedFrames) {
+        if (f == null || forwardedFrames > 0) return false;
+        Integer code = f.httpStatus();
+        if (code == null) return true;              // 连接级失败：没拿到响应，重试有意义
+        return code == 429 || code >= 500;
     }
 
     private String buildStreamErrorMsg(Throwable t, Response response) {
@@ -707,13 +949,24 @@ public class AiConversationLoop {
 
     private void safeRecordStreamResponse(Long logId, Integer httpStatus,
                                            int inputTokens, int outputTokens,
-                                           String streamEventsJson, int latencyMs, String requestId) {
+                                           String streamEventsJson, int latencyMs, String requestId,
+                                           String errorCode, String errorMsg) {
         if (logId == null) return;
         try {
             aiModelCallRecordService.recordStreamResponse(logId, httpStatus,
-                    inputTokens, outputTokens, streamEventsJson, latencyMs, requestId);
+                    inputTokens, outputTokens, streamEventsJson, latencyMs, requestId,
+                    errorCode, errorMsg);
         } catch (Exception e) {
             log.warn("模型调用日志记录流式响应阶段失败: {}", e.getMessage());
+        }
+    }
+
+    private void safeMarkRetryAttempt(Long logId, int retryCount) {
+        if (logId == null || retryCount <= 0) return;
+        try {
+            aiModelCallRecordService.markRetryAttempt(logId, retryCount);
+        } catch (Exception e) {
+            log.warn("模型调用日志记录重试次数失败: {}", e.getMessage());
         }
     }
 

@@ -80,6 +80,26 @@ public interface Connector {
      * @return {@code null} 表示这种类型不提供脚本（例如 HTTP 连接器，授权发生在对方系统里，
      *         没有「一段 SQL」可给）。调用方要把它翻译成「本类型暂不提供」，而不是当成失败。
      */
+    /**
+     * 这条连接<b>指向哪个外部目标</b>的稳定标识，用于「这个库已经接过了」这类提醒。
+     *
+     * <h3>为什么需要它</h3>
+     * {@code connection} 的唯一键是 {@code (tenant_id, name)}——<b>只管名字不重，不管指向哪</b>。
+     * 同一个库建两条连接是完全合法的（一条只读给 Agent、一条可写走审批：一条连接 = 一份凭据
+     * + 一套权限 + 一个出库档位），但语义层是按 {@code connector_id} 切的，于是同一个库会被
+     * <b>推导两遍</b>，而且两份口径<b>不互通</b>——在 A 上定的口径，Agent 用 B 查时一个字都看不到，
+     * 直接按默认算。这不报错，只是悄悄算出不一样的数。
+     *
+     * <h3>为什么只提醒、不拦截</h3>
+     * 按连接切语义层是<b>对的</b>：语义层是「用这套凭据能看到什么」的产物，换一套凭据可见范围就变了。
+     * 所以这里不改唯一键、不拒绝创建，只在建连时说一句，让人知道自己在做什么。
+     *
+     * @return 稳定标识；{@code null} = 本类型不判断重复（默认）。宁可漏提示，不可误提示。
+     */
+    default String targetIdentity(ConnectorInstance instance) {
+        return null;
+    }
+
     default GrantScript grantScript(GrantRequest req) {
         return null;
     }

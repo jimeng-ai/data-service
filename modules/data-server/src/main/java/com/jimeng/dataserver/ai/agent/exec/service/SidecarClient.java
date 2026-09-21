@@ -58,7 +58,8 @@ public class SidecarClient {
      * {@code GET /sandbox/capabilities}，带 {@code x-service-token}（与 /sandbox/run 同一道鉴权），
      * 本次调用的读超时为 {@code timeout}。
      *
-     * <p>返回原始状态码与正文（期望 200 {@code {"runProfiles":[...],"semanticToolsVersion":1}}）。
+     * <p>返回原始状态码与正文（期望 200
+     * {@code {"runProfiles":[...],"semanticToolsVersion":1,"connectorToolsVersion":1}}）。
      * 404 说明边车版本早于 profile 注册表——老边车会<b>静默忽略</b> {@code runProfile}，照常按文件处理 agent 跑完并报
      * success，所以派发语义层之前必须先问一次；401 是 token 不符。怎么解释交给调用方。
      *
@@ -66,6 +67,41 @@ public class SidecarClient {
      */
     public RequestService.HttpResp capabilities(Duration timeout) {
         return requestService.get(baseUrl() + "/sandbox/capabilities", serviceTokenHeader(), null, timeout);
+    }
+
+    /**
+     * 边车镜像里<b>连接器工具代理</b>（{@code mcp__connector__conn_*}）的契约版本，取自
+     * {@code GET /sandbox/capabilities} 的 {@code connectorToolsVersion}。
+     *
+     * <p><b>任何取不到的情形一律返回 0</b>：404（老边车，还没有 capabilities 路由）、200 但没有这个字段
+     * （边车版本早于连接器工具代理）、401、正文不是 JSON、连不上、读超时。
+     *
+     * <p>★ 为什么必须问这一下：老边车对认不得的 {@code connectorContext} 是<b>静默忽略</b>的，
+     * 照常按文件处理 agent 跑完并回 success。派发方以为下发了连接器，模型手里却一个 {@code conn_*}
+     * 都没有——它不会说「我没有这个能力」，它会拿历史数据讲或者自己编。有了版本号，这种情况
+     * 在派发前就判定为「这套代理对不上」，本轮干脆不下发（行为退回现状，且日志里说得清清楚楚）。
+     *
+     * <p>不抛异常：探测失败的代价应当是「本轮没有连接器工具」，而不是整轮对话 500。
+     */
+    public int connectorToolsVersion(Duration timeout) {
+        try {
+            RequestService.HttpResp resp = capabilities(timeout);
+            if (resp == null || resp.getStatusCode() == null || resp.getStatusCode() != 200) {
+                log.warn("[sidecar] 取 connectorToolsVersion 失败：capabilities 返回 {}，按 0 处理",
+                        resp == null ? "无响应" : resp.getStatusCode());
+                return 0;
+            }
+            Object raw = JSONUtil.parseObj(resp.getBody()).get("connectorToolsVersion");
+            if (raw == null) {
+                // 不是错误：边车早于连接器工具代理时就是没有这个字段。按 0 处理即「不支持」。
+                log.info("[sidecar] capabilities 没有 connectorToolsVersion，按 0（边车不支持连接器工具代理）处理");
+                return 0;
+            }
+            return Integer.parseInt(String.valueOf(raw).trim());
+        } catch (Exception e) {
+            log.warn("[sidecar] 取 connectorToolsVersion 异常，按 0 处理：{}", e.getMessage());
+            return 0;
+        }
     }
 
     private String baseUrl() {

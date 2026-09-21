@@ -71,6 +71,28 @@ public class MySqlConnector implements Connector {
         return "MySQL / 兼容 MySQL 协议的库（含 Doris、StarRocks）";
     }
 
+    /**
+     * {@code mysql://host:port/database}——<b>不含用户名</b>。
+     *
+     * <p>不含用户名是刻意的：用两个不同账号连同一个库，正是「一条只读、一条可写」那个合法场景，
+     * 而它恰恰<b>就是</b>要提醒的那一种（同一个库、两份语义层、口径不互通）。把用户名算进来，
+     * 这个提醒在最该出现的时候反而不出现了。
+     *
+     * <p>库名<b>不做</b>大小写归一：MySQL 的库名在 Linux 上区分大小写、在 macOS/Windows 上不区分，
+     * 平台无从知道客户库跑在哪。归一会在区分大小写的实例上把两个不同的库判成同一个——
+     * <b>误提示比漏提示糟</b>，它教人忽略提示。主机名按 DNS 规则不区分大小写，可以归一。
+     */
+    @Override
+    public String targetIdentity(ConnectorInstance instance) {
+        String host = instance.str("host");
+        String database = instance.str("database");
+        if (host == null || host.isBlank() || database == null || database.isBlank()) {
+            return null;
+        }
+        return "mysql://" + host.trim().toLowerCase(java.util.Locale.ROOT)
+                + ":" + instance.intVal("port", 3306) + "/" + database.trim();
+    }
+
     @Override
     public ParamSpec paramSpec() {
         return ParamSpec.of(

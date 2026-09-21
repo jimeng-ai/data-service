@@ -246,7 +246,56 @@ public class ConnectorService {
             throw e;
         }
         log.info("创建连接器实例 id={} kind={} name={}", row.getId(), row.getKind(), row.getName());
-        return toView(row);
+        ConnectorView view = toView(row);
+        view.setSameTargetHint(sameTargetHint(row, connector));
+        return view;
+    }
+
+    /**
+     * 新建时检查有没有别的连接指向同一个外部目标，有就返回一句提醒。
+     *
+     * <p><b>只提醒，不拦截。</b>按连接切语义层是对的（一条连接 = 一份凭据 + 一套权限 + 一个出库档位，
+     * 语义层是「用这套凭据能看到什么」的产物）。要拦的不是「建第二条」，而是「建完了不知道
+     * 自己建出了两份互不相通的口径」。
+     *
+     * <p>任何异常都只记日志、返回 null：这是<b>锦上添花</b>的提醒，绝不能让一条已经探测通过、
+     * 已经落库的连接因为「算不出提示语」而失败。
+     */
+    private String sameTargetHint(Connection row, Connector connector) {
+        try {
+            String target = connector.targetIdentity(loader.load(row));
+            if (target == null || target.isBlank()) {
+                return null;
+            }
+            List<Connection> peers = connectionMapper.selectList(
+                    new LambdaQueryWrapper<Connection>()
+                            .eq(Connection::getKind, row.getKind())
+                            .ne(Connection::getId, row.getId()));
+            if (peers == null || peers.isEmpty()) {
+                return null;
+            }
+            List<String> dupes = new ArrayList<>();
+            for (Connection peer : peers) {
+                try {
+                    if (target.equals(connector.targetIdentity(loader.load(peer)))) {
+                        dupes.add(peer.getName());
+                    }
+                } catch (RuntimeException e) {
+                    // 单条对端参数坏了不影响其余比较。
+                    log.debug("比对连接目标失败 peerId={}", peer.getId(), e);
+                }
+            }
+            if (dupes.isEmpty()) {
+                return null;
+            }
+            return "这个库已经接过了（连接 " + String.join("、", dupes) + "）。"
+                    + "语义层会按连接各推导一份，两边的业务口径不互通——"
+                    + "在一条连接上确认过的口径，Agent 用另一条查时看不到，会按默认算法算。"
+                    + "如果只是想换一套凭据或权限，这是预期行为；如果只是想再接一次同一个库，建议直接用已有的那条。";
+        } catch (RuntimeException e) {
+            log.debug("生成「同一目标」提示失败 connectionId={}", row.getId(), e);
+            return null;
+        }
     }
 
     /**
@@ -844,12 +893,40 @@ public class ConnectorService {
                 .semanticSyncedAt(row.getSemanticSyncedAt())
                 .semanticClaimAt(row.getSemanticClaimAt())
                 .semanticNote(row.getSemanticNote())
+                // ★ 这两列【刻意不做归一】：null 原样透出去。
+                //   semanticStatus 归一成 NONE 是因为那边的 null 读不出任何意思；这边不一样——
+                //   null 在这里是三态里的一态（没跑过），把它补成 COMPLETE 是谎报全覆盖，
+                //   补成 PARTIAL 则会把所有存量连接标红、训练所有人忽略这个标记。前端按 null 分支渲染。
+                .semanticCoverage(row.getSemanticCoverage() == null || row.getSemanticCoverage().isBlank()
+                        ? null : row.getSemanticCoverage())
+                .semanticGaps(splitGaps(row.getSemanticGaps()))
                 // 同样归一：存量行这一列是 NULL，parse 会把它落到默认档。界面上显示 null
                 // 读不出任何意思，而「第 2 档 · 派生统计」外加那句出库说明，客户当场就知道自己在什么位置。
                 .semanticDataTier(tier.name())
                 .semanticDataTierLabel(tier.label())
                 .semanticDataTierEgress(tier.egressStatement())
                 .build();
+    }
+
+    /**
+     * {@code semantic_gaps} 是逗号分隔的成因码，出网时拆成数组：前端要拿它渲染成一排标签，
+     * 让它在浏览器里再 split 一次等于把分隔符这个约定复制一份到另一个仓库。
+     *
+     * <p>空串（完整）与 null（没跑过）都给空列表：这两者的区别由 {@code semanticCoverage} 表达，
+     * 不要让前端从「gaps 是不是 null」上再推一遍，两处推法迟早对不上。
+     */
+    private static List<String> splitGaps(String gaps) {
+        if (gaps == null || gaps.isBlank()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String code : gaps.split(",")) {
+            String trimmed = code.trim();
+            if (!trimmed.isEmpty()) {
+                out.add(trimmed);
+            }
+        }
+        return out;
     }
 
     private static String str(Object v) {

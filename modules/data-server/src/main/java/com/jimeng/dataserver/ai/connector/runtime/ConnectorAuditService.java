@@ -149,6 +149,15 @@ public class ConnectorAuditService {
      */
     public static final String OP_CREDENTIAL_REVEAL = ADMIN_OP_PREFIX + "credential_reveal";
 
+    /**
+     * 管理台删掉一行语义。与 {@link #OP_CREDENTIAL_REVEAL} 同类：没碰客户库，动的是我们自己存的东西。
+     *
+     * <p>之所以必须留痕：被删掉的可能是一条<b>人在对话里确认过的</b>口径，连同它的覆盖留痕一起消失，
+     * 事后没有任何地方能回答「那条口径是谁、在哪次对话里删的」。而这张表上的删除是<b>物理删除</b>
+     * （唯一键不含 deleted，见 {@code ConnectorSemanticMapper#physicalDeleteRow}），删了就真没了。
+     */
+    public static final String OP_SEMANTIC_ROW_DELETE = ADMIN_OP_PREFIX + "semantic_row_delete";
+
     private final ConnectorAuditMapper auditMapper;
     private final AgentMapper agentMapper;
 

@@ -118,6 +118,31 @@ public class ChatConversationService {
         return map;
     }
 
+    /**
+     * 最近 {@code turns} 轮 user 消息里<b>最早</b>那条的创建时间，作为「近期」的时间下界。
+     *
+     * <p>用途：判断「本会话此前传过文件」时只看窗口之内的那些（见 {@code ChatRunService#decideExec}）。
+     *
+     * <p>会话的 user 消息不足 {@code turns} 条时返回 {@code null}，语义是<b>整条会话都在窗口内</b>——
+     * 调用方据此不加时间条件。返回 null 表示「不收窄」而不是「没有」，两者方向相反，别判反。
+     *
+     * <p>按 id 降序取而不是按时间：雪花 id 单调且与消息顺序同源，时钟回拨不影响它。
+     */
+    public Date userTurnCutoff(Long conversationId, int turns) {
+        if (conversationId == null || turns <= 0) {
+            return null;
+        }
+        List<ChatMessage> recent = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getRole, "user")
+                .orderByDesc(ChatMessage::getId)
+                .last("limit " + turns));
+        if (recent == null || recent.size() < turns) {
+            return null;
+        }
+        return recent.get(recent.size() - 1).getCreateTime();
+    }
+
     public ConversationDetail detail(Long id) {
         ChatConversation c = requireConversation(id);
         assertAgentAccess(c.getAgentId());

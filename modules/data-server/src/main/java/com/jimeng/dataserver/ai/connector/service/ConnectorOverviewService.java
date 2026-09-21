@@ -279,7 +279,14 @@ public class ConnectorOverviewService {
             if (ConnectorSemanticService.SCOPE_OBJECT.equals(r.getScope())) {
                 if (isBlank(r.getObjectName())) continue;
                 g.objects.put(r.getObjectName().trim(), r);
-            } else {
+            } else if (ConnectorSemanticService.SCOPE_METRIC.equals(r.getScope())) {
+                // ★ 这里必须【显式判 METRIC】，不能写成 else 兜底。
+                //   上面那句 wrapper 的 in(OBJECT, METRIC) 是今天的样子，而写入面已经扩到五类：
+                //   CAVEAT 行同样 term 非空、gloss 非空，而它的 gloss 是【一个还没人回答的问题】
+                //  （「销售额是否扣除退款？」）。它一旦被别的改动放进这个查询，else 兜底就会把它
+                //   原样渲染进「已确认的业务口径」那一段 —— 把待确认项当结论宣布给模型，
+                //   而模型不会去分辨标题，它只会照着算。漏一类的代价是「少注入一点」，
+                //   兜底错一类的代价是「悄悄算错」，两者完全不对等。
                 if (isBlank(r.getTerm())) continue;
                 // ★ STALE 的口径整条不注入，与 conn_catalog 的 glossaryPayload 同一条纪律：
                 //   口径里可能带着 SQL 片段，它引用的列一改那段 SQL 就是错的——而错了不报错，
@@ -502,8 +509,11 @@ public class ConnectorOverviewService {
      * 一条口径的依据，形如「9月13日由张三确认」。
      *
      * <p><b>与 {@code ConnectorToolExecutor.metricBasis} 刻意同形</b>（那边是 private，跨包拿不到）。
-     * 它不是装饰：平台没有管理台的口径纠正入口，任何能对话的人都能覆盖口径，
-     * 回答里亮出的这半句是口径被改坏之后唯一可能被业务方看见并纠正的地方。两处措辞要一起改。
+     * 它不是装饰：任何能对话的人都能覆盖口径且不做权限区分，而覆盖是<b>无声</b>的——
+     * 回答里亮出的这半句是口径被改坏之后，业务方在日常使用中唯一可能看见它的地方。
+     * 管理台确实有删除入口（{@code DELETE /admin/connectors/{id}/semantic/{rowId}}），但那只对
+     * <b>企业超管</b>开放，而看得出口径错了的往往是点不到那个按钮的业务方：先看见，才谈得上去纠正。
+     * 两处措辞要一起改。
      */
     private static String metricBasis(ConnectorSemantic m) {
         String who = isBlank(m.getAnsweredName()) ? "由用户在对话中确认" : "由" + m.getAnsweredName().trim() + "确认";

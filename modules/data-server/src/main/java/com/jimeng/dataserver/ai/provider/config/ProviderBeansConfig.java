@@ -156,7 +156,7 @@ public class ProviderBeansConfig {
                                       AnthropicOverOpenAiAdapter cross,
                                       SseServiceUtil sse) {
         return new GenericChatClient(providerName, configOf(providerName, props),
-                selection, loop, anthropic, openai, cross, sse);
+                selection, loop, anthropic, openai, cross, sse, props);
     }
 
     private static EmbeddingClient newEmbedding(String providerName,

@@ -73,6 +73,22 @@ public class SidecarRunPayload {
      */
     private SemanticContext semanticContext;
 
+    /**
+     * 非空时边车获得一组 {@code mcp__connector__conn_*} 工具，模型在沙箱平面也能查客户数据库。
+     *
+     * <h3>为什么需要它</h3>
+     * 带附件的会话整轮走沙箱平面，而那边过去<b>一个 conn_* 工具都没有</b>。后果不是报错，是
+     * 模型只能拿历史数据讲、或者自己编——HTTP 类连接器还能经 egress 代理够到，彻底零路径的
+     * 恰恰是 MYSQL，也就是语义层真正服务的那一类。
+     *
+     * <h3>它与 {@link #connections} 是两条不同的链路，不要混</h3>
+     * {@code connections} 是 egress 代理的 <b>HTTP 出口</b>：凭据按源 IP 注入，不经 ConnectorGateway
+     * 的任何护栏（只有方法/路径白名单）。{@code connectorContext} 走<b>宿主回调</b>：工具定义在沙箱、
+     * 执行留在 data-service，ReadOnlySqlGuard / WriteSqlGuard / 限流 / 审计 / agent_connection 实时授权
+     * 全部照常生效，容器连客户库的地址都不知道。
+     */
+    private ConnectorContext connectorContext;
+
     @Data
     public static class SkillRef {
         private String name;
@@ -143,6 +159,46 @@ public class SidecarRunPayload {
         private String provider;
         private Integer maxResults;
         private String authScheme;
+    }
+
+    /**
+     * 字段名须与边车 TS 的 {@code ConnectorContext} 一致（camelCase）。
+     *
+     * <p>刻意<b>不</b>把「本 Agent 被授权了哪些连接」的 id 集合放进来：那是快照，超管撤销授权后
+     * 本轮仍然有效。连接归属一律由 ConnectorGateway 按 {@code agent_connection} 的实时行判定。
+     */
+    @Data
+    public static class ConnectorContext {
+        /**
+         * 回调根地址，形如 {@code http://localhost:10011/data}。
+         *
+         * <p><b>必须按运行下发，边车绝不读自己的进程 env。</b>:8088 是 dev 与 prod <b>共用</b>的单进程、
+         * env 只有一份（部署态指向生产网关 20011），读 env 会让 dev 平面派发的运行回调到生产网关，
+         * 在另一套数据上执行读写，而且不报错。
+         */
+        private String callbackBaseUrl;
+        /** 短时效 JWT（purpose=connector-agent，钉死在 agentId + runId 上），边车用它回调宿主执行工具。 */
+        @ToString.Exclude
+        private String accessToken;
+        /** 十进制字符串。雪花 id 超出 JS 安全整数范围，发数字会被 JSON.parse 静默改值。仅用于边车日志，服务端一律以 token 为准。 */
+        private String agentId;
+        /**
+         * 七个工具的名字/描述/入参 schema，直接取自 {@code skills/connector/tools.json}。
+         *
+         * <p>随 run 下发而不是在边车抄一份：那份 description 里全是行为契约（截断语义、verified 三态、
+         * pending_approval、guard_blocked 与 forbidden 的区别）。抄一份的结果是两个平面的模型行为
+         * 半年后静默分叉——而那正是 B1 这一族缺陷的成因。
+         */
+        private List<ToolSchema> tools;
+    }
+
+    /** 字段名须与边车 TS 的 {@code ConnectorToolSchema} 一致。 */
+    @Data
+    public static class ToolSchema {
+        private String name;
+        private String description;
+        /** 对应 tools.json 的 {@code input_schema}（这里是 camelCase，边车按 inputSchema 读）。 */
+        private java.util.Map<String, Object> inputSchema;
     }
 
     @Data

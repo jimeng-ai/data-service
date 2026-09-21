@@ -4,6 +4,7 @@ import com.jimeng.dataserver.ai.connector.model.CatalogView;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -47,6 +48,48 @@ public interface DescribeCapable {
      * @return 存在的那部分名字；{@code null} = 不知道
      */
     default Set<String> existingObjects(Collection<String> names) {
+        return null;
+    }
+
+    /**
+     * 这几个对象里，哪些<b>此刻至少有一行数据</b>、哪些<b>确认一行都没有</b>（缺陷 B19）。
+     *
+     * <h3>为什么要探这一下</h3>
+     * POC 环境里 {@code D1_COMPANYCODE} 与 {@code EMM_PURCHASEORDERCONFIRM} 是 <b>0 行</b>。
+     * 模型 join 到这样一张空维表，拿回 0 行，然后把「没有数据」当成业务答案报给用户：
+     * 查询成功、没有报错、数字静默地错。结构快照里存着列名、类型、注释，
+     * 唯独没有「这张表里到底有没有东西」——而它恰恰是把「空结果」读成「答案」还是读成
+     * 「这张表是空的」的唯一判据。
+     *
+     * <h3>三态，{@code null} 与「键不在」都是正当答案</h3>
+     * <ul>
+     *   <li>{@code TRUE}：至少有一行；</li>
+     *   <li>{@code FALSE}：<b>确认</b>一行都没有；</li>
+     *   <li>键不在 map 里、或整个返回是 {@code null}：<b>不知道</b>（连接器答不了、超时、没权限、预算用完）。</li>
+     * </ul>
+     * <b>「没探到」绝不能记成「是空的」</b>：把一张有数据的表说成空表，比什么都不说更糟——
+     * 模型会据此告诉用户「这张表里没有数据」，而那是一句凭空编出来的结论。
+     * 默认实现返回 {@code null}：没实现这件事的连接器维持从前的行为，不会凭空多出一批「空表」。
+     *
+     * <h3>实现必须命中即停，并自己兜住成本上限</h3>
+     * 只需要一个布尔，所以探的是 {@code SELECT 1 FROM <表> LIMIT 1} 这类<b>命中即停</b>的语句：
+     * <ul>
+     *   <li><b>不要用 {@code COUNT(*)}</b>——大表上那是一次全表扫，为了一个布尔付全表的代价；</li>
+     *   <li><b>不要信 {@code information_schema.TABLE_ROWS}</b>——InnoDB 那一列是抽样估算值，
+     *       实测同一张表两次查能差几倍，对「是不是恰好 0 行」并不可靠（它可能对一张空表报出非 0，
+     *       也可能对一张有数据的表报 0）。这里要的恰恰是那个精确的边界。</li>
+     * </ul>
+     * 调用方会给一个<b>整批的时间预算</b>，实现必须在预算内收手、把没探到的名字<b>留成「不知道」</b>，
+     * 而不是把一次刷新拖成几分钟。
+     *
+     * <p>调用方在拉结构快照的<b>同一个会话</b>里调用它，与目录、描述、存在性确认同处一次网关往返
+     * （同一份审计、同一个并发许可）。
+     *
+     * @param names         要探的对象名；为空时实现可以直接返回空 map
+     * @param budgetMillis  这一整批的挂钟预算（毫秒）。用完就收手，剩下的按「不知道」处理
+     * @return 名字 → 是否至少有一行；缺键 = 不知道。整个返回 {@code null} = 这个连接器答不了
+     */
+    default Map<String, Boolean> probeRowPresence(Collection<String> names, long budgetMillis) {
         return null;
     }
 }

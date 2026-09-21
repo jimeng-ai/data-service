@@ -75,7 +75,10 @@ public class RunSegmentAssembler {
         if (calls == null) return;
         for (Object o : calls) {
             if (!(o instanceof JSONObject c)) continue;
-            s.upsertToolRunning(c.getStr("id"), c.getStr("name"), c.getStr("desc"), c.get("input"));
+            // 二道闸：发送端（AiConversationLoop#sendProgress）已经只发首句，这里再截一次，
+            // 覆盖别的写入路径与老边车发来的全量 desc。与 foldToolResult 的「过大不进 segments」同一条原则。
+            s.upsertToolRunning(c.getStr("id"), c.getStr("name"),
+                    ToolDescDisplay.firstSentence(c.getStr("desc")), c.get("input"));
         }
     }
 

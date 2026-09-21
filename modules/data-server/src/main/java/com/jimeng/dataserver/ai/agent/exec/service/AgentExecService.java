@@ -15,6 +15,8 @@ import com.jimeng.dataserver.ai.agent.service.AgentRuntimeService;
 import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
 import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
+import com.jimeng.dataserver.ai.connector.agent.ConnectorAgentContextFactory;
+import com.jimeng.dataserver.ai.connector.agent.ConnectorSkillMaterializer;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
 import com.jimeng.dataserver.ai.run.RunEventTee;
 import com.jimeng.dataserver.ai.skill.service.SkillBundleResolver;
@@ -89,6 +91,8 @@ public class AgentExecService {
     private final PermissionResolver permissionResolver;
     private final SkillTenantService skillTenantService;
     private final SkillBundleResolver skillBundleResolver;
+    private final ConnectorSkillMaterializer connectorSkillMaterializer;
+    private final ConnectorAgentContextFactory connectorAgentContextFactory;
 
     public void streamExec(AgentExecRequest req, String connectionId, String traceId) {
         String tenantId = TenantContext.get();
@@ -291,6 +295,29 @@ public class AgentExecService {
             payload.setSkills(skillBundleResolver.resolve(doerSkills));
         }
 
+        // 3b. 连接器工具代理：让沙箱平面也有 conn_*（数据库类连接器只有这一条路，egress 代理那条
+        //     只管 HTTP）。工具定义在沙箱、执行留在宿主，经 /data/internal/connector-agent/** 回调。
+        //
+        //     判定 + 登记 + 签发全在 ConnectorAgentContextFactory 里（评测平面共用同一份，见该类注释）。
+        //     租约未授予时 close() 是空操作，所以这里不再自己记 connectorRegistered 布尔——
+        //     那个布尔正是过去最容易漏掉的一行。
+        final ConnectorAgentContextFactory.Lease connectorLease = connectorAgentContextFactory.open(
+                tenantId, userIdL, view == null ? null : view.getAgentId(),
+                String.valueOf(runId), props.getWallClockSec());
+        if (connectorLease.granted()) {
+            payload.setConnectorContext(connectorLease.context());
+            // SKILL.md：工具描述之外还有一整套用法（取数顺序、写操作必须先查清影响行）。
+            // 物化失败返回 null，此时只是少了这份说明，连接器工具照常下发。
+            appendSkill(payload, connectorSkillMaterializer.materialize());
+            // 只记 runId / agentId / 工具数——token 绝不进任何日志。
+            log.info("[sandbox] 本轮下发连接器工具代理 runId={} agentId={} 工具数={}",
+                    runId, connectorLease.context().getAgentId(),
+                    connectorLease.context().getTools().size());
+        } else {
+            // debug 而不是 info：绝大多数运行（没绑连接、总开关没开）都会走到这里，info 会把日志刷爆。
+            log.debug("[sandbox] 本轮不下发连接器工具代理 runId={}：{}", runId, connectorLease.declineReason());
+        }
+
         // 4. 桥接边车 SSE
         final CountDownLatch latch = new CountDownLatch(1);
         final List<String> artifactEvents = Collections.synchronizedList(new ArrayList<>());
@@ -347,11 +374,28 @@ public class AgentExecService {
             log.error("调用边车异常 runId={}", runId, e);
             tee.tee(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
         } finally {
+            // ★ 撤销连接器回调凭据。正常结束、超时被杀、异常中断三条路都会走到这里；
+            //   排在回填之前，避免回填抛出时把撤销一起跳过。
+            //   不调只是退化成靠 TTL 自然过期，而那个窗口正是这张登记要消灭的东西：
+            //   运行早就结束了，泄漏的 token 却仍是该 Agent 全部连接器的读写凭据。
+            connectorLease.close();
             // 仍在 streamExecutor 线程，TenantContext 还在，可安全回填
             persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
                     System.currentTimeMillis() - startMs);
             runFinalizer.complete(connectionId);
         }
+    }
+
+    /** 把一个 SkillRef 追加进 payload.skills；ref 为 null 则原样不动（doerSkills 为空时也要设上）。 */
+    private static void appendSkill(SidecarRunPayload payload, SidecarRunPayload.SkillRef ref) {
+        if (ref == null) {
+            return;
+        }
+        List<SidecarRunPayload.SkillRef> skills = payload.getSkills() == null
+                ? new ArrayList<>()
+                : new ArrayList<>(payload.getSkills());
+        skills.add(ref);
+        payload.setSkills(skills);
     }
 
     /** 解析 "123" 形式的 agentId，非法 / 空返回 null。 */

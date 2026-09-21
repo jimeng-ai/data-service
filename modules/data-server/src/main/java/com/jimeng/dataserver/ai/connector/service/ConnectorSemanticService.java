@@ -24,6 +24,7 @@ import java.security.MessageDigest;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -35,6 +36,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * 语义层的读写。<b>只碰我们自己的库</b>，不碰客户系统、不叫模型。
@@ -99,6 +101,24 @@ public class ConnectorSemanticService {
     public static final String ANCHOR_JOIN = "JOIN";
     public static final String ANCHOR_COLUMN_SET = "COLUMN_SET";
 
+    /**
+     * {@code COLUMN_SET} 锚点依赖的列集合，存在 detail_json 里：
+     * {@code [{"object":"orders","column":"pay_amt","anchor":"<写入那一刻的 fieldAnchor>"}, ...]}。
+     * 形状由 {@link AnchorColumn#toDetailMap} 一处产出，写入侧不要在别处各拼各的键名。
+     *
+     * <p><b>读不出来（缺、不是列表、空、元素缺字段）一律当「这次没有依据判断」</b>，不是「结构变了」：
+     * 见 {@link AnchorVerdict#NO_BASIS}。{@code anchor} 是可选的，只用来说得出「是哪一列变了」；
+     * 没有它照样判得出变没变（整体 hash 就是 {@code anchor_hash}），只是名单只报得出「列没了」的那些。
+     */
+    static final String KEY_ANCHOR_COLUMNS = "anchor_columns";
+
+    /**
+     * {@code COLUMN_SET} 行被判过期时，detail_json 里记「是哪几列变了」，形如 {@code ["orders.pay_amt"]}。
+     * 与 {@link #KEY_STALE_REMOVED}（是哪几张表没了）同一个用途：让管理台和下一次刷新说得出原因，
+     * 而不是只留一个光秃秃的 STALE。<b>复活时清掉</b>——留着就等于把一次已经撤销的过期说成还在。
+     */
+    static final String KEY_STALE_COLUMNS = "stale_columns";
+
     /** 注入 conn_catalog 时 gloss 的截断长度。选表那一刻需要的就是一句话，完整版在 describe 给。 */
     static final int CATALOG_GLOSS_MAX = 80;
 
@@ -154,6 +174,33 @@ public class ConnectorSemanticService {
 
     /** 写回撞上别处的写之后，重读重来的最多次数。 */
     static final int WRITE_ATTEMPTS = 3;
+
+    /** JOIN 行的对端。人写的关系与推导写的关系用<b>同一对键</b>，注入层才不用分两种读法。 */
+    public static final String KEY_TO_OBJECT = "to_object";
+    public static final String KEY_TO_COLUMN = "to_column";
+
+    /**
+     * 人对一条关系给出的判断：{@link #HV_RELATED} / {@link #HV_UNRELATED}。
+     *
+     * <h4>★ 为什么「这两张表没关系」不能写成 {@code verified=REJECTED}</h4>
+     * {@code verified} 这一列的含义是<b>采样核过的结论</b>：{@code REJECTED} 读作「平台真的去客户库里取过样、
+     * 两边对不上」。把人说的一句话写进去有两个各自独立的坏处：
+     * <ul>
+     *   <li><b>伪装成一次采样</b>：注入层、管理台、下一轮验证都会把它当成实测结论，而它从来没被实测过；</li>
+     *   <li><b>再也纠正不了</b>：{@link #mergeInferred} 保留旧结论时是<b>整组</b>（{@link #JOIN_VERDICT_KEYS}）
+     *       跟着旧行搬运的，这条假结论会一路被抄进后面每一版推导，而推导侧永远不会去推翻一个「已经验过」的结论。</li>
+     * </ul>
+     * 所以人的否定只进 {@code detail_json} 的这一个独立键，{@code verified} 那一列<b>一次都不 set</b>
+     * （见 {@link #upsertHuman} 的覆盖分支）。
+     */
+    public static final String KEY_HUMAN_VERDICT = "human_verdict";
+    /** 人说这两列确实是同一个东西。 */
+    public static final String HV_RELATED = "RELATED";
+    /** 人说这两张表没有关系——别再把它当外键连。 */
+    public static final String HV_UNRELATED = "UNRELATED";
+
+    /** CAVEAT / METRIC 的适用范围。 */
+    public static final String KEY_APPLIES_TO = "applies_to";
 
     private final ConnectorSemanticMapper semanticMapper;
     private final ConnectionMapper connectionMapper;
@@ -742,55 +789,182 @@ public class ConnectorSemanticService {
         return s.isEmpty() ? null : s;
     }
 
-    // ================================================================ 写（口径沉淀路径）
+    // ================================================================ 写（人在对话里写下的语义）
 
     /**
-     * 沉淀一条业务口径。<b>这是 §5 的全部价值所在：模型现在本来就在问，缺的是问完之后记住。</b>
+     * 管理台删掉<b>一行</b>语义（任何 scope、任何 source）。
      *
-     * <p>为什么必须显式记 {@code answeredBy} 而不靠 {@code BaseEntity.createUser}：口径是在对话流里
+     * <h3>为什么这个入口必须存在</h3>
+     * {@code source=HUMAN} 的行<b>写下即永久免疫</b>重新推导与整层重生成（upsertInferred /
+     * replaceInferred / derive 上一共 5 处 SOURCE_HUMAN 跳过合起来就是这条纪律）。
+     * 好处是人确认过的东西不会被机器覆盖；代价是<b>写错了也再没有机器能改回来</b>——
+     * 在此之前唯一的纠错办法是用同一个 term 再说一遍覆盖，而 JOIN 这一类连覆盖都做不到
+     * （「这两张表没关系」不是一个能写进去的值）。
+     *
+     * <h3>为什么是物理删除</h3>
+     * 见 {@code ConnectorSemanticMapper#physicalDeleteRow}：唯一键不含 deleted，
+     * 软删死行会让同一条断言<b>永远写不进去</b>，而且报错会伪装成「正在被同时修改」。
+     *
+     * <h3>刻意不加 {@code @Transactional}</h3>
+     * 这条路上只有一条 DELETE，单语句自身原子；套一层事务只是白占连接。
+     *
+     * <h3>删 0 行不抛错</h3>
+     * 幂等：双击、前端乐观刷新之后再点、或者这行刚被另一个超管删掉，都不该弹一个假错误。
+     * 调用方拿返回值决定要不要记审计。
+     *
+     * @return 实际删除的行数（0 或 1）
+     */
+    public int deleteRow(Long connectorId, Long rowId) {
+        if (rowId == null) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "语义行 id 不能为空");
+        }
+        // 先确认这条连接属于当前租户：SQL 里虽然显式写了 tenant_id，但那个值正是从这里取的。
+        Connection conn = requireOwned(connectorId);
+        int removed = semanticMapper.physicalDeleteRow(conn.getTenantId(), connectorId, rowId);
+        if (removed > 0) {
+            log.info("管理台删除语义行 connectorId={} rowId={}", connectorId, rowId);
+        }
+        return removed;
+    }
+
+    /**
+     * 覆盖既有行时，锚点那两列怎么处理。
+     *
+     * <p>只有两档，因为「不动」不是一个策略而是两档各自的兜底：{@link #SET} 给的锚点为空就写 NONE，
+     * {@link #REBASE} 重算不出来就一列都不 set。
+     */
+    public enum HumanAnchor {
+        /**
+         * 按本次算出的锚点写下去。FIELD / JOIN / 明确给了依赖列的 METRIC 都走这一档——
+         * 它们的锚点这一次是从快照上现算的，就是新的基线。
+         */
+        SET,
+        /**
+         * 按<b>既有</b>的依赖列在当前快照上重算一次（re-baseline）。人重新确认口径、但没有重发依赖列时走这一档。
+         *
+         * <p>为什么必须重算而不是原样留着：人重新确认的意思就是「我知道结构变过，口径照这样算」。
+         * 只把 {@code status} 翻回 CONFIRMED、锚点还留着旧基线，下一次刷新重算依然对不上，
+         * 会把人刚确认的口径<b>再一次</b>悄悄标成 STALE、停止注入——而他完全不知道自己的确认被撤销了。
+         *
+         * <p>既有行本来就是 {@link #ANCHOR_NONE}（纯人工口径，没有算式）时<b>一列都不动</b>：
+         * 给它现编一个锚点等于凭空给它加上一个会过期的理由。
+         */
+        REBASE
+    }
+
+    /**
+     * 人在对话里写下的一条语义断言：{@link #upsertHuman} 的全部入参，五个 scope 共用一个形状。
+     *
+     * <h4>三列键怎么填（唯一键 = tenant_id, connector_id, scope, object_name, field_name, term）</h4>
+     * <pre>
+     * OBJECT  object=表名   field=""     term=""    anchor=NONE
+     * FIELD   object=表名   field=列名   term=""    anchor=FIELD
+     * JOIN    object=左表   field=左列   term=""    anchor=JOIN，detail 必带 to_object / to_column
+     * METRIC  object=""     field=""     term=词条  anchor=NONE 或 COLUMN_SET（给了依赖列时）
+     * CAVEAT  object=""     field=""     term=词条  anchor=NONE
+     * </pre>
+     * 填错的表现不是报错，是<b>写进另一行</b>：唯一键换了一组值，覆盖就变成了新增，
+     * 同一件事在库里有了两条各说各话的记录。
+     */
+    @Data
+    @Builder
+    public static class HumanWrite {
+        /** {@link #SCOPE_OBJECT} / {@link #SCOPE_FIELD} / {@link #SCOPE_JOIN} / {@link #SCOPE_METRIC} / {@link #SCOPE_CAVEAT}。 */
+        private String scope;
+        private String objectName;
+        private String fieldName;
+        private String term;
+        /** 给模型看的那句话。空白一律拒写——一行没有 gloss 的语义什么都不说，却会把这个键占掉。 */
+        private String gloss;
+        /** {@code detail_json} 的内容。{@code null} = 覆盖时沿用既有的那一份（只去掉过期名单）。 */
+        private Map<String, Object> detail;
+        /**
+         * 依据来源。人答的东西<b>不在客户的库里</b>——{@link #EV_COMMENT} / {@link #EV_DATA} 都是假话，
+         * 只能是 {@link #EV_GUESS}；而 CAVEAT 是「一个还没有答案的问题」、根本不是断言，传 {@code null}。
+         */
+        private String evidence;
+        /** 插入时写的锚点种类。{@link #ANCHOR_NONE} / {@link #ANCHOR_FIELD} / {@link #ANCHOR_JOIN}。 */
+        private String anchorKind;
+        /** 插入时写的锚点指纹。调用方从<b>快照</b>算好传进来（理由见 {@code ConnectorSnapshotColumnService}）。 */
+        private String anchorHash;
+        /**
+         * METRIC 的依赖列：算式里<b>真正出现</b>的那几列，已经盖好每列指纹。非空时锚点改写成
+         * {@link #ANCHOR_COLUMN_SET}，并把名单落进 {@code detail_json}。其余 scope 传空。
+         */
+        private List<AnchorColumn> anchorColumns;
+        /** 上一次刷新的结构快照（表名 → 列名 → 列）。算 COLUMN_SET 锚点与 {@link HumanAnchor#REBASE} 用。 */
+        private Map<String, Map<String, FieldDetail>> snapshot;
+        /** 覆盖时锚点怎么办。 */
+        private HumanAnchor onOverwrite;
+        /** 报错与日志里这条断言的称呼，例如「口径「销售额」」。会原样出现在模型看到的错误文案里。 */
+        private String subject;
+        private String answeredBy;
+        private String answeredName;
+        private String traceId;
+    }
+
+    /**
+     * 写下一条人确认过的语义（任意 scope）。<b>这是全仓库唯一一条从对话写 {@code source=HUMAN} 的路。</b>
+     *
+     * <p>为什么必须显式记 {@code answeredBy} 而不靠 {@code BaseEntity.createUser}：语义是在对话流里
      * 沉淀的，对话跑在 {@code streamExecutor} 上，{@code MdcAsyncSupport.wrap} 不传
      * {@code RequestContextHolder}，于是 {@code MyMetaObjectHandler} 拿不到用户、create_user 是 null。
      *
-     * <p>覆盖既有口径时把<b>旧值</b>追加进 history_json。平台不提供管理台的口径纠正入口，
-     * 任何能对话的人都能覆盖口径且不做权限区分——这是那个已知代价的唯一取证材料。
+     * <p>覆盖既有行时把<b>旧值</b>追加进 history_json。平台不提供管理台的口径纠正入口，
+     * 任何能对话的人都能覆盖且不做权限区分——这是那个已知代价的唯一取证材料。
+     * JOIN 的留痕额外带上旧的对端与旧的 {@code verified}（见 {@link #appendHistory}）：
+     * 一条采样核过的关系被人改了对端之后，不留这两样就<b>再也回不去</b>。
      *
      * <h3>★ 人确认一次，就清掉「是哪几张消失的表让它过期的」名单（{@link #KEY_STALE_REMOVED}）</h3>
-     * <b>不传 detail 时也清。</b>模型在对话里重新确认口径往往只补一句话、不重发结构化细节；名单若留着，
-     * 下一次刷新看到名单里那张表仍然不在（它确实不在），就会把人刚确认的口径悄悄重新标成 STALE、停止注入，
-     * 而人完全不知道自己的确认被撤销了。确认本身就是那句「我知道那张表没了，口径照这样算」。
+     * <b>不传 detail 时也清。</b>模型在对话里重新确认往往只补一句话、不重发结构化细节；名单若留着，
+     * 下一次刷新看到名单里那张表仍然不在（它确实不在），就会把人刚确认的东西悄悄重新标成 STALE、停止注入，
+     * 而人完全不知道自己的确认被撤销了。确认本身就是那句「我知道那张表没了，照这样算」。
      * 旧名单不会丢：它在旧 detail 里，而旧 detail 整份进了留痕。
+     *
+     * <h3>★ 覆盖路径一次都不 set {@code verified}</h3>
+     * 那一列的含义是「采样核过的结论」。人说「这两张表没关系」要写进 {@link #KEY_HUMAN_VERDICT}，
+     * 绝不能写成 {@link #V_REJECTED}——完整理由见那个常量的注释。
      *
      * <h3>★ 不在事务里；写回撞上别处的写就重读重试</h3>
      * 这里是「读旧值 → 追加留痕 → 写回」。中间若有别处的写落地（另一个人同时确认同一个词条、漂移处置刚给它挂上过期名单），
      * 整行写回会把那一次盖掉而不留痕：留痕里少一条旧值，或者一份过期名单连同它的来龙去脉一起消失。
      * 所以写回以「这一行仍是读到时的样子」为条件，不成立就重读、在新的旧值上再追加一次留痕。
      * <b>刻意不加 {@code @Transactional}</b>：可重复读隔离级别下同一个事务里的重读仍是第一次读的快照，重试会永远撞同一个条件；
-     * 每条语句各自提交，重读才看得见别人刚写下的东西。插入撞唯一键（同一个词条刚被另一次确认插进去）同样重读、按覆盖处理——
+     * 每条语句各自提交，重读才看得见别人刚写下的东西。插入撞唯一键（同一条断言刚被另一次确认插进去）同样重读、按覆盖处理——
      * 让这一次回答报错消失，不如让它排在后面、把前一次的回答留进留痕。
      * 重试 {@value #WRITE_ATTEMPTS} 次仍写不进去就报错：宁可让模型当场说「没记住，请再说一次」，也不能假装记住了。
      * 覆盖时 {@code answered_by} / {@code trace_id} 这类可空列按这次给的值<b>显式</b>写下去（包括 null）——
-     * 留着上一次的 trace_id，「这条口径是在哪次对话里答的」就指向了另一段对话。
+     * 留着上一次的 trace_id，「这条断言是在哪次对话里答的」就指向了另一段对话。
      */
-    public ConnectorSemantic defineMetric(Long connectorId, String term, String gloss,
-                                          Map<String, Object> detail,
-                                          String answeredBy, String answeredName, String traceId) {
-        if (term == null || term.isBlank()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "口径词条不能为空");
-        }
-        if (gloss == null || gloss.isBlank()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "口径说明不能为空");
+    public ConnectorSemantic upsertHuman(Long connectorId, HumanWrite w) {
+        if (w.getGloss() == null || w.getGloss().isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "语义说明不能为空");
         }
         Connection conn = requireOwned(connectorId);
-        String t = term.trim();
-        String g = gloss.trim();
+        String object = nullToEmpty(w.getObjectName()).trim();
+        String field = nullToEmpty(w.getFieldName()).trim();
+        String term = nullToEmpty(w.getTerm()).trim();
+        String gloss = w.getGloss().trim();
+        Map<String, Map<String, FieldDetail>> snapshot = w.getSnapshot() == null ? Map.of() : w.getSnapshot();
+
+        // 依赖列一给就改写锚点：口径从此锚在算式引用到的那几列上，任一列改了名 / 类型 / 可空 / 注释都让它失效。
+        // 算不出来（列不在快照里）就退回无锚——宁可它永不过期，也不要挂一个当场就对不上的假锚点。
+        List<AnchorColumn> columns = w.getAnchorColumns() == null ? List.of() : w.getAnchorColumns();
+        String insertKind = w.getAnchorKind();
+        String insertHash = w.getAnchorHash();
+        if (!columns.isEmpty()) {
+            String setHash = columnSetAnchor(columns, snapshot);
+            insertKind = setHash == null ? ANCHOR_NONE : ANCHOR_COLUMN_SET;
+            insertHash = setHash;
+        }
 
         for (int attempt = 1; attempt <= WRITE_ATTEMPTS; attempt++) {
             ConnectorSemantic existing = semanticMapper.selectOne(new LambdaQueryWrapper<ConnectorSemantic>()
                     .eq(ConnectorSemantic::getConnectorId, connectorId)
-                    .eq(ConnectorSemantic::getScope, SCOPE_METRIC)
-                    .eq(ConnectorSemantic::getObjectName, "")
-                    .eq(ConnectorSemantic::getFieldName, "")
-                    .eq(ConnectorSemantic::getTerm, t)
+                    .eq(ConnectorSemantic::getScope, w.getScope())
+                    .eq(ConnectorSemantic::getObjectName, object)
+                    .eq(ConnectorSemantic::getFieldName, field)
+                    .eq(ConnectorSemantic::getTerm, term)
                     .last("limit 1"));
 
             Date now = new Date();
@@ -798,79 +972,347 @@ public class ConnectorSemanticService {
                 ConnectorSemantic row = new ConnectorSemantic();
                 row.setTenantId(conn.getTenantId());
                 row.setConnectorId(connectorId);
-                row.setScope(SCOPE_METRIC);
-                row.setObjectName("");
-                row.setFieldName("");
-                row.setTerm(t);
-                row.setGloss(g);
-                row.setDetailJson(metricDetailJson(detail));
+                row.setScope(w.getScope());
+                row.setObjectName(object);
+                row.setFieldName(field);
+                row.setTerm(term);
+                row.setGloss(gloss);
+                row.setDetailJson(humanDetailJson(w.getDetail(), columns));
                 row.setSource(SOURCE_HUMAN);
-                // 人答的口径依据是"人说的"，不是数据也不是注释。它恰恰是数据库里查不到答案的那一类。
-                row.setEvidence(EV_GUESS);
+                row.setEvidence(w.getEvidence());
                 row.setStatus(ST_CONFIRMED);
+                // 新行只能是 NONE：这条断言从来没有被采样核过。人的否定判断进 detail 的 human_verdict，
+                // 绝不借 REJECTED 表达——那会让一句人说的话伪装成一次采样结论，而且再也纠正不了。
                 row.setVerified(V_NONE);
-                row.setAnchorKind(ANCHOR_NONE);
-                row.setAnsweredBy(answeredBy);
-                row.setAnsweredName(answeredName);
+                row.setAnchorKind(insertKind);
+                row.setAnchorHash(insertHash);
+                row.setAnsweredBy(w.getAnsweredBy());
+                row.setAnsweredName(w.getAnsweredName());
                 row.setAnsweredAt(now);
-                row.setTraceId(traceId);
+                row.setTraceId(w.getTraceId());
                 try {
                     semanticMapper.insert(row);
                     return row;
                 } catch (DuplicateKeyException e) {
-                    log.info("口径词条刚被另一次确认插入，重读后按覆盖处理 connectorId={} term={} attempt={}",
-                            connectorId, t, attempt);
+                    log.info("{} 刚被另一次确认插入，重读后按覆盖处理 connectorId={} attempt={}",
+                            w.getSubject(), connectorId, attempt);
                     continue;
                 }
             }
 
             // 覆盖：先把旧值留痕，再改。
-            String history = appendHistory(existing, answeredBy, answeredName, traceId, now);
-            String newDetail = detail != null
-                    ? metricDetailJson(detail)
-                    : withoutStaleRemoved(existing.getDetailJson(), existing.getId());
-            LambdaUpdateWrapper<ConnectorSemantic> w = new LambdaUpdateWrapper<ConnectorSemantic>()
+            String history = appendHistory(existing, w.getAnsweredBy(), w.getAnsweredName(), w.getTraceId(), now);
+            String newDetail = overwriteDetail(existing, w.getDetail(), columns);
+            String setKind = null;
+            String setHash = null;
+            if (w.getOnOverwrite() == HumanAnchor.SET) {
+                setKind = insertKind;
+                setHash = insertHash;
+            } else if (ANCHOR_COLUMN_SET.equals(existing.getAnchorKind())) {
+                List<AnchorColumn> rebased = restamp(parseAnchorColumns(readDetail(newDetail, existing.getId())
+                        .get(KEY_ANCHOR_COLUMNS)), snapshot);
+                String rebasedHash = rebased == null ? null : columnSetAnchor(rebased, snapshot);
+                if (rebasedHash != null) {
+                    setKind = ANCHOR_COLUMN_SET;
+                    setHash = rebasedHash;
+                    newDetail = withAnchorColumns(newDetail, existing.getId(), rebased);
+                }
+            }
+
+            LambdaUpdateWrapper<ConnectorSemantic> u = new LambdaUpdateWrapper<ConnectorSemantic>()
                     .eq(ConnectorSemantic::getId, existing.getId());
-            unchangedSince(w, existing);
-            w.set(ConnectorSemantic::getGloss, g)
+            unchangedSince(u, existing);
+            u.set(ConnectorSemantic::getGloss, gloss)
                     .set(ConnectorSemantic::getDetailJson, newDetail)
                     .set(ConnectorSemantic::getSource, SOURCE_HUMAN)
+                    // ★ evidence 必须跟着这次的值改。覆盖的很可能是一条推导出来的行（evidence=COMMENT/DATA），
+                    // 不改的话「客户库自己写的注释」这个来源标签就挂在了一句人说的话上——
+                    // 而注入层正是照 evidence 判这句话该不该被当成一手事实采信。
+                    .set(ConnectorSemantic::getEvidence, w.getEvidence())
                     .set(ConnectorSemantic::getStatus, ST_CONFIRMED)
-                    .set(ConnectorSemantic::getAnsweredBy, answeredBy)
-                    .set(ConnectorSemantic::getAnsweredName, answeredName)
+                    .set(ConnectorSemantic::getAnsweredBy, w.getAnsweredBy())
+                    .set(ConnectorSemantic::getAnsweredName, w.getAnsweredName())
                     .set(ConnectorSemantic::getAnsweredAt, now)
-                    .set(ConnectorSemantic::getTraceId, traceId)
+                    .set(ConnectorSemantic::getTraceId, w.getTraceId())
                     .set(ConnectorSemantic::getHistoryJson, history);
-            if (semanticMapper.update(null, w) > 0) {
+            if (setKind != null) {
+                u.set(ConnectorSemantic::getAnchorKind, setKind)
+                        .set(ConnectorSemantic::getAnchorHash, setHash);
+            }
+            if (semanticMapper.update(null, u) > 0) {
                 existing.setHistoryJson(history);
-                existing.setGloss(g);
+                existing.setGloss(gloss);
                 existing.setDetailJson(newDetail);
                 existing.setSource(SOURCE_HUMAN);
+                existing.setEvidence(w.getEvidence());
                 existing.setStatus(ST_CONFIRMED);
-                existing.setAnsweredBy(answeredBy);
-                existing.setAnsweredName(answeredName);
+                existing.setAnsweredBy(w.getAnsweredBy());
+                existing.setAnsweredName(w.getAnsweredName());
                 existing.setAnsweredAt(now);
-                existing.setTraceId(traceId);
+                existing.setTraceId(w.getTraceId());
+                if (setKind != null) {
+                    existing.setAnchorKind(setKind);
+                    existing.setAnchorHash(setHash);
+                }
                 return existing;
             }
-            log.info("口径写回时这一行刚被别处改过，重读后在新的旧值上再留一次痕 connectorId={} term={} attempt={}",
-                    connectorId, t, attempt);
+            log.info("{} 写回时这一行刚被别处改过，重读后在新的旧值上再留一次痕 connectorId={} attempt={}",
+                    w.getSubject(), connectorId, attempt);
         }
         throw new ServiceException(ExceptionCode.SERVER_BUSY,
-                "口径「" + t + "」正在被同时修改，这一次没有记下来，请再确认一次");
+                w.getSubject() + "正在被同时修改，这一次没有记下来，请再确认一次");
     }
 
-    /** 调用方给的 detail 落库形状：带进来的过期名单一律拿掉（它只该由漂移处置写）。 */
-    private String metricDetailJson(Map<String, Object> detail) {
-        if (detail == null) {
+    /**
+     * 沉淀一条业务口径。<b>这是 §5 的全部价值所在：模型现在本来就在问，缺的是问完之后记住。</b>
+     *
+     * <p>旧签名，等价于「没有依赖列、也没有快照」：口径不挂锚点，结构怎么变它都照样注入。
+     * 纯人工口径（「客户指下单人」）本来就该如此；带算式的口径请走下面那个重载。
+     */
+    public ConnectorSemantic defineMetric(Long connectorId, String term, String gloss,
+                                          Map<String, Object> detail,
+                                          String answeredBy, String answeredName, String traceId) {
+        return defineMetric(connectorId, term, gloss, detail, List.of(), Map.of(),
+                answeredBy, answeredName, traceId);
+    }
+
+    /**
+     * 沉淀一条业务口径，并把它锚在算式真正引用到的那几列上。
+     *
+     * <h3>为什么口径也要有能失效的锚</h3>
+     * 列被删掉还算吵闹（查询直接报错）；<b>列被复用成别的含义才是要命的那一种</b>——
+     * SQL 照跑、行数照出，数字静默地错，而模型会一直照着这条口径写下去。
+     *
+     * <h3>覆盖时的三个分支</h3>
+     * <ol>
+     *   <li><b>这次带了依赖列</b>：整份重算，新的列集合就是新基线；</li>
+     *   <li><b>没带、而既有行本来就锚着列集合</b>：按既有名单在当前快照上 re-baseline
+     *       （理由见 {@link HumanAnchor#REBASE}）；</li>
+     *   <li><b>没带、既有行是 {@link #ANCHOR_NONE}</b>：锚点那两列<b>一个都不 set</b>。
+     *       给一条纯人工口径现编一个锚点，等于凭空给它加上一个会过期的理由。</li>
+     * </ol>
+     *
+     * @param dependsOn 算式里<b>真正出现</b>的列（调用方已按快照核对过并盖好每列指纹）。
+     *                  多填一列的代价很具体：那一列改个注释就会让整条口径停止注入
+     * @param snapshot  上一次刷新的结构快照，算锚点与 re-baseline 用
+     */
+    public ConnectorSemantic defineMetric(Long connectorId, String term, String gloss,
+                                          Map<String, Object> detail,
+                                          List<AnchorColumn> dependsOn,
+                                          Map<String, Map<String, FieldDetail>> snapshot,
+                                          String answeredBy, String answeredName, String traceId) {
+        if (term == null || term.isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "口径词条不能为空");
+        }
+        if (gloss == null || gloss.isBlank()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "口径说明不能为空");
+        }
+        List<AnchorColumn> cols = dependsOn == null ? List.of() : dependsOn;
+        return upsertHuman(connectorId, HumanWrite.builder()
+                .scope(SCOPE_METRIC)
+                .objectName("")
+                .fieldName("")
+                .term(term.trim())
+                .gloss(gloss)
+                .detail(detail)
+                // 人答的口径依据是"人说的"，不是数据也不是注释。它恰恰是数据库里查不到答案的那一类。
+                .evidence(EV_GUESS)
+                .anchorKind(ANCHOR_NONE)
+                .anchorHash(null)
+                .anchorColumns(cols)
+                .snapshot(snapshot)
+                .onOverwrite(cols.isEmpty() ? HumanAnchor.REBASE : HumanAnchor.SET)
+                .subject("口径「" + term.trim() + "」")
+                .answeredBy(answeredBy)
+                .answeredName(answeredName)
+                .traceId(traceId)
+                .build());
+    }
+
+    /**
+     * 「这张表是干什么的」。OBJECT 行<b>不锚结构</b>：客户加一列并不改变这句话，
+     * 只有整张表消失才让它失效（见建表脚本里锚点那一段的论证）。
+     */
+    public ConnectorSemantic annotateObject(Long connectorId, String objectName, String note,
+                                            String answeredBy, String answeredName, String traceId) {
+        return upsertHuman(connectorId, HumanWrite.builder()
+                .scope(SCOPE_OBJECT)
+                .objectName(objectName)
+                .fieldName("")
+                .term("")
+                .gloss(note)
+                .evidence(EV_GUESS)
+                .anchorKind(ANCHOR_NONE)
+                .onOverwrite(HumanAnchor.SET)
+                .subject("表「" + objectName + "」的说明")
+                .answeredBy(answeredBy)
+                .answeredName(answeredName)
+                .traceId(traceId)
+                .build());
+    }
+
+    /**
+     * 「这一列什么意思」。这是 B4 里量最大的一类（实测 434 条语义里有 99 条 FIELD 自己写着「未确认 / 含义不清楚」）。
+     *
+     * @param anchorHash 调用方从<b>快照</b>里这一列算出的 {@link #fieldAnchor}。
+     *                   为空表示快照里找不到这一列——调用方本该在此之前就拒写，这里兜底成无锚
+     */
+    public ConnectorSemantic annotateField(Long connectorId, String objectName, String columnName, String note,
+                                           String anchorHash,
+                                           String answeredBy, String answeredName, String traceId) {
+        return upsertHuman(connectorId, HumanWrite.builder()
+                .scope(SCOPE_FIELD)
+                .objectName(objectName)
+                .fieldName(columnName)
+                .term("")
+                .gloss(note)
+                .evidence(EV_GUESS)
+                .anchorKind(anchorHash == null ? ANCHOR_NONE : ANCHOR_FIELD)
+                .anchorHash(anchorHash)
+                .onOverwrite(HumanAnchor.SET)
+                .subject("字段「" + objectName + "." + columnName + "」的说明")
+                .answeredBy(answeredBy)
+                .answeredName(answeredName)
+                .traceId(traceId)
+                .build());
+    }
+
+    /**
+     * 「这两张表怎么连」，以及<b>「这两张表没关系」</b>。
+     *
+     * <p>后者是 B4 之前根本写不进去的那一种：JOIN 连覆盖都做不到，因为「没关系」不是一个能写进去的值。
+     * 现在它是 {@link #KEY_HUMAN_VERDICT} 的一个取值，而 {@code verified} 那一列<b>一次都不 set</b>——
+     * 用 {@link #V_REJECTED} 表达会让这句话伪装成一次采样结论，并被 {@link #mergeInferred} 整组搬运下去。
+     *
+     * @param related    人说这两列是不是同一个东西
+     * @param anchorHash 调用方从快照里两端列算出的 {@link #joinAnchor}
+     */
+    public ConnectorSemantic annotateJoin(Long connectorId, String objectName, String columnName,
+                                          String toObject, String toColumn, boolean related, String note,
+                                          String anchorHash,
+                                          String answeredBy, String answeredName, String traceId) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put(KEY_TO_OBJECT, toObject);
+        detail.put(KEY_TO_COLUMN, toColumn);
+        detail.put(KEY_HUMAN_VERDICT, related ? HV_RELATED : HV_UNRELATED);
+        detail.put("basis", related ? "由业务方在对话中确认" : "业务方在对话中明确说这两张表没有关系");
+        return upsertHuman(connectorId, HumanWrite.builder()
+                .scope(SCOPE_JOIN)
+                .objectName(objectName)
+                .fieldName(columnName)
+                .term("")
+                .gloss(note)
+                .detail(detail)
+                .evidence(EV_GUESS)
+                .anchorKind(anchorHash == null ? ANCHOR_NONE : ANCHOR_JOIN)
+                .anchorHash(anchorHash)
+                .onOverwrite(HumanAnchor.SET)
+                .subject("关系「" + objectName + "." + columnName + " → " + toObject + "." + toColumn + "」")
+                .answeredBy(answeredBy)
+                .answeredName(answeredName)
+                .traceId(traceId)
+                .build());
+    }
+
+    /**
+     * 「用这条连接的时候要注意什么」。
+     *
+     * <p>{@code evidence} 传 {@code null} 是有意的：CAVEAT 不是一条断言，而是一句提醒 / 一个还没有答案的问题，
+     * 给它挂任何一个依据来源都是在说「这句话有某种出处」。
+     */
+    public ConnectorSemantic annotateCaveat(Long connectorId, String term, String note, List<String> appliesTo,
+                                            String answeredBy, String answeredName, String traceId) {
+        Map<String, Object> detail = null;
+        if (appliesTo != null && !appliesTo.isEmpty()) {
+            detail = new LinkedHashMap<>();
+            detail.put(KEY_APPLIES_TO, appliesTo);
+        }
+        return upsertHuman(connectorId, HumanWrite.builder()
+                .scope(SCOPE_CAVEAT)
+                .objectName("")
+                .fieldName("")
+                .term(term)
+                .gloss(note)
+                .detail(detail)
+                .evidence(null)
+                .anchorKind(ANCHOR_NONE)
+                .onOverwrite(HumanAnchor.SET)
+                .subject("告诫「" + term + "」")
+                .answeredBy(answeredBy)
+                .answeredName(answeredName)
+                .traceId(traceId)
+                .build());
+    }
+
+    /** 调用方给的 detail 落库形状：带进来的过期名单一律拿掉（它只该由漂移处置写），依赖列名单按本次的重写。 */
+    private String humanDetailJson(Map<String, Object> detail, List<AnchorColumn> columns) {
+        if (detail == null && columns.isEmpty()) {
             return null;
         }
-        if (!detail.containsKey(KEY_STALE_REMOVED)) {
-            return toJson(detail);
-        }
-        Map<String, Object> copy = new LinkedHashMap<>(detail);
+        Map<String, Object> copy = detail == null ? new LinkedHashMap<>() : new LinkedHashMap<>(detail);
         copy.remove(KEY_STALE_REMOVED);
+        if (!columns.isEmpty()) {
+            copy.put(KEY_ANCHOR_COLUMNS, detailColumns(columns));
+        }
         return toJson(copy);
+    }
+
+    /**
+     * 覆盖时 {@code detail_json} 写成什么。
+     *
+     * <p>三种情形刻意分开：这次给了 detail 就整份替换；没给但补了依赖列，就<b>只</b>换掉依赖列名单、
+     * 其余键一个字不动（「重新确认一次口径」不等于「把我没提的那些细节清空」）；两样都没给就沿用既有的，
+     * 只去掉过期名单。
+     */
+    private String overwriteDetail(ConnectorSemantic existing, Map<String, Object> detail,
+                                   List<AnchorColumn> columns) {
+        if (detail != null) {
+            return humanDetailJson(detail, columns);
+        }
+        if (!columns.isEmpty()) {
+            return withAnchorColumns(withoutStaleRemoved(existing.getDetailJson(), existing.getId()),
+                    existing.getId(), columns);
+        }
+        return withoutStaleRemoved(existing.getDetailJson(), existing.getId());
+    }
+
+    /** 在既有 detail 上原地换掉依赖列名单。序列化失败就原样返回——少一次 re-baseline，好过把整份 detail 写丢。 */
+    private String withAnchorColumns(String detailJson, Long id, List<AnchorColumn> columns) {
+        Map<String, Object> d = new LinkedHashMap<>(readDetail(detailJson, id));
+        d.put(KEY_ANCHOR_COLUMNS, detailColumns(columns));
+        String json = toJson(d);
+        return json == null ? detailJson : json;
+    }
+
+    /** 形状由 {@link AnchorColumn#toDetailMap} 一处产出，写入侧不要在别处各拼各的键名。 */
+    private static List<Map<String, Object>> detailColumns(List<AnchorColumn> columns) {
+        List<Map<String, Object>> out = new ArrayList<>(columns.size());
+        for (AnchorColumn c : columns) {
+            out.add(c.toDetailMap());
+        }
+        return out;
+    }
+
+    /**
+     * 按当前快照重新给每一列盖一次指纹（re-baseline 的那一步）。
+     *
+     * @return {@code null} = 名单读不出来，或者有列已经不在快照里了。<b>两种都不动锚点</b>：
+     *         后者意味着那条 STALE 是真的，人这一次确认改不了「列没了」这个事实
+     */
+    private static List<AnchorColumn> restamp(List<AnchorColumn> columns,
+                                              Map<String, Map<String, FieldDetail>> snapshot) {
+        if (columns == null || columns.isEmpty() || snapshot == null || snapshot.isEmpty()) {
+            return null;
+        }
+        List<AnchorColumn> out = new ArrayList<>(columns.size());
+        for (AnchorColumn c : columns) {
+            FieldDetail f = column(objectColumns(snapshot, c.objectName()), c.columnName());
+            if (f == null) {
+                return null;
+            }
+            out.add(new AnchorColumn(c.objectName(), c.columnName(), fieldAnchor(f)));
+        }
+        return out;
     }
 
     /**
@@ -905,6 +1347,16 @@ public class ConnectorSemanticService {
         entry.put("by_name", byName);
         entry.put("from_gloss", row.getGloss());
         entry.put("from_detail", row.getDetailJson());
+        // ★ 旧的采样结论必须单独留一份。覆盖路径一次都不 set verified（见 upsertHuman），
+        //   所以列上那个值不会被这次写动到；但下一次推导 / 验证可能会改它，届时「人改这条关系之前
+        //   平台到底验出过什么」就只剩这里了。JOIN 被人改掉对端之后，那个结论再也回不去。
+        entry.put("from_verified", row.getVerified());
+        // 对端单独抄一份，不指望读留痕的人再去解一次 from_detail 那串 JSON。
+        Map<String, Object> old = readDetail(row);
+        if (old.get(KEY_TO_OBJECT) != null || old.get(KEY_TO_COLUMN) != null) {
+            entry.put("from_to_object", old.get(KEY_TO_OBJECT));
+            entry.put("from_to_column", old.get(KEY_TO_COLUMN));
+        }
         entry.put("trace_id", traceId);
         hist.add(entry);
         while (hist.size() > HISTORY_MAX) {
@@ -1269,11 +1721,19 @@ public class ConnectorSemanticService {
                 continue;
             }
             String target = flippedStatus(r, v.stale());
-            if (target == null) {
+            // COLUMN_SET 行过期时顺手记下是哪几列变了，复活时清掉。别的锚点一律返回 null（detail 不动）。
+            String newDetail = staleColumnsDetail(r, v.stale() ? v.changedColumns() : List.of());
+            if (target == null && newDetail == null) {
                 continue;
             }
-            if (!writeDrift(r, target, null)) {
+            if (!writeDrift(r, target == null ? r.getStatus() : target, newDetail)) {
                 skipped++;
+                continue;
+            }
+            if (newDetail != null) {
+                r.setDetailJson(newDetail);
+            }
+            if (target == null) {
                 continue;
             }
             r.setStatus(target);
@@ -1307,12 +1767,28 @@ public class ConnectorSemanticService {
             // 名单只关心「表在不在」：确认还在（描述到，或目录列出 / 单独确认存在）就划掉。
             c.values().removeIf(x -> view.state(x).exists());
             List<String> causes = new ArrayList<>(c.values());
+
+            // 锚点这一次判成什么。COLUMN_SET 会答三值，其余锚点只有 OK / STALE。
+            AnchorJudgement j = anchorJudgement(r, view);
+            boolean noBasis = j.verdict() == AnchorVerdict.NO_BASIS;
+            // 「是哪几列变了」的名单：没有依据的这一轮一个字都不改（改成空 = 悄悄说「已经不变了」）。
+            List<String> changedCols = j.stale() ? j.changedColumns() : List.of();
+            boolean colsChanged = !noBasis && ANCHOR_COLUMN_SET.equals(r.getAnchorKind())
+                    && !stringList(d.get(KEY_STALE_COLUMNS)).equals(changedCols);
+
             String newDetail = null;
-            if (!causes.equals(before)) {
+            if (!causes.equals(before) || colsChanged) {
                 if (causes.isEmpty()) {
                     d.remove(KEY_STALE_REMOVED);
                 } else {
                     d.put(KEY_STALE_REMOVED, causes);
+                }
+                if (colsChanged) {
+                    if (changedCols.isEmpty()) {
+                        d.remove(KEY_STALE_COLUMNS);
+                    } else {
+                        d.put(KEY_STALE_COLUMNS, changedCols);
+                    }
                 }
                 newDetail = toJson(d);
                 if (newDetail == null) {
@@ -1321,8 +1797,13 @@ public class ConnectorSemanticService {
                     continue;
                 }
             }
-            boolean shouldStale = !causes.isEmpty() || anchorStale(r, view);
+            // 「这一次消失的表」是与锚点无关的另一份证据：表确实不在了，口径必然不成立，锚点有没有依据都一样。
+            boolean shouldStale = !causes.isEmpty() || j.stale();
             String target = flippedStatus(r, shouldStale);
+            if (noBasis && !shouldStale) {
+                // ★ 没有依据就一个字不动，尤其是不复活：复活同样是一个结论，而这次手上没有下结论的材料。
+                target = null;
+            }
             if (target == null && newDetail == null) {
                 continue;
             }
@@ -1398,7 +1879,8 @@ public class ConnectorSemanticService {
     /**
      * 挂在具体表上的一行，这次该不该过期。
      *
-     * @return {@code null} = 没有依据、一个字不碰（它挂的表或关系另一端没看到，而它又不是只看「表在不在」的行）；
+     * @return {@code null} = 没有依据、一个字不碰（它挂的表或关系另一端没看到、
+     *         或者它是 COLUMN_SET 而列集合里有表这次没描述到，而它又不是只看「表在不在」的行）；
      *         否则 {@code absent} 是它挂着的、这次 ABSENT 的表（折叠名 → 原写法），非空时必然过期
      */
     private AnchoredVerdict judgeAnchored(ConnectorSemantic r, String obj, DriftView view) {
@@ -1432,16 +1914,21 @@ public class ConnectorSemanticService {
         }
         if (!absent.isEmpty()) {
             // ABSENT 压过「没看到」：一端确定没了，另一端看没看到都不改变结论。
-            return new AnchoredVerdict(true, absent);
+            return new AnchoredVerdict(true, absent, List.of());
         }
         if (unseen) {
             // ★ 只有真没看到的那一端可以让判定跳过。描述到了的那一端上列没了，与 ABSENT 一样确定。
             if (join && describedEndLostColumn(r, obj, to, toCol, view)) {
-                return new AnchoredVerdict(true, Map.of());
+                return new AnchoredVerdict(true, Map.of(), List.of());
             }
             return null;
         }
-        return new AnchoredVerdict(anchorStale(r, view), Map.of());
+        AnchorJudgement j = anchorJudgement(r, view);
+        if (j.verdict() == AnchorVerdict.NO_BASIS) {
+            // COLUMN_SET 的列集合这次读不出来、或里面有表没描述到：没有依据，与上面「没看到」同一条规矩。
+            return null;
+        }
+        return new AnchoredVerdict(j.stale(), Map.of(), j.changedColumns());
     }
 
     /**
@@ -1479,7 +1966,121 @@ public class ConnectorSemanticService {
         return null;
     }
 
-    /** 锚点算不出来（列没了）也算失效；算出来但对不上同样失效。 */
+    /**
+     * 这一行的锚点这次判成什么。<b>三值，不是布尔。</b>
+     *
+     * <p>两值的时候「没有依据」只能并进「没变」，于是一条其实没人验证过的行被当成「结构照旧」——
+     * 已经 STALE 的还会被 {@link #flippedStatus} 复活。第三个值就是为了让「这次不知道」说得出口。
+     * 只有 COLUMN_SET 会答 {@code NO_BASIS}：FIELD / JOIN 的「没看到」在 {@link #judgeAnchored} 上游
+     * 就按表拦住了，而 COLUMN_SET 的列散在好几张表上，那道门拦不住。
+     */
+    private AnchorJudgement anchorJudgement(ConnectorSemantic r, DriftView view) {
+        if (ANCHOR_COLUMN_SET.equals(r.getAnchorKind())) {
+            return columnSetVerdict(r, view);
+        }
+        return anchorStale(r, view) ? new AnchorJudgement(AnchorVerdict.STALE, List.of()) : AnchorJudgement.OK;
+    }
+
+    /**
+     * 口径 SQL 片段引用的那几列，这次还是不是原来的样子。
+     *
+     * <h3>★ 为什么「没描述到」必须答 NO_BASIS，而不是 STALE</h3>
+     * 快照最多描述 200 张表。口径引用的表只要有一张这次没排进去，列就没得比——
+     * 此时判过期，人答的口径会在一次与结构无关的刷新里停止注入、管理台还去叫业务方重答；
+     * 判没变则更糟：它会把一条真该过期的行复活。<b>没描述到就是没有依据，状态一个字都不许动。</b>
+     * 表这次 ABSENT 是另一回事：表都没了，它的列当然也没了，那是确定的结论，照常按 STALE 走。
+     *
+     * <h3>为什么坏掉的列集合也只算 NO_BASIS</h3>
+     * detail_json 解析失败、名单不是列表、元素缺字段——这些是我们自己写坏了，不是客户库改了结构。
+     * 拿自己的 bug 去停用人答的口径是最难查的一种误报，所以只 warn，不动行。
+     */
+    private AnchorJudgement columnSetVerdict(ConnectorSemantic r, DriftView view) {
+        List<AnchorColumn> cols = parseAnchorColumns(readDetail(r).get(KEY_ANCHOR_COLUMNS));
+        if (cols == null || r.getAnchorHash() == null || r.getAnchorHash().isBlank()) {
+            log.warn("COLUMN_SET 行的列集合读不出来（缺 {} 或缺 anchor_hash），本轮既不判过期也不复活 "
+                            + "id={} scope={} term={}",
+                    KEY_ANCHOR_COLUMNS, r.getId(), r.getScope(), r.getTerm());
+            return AnchorJudgement.NO_BASIS;
+        }
+        for (AnchorColumn c : cols) {
+            Presence p = view.state(c.objectName());
+            if (p != Presence.DESCRIBED && p != Presence.ABSENT) {
+                // 只被目录列出、或根本没看到：这次没有列可比。★ 不能把「没看」当成「没了」。
+                log.debug("COLUMN_SET 行依赖的表这次没描述到（{}），本轮不判定 id={} object={} term={}",
+                        p, r.getId(), c.objectName(), r.getTerm());
+                return AnchorJudgement.NO_BASIS;
+            }
+        }
+        String now = computeColumnSetAnchor(cols, view::columns);
+        if (now != null && now.equals(r.getAnchorHash())) {
+            return AnchorJudgement.OK;
+        }
+        // 到这里已经确定变了。再逐列过一遍只为了说得出「是哪几列」：
+        // 列不在了一定报得出；fieldAnchor 变了要看写入侧有没有存下当时的每列指纹（存了才点得出名字）。
+        List<String> changed = new ArrayList<>();
+        for (AnchorColumn c : dedupSorted(cols)) {
+            FieldDetail f = column(view.columns(c.objectName()), c.columnName());
+            if (f == null || (c.anchor() != null && !c.anchor().equals(fieldAnchor(f)))) {
+                changed.add(c.qualifiedName());
+            }
+        }
+        return new AnchorJudgement(AnchorVerdict.STALE, List.copyOf(changed));
+    }
+
+    /**
+     * COLUMN_SET 行的「是哪几列变了」名单：过期时记下、复活时清掉。
+     *
+     * @return 要写的新 detail_json；{@code null} = 名单没变化（或序列化失败），detail 不动
+     */
+    private String staleColumnsDetail(ConnectorSemantic r, List<String> changed) {
+        if (!ANCHOR_COLUMN_SET.equals(r.getAnchorKind())) {
+            return null;
+        }
+        Map<String, Object> d = new LinkedHashMap<>(readDetail(r));
+        if (stringList(d.get(KEY_STALE_COLUMNS)).equals(changed)) {
+            return null;
+        }
+        if (changed.isEmpty()) {
+            d.remove(KEY_STALE_COLUMNS);
+        } else {
+            d.put(KEY_STALE_COLUMNS, changed);
+        }
+        // 序列化失败返回 null：名单没记下来，但状态该翻还是要翻——名单是取证材料，不是判定依据。
+        return toJson(d);
+    }
+
+    /**
+     * 从 detail_json 读出 COLUMN_SET 的列集合。
+     *
+     * @return {@code null} = 读不出来（不是列表、空列表、元素不是对象或缺字段）。
+     *         <b>调用方必须按「没有依据」处理，不许当成「结构变了」。</b>
+     */
+    private static List<AnchorColumn> parseAnchorColumns(Object raw) {
+        if (!(raw instanceof List<?> list) || list.isEmpty()) {
+            return null;
+        }
+        List<AnchorColumn> out = new ArrayList<>();
+        for (Object e : list) {
+            if (!(e instanceof Map<?, ?> m)) {
+                return null;
+            }
+            AnchorColumn c = new AnchorColumn(text(m.get(AnchorColumn.F_OBJECT)), text(m.get(AnchorColumn.F_COLUMN)),
+                    text(m.get(AnchorColumn.F_ANCHOR)));
+            if (!c.valid()) {
+                return null;
+            }
+            out.add(c);
+        }
+        return out;
+    }
+
+    /**
+     * 锚点算不出来（列没了）也算失效；算出来但对不上同样失效。
+     *
+     * <p><b>只回答两值，所以只能给「没看到」已经在上游拦掉的锚点用</b>（FIELD / JOIN：它们的表没描述到时，
+     * {@link #judgeAnchored} 根本走不到这里）。COLUMN_SET 必须走 {@link #columnSetVerdict} 的三值判定——
+     * 它的列散在好几张表上，上游那道「它挂的表在不在」的门拦不住「其中一张表这次没描述到」。
+     */
     private boolean anchorStale(ConnectorSemantic r, DriftView view) {
         if (ANCHOR_NONE.equals(r.getAnchorKind()) || r.getAnchorKind() == null) {
             return false;
@@ -1494,15 +2095,13 @@ public class ConnectorSemanticService {
      * 挂在它上面的字段与关系全部假过期。
      */
     private String recomputeAnchor(ConnectorSemantic r, DriftView view) {
-        Map<String, FieldDetail> cols = view.columns(r.getObjectName());
-        if (cols == null) return null;
-        FieldDetail left = column(cols, r.getFieldName());
-        if (left == null) return null;
-
         if (ANCHOR_FIELD.equals(r.getAnchorKind())) {
-            return fieldAnchor(left);
+            FieldDetail left = leftColumn(r, view);
+            return left == null ? null : fieldAnchor(left);
         }
         if (ANCHOR_JOIN.equals(r.getAnchorKind())) {
+            FieldDetail left = leftColumn(r, view);
+            if (left == null) return null;
             Map<String, Object> d = readDetail(r);
             String toObj = text(d.get("to_object"));
             String toCol = text(d.get("to_column"));
@@ -1511,8 +2110,26 @@ public class ConnectorSemanticService {
             if (right == null) return null;
             return joinAnchor(left, right);
         }
-        // COLUMN_SET 留给 P2 的口径 SQL 片段；现在没有产生它的路径。
+        if (ANCHOR_COLUMN_SET.equals(r.getAnchorKind())) {
+            // 列集合读不出来时得到 null（= 算不出来），与「有列不在了」同一个返回值；
+            // 两者的区别由 columnSetVerdict 分开，不在这里分。
+            return computeColumnSetAnchor(parseAnchorColumns(readDetail(r).get(KEY_ANCHOR_COLUMNS)), view::columns);
+        }
         return r.getAnchorHash();
+    }
+
+    /**
+     * 这一行自己那一列（{@code object_name.field_name}）。
+     *
+     * <p><b>★ 这两行刻意留在 FIELD / JOIN 各自的分支里，不准上提到方法开头。</b>
+     * METRIC / CAVEAT 行的 object_name 与 field_name 都是空串，取左列必然是 null；
+     * 上提之后 COLUMN_SET 的口径行一挂上就当场被判「锚点算不出来」= 过期——
+     * 明明是判定代码取错了列，看起来却像客户库真的改了结构。
+     */
+    private static FieldDetail leftColumn(ConnectorSemantic r, DriftView view) {
+        Map<String, FieldDetail> cols = view.columns(r.getObjectName());
+        if (cols == null) return null;
+        return column(cols, r.getFieldName());
     }
 
     private static FieldDetail column(Map<String, FieldDetail> cols, String name) {
@@ -1573,6 +2190,75 @@ public class ConnectorSemanticService {
     /** 关联的指纹：两端列任一变化都让这条关系不可信。 */
     public static String joinAnchor(FieldDetail left, FieldDetail right) {
         return sha256(fieldAnchor(left) + ">" + fieldAnchor(right));
+    }
+
+    /**
+     * 一个列集合的指纹：口径的 SQL 片段引用到的那几列，任何一列改了名 / 类型 / 可空 / 注释都让这条口径不可信。
+     *
+     * <h4>为什么口径必须锚在列集合上</h4>
+     * 列被删掉还算吵闹（查询直接报错）；<b>列被复用成别的含义才是要命的那一种</b>——
+     * SQL 照跑、行数照出，数字静默地错，而模型会一直照着这条口径写下去。所以口径也要有能失效的锚。
+     *
+     * <h4>★ 必须排序，而且按折叠后的名字排</h4>
+     * 列集合来自 detail_json，它的顺序是写入那一刻的书写顺序，重新确认一次顺序就可能不同。
+     * 不排序 = 同一组列算出两个 hash = <b>每次刷新都判假过期</b>，人答的口径被反复停用。
+     * 按折叠形态（{@link #ciFold}）排、也按折叠形态拼，则是因为处境判定与列查找本来就是大小写不敏感的：
+     * 只改了大小写的表名 / 列名必须算同一列，不能既判 DESCRIBED 又算出另一个 hash。
+     *
+     * @param fieldsByObject 本次描述到的每张表的字段（表名 → 列名 → FieldDetail），表名按折叠形态兜底匹配
+     * @return {@code null} = 集合为空、或有列这次找不到。调用方要分得清「算不出来」和「算出来但变了」
+     */
+    public static String columnSetAnchor(Collection<AnchorColumn> columns,
+                                         Map<String, Map<String, FieldDetail>> fieldsByObject) {
+        return computeColumnSetAnchor(columns, o -> objectColumns(fieldsByObject, o));
+    }
+
+    /** {@link #columnSetAnchor} 的内部形状：漂移处置手上是 {@code DriftView}，不是一张 map。 */
+    private static String computeColumnSetAnchor(Collection<AnchorColumn> columns,
+                                                 Function<String, Map<String, FieldDetail>> columnsOf) {
+        if (columns == null || columns.isEmpty()) {
+            return null;
+        }
+        StringBuilder b = new StringBuilder();
+        for (AnchorColumn c : dedupSorted(columns)) {
+            FieldDetail f = column(columnsOf.apply(c.objectName()), c.columnName());
+            if (f == null) {
+                return null;
+            }
+            b.append(c.foldedKey()).append('=').append(fieldAnchor(f)).append(',');
+        }
+        return sha256(b.toString());
+    }
+
+    /** 按折叠名去重并排序。重复的列只算一次：同一列写两遍不该算出另一个 hash。 */
+    private static List<AnchorColumn> dedupSorted(Collection<AnchorColumn> columns) {
+        Map<String, AnchorColumn> byKey = new LinkedHashMap<>();
+        for (AnchorColumn c : columns) {
+            if (c != null && c.valid()) {
+                byKey.putIfAbsent(c.foldedKey(), c);
+            }
+        }
+        List<AnchorColumn> out = new ArrayList<>(byKey.values());
+        out.sort(Comparator.comparing(AnchorColumn::foldedKey));
+        return out;
+    }
+
+    /** 表名先按原样找、找不到再按折叠形态找。理由同 {@link #recomputeAnchor}：处境判定是大小写不敏感的。 */
+    private static Map<String, FieldDetail> objectColumns(Map<String, Map<String, FieldDetail>> src, String object) {
+        if (src == null || object == null) {
+            return null;
+        }
+        Map<String, FieldDetail> c = src.get(object);
+        if (c != null) {
+            return c;
+        }
+        String k = ciFold(object);
+        for (Map.Entry<String, Map<String, FieldDetail>> e : src.entrySet()) {
+            if (e.getKey() != null && ciFold(e.getKey()).equals(k)) {
+                return e.getValue();
+            }
+        }
+        return null;
     }
 
     // ================================================================ 结构指纹（按表）
@@ -1973,8 +2659,87 @@ public class ConnectorSemanticService {
         }
     }
 
-    /** 挂在具体表上的一行的判定。{@code absent}：它挂着的、这次 ABSENT 的表（折叠名 → 原写法）。 */
-    private record AnchoredVerdict(boolean stale, Map<String, String> absent) {
+    /**
+     * 挂在具体表上的一行的判定。
+     *
+     * @param absent         它挂着的、这次 ABSENT 的表（折叠名 → 原写法）
+     * @param changedColumns COLUMN_SET 判过期时是哪几列变了（原写法，给人看）；其余锚点一律空
+     */
+    private record AnchoredVerdict(boolean stale, Map<String, String> absent, List<String> changedColumns) {
+    }
+
+    /**
+     * 锚点这一次的判定。<b>{@code NO_BASIS} 与 {@code OK} 必须分开</b>：
+     * 把「没依据」并进「没变」，一条早该过期的行会被当成「结构改回来了」复活。
+     */
+    public enum AnchorVerdict {
+        /** 重算出来与存着的锚点一致：结构没变。 */
+        OK,
+        /** 重算出来对不上（或列已经不在了）：结构变了，这一行不能再注入。 */
+        STALE,
+        /** 这次没有下结论的材料（依赖的表没描述到、列集合坏了）：状态一个字都不许动。 */
+        NO_BASIS
+    }
+
+    /** 一次锚点判定的结果。{@code changedColumns}：COLUMN_SET 判 STALE 时是哪几列变了（原写法，给人看）。 */
+    private record AnchorJudgement(AnchorVerdict verdict, List<String> changedColumns) {
+        static final AnchorJudgement OK = new AnchorJudgement(AnchorVerdict.OK, List.of());
+        static final AnchorJudgement NO_BASIS = new AnchorJudgement(AnchorVerdict.NO_BASIS, List.of());
+
+        boolean stale() {
+            return verdict == AnchorVerdict.STALE;
+        }
+    }
+
+    /**
+     * 锚点依赖的一列：表名 + 列名（+ 写入那一刻这一列的 {@link #fieldAnchor}，可为空）。
+     *
+     * <p>原写法一律保留：写回「是哪几列变了」和日志都要给人看。
+     * <b>比较、去重、排序一律按 {@link #foldedKey}</b>，与唯一键、处境判定同一个口径。
+     *
+     * @param anchor 写入那一刻这一列的指纹。<b>只用来说得出「是哪一列变了」，不参与判定</b>——
+     *               判定看的是整个集合的 hash（它就是行上的 {@code anchor_hash}）。为空时名单只报得出没了的列。
+     */
+    public record AnchorColumn(String objectName, String columnName, String anchor) {
+
+        static final String F_OBJECT = "object";
+        static final String F_COLUMN = "column";
+        static final String F_ANCHOR = "anchor";
+
+        public AnchorColumn {
+            objectName = objectName == null ? "" : objectName.trim();
+            columnName = columnName == null ? "" : columnName.trim();
+        }
+
+        public AnchorColumn(String objectName, String columnName) {
+            this(objectName, columnName, null);
+        }
+
+        /** 折叠后的 {@code obj.col}：排序、去重、拼指纹都用它。 */
+        public String foldedKey() {
+            return ciFold(objectName) + '.' + ciFold(columnName);
+        }
+
+        /** 给人看的 {@code obj.col}（原写法）。 */
+        public String qualifiedName() {
+            return objectName + "." + columnName;
+        }
+
+        /** 表名、列名都得有。缺一个就没法找回这一列，整份名单按「读不出来」处理。 */
+        public boolean valid() {
+            return !objectName.isEmpty() && !columnName.isEmpty();
+        }
+
+        /** 写进 detail_json 的形状。<b>写入侧用这一个，别在别处各拼各的键名。</b> */
+        public Map<String, Object> toDetailMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put(F_OBJECT, objectName);
+            m.put(F_COLUMN, columnName);
+            if (anchor != null && !anchor.isBlank()) {
+                m.put(F_ANCHOR, anchor);
+            }
+            return m;
+        }
     }
 
     /** 删取值时一行的改法。字段为 {@code null} = 那一列不动。 */

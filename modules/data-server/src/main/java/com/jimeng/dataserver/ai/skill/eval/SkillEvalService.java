@@ -11,6 +11,7 @@ import com.jimeng.dataserver.ai.agent.exec.config.AgentSandboxProperties;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.exec.service.SidecarClient;
 import com.jimeng.dataserver.ai.claude.service.ClaudeService;
+import com.jimeng.dataserver.ai.connector.agent.ConnectorAgentContextFactory;
 import com.jimeng.dataserver.web.MdcAsyncSupport;
 import com.jimeng.persistence.entity.SkillEvalRun;
 import com.jimeng.persistence.mapper.SkillEvalRunMapper;
@@ -49,6 +50,18 @@ import java.util.concurrent.TimeUnit;
  * data-service 的读超时。并发跑用例会直接把真实用户的对话挤进队列甚至挤掉；
  * 同步等更不行——跑到第 3、4 个用例就超过 HTTP 超时了。所以：提交即返回 runId，
  * 后台串行跑，前端轮询进度。
+ *
+ * <h3>★ 需要连接器的 skill：必须指定一个真实 agentId，否则直接拒绝这一轮</h3>
+ * {@code connector} 这类 skill 的全部契约都写在「怎么用 {@code conn_*} 工具」上。沙箱里没有这组工具时，
+ * 模型<b>一条用例都做不对</b>，而失败原因全都是「调不到工具」——那是一个<b>假红灯</b>：
+ * 它长得和「SKILL.md 写坏了」一模一样，会把人引去改文字，而真正的原因是本轮压根没有工具。
+ *
+ * <p>为什么不能凭空造一个 agentId：回调 token 的 {@code aid} claim 和 {@code ConnectorGateway} 的
+ * {@code agent_connection} 实时授权都以它为准。造一个不存在的 id，要么什么连接都查不到（还是假红灯），
+ * 要么——如果哪天授权判据松了——就成了一条绕过授权的路。所以口径是：
+ * <b>评测 connector 必须由调用方指定一个真实的、已被授权连接的 Agent</b>，缺了就在提交时报错，
+ * 绝不静默跑一个没有工具的 run。前置条件（总开关、回调地址、授权、边车版本）也在提交时一并查，
+ * 不合格就不开跑——那些用例烧的是真 token。
  */
 @Slf4j
 @Service
@@ -71,6 +84,7 @@ public class SkillEvalService {
     private final AgentSandboxProperties sandboxProps;
     private final ClaudeService claudeService;
     private final ThreadPoolTaskExecutor streamExecutor;
+    private final ConnectorAgentContextFactory connectorAgentContextFactory;
 
     /** 评委模型。留空则回落 sandboxProps 的 model；建议在 Nacos 配一个 ai_model 表里 enabled=1 的值。 */
     @org.springframework.beans.factory.annotation.Value("${skill.eval.grader-model:}")
@@ -83,13 +97,31 @@ public class SkillEvalService {
      * @param files skill 的文件表（脚本、references 等）；PROMPT skill 传空即可
      */
     public SkillEvalRun start(String skillName, String body, Map<String, String> files,
-                              EvalSuite suite, String mode, Long skillId, Long conversationId) {
+                              EvalSuite suite, String mode, Long skillId, Long conversationId,
+                              Long agentId) {
         if (suite == null || suite.getEvals() == null || suite.getEvals().isEmpty()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "没有测试用例：请在 skill 包里提供 evals/evals.json");
         }
         if (!MODE_RECALL.equals(mode) && !MODE_CAPABILITY.equals(mode)) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "mode 只能是 RECALL / CAPABILITY");
+        }
+        // ★ 提交时就把「这轮到底有没有 conn_* 工具」问清楚，见类注释：假红灯比不跑更贵。
+        if (requiresConnectorTools(skillName)) {
+            if (agentId == null) {
+                throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                        "评测 " + ConnectorAgentContextFactory.CONNECTOR_SKILL_NAME
+                                + " 技能必须指定 agentId：沙箱里的 conn_* 工具钉在一个真实 Agent 上"
+                                + "（回调 token 的 aid claim + agent_connection 实时授权），"
+                                + "不指定就只能跑出一个「模型调不到工具」的假红灯。");
+            }
+            String decline = connectorAgentContextFactory.preflight(
+                    TenantContext.get(), AdminRequestContext.findUserIdOrNull(), agentId);
+            if (decline != null) {
+                throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                        "本轮无法给沙箱下发 conn_* 工具，评测不开跑（否则每条用例都会因为调不到工具而失败，"
+                                + "那是假红灯）：" + decline);
+            }
         }
         SkillEvalRun run = new SkillEvalRun();
         run.setSkillId(skillId);
@@ -108,7 +140,7 @@ public class SkillEvalService {
         final Long runId = run.getId();
         final String tenantId = TenantContext.get();
         streamExecutor.execute(MdcAsyncSupport.wrap("skill-eval-" + runId,
-                () -> runAll(runId, tenantId, skillName, body, files, suite, mode)));
+                () -> runAll(runId, tenantId, skillName, body, files, suite, mode, agentId)));
         return run;
     }
 
@@ -121,7 +153,7 @@ public class SkillEvalService {
     // ------------------------------------------------------------------ 后台执行
 
     private void runAll(Long runId, String tenantId, String skillName, String body,
-                        Map<String, String> files, EvalSuite suite, String mode) {
+                        Map<String, String> files, EvalSuite suite, String mode, Long agentId) {
         List<Map<String, Object>> caseResults = new ArrayList<>();
         int passed = 0;
         int finished = 0;
@@ -139,7 +171,7 @@ public class SkillEvalService {
                     String prompt = MODE_RECALL.equals(mode)
                             ? EvalPrompts.recallPrompt(c.getPrompt())
                             : EvalPrompts.capabilityPrompt(skillName, c.getPrompt());
-                    Transcript t = runOneCase(tenantId, skillName, ref, prompt);
+                    Transcript t = runOneCase(tenantId, skillName, ref, prompt, agentId);
                     one.put("transcript", t.text());
                     one.put("artifacts", t.artifacts());
 
@@ -217,9 +249,15 @@ public class SkillEvalService {
     private record Transcript(String text, List<String> artifacts) {
     }
 
-    /** 派一次沙箱 run，把 SSE 事件折成可读的 transcript。阻塞直到本轮结束或超时。 */
+    /**
+     * 派一次沙箱 run，把 SSE 事件折成可读的 transcript。阻塞直到本轮结束或超时。
+     *
+     * <p><b>连接器工具按用例签发、按用例撤销</b>：每条用例是一次独立的沙箱 run，有自己的 runId，
+     * 而回调 token 与吊销登记都钉在 runId 上。整轮共用一枚的话，第 1 条用例跑完就得留着它给后面用，
+     * 等于把一枚全连接器读写凭据的有效期拉长到整轮评测（可能几分钟到十几分钟）。
+     */
     private Transcript runOneCase(String tenantId, String skillName,
-                                  SidecarRunPayload.SkillRef ref, String prompt) {
+                                  SidecarRunPayload.SkillRef ref, String prompt, Long agentId) {
         SidecarRunPayload payload = new SidecarRunPayload();
         payload.setRunId("eval-" + UUID.randomUUID());
         payload.setTenantId(tenantId);
@@ -239,6 +277,21 @@ public class SkillEvalService {
         limits.setMaxTurns(sandboxProps.getMaxTurns());
         limits.setMaxBudgetUsd(sandboxProps.getMaxBudgetUsd());
         payload.setLimits(limits);
+
+        // 与对话平面同一套（判定 → 登记 → 签发 → finally 撤销），不复制一份逻辑。
+        // agentId 为空（普通 skill 的评测）时 open 直接返回未授予的租约，close 是空操作。
+        ConnectorAgentContextFactory.Lease connectorLease = connectorAgentContextFactory.open(
+                tenantId, AdminRequestContext.findUserIdOrNull(), agentId,
+                payload.getRunId(), sandboxProps.getWallClockSec());
+        if (connectorLease.granted()) {
+            payload.setConnectorContext(connectorLease.context());
+        } else if (requiresConnectorTools(skillName)) {
+            // start() 已经 preflight 过，走到这里说明中途条件变了（授权被撤、边车重启成老版本…）。
+            // 不静默跑：跑出来的是假红灯，而它长得和「SKILL.md 写坏了」一模一样。
+            connectorLease.close();
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "本用例无法下发 conn_* 工具：" + connectorLease.declineReason());
+        }
 
         StringBuilder text = new StringBuilder();
         List<String> artifacts = new ArrayList<>();
@@ -265,14 +318,18 @@ public class SkillEvalService {
             }
         };
 
-        sidecarClient.run(payload, listener);
         try {
+            sidecarClient.run(payload, listener);
             if (!latch.await(sandboxProps.getWallClockSec() + 30L, TimeUnit.SECONDS)) {
                 text.append("\n[error] 本轮超时");
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             text.append("\n[error] 被中断");
+        } finally {
+            // ★ 正常结束、超时、被中断、派发本身抛异常，四条路都要走到这里撤销回调凭据。
+            //   漏掉只是退化成靠 TTL 自然过期，而那个窗口正是这张登记要消灭的东西。
+            connectorLease.close();
         }
         String s = text.toString();
         if (s.length() > MAX_TRANSCRIPT_CHARS) {
@@ -315,6 +372,18 @@ public class SkillEvalService {
         } catch (Exception e) {
             out.append("\n[").append(type).append("] ").append(data);
         }
+    }
+
+    /**
+     * 这个 skill 是不是「没有 {@code conn_*} 工具就根本测不了」的那一类。
+     *
+     * <p>按<b>名字</b>判而不是按 frontmatter 的 {@code requires}：评测的输入可能是构建器里的草稿，
+     * 草稿的 body 已经被剥掉 frontmatter（{@code SkillDraft} 只有 name/description/body/files），
+     * 这里拿不到 requires。名字是两条来源（磁盘平台技能、草稿）都一定有的东西。
+     */
+    private static boolean requiresConnectorTools(String skillName) {
+        return ConnectorAgentContextFactory.CONNECTOR_SKILL_NAME.equalsIgnoreCase(
+                skillName == null ? null : skillName.trim());
     }
 
     // ------------------------------------------------------------------ 评委

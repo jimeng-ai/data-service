@@ -1468,6 +1468,122 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
         return out;
     }
 
+    // ================================================================ 表里有没有行（缺陷 B19）
+
+    /**
+     * 单条探测语句的超时（秒）。<b>不是性能调优项，是成本上限的一半</b>：
+     * 一张表上的 {@code SELECT 1 ... LIMIT 1} 正常是毫秒级，跑到 2 秒只可能是锁等待或视图在现算——
+     * 这两种情况继续等下去也换不来一个可信的答案，不如记成「不知道」往下走。
+     */
+    private static final int ROW_PRESENCE_STATEMENT_TIMEOUT_SEC = 2;
+
+    /**
+     * 一次探测最多问多少个名字。快照本身最多 200 个对象（{@code ConnectorSchemaService.MAX_OBJECTS}），
+     * 这里再钉一道：调用方哪天放开上限，也不会让一次刷新变成对客户库的几千次往返。超出的名字按「不知道」处理。
+     */
+    static final int ROW_PRESENCE_MAX_NAMES = 200;
+
+    /**
+     * 这些对象里哪些至少有一行、哪些确认是空的。契约（含「不要用 COUNT(*)」「不要信 TABLE_ROWS」）见
+     * {@link DescribeCapable#probeRowPresence}。
+     *
+     * <h3>命中即停</h3>
+     * 语句是 {@code SELECT 1 FROM `t` LIMIT 1}：有数据时读到第一行就返回，空表时才会走完（空表上那也很便宜）。
+     * {@code COUNT(*)} 在 InnoDB 上是真的全表/全索引扫，为了一个布尔付那个代价没有道理；
+     * {@code information_schema.TABLE_ROWS} 是抽样估算，对「是不是恰好 0 行」不可靠。
+     *
+     * <h3>成本上限：一借连接 + 挂钟预算 + 单句超时</h3>
+     * 整批只借<b>一条</b>连接（N 次借还在跨公网的连接上比查询本身还贵），每句 {@value #ROW_PRESENCE_STATEMENT_TIMEOUT_SEC} 秒超时，
+     * 整批受调用方给的 {@code budgetMillis} 约束：每探一张表前先看预算，用完就<b>停下并把剩下的留成「不知道」</b>。
+     * 所以最坏情况是「预算 + 最后那一句的超时」，而不是「表数 × 超时」。
+     *
+     * <h3>每一种失败都只能落到「不知道」</h3>
+     * 名字过不了标识符白名单（反引号里拼名字，白名单是注入防线，不能放宽）、这一句报错（权限、表刚被删、超时）、
+     * 借不到连接、驱动抛未受检异常——一律<b>不写进结果 map</b>。空 map 与 {@code null} 在调用方眼里都是「全不知道」，
+     * 而把任何一种失败写成 {@code FALSE}，就是凭空告诉模型「这张表是空的」。
+     *
+     * <p><b>连接级的失败会中止整批</b>（{@link #rowPresenceAbortsBatch} 判定）：连接已经断了还接着发 199 条语句，
+     * 只是把一次失败重复 199 遍，还要占满整个预算。已经探到的结果照常返回——它们是真的。
+     */
+    @Override
+    public Map<String, Boolean> probeRowPresence(Collection<String> names, long budgetMillis) {
+        if (names == null || names.isEmpty() || budgetMillis <= 0) {
+            return Map.of();
+        }
+        List<String> asked = new ArrayList<>();
+        for (String n : names) {
+            String t = n == null ? null : n.trim();
+            if (t != null && IDENT_RE.matcher(t).matches() && asked.size() < ROW_PRESENCE_MAX_NAMES) {
+                asked.add(t);
+            }
+        }
+        if (asked.isEmpty()) {
+            return Map.of();
+        }
+        long deadline = System.nanoTime() + budgetMillis * 1_000_000L;
+        Map<String, Boolean> out = new LinkedHashMap<>();
+        try (Connection c = borrow()) {
+            applyReadOnly(c);
+            for (String name : asked) {
+                if (System.nanoTime() >= deadline) {
+                    log.warn("探测表是否为空：预算 {}ms 已用完，剩余 {} 个对象按「不知道」处理 connectorId={}",
+                            budgetMillis, asked.size() - out.size(), instance.id());
+                    break;
+                }
+                try (PreparedStatement ps = c.prepareStatement("SELECT 1 FROM `" + name + "` LIMIT 1")) {
+                    ps.setQueryTimeout(ROW_PRESENCE_STATEMENT_TIMEOUT_SEC);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        out.put(name, rs.next());
+                    }
+                } catch (SQLException e) {
+                    // 这一张探不到就只是这一张「不知道」。但连接本身废了就别再往下发了。
+                    log.debug("探测表是否为空失败，该对象按「不知道」处理 connectorId={} object={} errorCode={} sqlState={}",
+                            instance.id(), name, e.getErrorCode(), e.getSQLState(), e);
+                    if (rowPresenceAbortsBatch(e)) {
+                        log.warn("探测表是否为空时连接已不可用，中止本批（已探到 {} 个） connectorId={}",
+                                out.size(), instance.id(), e);
+                        break;
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            log.warn("探测表是否为空：借连接失败，整批按「不知道」处理 connectorId={} errorCode={} sqlState={}",
+                    instance.id(), e.getErrorCode(), e.getSQLState(), e);
+        } catch (RuntimeException e) {
+            // 驱动或连接池抛出的未受检异常同样不能漏进拉取——结构快照不该被一个叠加信息否决。
+            log.warn("探测表是否为空出现未归类异常，已探到的照常返回 connectorId={}", instance.id(), e);
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    /**
+     * 这个失败是「这一张表的事」还是「这条连接的事」。
+     *
+     * <p>只认<b>连接级</b>的三类：SQLState {@code 08}（连接异常）、连接数满（1040 / 1203）、
+     * 以及驱动判定连接已断的 2006 / 2013。其余（表被删 1146、没权限 1142、超时 1205 / 3024 / 1317）
+     * 都只影响这一张表，后面的照常探——一张表没权限不代表另一张也没有。
+     *
+     * <p><b>刻意不复用 {@link #catalogFallbackEligible}</b>：那个谓词回答的是「要不要换一条兜底 SQL 再试」，
+     * 把超时、权限也算进「不要试」，而这里要判的是「这条连接还能不能继续用」——超时之后连接是好的，
+     * 借它那句话来当中止判据，会让一次锁等待把后面 199 张表全部变成「不知道」。
+     */
+    static boolean rowPresenceAbortsBatch(SQLException e) {
+        if (e == null) {
+            return false;
+        }
+        switch (e.getErrorCode()) {
+            case 1040:      // ER_CON_COUNT_ERROR
+            case 1203:      // ER_TOO_MANY_USER_CONNECTIONS
+            case 2006:      // CR_SERVER_GONE_ERROR
+            case 2013:      // CR_SERVER_LOST
+                return true;
+            default:
+                break;
+        }
+        String state = e.getSQLState();
+        return state != null && state.startsWith("08");
+    }
+
     // ================================================================ 公共
 
     @Override

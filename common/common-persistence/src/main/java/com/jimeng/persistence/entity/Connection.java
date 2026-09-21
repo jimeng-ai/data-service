@@ -172,6 +172,36 @@ public class Connection extends BaseEntity {
     private String semanticNote;
 
     /**
+     * 当前这份说明书<b>是不是全本</b>：{@code COMPLETE} | {@code PARTIAL} | {@code null}。
+     *
+     * <p>残缺这件事 {@code semantic_note} 里一直写着，只是写成了一段中文散文——不显眼，
+     * 更要命的是<b>查不出来</b>（「哪些连接的说明书是残缺的」只能靠 LIKE 一段随时会改的文案去猜）。
+     * 这一列不替换那段散文，只在旁边给它一个能进 WHERE 的形状。
+     *
+     * <p>它值得一列，是因为残缺的失败方式正是这套设计一直在防的那一类：<b>模型看不见那些表和字段，
+     * 它不会报错，只会答得不对</b>——少一张明细表，照样给出一个看起来很正常的数字。
+     *
+     * <p><b>{@code null} = 没跑过</b>（存量行，或从未成功生成过），不是「残缺」，也不是缺值。
+     * 两者混成一个显示，等于上线当天把所有连接标红，然后所有人一起学会忽略这个标记。
+     * 只有一次<b>成功生成</b>才写它；失败与中断都不动——那时库里还是上一版说明书，
+     * 这一列描述的也该还是上一版。判定见 {@code SemanticCoverage.assess}。
+     */
+    @Schema(description = "说明书是不是全本：COMPLETE=完整 | PARTIAL=残缺（缺在哪见 semanticGaps）| null=没跑过（不等于残缺）")
+    @TableField("semantic_coverage")
+    private String semanticCoverage;
+
+    /**
+     * 残缺的成因码，逗号分隔，取值是 {@code SemanticGap} 的枚举常量名。
+     *
+     * <p>{@code COMPLETE} 时是<b>空串而不是 null</b>：它和 {@code semantic_coverage}、
+     * {@code semantic_note} 在同一次更新里落库，而 MyBatis-Plus 的 NOT_NULL 策略写不了 null，
+     * 留 null 会把上一轮的成因码留在行上，配出一行「说自己完整却列着缺口」的自相矛盾记录。
+     */
+    @Schema(description = "残缺成因码，逗号分隔（TABLES_MISSING / TABLES_GAVE_UP / SNAPSHOT_TRUNCATED / MODEL_OUTPUT_TRUNCATED）；完整时为空串")
+    @TableField("semantic_gaps")
+    private String semanticGaps;
+
+    /**
      * 数据出库档位：{@code METADATA_ONLY}（纯元数据）| {@code DERIVED_STATS}（派生统计，<b>默认</b>）
      * | {@code SAMPLE_VALUES}（样本值，默认关闭、须企业超管显式开启）。
      *

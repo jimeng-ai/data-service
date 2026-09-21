@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
+import com.jimeng.dataserver.ai.connector.service.SemanticCoverage;
 import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.persistence.entity.ConnectorSchema;
 import com.jimeng.persistence.entity.ConnectorSemantic;
@@ -180,10 +181,12 @@ public class SemanticGenerationFinalizer {
         transactionTemplate.executeWithoutResult(tx -> {
             semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
-            String note = notes.ready(generation, readyStats(generation));
+            SemanticGenerationNotes.ReadyStats stats = readyStats(generation);
+            String note = notes.ready(generation, stats);
             ConnectorSemanticGeneration update = terminalUpdate(READY, null, note);
             if (updateOwned(generation, update, List.of(FINALIZING)) == 0
-                    || !connectionClaim.release(generation.getConnectorId(), READY, note, true)) {
+                    || !connectionClaim.release(generation.getConnectorId(), READY, note, true,
+                            coverageOf(generation, stats))) {
                 tx.setRollbackOnly();
             }
         });
@@ -443,7 +446,8 @@ public class SemanticGenerationFinalizer {
 
             Counts counts = counts(generation.getId());
             applyCounts(generation, counts);
-            String note = notes.ready(generation, readyStats(generation, expectedVersion.count() >= 200));
+            SemanticGenerationNotes.ReadyStats stats = readyStats(generation, expectedVersion.count() >= 200);
+            String note = notes.ready(generation, stats);
             ConnectorSemanticGeneration ready = terminalUpdate(READY, null, note);
             ready.setTotalTables(counts.total());
             ready.setDoneTables(counts.done());
@@ -451,7 +455,8 @@ public class SemanticGenerationFinalizer {
             ready.setSkippedTables(counts.skipped());
             ready.setRemovedTables(counts.removed());
             if (updateOwned(generation, ready, List.of(FINALIZING)) == 0
-                    || !connectionClaim.release(generation.getConnectorId(), READY, note, true)) {
+                    || !connectionClaim.release(generation.getConnectorId(), READY, note, true,
+                            coverageOf(generation, stats))) {
                 tx.setRollbackOnly();
                 return PromoteOutcome.LOST;
             }
@@ -553,6 +558,28 @@ public class SemanticGenerationFinalizer {
                 yield true;
             }
         };
+    }
+
+    /**
+     * 这一批生成出来的说明书<b>是不是全本</b>，与 {@code notes.ready(...)} 那段散文同源、同一次 UPDATE 落库。
+     *
+     * <p>两者刻意不是一件事：散文回答「这次发生了什么」，这个判定回答「这份说明书现在能不能当全本用」。
+     * 后者要能进 SQL（{@code WHERE semantic_coverage = 'PARTIAL'}），也要能在界面上变成一个
+     * 看得见的警示——残缺的后果是<b>模型看不到缺掉的那些表，它不会报错，只会答得不对</b>，
+     * 埋在一段中文散文里没人会发现。
+     *
+     * <p>判据本身在 {@link SemanticCoverage}，与单次推导那条路径共用一把尺子。这里只负责把
+     * 本批次的事实（分片计数 + 快照是否截断）原样交出去，不在这里另写 if。
+     *
+     * <p>{@code modelOutputTruncated} 固定传 false：分片生成的每张表都是 agent 逐表回调写进来的，
+     * 没有「整份 JSON 被 max_tokens 截掉尾巴」这回事；写不出来的表会记成放弃，走
+     * {@code TABLES_GAVE_UP}。
+     */
+    private SemanticCoverage.Verdict coverageOf(ConnectorSemanticGeneration generation,
+                                                SemanticGenerationNotes.ReadyStats stats) {
+        return SemanticCoverage.assess(new SemanticCoverage.Facts(
+                generation.getTotalTables(), generation.getDoneTables(), generation.getGaveUpTables(),
+                stats.snapshotTruncated(), false));
     }
 
     private SemanticGenerationNotes.ReadyStats readyStats(ConnectorSemanticGeneration generation) {

@@ -64,6 +64,9 @@ class ConnectorToolExecutorSemanticTest {
     private ConnectorSemanticService semanticService;
     private ConnectorSemanticMapper semanticMapper;
     private ConnectorToolExecutor executor;
+    /** 下面 conn_define_metric 那一组要用：授权判定与结构快照都从这两个桩来。 */
+    private ConnectorGateway gateway;
+    private com.jimeng.dataserver.ai.connector.service.ConnectorSnapshotColumnService snapshotColumnService;
 
     /** FakeSession 返回的实时列。键值对表的用例会换成自己的一套。 */
     private List<FieldDetail> liveFields = List.of(
@@ -81,7 +84,7 @@ class ConnectorToolExecutorSemanticTest {
     @BeforeEach
     @SuppressWarnings("unchecked")
     void setUp() {
-        ConnectorGateway gateway = mock(ConnectorGateway.class);
+        gateway = mock(ConnectorGateway.class);
         semanticService = mock(ConnectorSemanticService.class);
         ConnectionMapper connectionMapper = mock(ConnectionMapper.class);
         semanticMapper = mock(ConnectorSemanticMapper.class);
@@ -92,13 +95,19 @@ class ConnectorToolExecutorSemanticTest {
         conn.setId(1L);
         conn.setName("crm");
         when(connectionMapper.selectOne(any())).thenReturn(conn);
+        snapshotColumnService = mock(com.jimeng.dataserver.ai.connector.service.ConnectorSnapshotColumnService.class);
         noSemantics();
         // 带取值的那些用例描述的是「第 3 档开着」的连接。不桩这一句，Mockito 的默认 false 会让它们
         // 全部走「档位没开放」那条路——断言照样能过一部分，测的却已经不是它们名字里说的那件事。
         when(semanticService.allowsSampleValues(any())).thenReturn(true);
 
         executor = new ConnectorToolExecutor(gateway, new ConnectorProperties(),
-                semanticService, connectionMapper, semanticMapper);
+                semanticService, connectionMapper, semanticMapper,
+                mock(com.jimeng.dataserver.admin.common.UserNameResolver.class),
+                // 空表标记默认一张都没有：本组测的是语义层，mock 的空 map 让 payload 与这套特性不存在时一字不差。
+                mock(com.jimeng.dataserver.ai.connector.service.ConnectorRowPresenceService.class),
+                // 结构快照：读路径的用例一条语义都不写，桩默认返回 null 正好用来钉「null 不许炸成 UPSTREAM_ERROR」。
+                snapshotColumnService);
     }
 
     // ------------------------------------------------------------------ 向后兼容
@@ -1366,6 +1375,84 @@ class ConnectorToolExecutorSemanticTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ------------------------------------------------------------------ conn_define_metric 的依赖列锚点（缺陷 B4）
+
+    /** conn_define_metric 的返回。授权与连接 id 在 setUp 的桩上已经齐了。 */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> defineMetric(Map<String, Object> args) {
+        when(gateway.listAuthorized()).thenReturn(List.of(
+                new com.jimeng.dataserver.ai.connector.runtime.ConnectorSummary(
+                        "crm", "CRM", "mysql", Set.of(Capability.DESCRIBE), "HEALTHY", null, true)));
+        when(semanticService.defineMetric(any(), anyString(), anyString(), any(), any(), any(),
+                any(), any(), any())).thenAnswer(inv -> {
+                    ConnectorSemantic row = new ConnectorSemantic();
+                    row.setTerm(inv.getArgument(1));
+                    row.setGloss(inv.getArgument(2));
+                    return row;
+                });
+        return (Map<String, Object>) executor.execute("conn_define_metric", args);
+    }
+
+    /**
+     * ★ 「锚在哪几列」必须回给模型：它是这条口径<b>将来怎么失效</b>的全部依据，
+     * 而「多填一列会让整条口径因为那列改注释而停止注入」这个代价，只有把名单亮出来才看得见。
+     */
+    @Test
+    void defineMetric_withDependsOn_returnsAnchoredColumns() {
+        when(snapshotColumnService.columnsOf(any())).thenReturn(Map.of("t_ord",
+                Map.of("pay_amt", new FieldDetail("pay_amt", "decimal(10,2)", true, "实付", null))));
+
+        Map<String, Object> out = defineMetric(Map.of("connector", "crm", "term", "销售额",
+                "definition", "SUM(pay_amt)", "depends_on", List.of("T_ORD.PAY_AMT")));
+
+        // 名字按快照的原写法归一：大小写不同的同一列不该算成另一列。
+        assertThat(out.get("anchored_on")).isEqualTo(List.of("t_ord.pay_amt"));
+        assertThat(String.valueOf(out.get("message"))).contains("停止注入");
+    }
+
+    /** 没给依赖列时 {@code anchored_on} <b>缺省即不出现</b>：空数组读起来是「它没锚在任何列上」，那是一句错话。 */
+    @Test
+    void defineMetric_withoutDependsOn_omitsAnchoredKey() {
+        Map<String, Object> out = defineMetric(Map.of("connector", "crm", "term", "客户",
+                "definition", "指下单人"));
+
+        assertThat(out).doesNotContainKey("anchored_on");
+        assertThat(out.get("saved")).isEqualTo(true);
+    }
+
+    /**
+     * 快照里找不到的列<b>整条拒写</b>，而且必须归成 CONFIG_ERROR（入参问题）。
+     * 归成 UPSTREAM_ERROR 的话模型会掉头去排查客户的数据库——而这个工具压根没碰客户系统。
+     */
+    @Test
+    void defineMetric_unknownDependsOnColumn_rejectedAsConfigError() {
+        when(snapshotColumnService.columnsOf(any())).thenReturn(Map.of("t_ord",
+                Map.of("pay_amt", new FieldDetail("pay_amt", "decimal(10,2)", true, "实付", null))));
+
+        Map<String, Object> out = defineMetric(Map.of("connector", "crm", "term", "销售额",
+                "definition", "SUM(x)", "depends_on", List.of("t_ord.不存在的列")));
+
+        assertThat(out.get("error")).isEqualTo("config_error");
+        assertThat(String.valueOf(out.get("detail"))).contains("t_ord.不存在的列");
+        verify(semanticService, never()).defineMetric(any(), anyString(), anyString(), any(), any(), any(),
+                any(), any(), any());
+    }
+
+    /**
+     * 快照桩返回 null（读快照那一趟坏了）时，口径照样记得住：不带依赖列的口径本来就不依赖结构。
+     * <b>绝不能炸成「目标系统返回了错误」</b>——那会把排查方向带到客户的数据库上去。
+     */
+    @Test
+    void defineMetric_snapshotUnavailable_stillSavesPlainMetric() {
+        when(snapshotColumnService.columnsOf(any())).thenReturn(null);
+
+        Map<String, Object> out = defineMetric(Map.of("connector", "crm", "term", "客户",
+                "definition", "指下单人"));
+
+        assertThat(out.get("saved")).isEqualTo(true);
+        assertThat(out).doesNotContainKey("error");
     }
 
     /** 只实现 describe 那一条路；其余方法本用例走不到。非 static：列从外层 {@link #liveFields} 取。 */

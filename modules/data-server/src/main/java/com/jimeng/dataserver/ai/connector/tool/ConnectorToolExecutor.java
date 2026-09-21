@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
+import com.jimeng.dataserver.admin.common.UserNameResolver;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.dataserver.ai.connector.error.ConnectorErrorCode;
 import com.jimeng.dataserver.ai.connector.error.ConnectorException;
@@ -16,7 +17,9 @@ import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.WriteOutcome;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorGateway;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorSummary;
+import com.jimeng.dataserver.ai.connector.service.ConnectorRowPresenceService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSnapshotColumnService;
 import com.jimeng.dataserver.ai.connector.service.SemanticJoinValidator;
 import com.jimeng.dataserver.ai.connector.service.SemanticValueProfiler;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -159,15 +162,33 @@ import java.util.regex.Pattern;
  * <b>{@code ConnectorSemanticDeriveService} 永远不准注进来</b>——它要叫 {@code ClaudeService} 做推导，
  * 正好闭合上面那条链。语义层的"读"和"推"分成两个类，就是为了让这条线一眼可判。
  *
- * <h3>第七个工具 conn_define_metric：为什么是显式工具而不是对话嗅探</h3>
+ * <h3>第七、八个工具 conn_define_metric / conn_annotate：为什么是显式工具而不是对话嗅探</h3>
  * 模型现在已经在问「销售额要不要扣退款」了（{@code SKILL.md} 写着要问），缺的不是问，是<b>问完之后记住</b>。
  * 那为什么不在对话历史里认一下「用户刚刚回答了一个口径问题」然后自动落库？因为设计自己的规矩是
  * 「口径这类必须 100% 正确的东西，用确定性规则做，不要交给模型理解」——嗅探恰恰是交给模型理解。
  * 工具调用是确定性的：调了就是调了，没调就是没记。
  *
- * <p>这个工具<b>不碰客户系统</b>（只写我们自己的 {@code connector_semantic}），所以它不走网关。
+ * <p>这两个工具<b>都不碰客户系统</b>（只写我们自己的 {@code connector_semantic}），所以它们不走网关。
  * 但授权照判：名字必须出现在 {@code listAuthorized()} 里，措辞与网关的 {@code findByName} 刻意一致——
  * 「不存在」和「未授权」同形，否则可以靠报错差异把租户里的连接名枚举出来。
+ *
+ * <h3>★ 为什么是两个工具，而不是给 conn_define_metric 加一个 scope 参数（缺陷 B4）</h3>
+ * {@code connector_semantic} 有五个 scope，但在 B4 之前<b>只有 METRIC 写得进去</b>：
+ * {@code defineMetric} 把 {@code SCOPE_METRIC} 写死在方法体里，而它是全仓库唯一一条从对话写
+ * {@code source=HUMAN} 的路。代价是实测 434 条语义里有 103 条自己写着「未确认 / 没有注释 / 含义不清楚」
+ * （FIELD 99、JOIN 3、OBJECT 1），这些绝大多数业务方一句话就能答，<b>但答了也没地方记</b>。
+ *
+ * <p>补写入口有两种做法，这里选了「拆成两个工具」。理由就是上面那条自己的规矩：
+ * <b>口径这类必须 100% 正确的东西用确定性规则做，不要交给模型理解</b>。一个 {@code scope} 参数恰恰是把
+ * 「用户刚说的这句话算 METRIC 还是 FIELD」交给模型判断，而且<b>两个方向都错得静默</b>：
+ * <ul>
+ *   <li>该写 FIELD 的写成了 METRIC → 它进每一轮 {@code conn_catalog} 的强制注入，
+ *       把真正相关的口径挤出上下文；</li>
+ *   <li>该写 METRIC 的写成了 FIELD → 它只在 {@code conn_describe} 那一张表上出现，
+ *       口径从此失去强制力，而没有任何地方看得出来。</li>
+ * </ul>
+ * 工具名本身就是一次意图确认（与上面「写操作为什么是第六个独立工具」同一条论证）：
+ * {@code conn_define_metric} 只写口径，{@code conn_annotate} 只写结构上的说明，谁也不会走错。
  *
  * <h3>execute() 为什么从不抛异常</h3>
  * 注册中心的兜底 catch 会把 {@code e.getMessage()} 原样塞进回灌模型的 payload，再经协议适配器
@@ -183,23 +204,31 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class ConnectorToolExecutor implements SkillToolExecutor {
 
-    static final String TOOL_LIST = "conn_list";
-    static final String TOOL_CATALOG = "conn_catalog";
-    static final String TOOL_DESCRIBE = "conn_describe";
-    static final String TOOL_QUERY = "conn_query";
-    static final String TOOL_INVOKE = "conn_invoke";
+    // 这八个常量是 public 的：沙箱回调面（ConnectorAgentCallbackController）的八个 path 段就是工具名，
+    // 必须引用同一份字面量。两边各写一份字符串，改名时只改一边的表现是「那个工具在沙箱平面静默失效」。
+    public static final String TOOL_LIST = "conn_list";
+    public static final String TOOL_CATALOG = "conn_catalog";
+    public static final String TOOL_DESCRIBE = "conn_describe";
+    public static final String TOOL_QUERY = "conn_query";
+    public static final String TOOL_INVOKE = "conn_invoke";
     /** 写操作单独一个名字。{@code conn_} 前缀已与既有工具做过撞名检查——撞名会被 mergeTools <b>静默丢弃</b>。 */
-    static final String TOOL_EXECUTE = "conn_execute";
-    /** 口径沉淀。唯一一个<b>不碰客户系统</b>的 conn_ 工具：它只写我们自己的 {@code connector_semantic}。 */
-    static final String TOOL_DEFINE_METRIC = "conn_define_metric";
+    public static final String TOOL_EXECUTE = "conn_execute";
+    /** 口径沉淀。与 {@link #TOOL_ANNOTATE} 一样<b>不碰客户系统</b>：只写我们自己的 {@code connector_semantic}。 */
+    public static final String TOOL_DEFINE_METRIC = "conn_define_metric";
+    /**
+     * 结构上的说明：表用途 / 字段含义 / 表关系 / 使用告诫（缺陷 B4）。
+     * <b>刻意与 {@link #TOOL_DEFINE_METRIC} 分开</b>，不是给它加一个 scope 参数——理由见类注释。
+     */
+    public static final String TOOL_ANNOTATE = "conn_annotate";
 
     /**
-     * 只认这七个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
+     * 只认这八个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
      * 是线性扫描 first-match，既无 {@code @Order} 也无冲突检测：两个执行器的 supports() 区间一旦重叠，
      * 胜者由 Spring 注入顺序静默决定。前缀匹配（{@code startsWith("conn_")}）就是在给未来埋这种雷。
      */
     private static final Set<String> TOOLS = Set.of(
-            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE, TOOL_EXECUTE, TOOL_DEFINE_METRIC);
+            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE, TOOL_EXECUTE, TOOL_DEFINE_METRIC,
+            TOOL_ANNOTATE);
 
     /**
      * 注入给模型看的那句提示。<b>semantic 与 comment 必须并排出现、永远不合并</b>：
@@ -244,6 +273,43 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     private static final String VALUE_DOMAIN_UNKNOWN_NOTE =
             "平台没有这一列的完整取值集合。这不等于它没有枚举值——不要据此写死查询条件，"
                     + "需要确切取值时自己查一次，或向用户确认。";
+
+    // ------------------------------------------------------------------ 空表标记（缺陷 B19）
+
+    /** 对象级的空表标记键。{@code conn_catalog} 放在每个 entry 上，{@code conn_describe} 放在顶层。 */
+    static final String KEY_EMPTY_TABLE = "empty_table";
+    /** 这个结论是什么时候探到的（= 那次结构刷新的时刻）。<b>与标记同生共死</b>，理由见 {@link #EMPTY_TABLE_NOTE}。 */
+    static final String KEY_EMPTY_TABLE_AT = "empty_table_at";
+    /** 这句话该怎么用。只在真有标记时出现。 */
+    static final String KEY_EMPTY_TABLE_NOTE = "empty_table_note";
+
+    /**
+     * 空表标记的措辞。<b>它要扭转的是一个具体的事故</b>：模型 join 到一张 0 行的维表，拿回空集，
+     * 然后把「没有数据」当成业务答案报给用户——查询成功、没有报错、数字静默地错。
+     *
+     * <h3>★ 三件事一件都不能少</h3>
+     * <ul>
+     *   <li><b>这是事实，不是猜测</b>：平台真的去客户库里探过，所以模型可以直接告诉用户「这张表是空的」；</li>
+     *   <li><b>带上观测时刻</b>：它来自上一次结构刷新，不是此刻。空表后来被灌进数据是常事，
+     *       模型自己查到了行就以自己查到的为准——不带时刻，这句话会被当成永恒真理；</li>
+     *   <li><b>没有标记 ≠ 有数据</b>：探测失败、第 1 档不探、表不在快照里，都没有标记。
+     *       不写死这一句，模型会把「没标记」读成「平台确认这张表有数据」，那是我们从没说过的话。</li>
+     * </ul>
+     *
+     * <p>★ 刻意<b>不</b>说「换个查法再试」。空表上换写法只是把同一个 0 行重跑几遍，
+     * 而每一次都打在客户的生产库上。这一条与 {@code SKILL.md}「零结果 ≠ 没有」并不冲突：
+     * 那条说的是<b>不知道</b>表里有没有数据时不许断言，这里说的是<b>已经知道</b>它是空的，
+     * 此时含糊其辞（「未查询到符合条件的记录」）反而把一个确定的事实说成了一次可能的失败。
+     */
+    private static final String EMPTY_TABLE_NOTE =
+            "带 " + KEY_EMPTY_TABLE + " 的对象：平台在 " + KEY_EMPTY_TABLE_AT
+                    + " 那一刻真的去客户库里探过，这张表里【一行数据都没有】。"
+                    + "所以任何基于它、或者 join 到它的查询都会返回 0 行，那是「这张表是空的」，"
+                    + "【不是】业务上的答案。用到它就如实告诉用户「这张表里一行数据都没有，无法据此得出结论」，"
+                    + "不要把空结果当成「本期没有发生」，也不要换个写法反复重试——空表上换几种写法，"
+                    + "得到的只是同一个 0 行，代价是几次打在客户生产库上的查询。"
+                    + "观测时刻之后表里可能已经被灌进数据，你自己查到了行就以你查到的为准。"
+                    + "【没有这个标记不等于表里有数据】：也可能是平台没探到（没权限、超时、这条连接的出库档位不允许探）。";
 
     // ------------------------------------------------------------------ detail_json 里的约定键
     // ★ 键名刻意写成字面量，不去引用产出方（SemanticJoinValidator / 推导服务）的常量：
@@ -353,6 +419,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     private static final int TERM_MAX = 191;
     /** {@code connector_semantic.gloss} 的列宽。 */
     private static final int GLOSS_MAX = 1000;
+    /** {@code connector_semantic.object_name} / {@code field_name} 的列宽。与 {@link #TERM_MAX} 同一个理由。 */
+    private static final int NAME_MAX = 191;
 
     private final ConnectorGateway connectorGateway;
     private final ConnectorProperties properties;
@@ -365,6 +433,30 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
      * 裸 {@code BaseMapper}，过得了上面那条「能不能走回 ProviderRegistry」的判据。
      */
     private final ConnectorSemanticMapper semanticMapper;
+    /** 只为把 answered_by 补成 answered_name——跨租户读 sys_user 的安全性集中在它那里论证，本类不自己搓查询。 */
+    private final UserNameResolver userNameResolver;
+    /**
+     * 空表标记（缺陷 B19）。它只读 {@code connector_schema} 一张表，是条叶子，过得了上面那条
+     * 「能不能走回 ProviderRegistry」的判据——<b>刻意不注入 {@code ConnectorSchemaService}</b>，
+     * 那个类手上有 {@code ObjectProvider<ConnectorSemanticDeriveService>}，而后者要叫模型：
+     * 今天 {@code ObjectProvider} 断得开这个环，但那是别人文件里的实现细节，改回直接注入就在本类上闭合。
+     *
+     * <p>放在字段列表<b>最后</b>：{@code @RequiredArgsConstructor} 按声明顺序生成构造器，
+     * 插在中间会让按位置构造本类的测试静默错位。
+     */
+    private final ConnectorRowPresenceService rowPresenceService;
+    /**
+     * 写语义时用的结构快照（缺陷 B4）。它只读 {@code connector_schema} 一张表，是条叶子，
+     * 过得了上面那条「能不能走回 ProviderRegistry」的判据——<b>刻意不注入 {@code ConnectorSchemaService}</b>，
+     * 理由与 {@link ConnectorRowPresenceService} 逐字相同。
+     *
+     * <p>为什么写语义读快照而不读 {@code conn_describe} 的实时结构：锚点将来要拿<b>快照</b>重算，
+     * 两边不同源时这一行一落库就"已经过期"，下一次刷新立刻把它标 STALE——人明明刚答完，
+     * 答案却从来没有被注入过一次。
+     *
+     * <p>同样放在字段列表<b>最后</b>：{@code @RequiredArgsConstructor} 按声明顺序生成构造器。
+     */
+    private final ConnectorSnapshotColumnService snapshotColumnService;
 
     @Override
     public boolean supports(String toolName) {
@@ -400,6 +492,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                     return doExecute(args);
                 case TOOL_DEFINE_METRIC:
                     return doDefineMetric(args);
+                case TOOL_ANNOTATE:
+                    return doAnnotate(args);
                 default:
                     // supports() 已经挡过一层，走到这里说明注册中心的路由和这里分叉了。
                     throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "未知的连接器工具：" + name);
@@ -459,6 +553,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         //   这时按名字反查 id 才是安全的；反过来先查 id 再调网关，等于开了一条不经授权就能
         //   用报错差异枚举本租户连接名的路。
         Long connectorId = resolveConnectorId(connector);
+        // 空表标记（缺陷 B19）：名字原样 → 探到的时刻。不在里面 = 有行，或者没探到，两者都不说话。
+        Map<String, Date> emptyTables = connectorId == null ? Map.of() : rowPresenceService.emptyObjects(connectorId);
         Map<String, ConnectorSemantic> objects = Map.of();
         List<Map<String, Object>> glossary = List.of();
         // ★ 口径和告诫必须【同一趟】出：凡是这次真的给出了答案的词条，对应的问题就要退场。
@@ -474,6 +570,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         List<Map<String, Object>> ambiguities = ambiguityPayload(connectorId, answeredTerms);
 
         boolean anySemantic = false;
+        boolean anyEmptyTable = false;
         List<Map<String, Object>> entries = new ArrayList<>();
         if (view != null && view.entries() != null) {
             for (CatalogEntry e : view.entries()) {
@@ -482,6 +579,16 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                 m.put("name", e.name());
                 m.put("type", e.type());
                 m.put("comment", e.comment());
+                // ★ 空表标记紧跟 comment：选表就发生在这一刻，等模型选完表拿到 0 行再说已经晚了。
+                //   没探到就一个字都不出现——"empty_table": false 读起来是「平台确认它有数据」，那是我们没说过的话。
+                if (emptyTables.containsKey(e.name())) {
+                    m.put(KEY_EMPTY_TABLE, true);
+                    String at = ConnectorRowPresenceService.formatObservedAt(emptyTables.get(e.name()));
+                    if (at != null) {
+                        m.put(KEY_EMPTY_TABLE_AT, at);
+                    }
+                    anyEmptyTable = true;
+                }
                 ConnectorSemantic s = objects.get(e.name());
                 if (s != null && s.getGloss() != null && !s.getGloss().isBlank()) {
                     // 这里给【短】版本：选表那一刻需要的就是一句话。完整版由 conn_describe 放在响应顶层的
@@ -499,6 +606,10 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         out.put("object_kind", view == null ? null : view.objectKind());
         if (anySemantic || !glossary.isEmpty() || !ambiguities.isEmpty()) {
             out.put("semantic_hint", SEMANTIC_HINT);
+        }
+        // 与 semantic_hint 同一条纪律：没有任何一张表被标上，这句话就不出现。
+        if (anyEmptyTable) {
+            out.put(KEY_EMPTY_TABLE_NOTE, EMPTY_TABLE_NOTE);
         }
         // ★ 口径排在 entries 【前面】不是排版问题：销售额扣不扣退款，决定了要不要 join 退款表，
         //   也就决定了接下来要选哪几张表。等模型选完表再看到口径，那个决策点已经过去了。
@@ -596,6 +707,17 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         out.put("object", detail == null ? object : detail.name());
         out.put("type", detail == null ? null : detail.type());
         out.put("comment", detail == null ? null : detail.comment());
+        // ★ 空表标记（缺陷 B19）放在顶层、紧挨 comment：这是「要不要用这张表」的判据，
+        //   不是字段级细节。没探到就一个 key 都不出现，理由见 EMPTY_TABLE_NOTE。
+        Date emptySince = connectorId == null ? null : rowPresenceService.emptySince(connectorId, objectName);
+        if (emptySince != null) {
+            out.put(KEY_EMPTY_TABLE, true);
+            String at = ConnectorRowPresenceService.formatObservedAt(emptySince);
+            if (at != null) {
+                out.put(KEY_EMPTY_TABLE_AT, at);
+            }
+            out.put(KEY_EMPTY_TABLE_NOTE, EMPTY_TABLE_NOTE);
+        }
         // ★ 表级 semantic 紧挨着 comment 放：两个 key、两句话，模型一眼就能对照「客户自己怎么说」和
         //   「平台怎么理解」。合成一个字段，冲突时它就分不清该信谁。
         out.putAll(objectLevel);
@@ -750,15 +872,23 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         //        于是模型掉头去排查客户的数据库，那条口径还悄悄丢了。
         //   不截断：截短的口径就是错的口径（「不扣退款」截成「不扣退」照样读得通，而意思反了），
         //        口径必须原样是用户说的那句话，宁可让模型重说一遍。
-        requireWithinLimit(term, TERM_MAX, "term", "口径词条");
-        requireWithinLimit(definition, GLOSS_MAX, "definition", "口径说明");
+        requireWithinLimit(term, TERM_MAX, "term", "口径词条", "口径");
+        requireWithinLimit(definition, GLOSS_MAX, "definition", "口径说明", "口径");
         List<String> appliesTo = stringListOrEmpty(args.get("applies_to"));
+        List<String> dependsOnRaw = stringListOrEmpty(args.get("depends_on"));
 
         requireAuthorizedName(connector);
         Long connectorId = resolveConnectorId(connector);
         if (connectorId == null) {
             throw ConnectorException.of(ConnectorErrorCode.NOT_FOUND, unauthorizedMessage(connector));
         }
+
+        // ★ 依赖列按【快照】解析，与 conn_annotate 同一份结构、同一条理由（见 doAnnotate 的锚点一节）。
+        //   没给 depends_on 时也要把快照读出来：覆盖一条既有的、锚在列集合上的口径要 re-baseline，
+        //   否则人重新确认之后下一次刷新会把它【再一次】悄悄标成 STALE、停止注入。
+        //   这是一条写路径，一次确认最多读一次快照，与每轮都调的 conn_catalog 不是一个量级。
+        Map<String, Map<String, FieldDetail>> snapshot = snapshotOf(connectorId);
+        List<ConnectorSemanticService.AnchorColumn> dependsOn = resolveDependsOn(dependsOnRaw, snapshot);
 
         Map<String, Object> detail = null;
         if (!appliesTo.isEmpty()) {
@@ -767,10 +897,13 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         }
 
         Long userId = currentUserId();
+        // 显示名：口径依据里「9月13日由张三确认」的那个「张三」。取不到就退回原来的「由用户确认」，
+        // 绝不因为记不下人而拒绝记口径。
+        String userName = currentUserName(userId);
         ConnectorSemantic row;
         try {
-            row = semanticService.defineMetric(connectorId, term, definition, detail,
-                    userId == null ? null : String.valueOf(userId), null,
+            row = semanticService.defineMetric(connectorId, term, definition, detail, dependsOn, snapshot,
+                    userId == null ? null : String.valueOf(userId), userName,
                     MDC.get(MdcContextFilter.MDC_TRACE_ID));
         } catch (ServiceException e) {
             // ServiceException 的文案是我们自己写的（"口径词条不能为空"这种），不含客户库信息，
@@ -786,6 +919,15 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         if (!appliesTo.isEmpty()) {
             out.put("applies_to", appliesTo);
         }
+        // 锚在哪几列，要原样回给模型看：它是这条口径【将来怎么失效】的全部依据，
+        // 而多填一列的代价（那一列改个注释就让整条口径停止注入）只有把名单亮出来才看得见。
+        List<String> anchoredOn = new ArrayList<>();
+        for (ConnectorSemanticService.AnchorColumn c : dependsOn) {
+            anchoredOn.add(c.qualifiedName());
+        }
+        if (!anchoredOn.isEmpty()) {
+            out.put("anchored_on", anchoredOn);
+        }
         out.put("saved", true);
         out.put("basis", basis);
         // ★ 这段话是写给模型看的，措辞是有意的：亮出依据这件事必须在【每次引用】时都做，
@@ -793,8 +935,335 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         //   是口径写错了之后，唯一可能被人看见并纠正的地方。
         out.put("message", "这条口径已记住，之后在这条连接上不必再问。以后凡是回答涉及「" + row.getTerm()
                 + "」，都要按这个口径写查询，并在答案里把依据亮出来，例如「（口径：" + ConnectorSemanticService.shortGloss(row.getGloss())
-                + "，" + basis + "）」。如果用户此刻纠正了这个口径，再调一次本工具覆盖它即可。");
+                + "，" + basis + "）」。如果用户此刻纠正了这个口径，再调一次本工具覆盖它即可。"
+                + (anchoredOn.isEmpty() ? ""
+                : "这条口径锚在 " + String.join("、", anchoredOn) + " 上：这几列里任何一列改了名 / 类型 / 注释，"
+                        + "平台都会把这条口径标成过期并停止注入，直到有人重新确认。"));
         return out;
+    }
+
+    // ------------------------------------------------------------------ 第八个工具：结构上的说明（缺陷 B4）
+
+    /** {@code conn_annotate} 的四类。小写，与 tools.json 的 enum 逐字一致。 */
+    private static final String K_OBJECT = "object";
+    private static final String K_FIELD = "field";
+    private static final String K_JOIN = "join";
+    private static final String K_CAVEAT = "caveat";
+    private static final Set<String> ANNOTATE_KINDS = Set.of(K_OBJECT, K_FIELD, K_JOIN, K_CAVEAT);
+
+    /**
+     * 把业务方刚刚答过的一条<b>结构上的说明</b>记下来：这张表是干什么的 / 这一列什么意思 /
+     * 这两张表怎么连（含「没关系」）/ 用这条连接要注意什么。
+     *
+     * <h4>为什么它和 conn_define_metric 是两个工具</h4>
+     * 见类注释那一节。一句话：{@code scope} 交给模型判断，两个方向都错得静默。
+     *
+     * <h4>★ 锚点必须与<b>快照</b>同源，不能用 conn_describe 的实时结构</h4>
+     * 这一行将来会被漂移处置拿<b>快照</b>重算一遍锚点，对不上就标 STALE。写入时若拿实时结构算，
+     * 而平台的快照还没跟上客户库的改动，这一行<b>一落库就已经过期</b>：下一次刷新立刻把它标成 STALE、
+     * 停止注入——业务方明明刚答完，答案却一次都没有被用上，而且没有任何地方看得出来。
+     * 所以这里一律走 {@link ConnectorSnapshotColumnService}，<b>快照里匹配不到的名字直接拒写</b>：
+     * 一条挂不上锚点的 FIELD / JOIN 断言是一条永远不会过期的断言，结构怎么变它都照样注入。
+     *
+     * <h4>★ 长度校验在这里做，只判不截</h4>
+     * 与 {@link #doDefineMetric} 同一条理由：放到 service 之后会一路撞到 MySQL，回来是一句原始 SQL 报错，
+     * 被兜底 catch 归成 {@code UPSTREAM_ERROR}「目标系统返回了错误」——而这个工具压根没碰客户系统，
+     * 于是模型掉头去排查客户的数据库。不截断是因为截短的说明就是错的说明。
+     */
+    private Map<String, Object> doAnnotate(Map<String, Object> args) {
+        String connector = requireString(args, "connector");
+        String kind = requireString(args, "kind").toLowerCase(Locale.ROOT);
+        if (!ANNOTATE_KINDS.contains(kind)) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                    "参数 kind 只能是 object（这张表是干什么的）/ field（这一列什么意思）/ "
+                            + "join（这两张表怎么连）/ caveat（使用告诫）四者之一，本次是「" + kind + "」。"
+                            + "业务口径（销售额怎么算）不走本工具，用 conn_define_metric。");
+        }
+        String note = requireString(args, "note");
+        String object = optionalString(args, "object");
+        String field = optionalString(args, "field");
+        String toObject = optionalString(args, "to_object");
+        String toColumn = optionalString(args, "to_column");
+        String term = optionalString(args, "term");
+
+        // 必填集按 kind 判，且【缺什么说什么】：只回一句「参数不全」会让模型把四个参数轮流试一遍。
+        requirePresent(kind, requiredOf(kind, object, field, toObject, toColumn, term));
+
+        // ★ 只判不截。名字超列宽通常意味着模型把一句话写进了表名那一栏，截断只会把它变成一个查无此表的名字。
+        requireWithinLimit(note, GLOSS_MAX, "note", "说明", "说明");
+        requireNameWithinLimit(object, "object", "表名");
+        requireNameWithinLimit(field, "field", "列名");
+        requireNameWithinLimit(toObject, "to_object", "对端表名");
+        requireNameWithinLimit(toColumn, "to_column", "对端列名");
+        if (term != null) {
+            requireWithinLimit(term, TERM_MAX, "term", "告诫词条", "告诫");
+        }
+
+        requireAuthorizedName(connector);
+        Long connectorId = resolveConnectorId(connector);
+        if (connectorId == null) {
+            throw ConnectorException.of(ConnectorErrorCode.NOT_FOUND, unauthorizedMessage(connector));
+        }
+
+        Long userId = currentUserId();
+        String userName = currentUserName(userId);
+        String answeredBy = userId == null ? null : String.valueOf(userId);
+        String traceId = MDC.get(MdcContextFilter.MDC_TRACE_ID);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("connector", connector);
+        out.put("kind", kind);
+        ConnectorSemantic row;
+        try {
+            if (K_CAVEAT.equals(kind)) {
+                // CAVEAT 挂在整条连接上、按词条唯一，不碰任何表名列名，所以它是四类里唯一不需要快照的。
+                List<String> appliesTo = stringListOrEmpty(args.get("applies_to"));
+                row = semanticService.annotateCaveat(connectorId, term, note, appliesTo,
+                        answeredBy, userName, traceId);
+                out.put("term", row.getTerm());
+                if (!appliesTo.isEmpty()) {
+                    out.put("applies_to", appliesTo);
+                }
+            } else {
+                Map<String, Map<String, FieldDetail>> snapshot = snapshotOf(connectorId);
+                if (snapshot.isEmpty()) {
+                    throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                            "平台还没有这条连接的结构快照，现在记下来的说明挂不上锚点（结构一变它也不会失效），"
+                                    + "所以这一条没有保存。这不是你能修复的问题，请如实告诉用户「需要管理员先在连接管理里刷新一次结构」。"
+                                    + "业务口径不依赖结构快照，conn_define_metric 仍然可用。");
+                }
+                // ★ 名字一律换成快照里的原写法：模型传进来的常常只差一个大小写，而唯一键是
+                //   utf8mb4_unicode_ci（大小写不敏感）。不归一的话两次说同一件事会在库里撞键，
+                //   由 DuplicateKeyException 兜回覆盖——能work，但库里存的表名会是模型随手写的那个壳。
+                String realObject = requireSnapshotObject(snapshot, object);
+                if (K_OBJECT.equals(kind)) {
+                    row = semanticService.annotateObject(connectorId, realObject, note,
+                            answeredBy, userName, traceId);
+                    out.put("object", row.getObjectName());
+                } else {
+                    Map<String, FieldDetail> columns = snapshot.get(realObject);
+                    FieldDetail left = requireSnapshotColumn(columns, realObject, field, "field");
+                    if (K_FIELD.equals(kind)) {
+                        row = semanticService.annotateField(connectorId, realObject, left.name(), note,
+                                ConnectorSemanticService.fieldAnchor(left), answeredBy, userName, traceId);
+                        out.put("object", row.getObjectName());
+                        out.put("field", row.getFieldName());
+                    } else {
+                        String realToObject = requireSnapshotObject(snapshot, toObject);
+                        FieldDetail right = requireSnapshotColumn(snapshot.get(realToObject), realToObject,
+                                toColumn, "to_column");
+                        boolean related = !Boolean.FALSE.equals(booleanOrNull(args.get("related")));
+                        row = semanticService.annotateJoin(connectorId, realObject, left.name(),
+                                realToObject, right.name(), related, note,
+                                ConnectorSemanticService.joinAnchor(left, right),
+                                answeredBy, userName, traceId);
+                        out.put("object", row.getObjectName());
+                        out.put("field", row.getFieldName());
+                        out.put("to_object", realToObject);
+                        out.put("to_column", right.name());
+                        out.put("related", related);
+                    }
+                }
+            }
+        } catch (ServiceException e) {
+            // ServiceException 的文案是我们自己写的，不含客户库信息，可以原样回给模型；
+            // 归 CONFIG_ERROR 是因为它一定是入参的问题，改了就能过。
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, e.getRespMsg());
+        }
+
+        out.put("note", row.getGloss());
+        out.put("saved", true);
+        out.put("basis", metricBasis(row));
+        out.put("message", annotateMessage(kind, row));
+        return out;
+    }
+
+    /** 这一类还缺哪些必填参数。返回空 = 齐了。 */
+    private static List<String> requiredOf(String kind, String object, String field,
+                                           String toObject, String toColumn, String term) {
+        List<String> missing = new ArrayList<>();
+        if (K_CAVEAT.equals(kind)) {
+            if (term == null) missing.add("term（这条告诫叫什么，用用户自己的说法）");
+            return missing;
+        }
+        if (object == null) missing.add("object（表名）");
+        if (K_FIELD.equals(kind) || K_JOIN.equals(kind)) {
+            if (field == null) missing.add(K_JOIN.equals(kind) ? "field（左侧列名）" : "field（列名）");
+        }
+        if (K_JOIN.equals(kind)) {
+            if (toObject == null) missing.add("to_object（对端表名）");
+            if (toColumn == null) missing.add("to_column（对端列名）");
+        }
+        return missing;
+    }
+
+    private static void requirePresent(String kind, List<String> missing) {
+        if (missing.isEmpty()) {
+            return;
+        }
+        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                "kind=" + kind + " 时还缺少必填参数：" + String.join("、", missing)
+                        + "。这一条没有被保存，补齐之后重新调用本工具即可。"
+                        + "这是入参问题，与客户的数据库无关，不要去排查那边。");
+    }
+
+    /**
+     * 快照里的表名（原写法），找不到返回 {@code null}。
+     *
+     * <p>先按原样找、找不到再按 {@link ConnectorSemanticService#ciFold} 折叠找，与唯一键的排序规则同一个口径：
+     * 大小写不同的同一张表必须落到同一行，而不是两条各说各话的说明。
+     */
+    private static String findSnapshotObject(Map<String, Map<String, FieldDetail>> snapshot, String object) {
+        if (object == null) {
+            return null;
+        }
+        if (snapshot.containsKey(object)) {
+            return object;
+        }
+        String folded = ConnectorSemanticService.ciFold(object);
+        for (String name : snapshot.keySet()) {
+            if (ConnectorSemanticService.ciFold(name).equals(folded)) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** 快照里这张表的某一列（原写法），找不到返回 {@code null}。折叠匹配的理由同 {@link #findSnapshotObject}。 */
+    private static FieldDetail findSnapshotColumn(Map<String, FieldDetail> columns, String column) {
+        if (columns == null || column == null) {
+            return null;
+        }
+        FieldDetail f = columns.get(column);
+        if (f != null) {
+            return f;
+        }
+        String folded = ConnectorSemanticService.ciFold(column);
+        for (Map.Entry<String, FieldDetail> e : columns.entrySet()) {
+            if (ConnectorSemanticService.ciFold(e.getKey()).equals(folded)) {
+                return e.getValue();
+            }
+        }
+        return null;
+    }
+
+    /** 找不到就<b>拒写</b>——理由见 {@link #doAnnotate} 的锚点那一节。 */
+    private static String requireSnapshotObject(Map<String, Map<String, FieldDetail>> snapshot, String object) {
+        String real = findSnapshotObject(snapshot, object);
+        if (real != null) {
+            return real;
+        }
+        throw ConnectorException.of(ConnectorErrorCode.NOT_FOUND,
+                "平台的结构快照里没有表「" + object + "」，这条说明没有被保存。"
+                        + "先用 conn_catalog 确认表名原样怎么写（说明要挂在快照里那张表上，否则结构变了它也不会失效）。"
+                        + "如果这张表是刚建的，说明平台的结构快照还没刷新到它，请如实告诉用户。");
+    }
+
+    /** 快照里这张表的某一列。{@code paramKey} 只为把「是哪个入参错了」说清楚。 */
+    private static FieldDetail requireSnapshotColumn(Map<String, FieldDetail> columns, String object,
+                                                     String column, String paramKey) {
+        FieldDetail f = findSnapshotColumn(columns, column);
+        if (f != null) {
+            return f;
+        }
+        throw ConnectorException.of(ConnectorErrorCode.NOT_FOUND,
+                "平台的结构快照里，表「" + object + "」上没有列「" + column + "」（参数 " + paramKey + "），"
+                        + "这条说明没有被保存。先用 conn_describe 看一眼这张表的列名原样怎么写。");
+    }
+
+    /**
+     * {@code conn_define_metric} 的 {@code depends_on}：把 {@code 表名.列名} 按<b>快照</b>解析成锚点依赖列。
+     *
+     * <h4>为什么找不到就整条拒写，而不是把认得出的那几列留下</h4>
+     * 锚点是"列集合"级别的：漏掉一列，那一列改了名 / 类型 / 注释都不会让这条口径失效——
+     * 而口径失效正是这个锚点存在的全部理由。半份名单给出的是一种<b>看起来在保护、其实没有</b>的假象。
+     * 报错里点名是哪几项没找到，模型改一下重调就行；实在对不上就去掉 {@code depends_on} 再调一次，
+     * 口径照样记得住，只是从此不会自动过期。
+     */
+    private static List<ConnectorSemanticService.AnchorColumn> resolveDependsOn(
+            List<String> raw, Map<String, Map<String, FieldDetail>> snapshot) {
+        if (raw.isEmpty()) {
+            return List.of();
+        }
+        if (snapshot.isEmpty()) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                    "平台还没有这条连接的结构快照，depends_on 里的列核对不了，这条口径没有被保存。"
+                            + "去掉 depends_on 重新调用一次就能把口径记下来（代价是结构变了它不会自动失效）。");
+        }
+        List<ConnectorSemanticService.AnchorColumn> out = new ArrayList<>();
+        List<String> unknown = new ArrayList<>();
+        for (String item : raw) {
+            // 按【最后一个】点切：schema.table.column 这种三段写法也要认得出来。
+            int dot = item.lastIndexOf('.');
+            String object = dot > 0 ? item.substring(0, dot).trim() : null;
+            String column = dot > 0 && dot < item.length() - 1 ? item.substring(dot + 1).trim() : null;
+            String realObject = object == null ? null : findSnapshotObject(snapshot, object);
+            FieldDetail f = realObject == null ? null : findSnapshotColumn(snapshot.get(realObject), column);
+            if (f == null) {
+                unknown.add(item);
+                continue;
+            }
+            out.add(new ConnectorSemanticService.AnchorColumn(realObject, f.name(),
+                    ConnectorSemanticService.fieldAnchor(f)));
+        }
+        if (!unknown.isEmpty()) {
+            throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
+                    "depends_on 里这几项在平台的结构快照里找不到：" + String.join("、", unknown)
+                            + "。每一项都要写成「表名.列名」，名字按 conn_describe 里的原样写。"
+                            + "这条口径没有被保存——改对之后重调，或者去掉 depends_on 再调一次"
+                            + "（那样口径照样记得住，只是结构变了它不会自动失效）。");
+        }
+        return out;
+    }
+
+    /** 记完之后给模型的那句话。四类各说各的，因为它们之后该被怎么用完全不同。 */
+    private static String annotateMessage(String kind, ConnectorSemantic row) {
+        switch (kind) {
+            case K_OBJECT:
+                return "已记住「" + row.getObjectName() + "」这张表的用途，之后 conn_catalog / conn_describe "
+                        + "会把它作为 semantic 给你，不必再问同一个问题。";
+            case K_FIELD:
+                return "已记住「" + row.getObjectName() + "." + row.getFieldName() + "」这一列的含义，"
+                        + "之后 conn_describe 会把它作为这一列的 semantic 给你。"
+                        + "注意它与 comment（客户库自己写的注释）是并排两样东西，冲突时以 comment 为准。";
+            case K_JOIN:
+                return "已记住这条关系。它是【人说的】、没有经过采样验证，"
+                        + "所以之后 conn_describe 给它的 verified 仍然是 NONE：真要按它 join 之前，"
+                        + "还是先跑一条 COUNT 自验一次。";
+            default:
+                return "已记住这条告诫，之后 conn_catalog 会把它放进 ambiguities 提醒你。"
+                        + "它是一句提醒，不是一条已确认的结论——引用时要说清楚这是谁提醒的。";
+        }
+    }
+
+    /** 表名 / 列名的列宽校验。为空（这一类不需要它）就不判。 */
+    private static void requireNameWithinLimit(String value, String key, String label) {
+        if (value != null) {
+            requireWithinLimit(value, NAME_MAX, key, label, "说明");
+        }
+    }
+
+    /**
+     * 结构快照，null 归一成空 map。
+     *
+     * <p>契约上 {@link ConnectorSnapshotColumnService#columnsOf} 从不返回 null，这里再兜一层：
+     * 一个 null 在这条路上会变成 NPE，被兜底 catch 归成 {@code UPSTREAM_ERROR}「目标系统返回了错误」——
+     * 而这个工具压根没碰客户系统，模型会掉头去排查客户的数据库。空 map 则会走到那句
+     * 「平台还没有这条连接的结构快照」，方向是对的。
+     */
+    private Map<String, Map<String, FieldDetail>> snapshotOf(Long connectorId) {
+        Map<String, Map<String, FieldDetail>> snapshot = snapshotColumnService.columnsOf(connectorId);
+        return snapshot == null ? Map.of() : snapshot;
+    }
+
+    /** 可选字符串入参：缺、null、纯空白一律返回 null（而不是空串——空串会被当成「明确填了空」）。 */
+    private static String optionalString(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
     }
 
     // ------------------------------------------------------------------ 语义层注入
@@ -1803,6 +2272,23 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     }
 
     /**
+     * 当前用户的显示名，取不到返回 null（basis 退化成「由用户在对话中确认」）。
+     *
+     * <p>查用户表失败绝不能让记口径失败：口径本身比「谁答的」重要得多。
+     */
+    private String currentUserName(Long userId) {
+        if (userId == null) {
+            return null;
+        }
+        try {
+            return userNameResolver.displayNameOf(userId);
+        } catch (Exception e) {
+            log.debug("解析口径回答人显示名失败 userId={}，按匿名记录", userId, e);
+            return null;
+        }
+    }
+
+    /**
      * 授权校验（{@code conn_define_metric} 专用）。措辞与 {@code ConnectorGateway.findByName}
      * <b>刻意一致</b>：「不存在」与「未授权」必须同形，否则可以靠报错差异枚举出本租户有哪些连接名。
      */
@@ -1861,12 +2347,12 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
      * <p>报错文案里<b>不回显原值</b>：一段几千字的入参再原样灌回模型上下文只是噪声，
      * 而模型手里本来就有它刚发出去的那个值。
      */
-    private static void requireWithinLimit(String value, int max, String key, String label) {
+    private static void requireWithinLimit(String value, int max, String key, String label, String noun) {
         int len = value.codePointCount(0, value.length());
         if (len > max) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    label + "（参数 " + key + "）最多 " + max + " 字，本次是 " + len + " 字，这条口径没有被保存。"
-                            + "平台不会替你截断——截短的口径就是错的口径。请把它改短后重新调用本工具。"
+                    label + "（参数 " + key + "）最多 " + max + " 字，本次是 " + len + " 字，这条" + noun + "没有被保存。"
+                            + "平台不会替你截断——截短的" + noun + "就是错的" + noun + "。请把它改短后重新调用本工具。"
                             + "这是入参问题，与客户的数据库无关，不要去排查那边。");
         }
     }

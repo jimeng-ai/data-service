@@ -1,7 +1,11 @@
 package com.jimeng.dataserver.ai.connector.error;
 
 /**
- * 统一错误语义。<b>所有连接器的失败必须归到这九类里的一类。</b>
+ * 统一错误语义。<b>所有连接器的失败必须归到这十类里的一类。</b>
+ *
+ * <p>（这句话本身曾经是错的：加了 {@link #GUARD_BLOCKED} 之后这里仍写着「九类」，
+ * 而 {@code skills/connector/SKILL.md} 照抄了那个数字，于是教给模型的错误码清单里
+ * 根本没有 guard_blocked 这一项——模型收到一个它没见过的值。改枚举时记得连同 SKILL.md 一起改。）
  *
  * <p>它比看上去重要，有两个理由：
  *

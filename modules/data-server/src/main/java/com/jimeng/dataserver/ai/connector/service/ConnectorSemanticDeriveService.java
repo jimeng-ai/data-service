@@ -145,6 +145,9 @@ public class ConnectorSemanticDeriveService {
     /** semantic_note 列是 varchar(512)，留点余量。 */
     private static final int NOTE_MAX = 500;
 
+    /** semantic_gaps 列是 varchar(255)，留点余量。成因码只有四种，正常远不到上限。 */
+    private static final int GAPS_MAX = 240;
+
     /**
      * 认领超过这么久还停在 RUNNING，就认为上一次推导已经死了（部署重启、进程被杀），可以抢占。
      *
@@ -595,7 +598,8 @@ public class ConnectorSemanticDeriveService {
             List<ConnectorSemantic> corpusJoins = readCorpusJoins(connectorId, fieldsByObject, notes);
 
             String raw = callModel(connectorId, conn, digest, cfg, gaps);
-            Map<String, Object> parsed = parseJson(raw, notes);
+            Parsed parseOutcome = parseJson(raw, notes);
+            Map<String, Object> parsed = parseOutcome.map();
 
             // 一次查，两处用：既是「哪些口径人已经答过了」，也是「上一版说明书里有没有东西可丢」。
             List<ConnectorSemantic> existing = existingRows(connectorId);
@@ -631,7 +635,17 @@ public class ConnectorSemanticDeriveService {
             int n = semanticService.replaceInferred(connectorId, fresh);
 
             String note = withNotePrefix(notePrefix, summarize(st, digest, notes));
-            writeStatus(connectorId, SEM_READY, note, true, claimAt);
+            // ★ 覆盖面判定和 note 在同一次 UPDATE 里落库（理由见 writeStatus 的参数注释）。
+            //   事实全部取自本次推导已经算出来的数，不另查一遍库：digest 的分子分母就是
+            //   summarize 里那句「覆盖 N/M 个对象」的来源，两者永远说同一件事。
+            SemanticCoverage.Verdict coverage = SemanticCoverage.assess(new SemanticCoverage.Facts(
+                    digest.totalObjects(), digest.includedObjects(), 0,
+                    beyond > 0, parseOutcome.modelOutputTruncated()));
+            writeStatus(connectorId, SEM_READY, note, true, claimAt, coverage);
+            if (coverage.partial()) {
+                log.warn("语义层说明书不完整 connectorId={} 成因={}：模型看不到缺掉的那部分，它不会报错，只会答得不对",
+                        connectorId, coverage.gapCodes());
+            }
 
             // ★ 说明书【已经可用了】才派发验证阶段：READY 已经写下去，关系那一栏如实写着「未经数据验证」。
             //   验证是把那句话往前推一格，不是这份说明书能不能用的前提——所以它绝不该挂在 READY 前面。
@@ -1253,7 +1267,9 @@ public class ConnectorSemanticDeriveService {
             sent = List.copyOf(includedNames);
             String raw = sendToModel(connectorId, content, cfg, "语义层增量推导开始",
                     digest.includedObjects(), targets.size(), digest.text().length() + ctx.text().length());
-            Map<String, Object> parsed = parseJson(raw, notes);
+            // 增量补写【不重判覆盖面】：它只补指定的几张表，算不出「本该覆盖多少」这个分母。
+            // 硬算出来的数会是个假的全集，比不写更坏——那两列继续描述上一次全量生成的结论。
+            Map<String, Object> parsed = parseJson(raw, notes).map();
 
             AssemblyReport st = new AssemblyReport();
             // 写库之前的已有行：既用来挑掉人答过的口径，也用来算「这批真的多出了哪些行」（决定验证派给谁）。
@@ -1876,7 +1892,7 @@ public class ConnectorSemanticDeriveService {
      * <p>第三件才是真正值得写代码的：一次推导要几十秒，因为最后一条 field 被切掉就整份丢弃太亏。
      * 但修复必须<b>出声</b>——把残缺当完整，正是这套设计从头到尾在防的事，所以修复成功也要进 note。
      */
-    private Map<String, Object> parseJson(String raw, List<String> notes) throws Exception {
+    private Parsed parseJson(String raw, List<String> notes) throws Exception {
         String s = raw == null ? "" : raw.trim();
         if (s.startsWith("```")) {
             int nl = s.indexOf('\n');
@@ -1893,18 +1909,20 @@ public class ConnectorSemanticDeriveService {
             s = s.substring(a);
         }
         try {
-            return readMap(s);
+            return new Parsed(readMap(s), false);
         } catch (Exception first) {
             String repaired = repairTruncatedJson(s);
             if (repaired.equals(s)) {
                 throw first;
             }
             Map<String, Object> m = readMap(repaired);
+            // 这句话一个字都别改：前端和运维都在读它。截断的【结构化】信号另走
+            // Parsed.modelOutputTruncated → SemanticCoverage，不是从这段散文里反解出来的。
             notes.add("模型输出疑似被 max_tokens 截断，已截到最后一个完整条目，"
                     + "说明书不完整（可调大 connector.semantic.max-tokens）");
             log.warn("语义层推导的模型输出被截断，已修复后解析：原长 {} 字符，修复后 {} 字符",
                     s.length(), repaired.length());
-            return m;
+            return new Parsed(m, true);
         }
     }
 
@@ -2025,9 +2043,21 @@ public class ConnectorSemanticDeriveService {
      * 等于在最需要这条信息的时候删掉它。本次尝试发生在什么时候，看 {@code semantic_claim_at}。
      */
     private void writeStatus(Long connectorId, String status, String note, boolean stampTime, Date claimAt) {
+        writeStatus(connectorId, status, note, stampTime, claimAt, null);
+    }
+
+    /**
+     * @param coverage 本次生成「是不是全本」的判定；{@code null} = 这条出路不重新判覆盖面，那两列原样不动。
+     *                 <b>它和 note 必须在同一个实体、同一次 UPDATE 里落库</b>：分成两次写，中间任何一次
+     *                 失败都会留下一行「散文说残缺、结构化信号说完整」的记录，而那种行比没有信号更坏——
+     *                 它会让人相信一个错的答案。失败与中断路径一律传 null：那时库里还是上一版说明书，
+     *                 这两列描述的也该还是上一版。
+     */
+    private void writeStatus(Long connectorId, String status, String note, boolean stampTime, Date claimAt,
+                             SemanticCoverage.Verdict coverage) {
         try {
             Date syncedAt = (stampTime && SEM_READY.equals(status)) ? truncateToSecond(new Date()) : null;
-            Connection u = statusEntity(status, note, syncedAt, null);
+            Connection u = statusEntity(status, note, syncedAt, null, coverage);
             LambdaUpdateWrapper<Connection> w = new LambdaUpdateWrapper<Connection>()
                     .eq(Connection::getId, connectorId);
             if (claimAt != null) {
@@ -2045,6 +2075,16 @@ public class ConnectorSemanticDeriveService {
 
     /** 只装 semantic_* 那几列，绝不带 id——id 是 where 条件，不该出现在 set 里。 */
     private Connection statusEntity(String status, String note, Date syncedAt, Date claimAt) {
+        return statusEntity(status, note, syncedAt, claimAt, null);
+    }
+
+    /**
+     * 同上，外加覆盖面判定。{@code coverage} 为 null 时这两列一个都不装——
+     * MyBatis-Plus 的 NOT_NULL 策略于是不会把它们带进 SET，行上原来的值原样保留。
+     * 反过来，判了就<b>两列一起装</b>：完整时 gaps 是空串而不是 null，否则上一轮的成因码会留在行上。
+     */
+    private Connection statusEntity(String status, String note, Date syncedAt, Date claimAt,
+                                    SemanticCoverage.Verdict coverage) {
         Connection u = new Connection();
         if (status != null) {
             u.setSemanticStatus(status);
@@ -2055,6 +2095,10 @@ public class ConnectorSemanticDeriveService {
         }
         if (claimAt != null) {
             u.setSemanticClaimAt(claimAt);
+        }
+        if (coverage != null) {
+            u.setSemanticCoverage(coverage.code());
+            u.setSemanticGaps(clip(coverage.gapCodes(), GAPS_MAX));
         }
         return u;
     }
@@ -3824,6 +3868,16 @@ public class ConnectorSemanticDeriveService {
      */
     private record Digest(String text, int includedObjects, int totalObjects,
                           boolean totalIsLowerBound, List<String> notes) {
+    }
+
+    /**
+     * 解析模型返回的结果，外加<b>它是不是被截断后修复出来的</b>。
+     *
+     * <p>截断修复的那句话一直写在 {@code notes} 里给人看，但「说明书残缺」这件事不能靠
+     * 回头去 match 那句中文：文案会改、会被别的说明挤掉、也无法进 SQL。
+     * 所以这里把它作为一个<b>布尔事实</b>带出来，喂给 {@link SemanticCoverage}。
+     */
+    private record Parsed(Map<String, Object> map, boolean modelOutputTruncated) {
     }
 
     /**

@@ -174,6 +174,35 @@ class ConnectorOverviewServiceTest {
                 .doesNotContain("销售额");
     }
 
+    /**
+     * ★ CAVEAT / FIELD 行不会被当成口径。
+     *
+     * <p>分桶曾经是 {@code if (OBJECT) ... else ...}，靠「查询只捞 OBJECT 和 METRIC」这个外部前提
+     * 才成立。写入面已经扩到五类，而 CAVEAT 行长得和 METRIC 很像——term 非空、gloss 非空，
+     * 区别只在于它的 gloss 是<b>一个还没人回答的问题</b>。一旦有人动了那条 wrapper，else 兜底就会
+     * 把「销售额是否扣除退款？」渲染进「已确认的业务口径」那一段：<b>把待确认项宣布成结论</b>，
+     * 而模型不会去分辨标题，它只会照着算。
+     *
+     * <p>这里直接喂进 CAVEAT 和 FIELD，模拟那个前提被打破之后的输入。
+     */
+    @Test
+    void caveatAndFieldRows_areNeverRenderedAsConfirmedMetrics() {
+        grant(1L, "crm", null, "mysql");
+        when(schemaMapper.selectList(any())).thenReturn(List.of(schema(1L, "t_ord_mst", "订单主表", "TABLE")));
+        when(semanticMapper.selectList(any())).thenReturn(List.of(
+                caveat(1L, "销售额", "销售额是否扣除退款？"),
+                field(1L, "t_ord_mst", "amt", "订单金额，单位分")));
+
+        String text = service.buildOverview();
+
+        assertThat(text).as("待确认的问题被写进「已确认的业务口径」= 把疑问当结论宣布给模型")
+                .doesNotContain("销售额是否扣除退款？");
+        assertThat(text).as("FIELD 行是 conn_describe 的事，同样不该落进口径段")
+                .doesNotContain("订单金额，单位分");
+        assertThat(text).as("表清单本身照常渲染：这条修的是分桶，不是把整条连接丢掉")
+                .contains("t_ord_mst");
+    }
+
     // ------------------------------------------------------------------ ★ 截断必须自报
 
     @Test
@@ -283,6 +312,33 @@ class ConnectorOverviewServiceTest {
         s.setObjectName(objectName);
         s.setGloss(gloss);
         s.setStatus(status);
+        s.setSource(ConnectorSemanticService.SOURCE_INFERRED);
+        return s;
+    }
+
+    /** 待澄清项：term 非空、gloss 是<b>一个问句</b>——和口径最像、也最不能被当成口径的那一类。 */
+    private static ConnectorSemantic caveat(Long connectorId, String term, String question) {
+        ConnectorSemantic s = new ConnectorSemantic();
+        s.setConnectorId(connectorId);
+        s.setScope(ConnectorSemanticService.SCOPE_CAVEAT);
+        s.setObjectName("");
+        s.setFieldName("");
+        s.setTerm(term);
+        s.setGloss(question);
+        s.setStatus(ConnectorSemanticService.ST_DRAFT);
+        s.setSource(ConnectorSemanticService.SOURCE_INFERRED);
+        return s;
+    }
+
+    private static ConnectorSemantic field(Long connectorId, String objectName, String fieldName, String gloss) {
+        ConnectorSemantic s = new ConnectorSemantic();
+        s.setConnectorId(connectorId);
+        s.setScope(ConnectorSemanticService.SCOPE_FIELD);
+        s.setObjectName(objectName);
+        s.setFieldName(fieldName);
+        s.setTerm("");
+        s.setGloss(gloss);
+        s.setStatus(ConnectorSemanticService.ST_CONFIRMED);
         s.setSource(ConnectorSemanticService.SOURCE_INFERRED);
         return s;
     }

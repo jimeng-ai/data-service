@@ -23,6 +23,7 @@ import com.jimeng.persistence.entity.AgentInputFile;
 import com.jimeng.persistence.mapper.AgentInputFileMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -67,6 +68,24 @@ public class ChatRunService {
     private final SkillTenantService skillTenantService;
     private final ThreadPoolTaskExecutor streamExecutor;
     private final ThreadPoolTaskExecutor runPumpExecutor;
+
+    /**
+     * 「本会话曾经传过文件 → 之后每一轮都走沙箱」这条判据的回看窗口，单位是<b>轮</b>（user 消息条数）。
+     *
+     * <h3>默认 0 = 不限，与改造前逐字一致</h3>
+     * 本仓库 push main 即部署生产，所以默认值只能是「现状」。要收窄由运维按实测数据显式配。
+     *
+     * <h3>为什么不直接拍一个 N</h3>
+     * 这条判据存在的理由是：后续轮次可能要引用先前上传的文件，而对话平面够不到它们。
+     * 代价是纯查库的一轮也要起容器、拉附件。两边都是真的，取舍点在「隔多少轮之后就不会再提那个文件了」——
+     * 那是个<b>经验值</b>，没有实测分布就是瞎拍。而拍错的方向是不对称的：
+     * 多走一次沙箱只是慢，少走一次沙箱是模型看不见用户刚传的文件、还不报错。
+     *
+     * <p>（这条判据原先最严重的后果是「Agent 突然不会查数据库了」——那已经由沙箱平面接上
+     * conn_* 工具解决，见 {@code docs/sandbox-connector-plane.md}。这里剩下的纯粹是成本。）
+     */
+    @Value("${chat.sandbox-stickiness-turns:0}")
+    private int sandboxStickinessTurns;
 
     // ------------------------------------------------------------------ 发起一轮
 
@@ -150,11 +169,50 @@ public class ChatRunService {
      * 才发生，避免给纯对话路径平添一次查询。
      */
     private boolean decideExec(Long conversationId, List<Long> fileIds, String agentId, boolean preview) {
-        if (fileIds != null && !fileIds.isEmpty()) return true;
-        Long n = inputFileMapper.selectCount(new LambdaQueryWrapper<AgentInputFile>()
-                .eq(AgentInputFile::getConversationId, conversationId));
-        if (n != null && n > 0) return true;
-        return hasSandboxOnlySkill(agentId, preview);
+        if (fileIds != null && !fileIds.isEmpty()) {
+            logRoute(conversationId, true, "本轮带附件");
+            return true;
+        }
+        if (hasHistoricalInput(conversationId)) {
+            logRoute(conversationId, true, "本会话此前传过文件（窗口="
+                    + (sandboxStickinessTurns <= 0 ? "不限" : sandboxStickinessTurns + " 轮") + "）");
+            return true;
+        }
+        boolean doer = hasSandboxOnlySkill(agentId, preview);
+        logRoute(conversationId, doer, doer ? "Agent 绑定了只能在沙箱执行的技能（DOER）" : "无附件、无 DOER 技能");
+        return doer;
+    }
+
+    /**
+     * 本会话此前有没有传过文件。窗口 &lt;= 0 时看整条会话（默认，与改造前一致）；
+     * 配了正数就只看最近 N 轮之内登记的输入文件。
+     *
+     * <p>按 id 降序取最近 N 条 user 消息、拿其中最老那条的 id 作下界，再问输入文件表有没有更新的行。
+     * 用消息 id 而不是时间戳：雪花 id 单调且与消息顺序同源，时间戳会被时钟回拨影响。
+     */
+    private boolean hasHistoricalInput(Long conversationId) {
+        LambdaQueryWrapper<AgentInputFile> q = new LambdaQueryWrapper<AgentInputFile>()
+                .eq(AgentInputFile::getConversationId, conversationId);
+        if (sandboxStickinessTurns > 0) {
+            // 取不到下界（会话短于 N 轮）说明整条会话都在窗口内，不加条件。
+            java.util.Date since = chatConversationService.userTurnCutoff(conversationId, sandboxStickinessTurns);
+            if (since != null) {
+                q.ge(AgentInputFile::getCreateTime, since);
+            }
+        }
+        Long n = inputFileMapper.selectCount(q);
+        return n != null && n > 0;
+    }
+
+    /**
+     * 把路由判定写进日志。
+     *
+     * <p>这条判定过去是完全不可见的：用户只知道「Agent 的行为变了」，排查的人也没有任何痕迹可循，
+     * 而它决定了整轮跑在哪个平面。想要收窄上面那个窗口，先得有这行日志攒出来的分布。
+     */
+    private void logRoute(Long conversationId, boolean exec, String reason) {
+        log.info("对话路由 conversationId={} plane={} reason={}",
+                conversationId, exec ? "sandbox" : "conversation", reason);
     }
 
     /** 该 Agent 是否绑定了必须在沙箱里执行的技能（DOER）。解析失败一律返回 false：

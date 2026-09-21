@@ -102,6 +102,17 @@ public class ConnectorSchemaService {
     private static final int MAX_OBJECTS = 200;
 
     /**
+     * 「这张表有没有行」整批探测的挂钟预算（毫秒）。见 {@link #probeRowPresenceQuietly}。
+     *
+     * <p>定在 20 秒的依据：最多 {@link #MAX_OBJECTS} 个对象，正常库上一条
+     * {@code SELECT 1 ... LIMIT 1} 是毫秒级，跨公网算上往返也就几十毫秒，20 秒有数倍余量；
+     * 而真遇到慢表（锁等待、视图在现算），再等下去也换不来可信答案。
+     * <b>上限是挂钟，不是「每张表的超时 × 表数」</b>——后者会让一次刷新随表数线性变慢，
+     * 正是这条预算要挡住的事。预算用完时剩下的对象留成「不知道」，不是「空」。
+     */
+    static final long ROW_PRESENCE_BUDGET_MILLIS = 20_000L;
+
+    /**
      * 待补报名单的 Redis 键前缀（后接 connection.id），值是一个表名集合。见 {@link #rememberPendingRemoved}。
      *
      * <p>放 Redis 而不是我们库里：语义层那张表只放说明书本身，结构快照那张表每次刷新都整批删了重插，
@@ -437,6 +448,9 @@ public class ConnectorSchemaService {
 
         // 拉取开始的时刻：既是这份快照每行的 synced_at，也是落库前「有没有更新的快照先落了库」的比较基准。
         Date pullStart = new Date();
+        // 「这张表有没有行」是从数据算出来的一个布尔，按第 2 档（派生统计）处理，理由见 probeRowPresenceQuietly。
+        // 第 1 档的连接整批不探，每张表都是「不知道」——不是「都不空」，也不是「都空」。
+        boolean probeRowPresence = SemanticDataTier.parse(row.getSemanticDataTier()).allowsDerivedStats();
         // 开会话之前读好：它要并进归因，也要在目录截断时一起确认存不存在。
         Set<String> pendingRemoved = readPendingRemoved(connectorId);
 
@@ -454,7 +468,7 @@ public class ConnectorSchemaService {
                                     "这条连接的自描述能力不可用，请先点「测试连接」重新探测");
                         }
                         return pullDetails(describe, describe.catalog(), row, pullStart,
-                                () -> knownObjectNames(connectorId, pendingRemoved));
+                                () -> knownObjectNames(connectorId, pendingRemoved), probeRowPresence);
                     });
         } catch (ConnectorException e) {
             // 已归一、已脱敏，转成业务异常给管理台看。
@@ -787,9 +801,9 @@ public class ConnectorSchemaService {
                         List<String> checkedNames, Set<String> existingNames) {}
 
     private Pull pullDetails(DescribeCapable describe, CatalogView catalog, Connection row, Date syncedAt,
-                             Supplier<Collection<String>> knownNames) {
+                             Supplier<Collection<String>> knownNames, boolean probeRowPresence) {
         List<CatalogEntry> entries = catalog.entries() == null ? List.of() : catalog.entries();
-        List<ConnectorSchema> out = new ArrayList<>();
+        List<CatalogEntry> kept = new ArrayList<>();
         List<ObjectDetail> details = new ArrayList<>();
         int n = 0;
         for (CatalogEntry e : entries) {
@@ -800,9 +814,9 @@ public class ConnectorSchemaService {
                         MAX_OBJECTS, row.getId(), truncationNote(catalog, MAX_OBJECTS));
                 break;
             }
-            // 截断判断通过之后 n 恰好是这张表在目录里从 1 开始的位置，即重要性排名。
-            // 描述失败的对象同样占一个位置：它在目录里就排在那儿，跳过它会让后面每一张表的排名错一位。
-            int position = n;
+            // 截断判断通过之后 n 恰好是这张表在目录里从 1 开始的位置，即重要性排名；
+            // 下面按 kept 的下标 + 1 复现同一个位置。描述失败的对象同样占一个位置：
+            // 它在目录里就排在那儿，跳过它会让后面每一张表的排名错一位。
             ObjectDetail detail;
             try {
                 detail = describe.describe(e.name());
@@ -814,8 +828,20 @@ public class ConnectorSchemaService {
                 detail = new ObjectDetail(e.name(), e.type(), e.comment(), List.of(),
                         Map.of(DESCRIBE_ERROR_KEY, "结构获取失败：" + ex.getCode().title()));
             }
-            out.add(toRow(row, e, detail, syncedAt, position));
+            kept.add(e);
             details.add(detail);
+        }
+
+        // ★ 探完再落行：探测结论要盖进同一份 detail_json，行只在这之后拼一次。
+        //   先拼行、再回头改 detail_json，等于把刚序列化好的 JSON 再解一次——本类反复警告的「读复印件」。
+        Map<String, Boolean> presence = probeRowPresence
+                ? probeRowPresenceQuietly(describe, details, row)
+                : Map.of();
+        List<ConnectorSchema> out = new ArrayList<>(kept.size());
+        for (int i = 0; i < kept.size(); i++) {
+            CatalogEntry e = kept.get(i);
+            // 排名就是目录位置，与上面那一轮的 position 一致（描述失败的对象同样占位）。
+            out.add(toRow(row, e, details.get(i), syncedAt, i + 1, presence.get(e.name())));
         }
 
         List<String> checked = List.of();
@@ -834,6 +860,70 @@ public class ConnectorSchemaService {
             }
         }
         return new Pull(catalog, out, details, checked, existing);
+    }
+
+    /**
+     * 探一次「这几张表里有没有行」（缺陷 B19）。失败一律落到「不知道」，绝不落到「空」。
+     *
+     * <h3>为什么这件事值得在刷新时多跑一趟</h3>
+     * POC 环境里 {@code D1_COMPANYCODE} 与 {@code EMM_PURCHASEORDERCONFIRM} 是 0 行。
+     * 模型 join 到这样一张空维表，拿回 0 行，把「没有数据」当成业务答案报给用户——
+     * 查询成功、没有报错、数字静默地错。结构快照里什么都有，唯独没有「这张表里到底有没有东西」。
+     *
+     * <h3>★ 只探描述成功的对象</h3>
+     * {@code describe} 失败的那些（权限只到部分表、表刚被删）留在快照里只有一条名字行。
+     * 对它们发探测语句几乎必然同样失败，只是把预算烧在注定拿不到答案的地方；
+     * 而且对模型而言，一张连结构都没取到的表本来就不该有任何「它是空的」的结论。
+     *
+     * <h3>★ 成本上限：一次刷新最多 {@value #ROW_PRESENCE_BUDGET_MILLIS} 毫秒</h3>
+     * 上限交给连接器，是因为「怎么才算便宜」是方言相关的（MySQL 那边是
+     * 一借连接 + 每句 {@code SELECT 1 ... LIMIT 1} + 单句超时）。这里只负责把预算写在明处：
+     * 对象数最多 {@link #MAX_OBJECTS} 个，正常库上每张表是毫秒级，20 秒够跑完；
+     * 遇上锁等待之类的慢表，连接器会在预算用完时收手，剩下的<b>留成「不知道」</b>。
+     * 所以一次刷新的最坏增量是这个预算，<b>不随表数增长</b>——不会因为表多而跑几分钟。
+     *
+     * <h3>★ 出库档位：按第 2 档（派生统计）处理，不是按第 3 档</h3>
+     * 探测带出客户库的只有一个布尔：这张表<b>有没有行</b>。它不是任何一行真实取值，
+     * 所以与第 3 档（样本值）无关，也不需要过 PII 过滤——没有值可过。
+     * 但它<b>确实是从数据算出来的</b>：第 1 档 {@code METADATA_ONLY} 对客户的承诺原话是
+     * 「不做任何聚合，没有一条业务记录参与运算」，而这条语句要去碰行。所以闸问的是
+     * {@link SemanticDataTier#allowsDerivedStats()}，与 {@code TableShapeDetector} 同一档；
+     * 第 1 档的连接上整批不探，每张表都是「不知道」，模型侧退回到今天的行为。
+     * 第 2 档对客户承诺的清单里已经有「基数」——「基数是不是 0」正是它最弱的那一格，
+     * 所以 {@link SemanticDataTier#egressStatement()} 那句话不需要改，也不该为这件事变宽。
+     *
+     * @return 名字 → 是否至少有一行。<b>键不在 = 不知道</b>；永远不返回 {@code null}
+     */
+    private Map<String, Boolean> probeRowPresenceQuietly(DescribeCapable describe, List<ObjectDetail> details,
+                                                         Connection row) {
+        List<String> names = new ArrayList<>();
+        for (ObjectDetail d : details) {
+            if (d != null && d.name() != null && !describeFailed(d)) {
+                names.add(d.name());
+            }
+        }
+        if (names.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            Map<String, Boolean> probed = describe.probeRowPresence(names, ROW_PRESENCE_BUDGET_MILLIS);
+            if (probed == null) {
+                // 连接器答不了（HTTP 连接器、老实现）。全是「不知道」，不是「全是空的」。
+                return Map.of();
+            }
+            long empty = probed.values().stream().filter(v -> Boolean.FALSE.equals(v)).count();
+            if (empty > 0) {
+                // INFO 而不是 debug：空表是排查「模型为什么说没有数据」时第一个要看的东西。
+                log.info("结构刷新探到空表 connectorId={} 空表数={} 已探到={} 共描述={}",
+                        row.getId(), empty, probed.size(), names.size());
+            }
+            return probed;
+        } catch (RuntimeException e) {
+            // 一个叠加信息不能否决一次成功的结构拉取。整批退回「不知道」。
+            log.warn("探测表是否为空失败，本次全部按「不知道」处理 connectorId={} 对象数={}",
+                    row.getId(), names.size(), e);
+            return Map.of();
+        }
     }
 
     /**
@@ -1007,16 +1097,23 @@ public class ConnectorSchemaService {
     /**
      * @param importanceRank 这张表在连接器目录里从 1 开始的位置。只存位置，不存档位与引用数：位置已经完整表达了
      *                       连接器的排序结果，而把档位塞进 {@link CatalogEntry} 要动所有连接器与 {@code ConnectorToolExecutor}。
+     * @param nonEmpty       本次探到的「这张表有没有行」：{@code TRUE} 有 / {@code FALSE} 确认空 / {@code null} 不知道。
+     *                       它<b>不进 {@code content_hash}</b>（见下面那行注释的同一条理由）：一张表从空变成非空
+     *                       不是结构漂移，算进去会让挂在它上面的说明书整批被标过期。
      */
     private ConnectorSchema toRow(Connection row, CatalogEntry entry, ObjectDetail detail, Date syncedAt,
-                                  int importanceRank) {
+                                  int importanceRank, Boolean nonEmpty) {
         ConnectorSchema s = new ConnectorSchema();
         s.setTenantId(row.getTenantId());
         s.setConnectorId(row.getId());
         s.setObjectType(entry.type() == null ? "TABLE" : entry.type());
         s.setObjectName(entry.name());
         s.setObjectComment(entry.comment());
-        s.setDetailJson(toJson(toDetailMap(detail)));
+        Map<String, Object> detailMap = toDetailMap(detail);
+        // 「有没有行」盖进同一份 detail_json，不加新列。null（没探到）什么都不写——
+        // 键不在就是「不知道」，而把「没探到」写成「空」比不写更糟。契约见 RowPresence。
+        RowPresence.stamp(detailMap, nonEmpty);
+        s.setDetailJson(toJson(detailMap));
         // 哈希算的是【结构】而不是整个 JSON：注释里带的「约 N 行」是估算值，每次都在变，
         // 拿它进哈希会让每次刷新都报「变了」，报警变成噪音之后没人会看。
         s.setContentHash(sha256(structureFingerprint(detail)));

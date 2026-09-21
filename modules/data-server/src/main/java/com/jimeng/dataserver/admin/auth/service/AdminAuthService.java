@@ -55,6 +55,25 @@ public class AdminAuthService {
      */
     public static final int SEMANTIC_AGENT_TOKEN_GRACE_SEC = 120;
 
+    /**
+     * 对话 agent 连接器回调 token 的 {@code purpose} claim。
+     *
+     * <p><b>必须是与 {@link #PURPOSE_SEMANTIC_AGENT} 不同的值</b>：两条回调前缀上各有一个过滤器，
+     * 各自只认自己的 purpose、也只放行自己的前缀。复用同一个值，一枚语义层 token 就成了
+     * 「那个 Agent 全部连接器的读写凭据」，而两边的资源绑定检查谁都不会发现。
+     */
+    public static final String PURPOSE_CONNECTOR_AGENT = "connector-agent";
+
+    /**
+     * 对话 agent 连接器回调 token 在本次运行墙钟之外多给的秒数，与语义层、RAG 回调同一口径。
+     * 一次运行从签发到结束，除墙钟本身还有边车准入排队和容器启动，token 不能赶在运行结束之前先过期，
+     * 否则最后几次 {@code conn_*} 调用会被拒、而模型只会当成"查不到"继续往下说。
+     *
+     * <p>多给的这段<b>不扩大重放窗口</b>：回调前缀的过滤器每次查
+     * {@code ConnectorAgentRunRegistry}，运行一结束登记即删，token 提前失效。
+     */
+    public static final int CONNECTOR_AGENT_TOKEN_GRACE_SEC = 120;
+
     private final SysUserMapper sysUserMapper;
     private final SysEnterpriseMapper sysEnterpriseMapper;
     private final BCryptPasswordEncoder passwordEncoder;
@@ -232,6 +251,56 @@ public class AdminAuthService {
         payload.put("gen", String.valueOf(generationId));       // 字符串：雪花 id 超出 JS 安全整数
         payload.put("cid", String.valueOf(connectorId));
         payload.put("slice", sliceNo);
+        payload.put("rid", runId);
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
+    }
+
+    /**
+     * 对话 agent 一次沙箱运行的连接器回调 token 有效期（毫秒）
+     * = (本次运行墙钟秒数 + {@link #CONNECTOR_AGENT_TOKEN_GRACE_SEC}) × 1000。
+     * 口径<b>只留这一处</b>，派发方与 {@code ConnectorAgentRunRegistry.begin} 的 TTL 都从这里取：
+     * 两处各自重算，早晚会算出「登记先于 token 过期」，表现是运行末尾的回调莫名其妙被拒。
+     */
+    public static long connectorAgentTokenTtlMs(int wallClockSec) {
+        return (wallClockSec + (long) CONNECTOR_AGENT_TOKEN_GRACE_SEC) * 1000L;
+    }
+
+    /**
+     * 为对话 agent 的<b>一次沙箱运行</b>签发窄权限连接器回调 token。与 {@link #mintSemanticAgentToken}
+     * 同密钥、同 hutool 写法、HS256；网关照常验签并据 {@code tenant_id} 注入租户，
+     * 范围限定由 {@code ConnectorAgentScopeFilter} 执行。
+     *
+     * <h3>claims</h3>
+     * <ul>
+     *   <li>{@code id}：发起这轮对话的用户，字符串，与登录签发一致。<b>网关要求非空</b>，缺了直接 401。</li>
+     *   <li>{@code tenant_id}：本轮租户，网关据此注入 {@code X-Tenant-Id}。</li>
+     *   <li>{@code realm}：ENTERPRISE。</li>
+     *   <li>{@code purpose}：{@link #PURPOSE_CONNECTOR_AGENT}。</li>
+     *   <li>{@code aid}：Agent id，<b>字符串</b>——雪花 id 超出 JS 安全整数，
+     *       按数字写进 JWT 会在任何 JS 端解析时被静默改值（沙箱是 Node 宿主进程）。</li>
+     *   <li>{@code rid}：本次运行 id。它是吊销的抓手：运行结束即从
+     *       {@code ConnectorAgentRunRegistry} 删除，在途回调随即进不来。</li>
+     * </ul>
+     *
+     * <p><b>刻意不把"被授权的连接 id 集合"写进 claims</b>：那是一份快照，超管撤销授权要等到下一轮才生效。
+     * 连接归属由 {@code ConnectorGateway} 按 {@code agent_connection} 实时查。
+     *
+     * <p>token 只进下发给边车的 payload、由宿主进程里的工具代理闭包持有；不进容器 env、不进 prompt，
+     * 也不回显在工具结果与错误文案里。调用方不要把它打进日志。
+     *
+     * @param ttlMs 用 {@link #connectorAgentTokenTtlMs(int)} 算
+     */
+    public String mintConnectorAgentToken(Long userId, String tenantId, Long agentId, String runId, long ttlMs) {
+        Date now = new Date();
+        Map<String, Object> payload = new HashMap<>();
+        payload.put(JWTPayload.ISSUED_AT, now);
+        payload.put(JWTPayload.NOT_BEFORE, now);
+        payload.put(JWTPayload.EXPIRES_AT, new Date(now.getTime() + ttlMs));
+        payload.put("id", String.valueOf(userId));              // 网关要求非空（AuthorizeFilter 缺 id 即 401）
+        payload.put("tenant_id", tenantId);                     // 网关据此注入 X-Tenant-Id
+        payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        payload.put("purpose", PURPOSE_CONNECTOR_AGENT);
+        payload.put("aid", String.valueOf(agentId));            // 字符串：雪花 id 超出 JS 安全整数
         payload.put("rid", runId);
         return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }

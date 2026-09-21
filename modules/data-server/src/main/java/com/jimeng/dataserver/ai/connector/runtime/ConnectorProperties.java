@@ -41,6 +41,45 @@ public class ConnectorProperties {
     private SchemaRefresh schemaRefresh = new SchemaRefresh();
     private Semantic semantic = new Semantic();
     private Overview overview = new Overview();
+    private Agent agent = new Agent();
+
+    /**
+     * 沙箱平面的连接器工具代理（Nacos {@code connector.agent.*}）。
+     *
+     * <p>解决的是：带附件的会话整轮路由到沙箱平面，而沙箱平面<b>一个 {@code conn_*} 工具都没有</b>——
+     * Agent 查不了数据库，而且不报错，模型只会拿历史数据讲或者自己编。修法是沙箱侧只放工具代理，
+     * 真正执行留在宿主，经 {@code /data/internal/connector-agent/**} 回调既有的 {@code ConnectorToolExecutor}。
+     */
+    @Data
+    public static class Agent {
+        /**
+         * 总开关，默认<b>关</b>。关闭时沙箱平面维持现状（没有 conn_ 工具），不下发回调 token、不登记运行。
+         *
+         * <p>默认关的理由就是本类开头那条纪律的另一面：<b>push main 即部署生产</b>，
+         * 代码合入那一刻的行为必须与现状<b>逐字一致</b>，在 Nacos 打开才生效。
+         */
+        private boolean enabled = false;
+
+        /**
+         * 下发给沙箱的回调根地址，含 {@code /data}：dev {@code http://localhost:10011/data}；
+         * 生产 {@code http://localhost:20011/data}。
+         *
+         * <p><b>★ 故意没有默认值，空 = 这项能力不可用。</b>沙箱 :8088 是 dev 与 prod <b>共用的单进程</b>、
+         * env 只有一份；给了默认值，dev 平面的运行就会回调到生产网关，在<b>另一套数据</b>上执行读写，
+         * 而且一个字的错都不报——查出来的数是真的，只是别人家的。
+         *
+         * <p>与 {@code jwt.secret} / {@code CONNECTION_CREDENTIAL_KEY} / {@code SANDBOX_SERVICE_TOKEN}
+         * 同一条 fail-closed 纪律：配错的代价是静默的越权，那就宁可缺配时直接没有这项能力。
+         */
+        private String callbackBaseUrl = "";
+
+        /**
+         * 沙箱镜像里工具代理的最低版本。边车报的版本低于它即判定这套代理对不上，不走回调面。
+         * 沙箱与 data-service 各自部署、没有跨仓库原子提交，版本不匹配必须能被识别出来，
+         * 而不是等到模型调了一个边车根本没有的工具。
+         */
+        private int minSandboxToolsVersion = 1;
+    }
 
     /** 「能查」的护栏。 */
     @Data

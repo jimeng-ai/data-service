@@ -15,6 +15,7 @@ import com.jimeng.persistence.mapper.ConnectorSemanticGenerationTableMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticStagedMapper;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
+import com.jimeng.dataserver.ai.connector.service.SemanticCoverage;
 import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
@@ -90,6 +91,8 @@ class SemanticGenerationFinalizerTest {
 
         when(generationMapper.update(any(), any())).thenReturn(1);
         when(claim.release(any(), any(), any(), any(Boolean.class))).thenReturn(true);
+        // READY 走的是带覆盖面判定的 5 参重载（失败/中断仍走 4 参那条，两者的桩要分开给）。
+        when(claim.release(any(), any(), any(), any(Boolean.class), any())).thenReturn(true);
         stubTables(List.of());
         when(schemaMapper.selectList(any())).thenReturn(List.of());
         when(semanticMapper.selectList(any())).thenReturn(List.of());
@@ -139,10 +142,35 @@ class SemanticGenerationFinalizerTest {
         assertEquals("READY", updates.getAllValues().get(1).getStatus());
         assertNull(updates.getAllValues().get(1).getOwnerToken());
         verify(claim).lockRow(20L);
+        // ★ 覆盖面判定和 note 必须在【同一次 release】里落库：分两次写，中间失败就会留下一行
+        //   「散文说残缺、结构化信号说完整」的记录，而那比没有信号更坏——它让人相信一个错的答案。
         verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
-                org.mockito.ArgumentMatchers.contains("覆盖 1/1 张表"), org.mockito.ArgumentMatchers.eq(true));
+                org.mockito.ArgumentMatchers.contains("覆盖 1/1 张表"), org.mockito.ArgumentMatchers.eq(true),
+                org.mockito.ArgumentMatchers.eq(SemanticCoverage.assess(
+                        new SemanticCoverage.Facts(1, 1, 0, false, false))));
         verify(semanticService, org.mockito.Mockito.times(2)).requireOwned(20L);
         verify(stagedMapper, never()).physicalDeleteByGeneration(any(), any());
+    }
+
+    @Test
+    @DisplayName("DIRECT 有表被放弃：READY 照写，但覆盖面判成 PARTIAL(TABLES_GAVE_UP)，与 note 同一次落库")
+    void directWithGaveUpTableIsMarkedPartial() {
+        // DIRECT 没有 STAGED 那条放弃率闸门（那条是「要不要替换上一版」的判断），
+        // 所以这一批照样 READY——说明书能用，只是不全。「能用」和「是全本」是两件事，
+        // 而后者过去只写在 note 的散文里，没人看那个字段就发现不了。
+        ConnectorSemanticGeneration generation = generation("DIRECT");
+        stubTables(List.of(table("DONE"), table("GAVE_UP")));
+        when(semanticMapper.selectList(any())).thenReturn(List.of(semantic("OBJECT")));
+
+        assertEquals(SemanticGenerationFinalizer.FinishResult.DONE, finalizer.finish(generation, 0.0));
+
+        ArgumentCaptor<SemanticCoverage.Verdict> coverage =
+                ArgumentCaptor.forClass(SemanticCoverage.Verdict.class);
+        verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
+                org.mockito.ArgumentMatchers.contains("放弃 1 张"), org.mockito.ArgumentMatchers.eq(true),
+                coverage.capture());
+        assertTrue(coverage.getValue().partial());
+        assertEquals("TABLES_MISSING,TABLES_GAVE_UP", coverage.getValue().gapCodes());
     }
 
     @Test
@@ -160,8 +188,11 @@ class SemanticGenerationFinalizerTest {
         assertEquals("INTERRUPTED", update.getValue().getStatus());
         assertEquals(GenerationReasonCode.GAVE_UP_RATIO.name(), update.getValue().getReasonCode());
         verify(stagedMapper, never()).physicalDeleteByGeneration(any(), any());
+        // ★ 中断走 4 参那条：库里还是上一版说明书，semantic_coverage / semantic_gaps 就该还描述上一版。
+        //   在这里顺手写一个「本轮」的覆盖面，等于用一批没落库的产出去描述一份没被替换的说明书。
         verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
                 org.mockito.ArgumentMatchers.contains("上一版"), org.mockito.ArgumentMatchers.eq(false));
+        verify(claim, never()).release(any(), any(), any(), any(Boolean.class), any());
     }
 
     @Test
@@ -170,6 +201,7 @@ class SemanticGenerationFinalizerTest {
         ConnectorSemanticGeneration generation = generation("DIRECT");
         stubTables(List.of(table("DONE")));
         when(claim.release(any(), any(), any(), any(Boolean.class))).thenReturn(false);
+        when(claim.release(any(), any(), any(), any(Boolean.class), any())).thenReturn(false);
 
         assertEquals(SemanticGenerationFinalizer.FinishResult.DONE, finalizer.finish(generation, 0.0));
 
@@ -235,7 +267,8 @@ class SemanticGenerationFinalizerTest {
         order.verify(generationMapper).update(any(), any()); // READY
         verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
                 org.mockito.ArgumentMatchers.contains("上一版机器生成的说明已替换"),
-                org.mockito.ArgumentMatchers.eq(true));
+                org.mockito.ArgumentMatchers.eq(true),
+                org.mockito.ArgumentMatchers.argThat(v -> v != null && !v.partial()));
         verify(semanticService, org.mockito.Mockito.times(2)).requireOwned(20L);
     }
 
