@@ -89,13 +89,16 @@ connector:
 
 ## 工具名与文档
 
-沙箱侧 server 名 `connector`，七个短名**原样保留 `conn_` 前缀**：
+沙箱侧 server 名 `connector`，八个短名**原样保留 `conn_` 前缀**：
 
 ```
 mcp__connector__conn_list      mcp__connector__conn_catalog   mcp__connector__conn_describe
 mcp__connector__conn_query     mcp__connector__conn_invoke    mcp__connector__conn_execute
-mcp__connector__conn_define_metric
+mcp__connector__conn_define_metric                            mcp__connector__conn_annotate
 ```
+
+下发的是 `tools.json` 里的**全部**工具（`ConnectorAgentContextFactory.toolSchemas()` 逐条按
+`^conn_[a-z_]{1,32}$` 校验后整组下发），所以这里的枚举只是当时的快照——真相以 `tools.json` 为准。
 
 保留前缀让 `skills/connector/SKILL.md` **一个字都不用改**就能两平面共用（正文里 `conn_*` 字面量
 38 处、tools.json 描述里 28 处）。工具的 name/description/input_schema **随 run 下发**而不是

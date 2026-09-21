@@ -2,7 +2,7 @@
 
 `data-service` 是一个基于 **Spring Boot 3 + Spring Cloud Alibaba + Nacos** 的多租户 AI Agent 平台后端。
 
-它最初只做高德地图数据查询与 POI 分析，目前核心已经演进为一套**与厂商无关的 LLM 网关**：支持多轮工具调用、技能（Skill）/ 插件（Plugin）扩展、RAG 知识库、对话式 Agent 构建、计费与调用链追踪，并在网关层做统一鉴权与租户隔离。
+它最初只做高德地图数据查询与 POI 分析，目前核心已经演进为一套**与厂商无关的 LLM 网关**：支持多轮工具调用、技能（Skill）扩展、连接器（读写客户自有系统）、RAG 知识库、对话式 Agent 构建、计费与调用链追踪，并在网关层做统一鉴权与租户隔离。
 
 > **接手提示**：仓库历史上还存在过一个独立的 `sys-server` 模块，**现已不存在**。所有业务 + 管理后台 + AI 能力都收敛到了 `data-server` 这一个业务模块里（原 `sys-server` 能力并入其 `admin` 包）。文档与代码冲突时，**以代码和 `bootstrap.yml` 为准**。
 
@@ -10,7 +10,7 @@
 
 当前仓库已落地的能力大致分四块：
 
-- **AI 平台（核心）**：provider 抽象的 LLM 网关、多轮工具调用循环、技能/插件体系、RAG 知识库、对话式 Agent 构建、模型管理、按「模型 × 功能」计费、调用链 Trace。
+- **AI 平台（核心）**：provider 抽象的 LLM 网关、多轮工具调用循环、技能体系、连接器（客户自有 MySQL / HTTP 系统的受控读写）、RAG 知识库、对话式 Agent 构建、模型管理、按「模型 × 功能」计费、调用链 Trace。
 - **管理后台**：两层管理模型（运营 operator / 企业租户）、基于 RBAC 的资源授权、企业（租户）与成员管理、产品反馈、运营统计。
 - **地图数据（早期能力，保留）**：对接高德开放接口的关键词 / 周边 POI 查询，按 `typecode` 分类后做 DBSCAN 聚类与周边分析，行政区编码 / POI 分类字典维护。
 - **通用基础设施**：统一响应 / 异常、JWT、Redis/Redisson、OkHttp、Knife4j、Snowflake ID、MyBatis-Plus、多租户拦截、SSE 工具等。
@@ -60,29 +60,30 @@ data-service
 
 - `gaode` —— 高德 POI 查询 + DBSCAN 聚类（早期能力）。
 - `admin` —— 鉴权 / RBAC / 多租户运营后台（`auth`、`operator`、`rbac`）。
-- `ai` —— 平台核心：`provider`、`protocol`、`conversation`、`skill`、`plugin`、`plugingen`、`rag`、`agent`（含 `builder`）、`chat`、`run`、`claude`、`openai`、`model`、`billing`、`trace`、`stats`、`search`、`feedback`、`image` 等。
+- `ai` —— 平台核心：`provider`、`protocol`、`conversation`、`resilience`、`skill`、`connection`、`connector`、`rag`、`agent`（含 `builder`、`exec`）、`chat`、`run`、`claude`、`openai`、`model`、`billing`、`trace`、`stats`、`search`、`feedback`、`image`、`web`、`support` 等。
 
 ## 核心子系统
 
 ### 1. AI 子系统（`ai`）
 
-平台主体：一套 provider 无关的 LLM 网关，支持工具调用、技能/插件与 RAG。
+平台主体：一套 provider 无关的 LLM 网关，支持工具调用、技能、连接器与 RAG。
 
 - **Provider 抽象**（`ai/provider`）：`ProviderRegistry` + SPI（`ChatClient` / `EmbeddingClient` / `RerankClient` / `ContextualizationClient`）。激活的 provider 由 `ai.provider` 决定；`@PostConstruct` 做 **fail-fast** 校验，缺 bean 或缺 yml 字段则启动中止。
 - **协议适配**（`ai/protocol`）：`AiProtocolAdapter` 统一 `ClaudeProtocolAdapter`（Anthropic）与 `OpenAiProtocolAdapter` 的差异（工具定义、tool_use 提取、多轮消息拼装、usage 解析、流式分帧）。
 - **对话循环**（`ai/conversation`）：`AiConversationLoop` 驱动多轮工具调用（阻塞 `runBlocking` / 流式 `runStream`），受 `skill.max-tool-rounds` 限制，累计 token 用量，发 SSE 事件（`progress` / `tool_result` / `summary` / `error`），并记录每次模型调用。
-- **技能 vs 插件**（`ai/skill`、`ai/plugin`）：`ToolPackage` 要么是平台 **Skill**（`tenantId == null`），要么是租户 **Plugin**（`tenantId != null`）。Skill 走「发现 → `activate_skills` → 注入」，避免工具定义淹没上下文；Agent 绑定的插件则直接作为 tool_use 注入。插件是 DB 驱动的 HTTP 工具（`Plugin` / `PluginTool` / `PluginHttpMapping` / `PluginCredential`），由 `PluginTemplateRenderer` 渲染请求、`PluginResponseExtractor` 抽取结果、`PluginAuthApplier`（ApiKey / Basic / Bearer / Hmac）施加鉴权。
+- **技能**（`ai/skill`）：`ToolPackage` 是统一抽象——要么是磁盘上的**平台技能**（`tenantId == null`，全局可见），要么是 DB 里的**租户技能**（`ai_skill` 行，`tenantId != null`，可 `PRIVATE` 仅自己可见或共享给全租户）。都走「发现 → `activate_skills` → 注入」的渐进式披露，避免工具定义淹没上下文。
+- **连接器**（`ai/connection`、`ai/connector`）：让 Agent 读写**客户自有的业务系统**，`MYSQL` 与 `HTTP` 两类。凭据在 `connection` 表加密托管（`credential_cipher` + `encryption_version`，密钥取 Nacos `connection.credential-key`，未配置则拒绝保存凭据、**不退化为明文**）；授权只认 `agent_connection` 的**实时行**（超管撤销立刻生效，不读发布快照）。八个 `conn_*` 工具（`list` / `catalog` / `describe` / `query` / `invoke` / `execute` / `define_metric` / `annotate`）统一经 `ConnectorGateway`：授权 → 能力位 → 写策略 → 限流 → 护栏（`ReadOnlySqlGuard` / `WriteSqlGuard`）→ 审计（`connector_audit`）。SQL 由模型自己写，平台只做护栏。语义层（`connector_semantic`）为每条连接生成「说明书」并每轮注入 system 上下文——没有它模型只能看见表名、猜不出业务含义。
 - **RAG**（`ai/rag`）：入库经 RabbitMQ 异步（`IngestionQueueProducer` → `IngestionQueueConsumer`）：解析（Tika / PDFBox / docx / markdown 注册表）→ `HierarchicalChunker` → `ContextualizationService` → `EmbeddingService` → Elasticsearch 索引；查询走 `HybridSearchService` + `RerankService` → `RagAnswerService`。
 - **Agent 构建与运行**（`ai/agent`）：对话式 Agent 向导（`builder`）、Agent 运行时与执行（`runtime` / `exec`）。
 - **可重连对话**（`ai/run`、`ai/chat`）：服务端自有 run + Redis Stream 续播，发送后可离开 / 可重连。
-- **计费与可观测**（`ai/billing`、`ai/trace`、`ai/stats`）：按「模型 × 功能（`biz_type`）」记账；调用链 Trace 埋点（LLM / 工具 / 插件 / KB / Rerank）。
+- **计费与可观测**（`ai/billing`、`ai/trace`、`ai/stats`）：按「模型 × 功能（`biz_type`）」记账；调用链 Trace 埋点（LLM / 工具 / 连接器 / KB / Rerank）。trace 视图里仍保留 `PLUGIN_TRIGGER` 标签，**只为渲染插件子系统下线前的历史行**，不代表还有插件能力。
 
 ### 2. 管理后台与多租户（`admin`）
 
 **两层管理模型**：
 
 - *运营层*（`SysOperator`）管理企业（`SysEnterprise` = 租户）。
-- *企业层*（`SysUser`，超管 / 成员）走 RBAC，角色经 `SysRoleResource` 授予对资源类型 `MENU / AGENT / KNOWLEDGE_BASE / PLUGIN` 的权限。`PermissionResolver` 按请求实时解析有效权限（权限**不**写进 JWT）。
+- *企业层*（`SysUser`，超管 / 成员）走 RBAC，角色经 `SysRoleResource` 授予对资源类型 `MENU / AGENT / KNOWLEDGE_BASE / SKILL` 的权限（`PLUGIN` 随插件子系统一并移除，存量 `PLUGIN` 行被 `PermissionResolver.parseType` 忽略）。`PermissionResolver` 按请求实时解析有效权限（权限**不**写进 JWT）。
 
 **租户隔离核心不变量**（勿削弱）：
 
@@ -163,8 +164,8 @@ mvn clean install -DskipTests       # 构建全部模块（或 ./deploy.sh build
 
 ```bash
 mvn -pl modules/data-server test                                   # 全部
-mvn -pl modules/data-server test -Dtest=HmacAuthApplierTest        # 单类
-mvn -pl modules/data-server test -Dtest=PluginTemplateRendererTest#methodName  # 单方法
+mvn -pl modules/data-server test -Dtest=AiConversationLoopRetryTest  # 单类
+mvn -pl modules/data-server test -Dtest=ConnectorAuditServiceTest#methodName  # 单方法
 ```
 
 ## 约定
