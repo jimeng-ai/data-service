@@ -222,13 +222,60 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
     public static final String TOOL_ANNOTATE = "conn_annotate";
 
     /**
+     * <b>读</b>工具：只取信息，没有副作用。超时自动重发最多是多读一次，代价只有一次往返。
+     */
+    public static final Set<String> READ_TOOLS = Set.of(
+            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE);
+
+    /**
+     * <b>写</b>工具：调用一次就留下痕迹，所以<b>超时一律不得自动重发</b>。
+     *
+     * <h4>为什么 {@link #TOOL_DEFINE_METRIC} / {@link #TOOL_ANNOTATE} 也在这里</h4>
+     * 它们不碰客户的系统——但它们<b>覆盖</b>平台自己那份说明书，而覆盖是无声的。
+     * 超时重发一条覆盖写的后果不是「多写一次同样的值」：服务端那一条很可能已经成功了，
+     * 重发会把它<b>原样再盖一遍</b>，留痕里多一条空更新；而如果这几十秒里正好有业务方
+     * 改了同一行，那次修改会被<b>无痕盖掉</b>。判据是「这次调用留不留痕」，
+     * 不是「碰不碰客户的库」——按后者分类，这两个工具会被归进读侧，而那正是上面那个事故。
+     *
+     * <h4>★ 这张表是「写工具」在本系统里的唯一来源</h4>
+     * 同一份名单还活在另外三个平面上，它们<b>各自持有一份副本</b>，而且漏改<b>一处都不报错</b>：
+     * <ul>
+     *   <li>沙箱平面 {@code jm-agent-sandbox/src/mcp/connectorTools.ts} 的 {@code WRITE_TOOL_NAMES}
+     *       ——漏改，新工具走读策略（{@code retries=1}），于是发生上面那个覆盖事故；</li>
+     *   <li>{@code skills/connector/evals/evals.json} ——漏改，这个写工具没有任何行为契约被评测覆盖；</li>
+     *   <li>{@code skills/connector/tools.json} 的 description ——漏改，模型不知道再调一次是覆盖而不是新增。</li>
+     * </ul>
+     * 四处的对齐由 {@code ConnectorWriteToolContractTest} 钉住。<b>加写工具请先改这里</b>，
+     * 那条测试会把其余三处一并逼出来。
+     */
+    public static final Set<String> WRITE_TOOLS = Set.of(
+            TOOL_EXECUTE, TOOL_DEFINE_METRIC, TOOL_ANNOTATE);
+
+    /**
      * 只认这八个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
      * 是线性扫描 first-match，既无 {@code @Order} 也无冲突检测：两个执行器的 supports() 区间一旦重叠，
      * 胜者由 Spring 注入顺序静默决定。前缀匹配（{@code startsWith("conn_")}）就是在给未来埋这种雷。
+     *
+     * <p>★ 它<b>由读 / 写两张表派生</b>，不再是第三份手写名单：加了工具却忘了分类，它就不在这里，
+     * {@link #supports} 直接不认——表现是那个工具从头到尾没生效，而不是「它悄悄按读工具跑」。
      */
-    private static final Set<String> TOOLS = Set.of(
-            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE, TOOL_EXECUTE, TOOL_DEFINE_METRIC,
-            TOOL_ANNOTATE);
+    private static final Set<String> TOOLS = toolUniverse();
+
+    /**
+     * 合并读 / 写两张表，并在类加载期就拒绝<b>同时</b>登记为两者的工具。
+     *
+     * <p>重叠不抛异常的话，{@code Set.copyOf} 会静默去重，于是一个工具在这里是读、在沙箱那边是写，
+     * 两个平面对同一次超时做出相反的处置——这种分叉查起来比启动失败贵得多。
+     */
+    private static Set<String> toolUniverse() {
+        Set<String> all = new HashSet<>(READ_TOOLS);
+        for (String w : WRITE_TOOLS) {
+            if (!all.add(w)) {
+                throw new IllegalStateException("工具 " + w + " 同时被登记为读工具和写工具，两边的超时处置相反");
+            }
+        }
+        return Set.copyOf(all);
+    }
 
     /**
      * 注入给模型看的那句提示。<b>semantic 与 comment 必须并排出现、永远不合并</b>：
@@ -931,8 +978,9 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         out.put("saved", true);
         out.put("basis", basis);
         // ★ 这段话是写给模型看的，措辞是有意的：亮出依据这件事必须在【每次引用】时都做，
-        //   因为平台没有管理台的口径纠正入口——回答里那半句「（口径：扣除退款，X月X日确认）」
-        //   是口径写错了之后，唯一可能被人看见并纠正的地方。
+        //   因为管理台那个删除入口【只对企业超管开放】（ConnectorAdminController#deleteSemanticRow）——
+        //   回答里那半句「（口径：扣除退款，X月X日确认）」是口径写错了之后【业务方】唯一看得见它的地方，
+        //   也是「去找超管删掉」这条唯一纠错链的起点。省掉它，一个错口径可以错上几个月没人知道。
         out.put("message", "这条口径已记住，之后在这条连接上不必再问。以后凡是回答涉及「" + row.getTerm()
                 + "」，都要按这个口径写查询，并在答案里把依据亮出来，例如「（口径：" + ConnectorSemanticService.shortGloss(row.getGloss())
                 + "，" + basis + "）」。如果用户此刻纠正了这个口径，再调一次本工具覆盖它即可。"
