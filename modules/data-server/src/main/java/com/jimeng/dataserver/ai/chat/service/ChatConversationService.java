@@ -325,8 +325,23 @@ public class ChatConversationService {
         } catch (NumberFormatException e) {
             return;
         }
-        permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+        try {
+            permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
+        } catch (ServiceException denied) {
+            // 隐藏的 Skill 构建器 Agent（__skill_builder__）不是可授权的业务资源：它不带知识库 / 技能 / 连接，
+            // 只用来承载构建器会话；而技能页面对所有成员开放（不受模块权限门控）。不豁免它，普通成员连
+            // 构建器会话都建不了（此前就是这样，且不报错之外的任何提示）。会话仍然按人私有（assertOwner 照常叠加）。
+            // 先走 RBAC、被拒才查 code：正常授权路径不多一次查询。
+            Agent a = agentMapper.selectById(id);
+            if (a != null && SKILL_BUILDER_AGENT_CODE.equals(a.getCode())) {
+                return;
+            }
+            throw denied;
+        }
     }
+
+    /** 与 SkillBuilderSessionService.BUILDER_AGENT_CODE 一致（本类不反向依赖构建器包）。 */
+    private static final String SKILL_BUILDER_AGENT_CODE = "__skill_builder__";
 
     /**
      * 校验当前账号是会话属主（或超管）。会话「按人私有」：成员只能读写自己创建的会话，

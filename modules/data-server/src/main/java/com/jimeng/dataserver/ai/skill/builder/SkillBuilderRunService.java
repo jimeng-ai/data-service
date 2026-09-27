@@ -2,48 +2,48 @@ package com.jimeng.dataserver.ai.skill.builder;
 
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import cn.hutool.json.JSONUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.TenantContext;
-import com.jimeng.common.core.utils.SseServiceUtil;
-import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
-import com.jimeng.dataserver.ai.agent.builder.BuilderAttachmentService;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.TurnRequest;
 import com.jimeng.dataserver.ai.agent.exec.config.AgentSandboxProperties;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.agent.exec.service.SidecarClient;
-import com.jimeng.dataserver.ai.agent.runtime.AgentIdContext;
+import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.BizTypeContext;
+import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
+import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.TurnStartResponse;
 import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
 import com.jimeng.dataserver.ai.chat.service.ChatConversationService.TurnMessageIds;
-import com.jimeng.dataserver.ai.claude.service.ClaudeService;
+import com.jimeng.dataserver.ai.provider.ProviderRegistry;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
+import com.jimeng.dataserver.ai.run.ChatHistoryReconstructor;
 import com.jimeng.dataserver.ai.run.ConversationRunLock;
 import com.jimeng.dataserver.ai.run.RunEventTee;
 import com.jimeng.dataserver.ai.run.RunFinalizer;
 import com.jimeng.dataserver.ai.run.RunHandle;
 import com.jimeng.dataserver.ai.run.RunRegistry;
 import com.jimeng.dataserver.ai.run.RunState;
-import com.jimeng.dataserver.ai.skill.SkillConst;
-import com.jimeng.dataserver.ai.skill.service.SkillBundleResolver;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftUpdateEvent;
 import com.jimeng.dataserver.web.MdcAsyncSupport;
-import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AgentInputFile;
-import com.jimeng.persistence.entity.ChatMessage;
+import com.jimeng.persistence.entity.AiSkill;
+import com.jimeng.persistence.entity.SkillBuilderSession;
 import com.jimeng.persistence.mapper.AgentInputFileMapper;
-import com.jimeng.persistence.mapper.ChatMessageMapper;
+import com.jimeng.persistence.mapper.AiSkillMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.Response;
 import okhttp3.sse.EventSource;
 import okhttp3.sse.EventSourceListener;
+import org.springframework.core.task.TaskRejectedException;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,68 +53,62 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Skill 构建器单开的可重连一轮生成：镜像 {@link com.jimeng.dataserver.ai.agent.builder.AgentBuilderRunService}，
- * 复用同一套 run 原语（{@link ConversationRunLock}/{@link RunRegistry}/{@link RunEventTee}/{@link RunFinalizer}）
- * 与流式管线（{@link ClaudeService#messagesStream}）。差异：
- * <ul>
- *   <li>设 {@code __skill_builder_mode__=TRUE}（而非 agent_builder），SkillRuntimeService 据此只注入 draft_skill。</li>
- *   <li>计费 biz_type 用 {@code skill_gen}（{@link BizTypeContext#SKILL_GEN}）。</li>
- *   <li>每个会话维持一份内存态 {@link SkillDraft}（含 files/脚本——DRAFT ai_skill 行不存这些），
- *       供试跑/finalize 取用。{@link DraftSkillToolExecutor} 处理一次 draft_skill 后回调
- *       {@link #mergeDraft} 合并增量。</li>
- * </ul>
+ * Skill 构建器的一轮：把用户这句话派发到边车的 skill-builder 运行形态（沙箱里原样跑 Anthropic skill-creator），
+ * 流式转发给前端，结束后从工作区同步草稿。
  *
- * <p>另含沙箱试跑（{@link #testRun}）：把内存草稿物化到 MinIO 临时前缀，构造 SkillRef 后复用边车 dispatch 跑一轮。
+ * <p>复用对话链路的 run 原语（{@link ConversationRunLock} / {@link RunRegistry} / {@link RunEventTee} /
+ * {@link RunFinalizer}），所以断线重连、多窗口续播、取消、聊天记录落库都和普通对话一样。差异：
+ * <ul>
+ *   <li>跑在专用的 {@code skillBuilderExecutor} 上（一轮可达一小时，不能占对话线程池）；</li>
+ *   <li>limits / 模型取 {@link SkillBuilderProperties}，不动 {@code agent.sandbox.*} 的全局值；</li>
+ *   <li>产物事件不转发：skill-creator 的产出都嵌在评审页里，不走 output/；</li>
+ *   <li>结束时发一个 {@code draft-update}：草稿、最新评审页、触发优化报告都从工作区重新读出来。</li>
+ * </ul>
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class SkillBuilderRunService {
 
-    private static final String ROLE_USER = "user";
-    private static final String ROLE_ASSISTANT = "assistant";
-    private static final String STATUS_COMPLETED = "COMPLETED";
+    public static final String RUN_PROFILE = "skill-builder";
+    /** 边车契约版本（capabilities.skillBuilderVersion）。低于它就不派发。 */
+    static final int REQUIRED_SKILL_BUILDER_VERSION = 1;
 
+    private final SkillBuilderSessionService sessions;
+    private final SkillTriggerContextFactory triggerContextFactory;
+    private final SkillBuilderProperties props;
+    private final AgentSandboxProperties sandboxProps;
+    private final SidecarClient sidecarClient;
+    private final RagMinioStorageService storage;
     private final ChatConversationService conversationService;
-    private final ChatMessageMapper messageMapper;
+    private final ChatHistoryReconstructor historyReconstructor;
     private final AgentInputFileMapper inputFileMapper;
+    private final AiSkillMapper aiSkillMapper;
     private final PermissionResolver permissionResolver;
-    private final BuilderAttachmentService attachmentService;
     private final ConversationRunLock lock;
     private final RunRegistry runRegistry;
     private final RunFinalizer runFinalizer;
     private final RunEventTee tee;
-    private final ClaudeService claudeService;
-    private final SkillBuilderService builderService;
-    private final ThreadPoolTaskExecutor streamExecutor;
+    private final UsageExtractor usageExtractor;
+    private final AiModelCallRecordService recordService;
+    private final ProviderRegistry providerRegistry;
+    private final ThreadPoolTaskExecutor skillBuilderExecutor;
 
-    // 试跑依赖（复用 exec 的边车 dispatch 链路）。
-    private final RagMinioStorageService storage;
-    private final SidecarClient sidecarClient;
-    private final AgentSandboxProperties sandboxProps;
-    private final SseServiceUtil sseServiceUtil;
-    /** 每会话内存草稿（含 files/脚本）的共享持有者——独立叶子组件，破构造环。 */
-    private final SkillDraftStore draftStore;
-
-    // ------------------------------------------------------------------ turn / stream
-
-    public TurnStartResponse startTurn(Long conversationId, TurnRequest req, String traceId) {
+    public TurnStartResponse startTurn(Long sessionId, TurnRequest req, String traceId) {
         String query = req == null ? null : req.getQuery();
-        if (query == null || query.isBlank()) {
+        if (StrUtil.isBlank(query)) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "query 不能为空");
         }
+        SkillBuilderSession session = sessions.requireActive(sessions.requireOwned(sessionId));
+        Long conversationId = session.getConversationId();
         conversationService.requireConversationWithAccess(conversationId);
-
-        List<Long> fileIds = req.getFileIds();
-        // 输入文件按人私有：只允许使用自己上传的文件（防 IDOR）。
-        assertOwnFiles(fileIds);
+        List<AgentInputFile> inputs = ownInputFiles(req.getFileIds());
 
         String runId = UUID.randomUUID().toString();
         if (!lock.tryAcquire(conversationId, runId) || conversationService.hasActiveGeneration(conversationId)) {
             lock.release(conversationId, runId);
-            throw new ServiceException(ExceptionCode.CONVERSATION_GENERATING, "该会话正在生成，请稍候");
+            throw new ServiceException(ExceptionCode.CONVERSATION_GENERATING, "构建器正在工作，请等这一轮结束");
         }
-
         TurnMessageIds ids;
         try {
             ids = conversationService.insertTurnMessages(conversationId, query, req.getAttachments(), runId);
@@ -122,265 +116,235 @@ public class SkillBuilderRunService {
             lock.release(conversationId, runId);
             throw e;
         }
-
-        RunState state = new RunState(System.currentTimeMillis());
         runRegistry.register(new RunHandle(runId, conversationId, ids.assistantMessageId(),
-                TenantContext.get(), state));
+                TenantContext.get(), new RunState(System.currentTimeMillis())));
+        sessions.recordRun(sessionId, runId);
 
-        streamExecutor.execute(MdcAsyncSupport.wrap(runId,
-                () -> streamBuild(conversationId, query, fileIds, runId, traceId)));
-
+        Long cutoff = ids.userMessageId();
+        try {
+            skillBuilderExecutor.execute(MdcAsyncSupport.wrap(runId,
+                    () -> dispatch(sessionId, query, inputs, runId, traceId, cutoff)));
+        } catch (TaskRejectedException e) {
+            log.warn("Skill 构建器执行器已满，拒绝 runId={}", runId);
+            failEarly(runId, "构建器繁忙（同时在构建的会话太多），请稍后再发一次");
+            runFinalizer.complete(runId);
+        }
         return new TurnStartResponse(runId, ids.userMessageId(), ids.assistantMessageId());
     }
 
-    /** 校验 fileIds 都属当前用户（超管放行）；非属主直接拒。 */
-    private void assertOwnFiles(List<Long> fileIds) {
-        if (fileIds == null || fileIds.isEmpty()) return;
+    /** 输入文件按人私有：只能用自己上传的（防 IDOR），超管放行。 */
+    private List<AgentInputFile> ownInputFiles(List<Long> fileIds) {
+        List<AgentInputFile> out = new ArrayList<>();
+        if (fileIds == null) return out;
         for (Long id : fileIds) {
-            AgentInputFile f = inputFileMapper.selectById(id);
-            if (f == null) {
-                throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在: " + id);
-            }
+            AgentInputFile f = inputFileMapper.selectById(id);   // 租户隔离表
+            if (f == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在: " + id);
             permissionResolver.assertOwnerOrSuperAdmin(f.getCreateUser());
+            out.add(f);
         }
+        return out;
     }
 
-    /** executor 线程：构建器模型 + 仅 draft_skill 工具，走 ClaudeService 流式（与 AgentBuilderRunService 同管线）。 */
-    private void streamBuild(Long conversationId, String query, List<Long> fileIds,
-                             String runId, String traceId) {
-        BizTypeContext.set(BizTypeContext.SKILL_GEN);   // 计费按「skill 生成」记账（Task 7 运营平台展示用）
+    /** executor 线程：派发到边车并等它结束；无论怎样结束都同步草稿、记账、收尾。 */
+    private void dispatch(Long sessionId, String query, List<AgentInputFile> inputs,
+                          String runId, String traceId, Long cutoffMessageId) {
+        BizTypeContext.set(BizTypeContext.SKILL_GEN);
+        long startMs = System.currentTimeMillis();
+        final String[] summaryHolder = new String[1];
+        final String[] streamError = new String[1];
+        String model = builderModel();
         try {
-            Agent builder = builderService.ensureBuilderAgent();
-
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("stream", true);
-            body.put("messages", buildMessages(conversationId, query, fileIds));
-            body.put("__skill_builder_mode__", Boolean.TRUE);    // SkillRuntimeService 据此只注入 draft_skill
-            body.put("agent_id", String.valueOf(builder.getId()));
-            body.put("agent_preview", Boolean.TRUE);             // 读实时构建器 Agent（无需发布快照）
-
-            AgentIdContext.set(String.valueOf(builder.getId()));
-            claudeService.prepareAgentContext(body);
-            claudeService.messagesStream(body, runId, traceId);
-        } catch (Exception e) {
-            log.error("Skill 构建器生成失败 runId={}", runId, e);
-            Map<String, Object> err = new LinkedHashMap<>();
-            err.put("error", e.getClass().getSimpleName());
-            err.put("message", String.valueOf(e.getMessage()));
-            try {
-                tee.teeJson(runId, "error", err);
-                runFinalizer.complete(runId);
-            } catch (Exception ignore) {
-                // 兜底收尾失败忽略
+            // 归属已在请求线程上校验过；这里按 id 直接取，不依赖执行器线程上的请求上下文。
+            SkillBuilderSession session = sessions.load(sessionId);
+            int v = sidecarClient.skillBuilderVersion(Duration.ofSeconds(5));
+            if (v < REQUIRED_SKILL_BUILDER_VERSION) {
+                throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR,
+                        "沙箱版本不支持 Skill 构建器（skillBuilderVersion=" + v + "），请先部署新版 jm-agent-sandbox");
             }
+            SidecarRunPayload payload = buildPayload(session, query, inputs, runId, traceId, cutoffMessageId, model);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            EventSourceListener listener = new EventSourceListener() {
+                @Override
+                public void onEvent(EventSource es, String id, String type, String data) {
+                    if (type == null) return;
+                    if ("artifact".equals(type)) {
+                        // skill-creator 的产出嵌在评审页里；output/ 里出现东西说明模型没按约定来，记一笔即可。
+                        log.info("构建器 run 产生了 output/ 产物（未转发） runId={} data={}", runId, StrUtil.maxLength(data, 200));
+                        return;
+                    }
+                    if ("summary".equals(type)) summaryHolder[0] = data;
+                    tee.tee(runId, type, data);
+                }
+
+                @Override
+                public void onClosed(EventSource es) {
+                    latch.countDown();
+                }
+
+                @Override
+                public void onFailure(EventSource es, Throwable t, Response response) {
+                    String msg = t != null ? t.getMessage() : ("sidecar http " + (response != null ? response.code() : "?"));
+                    if (response != null && response.code() == 503) msg = "构建器繁忙（沙箱里正在跑别的构建），请稍后再发一次";
+                    streamError[0] = msg;
+                    log.error("构建器边车流式失败 runId={} err={}", runId, msg);
+                    tee.tee(runId, "error", new JSONObject().set("message", msg).toString());
+                    latch.countDown();
+                }
+            };
+            EventSource upstream = sidecarClient.run(payload, listener);
+            RunHandle handle = runRegistry.get(runId);
+            if (handle != null) handle.setUpstream(upstream);   // 「停止」经它关闭上游，边车据此 docker kill
+            if (!latch.await(props.getWallClockSec() + 60L, TimeUnit.SECONDS)) {
+                streamError[0] = "timeout";
+                upstream.cancel();
+                tee.tee(runId, "error", new JSONObject().set("message", "这一轮超过了时间上限，已停止").toString());
+            }
+        } catch (Exception e) {
+            streamError[0] = String.valueOf(e.getMessage());
+            log.error("构建器派发异常 runId={}", runId, e);
+            failEarly(runId, e instanceof ServiceException ? e.getMessage() : "构建器出错：" + e.getMessage());
         } finally {
-            runFinalizer.complete(runId);    // 幂等兜底
-        }
-    }
-
-    /** 历史按纯文本；本轮 user 消息在有附件时组装成多模态 content 数组（图片块 + 文档文本块 + 提问文本块）。 */
-    private List<Map<String, Object>> buildMessages(Long conversationId, String query, List<Long> fileIds) {
-        List<ChatMessage> history = messageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
-                .eq(ChatMessage::getConversationId, conversationId)
-                .eq(ChatMessage::getStatus, STATUS_COMPLETED)
-                .orderByAsc(ChatMessage::getId));
-        List<Map<String, Object>> messages = new ArrayList<>();
-        for (ChatMessage m : history) {
-            if (m.getContent() == null || m.getContent().isEmpty()) continue;
-            Map<String, Object> one = new LinkedHashMap<>();
-            one.put("role", ROLE_USER.equals(m.getRole()) ? ROLE_USER : ROLE_ASSISTANT);
-            one.put("content", m.getContent());
-            messages.add(one);
-        }
-        // 去掉末条「与本轮 query 相同的 user 文本」占位，改用多模态版本替换。
-        if (!messages.isEmpty()) {
-            Map<String, Object> last = messages.get(messages.size() - 1);
-            if (ROLE_USER.equals(last.get("role")) && query.equals(last.get("content"))) {
-                messages.remove(messages.size() - 1);
+            try {
+                Boolean persisted = summaryHolder[0] == null ? null
+                        : JSONUtil.parseObj(summaryHolder[0]).getBool("workspacePersisted");
+                DraftUpdateEvent ev = sessions.syncAfterRun(sessionId, persisted);
+                tee.teeJson(runId, "draft-update", ev);
+            } catch (Exception e) {
+                log.warn("构建器同步草稿失败 runId={} err={}", runId, e.getMessage());
             }
+            recordUsage(sessionId, runId, summaryHolder[0], streamError[0], model, System.currentTimeMillis() - startMs);
+            runFinalizer.complete(runId);
+            BizTypeContext.clear();
         }
-
-        List<Map<String, Object>> attachmentBlocks = attachmentService.toContentBlocks(fileIds);
-        Map<String, Object> userMsg = new LinkedHashMap<>();
-        userMsg.put("role", ROLE_USER);
-        if (attachmentBlocks.isEmpty()) {
-            userMsg.put("content", query);          // 纯文本
-        } else {
-            List<Map<String, Object>> content = new ArrayList<>(attachmentBlocks);
-            Map<String, Object> q = new LinkedHashMap<>();
-            q.put("type", "text");
-            q.put("text", query);
-            content.add(q);
-            userMsg.put("content", content);        // 多模态数组
-        }
-        messages.add(userMsg);
-        return messages;
     }
 
-    // ------------------------------------------------------------------ in-memory draft
+    SidecarRunPayload buildPayload(SkillBuilderSession session, String query, List<AgentInputFile> inputs,
+                                   String runId, String traceId, Long cutoffMessageId, String model) {
+        AiSkill base = session.getBaseSkillId() == null ? null : aiSkillMapper.selectById(session.getBaseSkillId());
 
-    /**
-     * 合并一次 draft_skill 增量到该会话的内存草稿，并返回合并后的快照。
-     * 由 {@link DraftSkillToolExecutor} 在对话循环执行 draft_skill 后回调（runId→conversationId 已解析）。
-     */
-    public SkillDraft mergeDraft(Long conversationId, Map<String, Object> patch) {
-        return draftStore.merge(conversationId, patch);
-    }
-
-    /** 取该会话当前内存草稿（试跑/finalize 用）；无则 null。 */
-    public SkillDraft currentDraft(Long conversationId) {
-        return draftStore.current(conversationId);
-    }
-
-    // ------------------------------------------------------------------ sandbox dry-run
-
-    /**
-     * 沙箱试跑：用当前内存草稿（DOER + files）跑一轮，验证脚本能处理样例输入并产出结果。
-     * 不落 AgentExecRun（一次性、throwaway），直接把边车 SSE 桥接给调用方，事件与 exec 一致
-     * （progress / code_output / claude-delta / tool_result / artifact / summary / error）。
-     *
-     * @param conversationId 会话 id（取内存草稿）
-     * @param sampleFileId   样例输入文件 id（来自 POST /data/agent/files），按人私有校验；可空（无输入也能跑）
-     * @param traceId        链路 id（可空）
-     */
-    public SseEmitter testRun(Long conversationId, Long sampleFileId, String traceId) {
-        conversationService.requireConversationWithAccess(conversationId);
-
-        SkillDraft draft = currentDraft(conversationId);
-        if (draft == null
-                || !SkillConst.TYPE_DOER.equalsIgnoreCase(draft.getSkillType())
-                || draft.getFiles() == null || draft.getFiles().isEmpty()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "草稿无可执行脚本，无需试跑");
-        }
-        String draftName = StrUtil.blankToDefault(draft.getName(), "draft-skill");
-
-        // 校验样例文件属当前用户（防 IDOR），并取出其 MinIO 引用。
-        AgentInputFile sample = null;
-        if (sampleFileId != null) {
-            sample = inputFileMapper.selectById(sampleFileId);
-            if (sample == null) {
-                throw new ServiceException(ExceptionCode.NOT_FOUND, "文件不存在: " + sampleFileId);
+        SidecarRunPayload p = new SidecarRunPayload();
+        p.setRunId(runId);
+        p.setTenantId(session.getTenantId());
+        p.setUserId(String.valueOf(session.getOwnerUserId()));
+        p.setTraceId(traceId);
+        p.setRunProfile(RUN_PROFILE);
+        p.setPrompt(turnReminder(session, base) + "\n\n" + query);
+        p.setHistory(history(session.getConversationId(), cutoffMessageId));
+        p.setArtifactBucket(storage.getBucket());
+        if (!inputs.isEmpty()) {
+            List<SidecarRunPayload.InputFile> in = new ArrayList<>();
+            for (AgentInputFile f : inputs) {
+                SidecarRunPayload.InputFile x = new SidecarRunPayload.InputFile();
+                x.setObjectName(f.getObjectName());
+                x.setFilename(f.getFilename());
+                x.setBucket(f.getBucket());
+                x.setSizeBytes(f.getSizeBytes());
+                in.add(x);
             }
-            permissionResolver.assertOwnerOrSuperAdmin(sample.getCreateUser());
+            p.setInputFiles(in);
         }
-
-        String tenantId = TenantContext.get();
-        String userId = AdminRequestContext.findUserIdOrNull() == null
-                ? null : String.valueOf(AdminRequestContext.findUserIdOrNull());
-
-        // 1. 物化草稿到 MinIO 临时前缀 skills/draft/{conversationId}/，构造 SkillRef。
-        String prefix = "skills/draft/" + conversationId + "/";
-        SidecarRunPayload.SkillRef ref = materializeDraft(draftName, prefix, draft);
-
-        // 2. 组 dispatch payload（一次性，不落 AgentExecRun）。
-        SidecarRunPayload payload = buildDryRunPayload(tenantId, userId, traceId, draftName, ref, sample);
-
-        // 3. 桥接边车 SSE 给调用方（镜像 AgentExecController 的连接管理）。
-        String connectionId = UUID.randomUUID().toString();
-        long timeoutMs = (sandboxProps.getWallClockSec() + 60L) * 1000L;
-        SseEmitter emitter = sseServiceUtil.getConnection(connectionId, timeoutMs);
-        streamExecutor.execute(MdcAsyncSupport.wrap(connectionId,
-                () -> dispatchDryRun(payload, connectionId)));
-        return emitter;
-    }
-
-    /** 把 SKILL.md（draft.body）+ files 写到 MinIO 临时前缀，列出对象并构造 SkillRef。 */
-    private SidecarRunPayload.SkillRef materializeDraft(String draftName, String prefix, SkillDraft draft) {
-        try {
-            if (StrUtil.isNotBlank(draft.getBody())) {
-                storage.putObject(prefix + "SKILL.md",
-                        draft.getBody().getBytes(java.nio.charset.StandardCharsets.UTF_8), "text/markdown");
-            }
-            for (Map.Entry<String, String> e : draft.getFiles().entrySet()) {
-                String rel = e.getKey();
-                if (StrUtil.isBlank(rel)) continue;
-                // 防越界：去掉前导 / 与 ../，保证写在前缀内。
-                String safeRel = rel.replace("\\", "/").replaceAll("^/+", "").replace("../", "");
-                String content = e.getValue() == null ? "" : e.getValue();
-                storage.putObject(prefix + safeRel,
-                        content.getBytes(java.nio.charset.StandardCharsets.UTF_8), "text/plain");
-            }
-            List<String> objects = storage.listObjects(prefix);
-            return SkillBundleResolver.toSkillRef(draftName, prefix, storage.getBucket(), objects);
-        } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "物化草稿到沙箱失败: " + e.getMessage());
-        }
-    }
-
-    /** 组试跑 dispatch payload：注入草稿 skill + 样例输入 + 固定提示，LLM/limits 取沙箱配置。 */
-    private SidecarRunPayload buildDryRunPayload(String tenantId, String userId, String traceId,
-                                                 String draftName, SidecarRunPayload.SkillRef ref,
-                                                 AgentInputFile sample) {
-        SidecarRunPayload payload = new SidecarRunPayload();
-        payload.setRunId("dryrun-" + UUID.randomUUID());
-        payload.setTenantId(tenantId);
-        payload.setUserId(userId);
-        payload.setTraceId(traceId);
-        payload.setPrompt("用名为「" + draftName + "」的 skill 处理输入并产出结果；"
-                + "若有输入文件，请按 skill 指引完整处理后给出产物。");
-        if (sample != null) {
-            SidecarRunPayload.InputFile in = new SidecarRunPayload.InputFile();
-            in.setObjectName(sample.getObjectName());
-            in.setFilename(sample.getFilename());
-            in.setBucket(sample.getBucket());
-            in.setSizeBytes(sample.getSizeBytes());
-            payload.setInputFiles(List.of(in));
-        }
-        payload.setArtifactBucket(storage.getBucket());
-        payload.setSkills(List.of(ref));
 
         SidecarRunPayload.Llm llm = new SidecarRunPayload.Llm();
         llm.setBaseUrl(sandboxProps.getLlm().getBaseUrl());
         llm.setAuthToken(sandboxProps.getLlm().getAuthToken());
-        llm.setModel(sandboxProps.getLlm().getModel());
         llm.setAuthScheme(sandboxProps.getLlm().getAuthScheme());
-        payload.setLlm(llm);
+        llm.setModel(model);
+        p.setLlm(llm);
 
         SidecarRunPayload.Limits limits = new SidecarRunPayload.Limits();
-        limits.setWallClockSec(sandboxProps.getWallClockSec());
-        limits.setMaxTurns(sandboxProps.getMaxTurns());
-        limits.setMaxBudgetUsd(sandboxProps.getMaxBudgetUsd());
-        payload.setLimits(limits);
-        return payload;
+        limits.setWallClockSec(props.getWallClockSec());
+        limits.setMaxTurns(props.getMaxTurns());
+        limits.setMaxBudgetUsd(props.getMaxBudgetUsd());
+        p.setLimits(limits);
+
+        SidecarRunPayload.Workspace ws = new SidecarRunPayload.Workspace();
+        ws.setBucket(storage.getBucket());
+        ws.setPrefix(session.getWorkspacePrefix());
+        p.setWorkspace(ws);
+
+        SidecarRunPayload.SkillBuilder sb = new SidecarRunPayload.SkillBuilder();
+        sb.setTriggerEval(triggerContextFactory.build(base == null ? null : base.getName()));
+        sb.setSkillTypeOverride(session.getSkillTypeOverride());
+        sb.setCliMaxWorkers(props.getCliMaxWorkers());
+        p.setSkillBuilder(sb);
+        return p;
     }
 
-    /** executor 线程：调边车并把 SSE 原样桥接给调用方；产物事件直接透传（试跑不落 artifact 库）。 */
-    private void dispatchDryRun(SidecarRunPayload payload, String connectionId) {
-        final CountDownLatch latch = new CountDownLatch(1);
-        EventSourceListener listener = new EventSourceListener() {
-            @Override
-            public void onEvent(EventSource es, String id, String type, String data) {
-                if (type == null) return;
-                tee.tee(connectionId, type, data);
-            }
+    /**
+     * 每轮放在用户消息前的精简提醒。与边车 skillBuilderContract.ts 的系统提示讲的是同一套约定：
+     * dev 关 egress 时中转供应商可能把整个 system 换掉（边车 CLAUDE.md「系统提示词的送达」），
+     * 放在用户消息里的这几句总能到达模型。改约定两处一起改。
+     */
+    static String turnReminder(SkillBuilderSession session, AiSkill base) {
+        StringBuilder sb = new StringBuilder("【Skill 构建器·本轮提醒】按 skill-creator 的流程推进（先用 Skill 工具加载 skill-creator）。")
+                .append("被构建的 skill 放在 /work/skill/<skill-name>/，工作区放在 /work/skill/<skill-name>-workspace/；")
+                .append("评审页一律用 generate_review.py 的 --static 写到 <workspace>/iteration-N/review.html（不要起服务器），")
+                .append("用户在右侧「评审」页查看并提交反馈（保存为同目录 feedback.json）。")
+                .append("容器没有外网，本轮结束即回收：所有脚本在本轮内前台跑完。全程用简体中文和用户交流。");
+        if (base != null) {
+            sb.append("\n本会话是在改进已有 skill「").append(base.getName()).append("」（当前 v").append(base.getVersion())
+                    .append("，已放在 /work/skill/").append(base.getName()).append("/）：动手前先快照当基线，发布时 name 保持不变。");
+        }
+        if (session.getSkillTypeOverride() != null) {
+            sb.append("\n用户指定了这个 skill 在产品里的运行方式：")
+                    .append("PROMPT".equals(session.getSkillTypeOverride())
+                            ? "对话内注入（只用 SKILL.md，不要依赖附带文件）。" : "沙箱执行（可以附带脚本与参考资料）。");
+        }
+        return sb.toString();
+    }
 
-            @Override
-            public void onClosed(EventSource es) {
-                latch.countDown();
-            }
+    private List<SidecarRunPayload.History> history(Long conversationId, Long cutoffMessageId) {
+        List<Map<String, Object>> flat = historyReconstructor.reconstructFlatText(conversationId, cutoffMessageId, null);
+        if (flat == null) return null;
+        List<SidecarRunPayload.History> out = new ArrayList<>();
+        for (Map<String, Object> h : flat) {
+            if (h == null || h.get("role") == null || h.get("content") == null) continue;
+            SidecarRunPayload.History one = new SidecarRunPayload.History();
+            one.setRole("assistant".equals(String.valueOf(h.get("role"))) ? "assistant" : "user");
+            one.setContent(String.valueOf(h.get("content")));
+            out.add(one);
+        }
+        return out;
+    }
 
-            @Override
-            public void onFailure(EventSource es, Throwable t, Response response) {
-                String msg = t != null ? t.getMessage()
-                        : ("sidecar http " + (response != null ? response.code() : "?"));
-                log.error("skill 试跑边车流式失败 connectionId={} err={}", connectionId, msg);
-                tee.tee(connectionId, "error", new JSONObject().set("message", msg).toString());
-                latch.countDown();
-            }
-        };
+    private String builderModel() {
+        return StrUtil.blankToDefault(props.getModel(), sandboxProps.getLlm().getModel());
+    }
+
+    /** 派发前就失败（版本不对、执行器满、参数异常）：记进 RunState，让这条助手消息落成 FAILED 并带原因，而不是空气泡。 */
+    private void failEarly(String runId, String message) {
+        Map<String, Object> err = new LinkedHashMap<>();
+        err.put("message", message);
+        tee.teeJson(runId, "error", err);
+        RunHandle h = runRegistry.get(runId);
+        if (h != null && h.getState().getTerminalStatus() == null) {
+            h.getState().setError(message);
+            h.getState().markTerminal("FAILED");
+        }
+    }
+
+    /**
+     * 用量记账（ai_model_call_log，biz_type=skill_gen）。只含 CLI 主会话 + 子 agent 的用量——容器里的
+     * `claude -p` 子进程（DOER 触发测试、改写 description）与 PROMPT 触发测试的直连调用不在 summary.usage 里，
+     * 这是已知的计量缺口（见设计文档「已知限制」）。
+     */
+    private void recordUsage(Long sessionId, String runId, String summaryJson, String streamError, String model, long latencyMs) {
+        if (summaryJson == null) return;
         try {
-            EventSource upstream = sidecarClient.run(payload, listener);
-            RunHandle handle = runRegistry.get(connectionId);
-            if (handle != null) handle.setUpstream(upstream);
-            boolean done = latch.await(sandboxProps.getWallClockSec() + 30L, TimeUnit.SECONDS);
-            if (!done) {
-                tee.tee(connectionId, "error", new JSONObject().set("message", "timeout").toString());
-            }
+            JSONObject usageJson = JSONUtil.parseObj(summaryJson).getJSONObject("usage");
+            if (usageJson == null) return;
+            NormalizedUsage usage = usageExtractor.extract(usageJson);
+            if (usage.getInputTokens() == null && usage.getOutputTokens() == null) return;
+            Map<String, Object> note = new LinkedHashMap<>();
+            note.put("biz_type", BizTypeContext.SKILL_GEN);
+            note.put("builder_session_id", String.valueOf(sessionId));
+            note.put("run_id", runId);
+            recordService.recordComputedCall(providerRegistry.activeProvider(), "sandbox:skill-builder", model,
+                    BizTypeContext.SKILL_GEN, usage, streamError == null ? 200 : 500,
+                    (int) Math.min(latencyMs, Integer.MAX_VALUE), note, null);
         } catch (Exception e) {
-            log.error("skill 试跑调用边车异常 connectionId={}", connectionId, e);
-            tee.tee(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
-        } finally {
-            runFinalizer.complete(connectionId);
+            log.warn("构建器用量记账失败 runId={} err={}", runId, e.getMessage());
         }
     }
 }

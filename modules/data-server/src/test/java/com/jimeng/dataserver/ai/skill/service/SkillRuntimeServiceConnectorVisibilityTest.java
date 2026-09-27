@@ -55,7 +55,6 @@ class SkillRuntimeServiceConnectorVisibilityTest {
 
         service = new SkillRuntimeService(registry, mock(SkillToolExecutorRegistryService.class),
                 new com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage(),
-                new com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage(),
                 overview);
         ReflectionTestUtils.setField(service, "skillEnabled", true);
         ReflectionTestUtils.setField(service, "explicitPrefix", "@");

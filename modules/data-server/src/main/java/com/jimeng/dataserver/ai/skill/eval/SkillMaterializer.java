@@ -20,8 +20,8 @@ import java.util.Map;
  *
  * <p><b>刻意做成只依赖存储的叶子组件。</b>这段逻辑原本私有在 SkillBuilderRunService 里，
  * 评测也需要它；若让 SkillEvalService 去依赖 SkillBuilderRunService，就会牵进
- * ClaudeService → … → SkillToolExecutorRegistryService 那条链，正是当初逼出
- * SkillDraftStore（"独立叶子组件，破构造环"）的同一个环。
+ * ClaudeService → … → SkillToolExecutorRegistryService 那条链，正是此前草稿存储必须保持为
+ * “独立叶子组件”时遇到的同类构造环。
  */
 @Slf4j
 @Component
@@ -44,7 +44,7 @@ public class SkillMaterializer {
                 for (Map.Entry<String, String> e : files.entrySet()) {
                     String rel = e.getKey();
                     if (rel == null || rel.isBlank()) continue;
-                    // 防越界：去前导 / 与 ../，保证只写在前缀内。与 SkillBuilderRunService 同一套规则。
+                    // 防越界：去前导 / 与 ../，保证只写在前缀内。（下发给沙箱时 SkillBundleResolver 还会再滤掉根目录 evals/。）
                     String safeRel = rel.replace("\\", "/").replaceAll("^/+", "").replace("../", "");
                     String content = e.getValue() == null ? "" : e.getValue();
                     storage.putObject(prefix + safeRel, content.getBytes(StandardCharsets.UTF_8), "text/plain");
@@ -64,7 +64,7 @@ public class SkillMaterializer {
     /**
      * 把已发布 skill 的 bundle（MinIO 前缀下的对象）读回「相对路径 → 内容」表。
      * 与 {@link #materialize} 对称：那个把 files 写进前缀，这个从前缀读回来——评测已发布 skill 时
-     * 需要它拿到 {@code evals/evals.json} 与随包文件（草稿评测走 SkillDraftStore，不经这里）。
+     * 需要它拿到 {@code evals/evals.json} 与随包文件（新构建器草稿与评审直接位于会话工作区，不经这里）。
      *
      * @param bundleKey {@code AiSkill.bundleKey}，即该 skill 文件在 MinIO 的前缀
      */

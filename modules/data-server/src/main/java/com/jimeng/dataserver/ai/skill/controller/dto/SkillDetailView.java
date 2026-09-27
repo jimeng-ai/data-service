@@ -19,6 +19,8 @@ public class SkillDetailView {
     /** 创建者显示名（displayName，缺省回退 username）；由控制器解析后填入，前端展示用 */
     private String ownerName;
     private Integer version;
+    /** 构建器草稿所属的会话 id（与 SkillView 同一套判定）；不是构建器草稿则为 null。 */
+    private String builderSessionId;
     /** SKILL.md 正文 */
     private String body;
     /** DOER bundle 文件（脚本/依赖/README 等，不含已由 body 呈现的根 SKILL.md）；PROMPT 为空 */
@@ -36,6 +38,7 @@ public class SkillDetailView {
         v.setOwnerUserId(s.getOwnerUserId() == null ? null : String.valueOf(s.getOwnerUserId()));
         v.setOwnerName(ownerName);
         v.setVersion(s.getVersion());
+        v.setBuilderSessionId(SkillView.of(s).getBuilderSessionId());
         v.setBody(s.getBody());
         v.setFiles(files);
         return v;

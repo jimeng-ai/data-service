@@ -4,8 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
-import com.jimeng.dataserver.ai.skill.builder.SkillDraft;
-import com.jimeng.dataserver.ai.skill.builder.SkillDraftStore;
+import com.jimeng.dataserver.admin.common.AdminRequestContext;
+import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.service.SkillPackageLoaderService;
 import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
@@ -44,18 +44,15 @@ public class SkillEvalController {
     private static final String EVALS_PATH = "evals/evals.json";
 
     private final SkillEvalService evalService;
-    private final SkillDraftStore draftStore;
     private final AiSkillMapper aiSkillMapper;
     private final SkillMaterializer materializer;
     private final SkillPackageLoaderService skillPackageLoaderService;
 
     @Data
     public static class StartRequest {
-        /** 三选一：构建器会话 id（测草稿）*/
-        private Long conversationId;
-        /** 三选一：已入库 skill 的 id */
+        /** 二选一：已入库 skill 的 id */
         private Long skillId;
-        /** 三选一：磁盘上的平台技能名（如 {@code connector}），它不在 ai_skill 表里 */
+        /** 二选一：磁盘上的平台技能名（如 {@code connector}），它不在 ai_skill 表里 */
         private String skillName;
         /** RECALL（默认，测模型会不会想到用）| CAPABILITY（测用对没用对）*/
         private String mode;
@@ -75,20 +72,12 @@ public class SkillEvalController {
     @Operation(summary = "发起一轮评测（立即返回，后台串行跑）")
     @PostMapping("/runs")
     public SkillEvalRun start(@RequestBody StartRequest req) {
-        if (req == null || (req.getConversationId() == null && req.getSkillId() == null
+        if (req == null || (req.getSkillId() == null
                 && (req.getSkillName() == null || req.getSkillName().isBlank()))) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "conversationId / skillId / skillName 必须给一个");
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skillId / skillName 必须给一个");
         }
         String mode = req.getMode() == null ? SkillEvalService.MODE_RECALL : req.getMode().toUpperCase();
 
-        if (req.getConversationId() != null) {
-            SkillDraft d = draftStore.current(req.getConversationId());
-            if (d == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "该会话没有草稿");
-            Map<String, String> files = d.getFiles() == null ? Map.of() : d.getFiles();
-            return evalService.start(d.getName(), d.getBody(), files,
-                    parseSuite(files.get(EVALS_PATH)), mode, null, req.getConversationId(), req.getAgentId());
-        }
         if (req.getSkillId() == null) {
             // 磁盘平台技能（connector / rag-knowledge…）：正文与随包文件都在 skills/<name>/ 下。
             String name = req.getSkillName().trim();
@@ -104,8 +93,15 @@ public class SkillEvalController {
             return evalService.start(pkg.getName(), body, files,
                     parseSuite(files.get(EVALS_PATH)), mode, null, null, req.getAgentId());
         }
-        AiSkill s = aiSkillMapper.selectById(req.getSkillId());
+        AiSkill s = aiSkillMapper.selectById(req.getSkillId());   // 租户隔离表：别的租户的查不到
         if (s == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "skill 不存在");
+        // 租户内的可见性：别人的私有 skill 不能拿来跑评测（评测记录里有它的正文与运行过程）。
+        // 草稿的测试在构建器里由 skill-creator 自己做，这里只评已发布的 skill。
+        if (SkillConst.STATUS_DRAFT.equals(s.getStatus())
+                || (!SkillConst.SCOPE_TENANT.equals(s.getScope())
+                    && !java.util.Objects.equals(s.getOwnerUserId(), AdminRequestContext.requireUserId()))) {
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "skill 不存在");
+        }
         // 已发布 skill：正文在 DB（body）、随包文件在 MinIO bundle。读回文件表拿 evals/evals.json，
         // 再走与草稿同一套 evalService.start（内部会把 body+files 重新物化进沙箱）。
         Map<String, String> files = materializer.readBundleFiles(s.getBundleKey());

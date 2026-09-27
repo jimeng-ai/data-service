@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.skill.eval;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.Data;
 
@@ -15,6 +16,9 @@ import java.util.List;
 public class EvalSuite {
 
     /** 与 skill frontmatter 的 name 一致 */
+    // skill-creator 的 evals.json 用下划线（skill_name / expected_output），这里原先只认驼峰且 ignoreUnknown，
+    // 于是构建器写出来的 expected_output 被静默丢掉、评委永远拿不到「期望结果」。两种写法都认。
+    @JsonAlias("skill_name")
     private String skillName;
 
     private List<EvalCase> evals;
@@ -29,6 +33,7 @@ public class EvalSuite {
         private String prompt;
 
         /** 人读的成功描述 */
+        @JsonAlias("expected_output")
         private String expectedOutput;
 
         /** 可选输入文件（相对 skill 根）。当前实现尚未支持，忽略。 */

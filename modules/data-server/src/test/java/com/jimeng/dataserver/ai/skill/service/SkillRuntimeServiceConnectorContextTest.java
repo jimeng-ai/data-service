@@ -51,7 +51,6 @@ class SkillRuntimeServiceConnectorContextTest {
 
         service = new SkillRuntimeService(registry, mock(SkillToolExecutorRegistryService.class),
                 new com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage(),
-                new com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage(),
                 overviewService);
         ReflectionTestUtils.setField(service, "skillEnabled", true);
         ReflectionTestUtils.setField(service, "explicitPrefix", "@");

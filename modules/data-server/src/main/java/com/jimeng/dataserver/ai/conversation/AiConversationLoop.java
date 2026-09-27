@@ -116,6 +116,14 @@ public class AiConversationLoop {
     private void injectBuiltinTools(Map<String, Object> body, AiProtocolAdapter adapter,
                                     boolean webTools, boolean skillInstall, boolean imageGen) {
         List<Object> tools = adapter.getToolsList(body);
+        tools.addAll(builtinDefs(adapter, webTools, skillInstall, imageGen));
+        adapter.setToolsList(body, tools);
+        adapter.ensureToolChoiceAuto(body);
+    }
+
+    private static List<Object> builtinDefs(AiProtocolAdapter adapter,
+                                            boolean webTools, boolean skillInstall, boolean imageGen) {
+        List<Object> tools = new java.util.ArrayList<>();
         if (webTools) {
             tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_SEARCH));
             tools.add(adapter.convertToolDef(WebToolDefinitions.WEB_FETCH));
@@ -127,8 +135,16 @@ public class AiConversationLoop {
         if (imageGen) {
             tools.add(adapter.convertToolDef(ImageGenToolDefinitions.GENERATE_IMAGE));
         }
-        adapter.setToolsList(body, tools);
-        adapter.ensureToolChoiceAuto(body);
+        return tools;
+    }
+
+    /**
+     * 本部署当前对所有 Agent 生效的内置工具定义（按各自开关，顺序与注入时相同）。
+     * Skill 构建器的 PROMPT 类触发测试用它复现生产请求里与 activate_skills 竞争的那几个工具——
+     * 同一个开关判断，不另抄一份（抄了就会出现「生产里有 generate_image、触发测试里没有」的漂移）。
+     */
+    public List<Object> builtinToolDefs(AiProtocolAdapter adapter) {
+        return builtinDefs(adapter, webSearchProperties.enabled(), skillInstallEnabled, imageGenClient.enabled());
     }
 
     // ------------------------------------------------------------------ non-stream

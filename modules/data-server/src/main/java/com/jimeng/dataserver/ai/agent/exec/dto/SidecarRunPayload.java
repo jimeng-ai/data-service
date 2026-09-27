@@ -89,6 +89,15 @@ public class SidecarRunPayload {
      */
     private ConnectorContext connectorContext;
 
+    /**
+     * 只在 {@code runProfile="skill-builder"} 时下发且必填：跨轮持久化的工作区在 MinIO 上的位置
+     * （边车 {@code src/types.ts} 的 {@code WorkspaceRef}）。其余形态带它边车直接 400。
+     */
+    private Workspace workspace;
+
+    /** 只在 {@code runProfile="skill-builder"} 时下发：PROMPT 类触发测试的发现请求上下文等（边车 {@code SkillBuilderContext}）。 */
+    private SkillBuilder skillBuilder;
+
     @Data
     public static class SkillRef {
         private String name;
@@ -213,6 +222,49 @@ public class SidecarRunPayload {
         private List<String> allowMethods;
         /** 允许的路径 glob；空则边车按默认 ["/**"] 处理 */
         private List<String> allowPaths;
+    }
+
+    /** 字段名须与边车 TS 的 {@code WorkspaceRef} 一致。 */
+    @Data
+    public static class Workspace {
+        /** 缺省用边车自己的 bucket；构建器总是显式给（与 data-service 读写同一个 bucket）。 */
+        private String bucket;
+        /** 以 / 结尾、不以 / 开头、没有 . / .. 段——边车按这个形状校验，不合规回 400。 */
+        private String prefix;
+    }
+
+    /** 字段名须与边车 TS 的 {@code SkillBuilderContext} 一致。 */
+    @Data
+    public static class SkillBuilder {
+        private TriggerEval triggerEval;
+        /** PROMPT / DOER；null = 边车按「SKILL.md 之外有没有附带文件」推断（与 SkillBundleRules 同一条规则）。 */
+        private String skillTypeOverride;
+        private Integer cliMaxWorkers;
+    }
+
+    /**
+     * 字段名须与边车 TS 的 {@code SkillTriggerEvalContext} 一致。没有任何密钥：边车只把它写成
+     * /work/.jimeng/skill-builder.json，由 skill-creator 的 run_eval.py（jimeng 适配版）经容器里本来就有的
+     * LLM 通道发出与生产逐字一致的发现请求。
+     */
+    @Data
+    public static class TriggerEval {
+        /** 发现文本中候选列表之前的全部内容（SkillRuntimeService#discoveryHeader）。 */
+        private String header;
+        /** 每个候选一行的格式（SkillRuntimeService#DISCOVERY_LINE_TEMPLATE）。 */
+        private String lineTemplate;
+        private List<Candidate> candidates;
+        /** Anthropic 形态的工具定义，至少含 activate_skills。 */
+        private List<java.util.Map<String, Object>> tools;
+        private String model;
+        private Integer maxTokens;
+        private String activateToolName;
+    }
+
+    @Data
+    public static class Candidate {
+        private String name;
+        private String description;
     }
 
     @Data

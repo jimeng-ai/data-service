@@ -53,7 +53,6 @@ public class SkillRuntimeService {
     private final ToolPackageRegistry toolPackageRegistry;
     private final SkillToolExecutorRegistryService skillToolExecutorRegistryService;
     private final com.jimeng.dataserver.ai.agent.builder.DraftAgentToolPackage draftAgentToolPackage;
-    private final com.jimeng.dataserver.ai.skill.builder.DraftSkillToolPackage draftSkillToolPackage;
 
     /**
      * 连接器「默认注入目录」+「这一轮命中的口径」的来源。
@@ -77,10 +76,6 @@ public class SkillRuntimeService {
         if (body != null && Boolean.TRUE.equals(body.remove("__agent_builder_mode__"))) {
             injectFullSkillContext(body, java.util.List.of(draftAgentToolPackage), adapter);
             return SkillApplyResult.activated(java.util.List.of(draftAgentToolPackage.getName()));
-        }
-        if (body != null && Boolean.TRUE.equals(body.remove("__skill_builder_mode__"))) {
-            injectFullSkillContext(body, java.util.List.of(draftSkillToolPackage), adapter);
-            return SkillApplyResult.activated(java.util.List.of(draftSkillToolPackage.getName()));
         }
         if (!skillEnabled || body == null) return SkillApplyResult.disabled();
 
@@ -336,9 +331,17 @@ public class SkillRuntimeService {
         adapter.ensureToolChoiceAuto(body);
     }
 
-    private void injectDiscoveryContext(Map<String, Object> body,
-                                         List<ToolPackage> skills,
-                                         AiProtocolAdapter adapter) {
+    /**
+     * 发现文本里每个候选一行的格式（{name} / {description} 占位）。Skill 构建器的 PROMPT 类触发测试
+     * （沙箱里 skill-creator 的 run_eval.py 适配版）拿同一个模板渲染，两边逐字一致——改这里就是改两处。
+     */
+    public static final String DISCOVERY_LINE_TEMPLATE = "- **{name}**: {description}";
+
+    /**
+     * 发现文本中候选列表之前的全部内容：skill 系统提示 + 强约束的激活指引。
+     * {@link #injectDiscoveryContext} 与 Skill 构建器的触发测试共用这一份，保证测的就是生产发出的那段话。
+     */
+    public String discoveryHeader() {
         StringBuilder sb = new StringBuilder(skillSystemPrompt).append("\n\n");
         // 强约束的激活指引：模型常因「内置工具能直接完成」而跳过明显相关的 Skill（例如收到生图请求时
         // 直接调 generate_image，却不先激活『图像提示词优化』Skill）。这里要求：在调用任何其它工具或直接
@@ -349,8 +352,22 @@ public class SkillRuntimeService {
         sb.append("- 只要某个 Skill 明显相关，你【必须】先调用 activate_skills 激活它，激活后严格遵循该 Skill 的指引再继续后续动作；\n");
         sb.append("- 不要在存在明显相关 Skill 的情况下跳过激活、直接用其它工具或凭空作答；\n");
         sb.append("- 若确实没有相关 Skill，可不激活、正常继续。\n\n");
+        return sb.toString();
+    }
+
+    /** 按 {@link #DISCOVERY_LINE_TEMPLATE} 渲染一个候选。description 为 null 时写成 "null"，与改造前的拼接逐字相同。 */
+    public static String discoveryLine(String name, String description) {
+        return DISCOVERY_LINE_TEMPLATE
+                .replace("{name}", String.valueOf(name))
+                .replace("{description}", String.valueOf(description));
+    }
+
+    private void injectDiscoveryContext(Map<String, Object> body,
+                                         List<ToolPackage> skills,
+                                         AiProtocolAdapter adapter) {
+        StringBuilder sb = new StringBuilder(discoveryHeader());
         for (ToolPackage skill : skills) {
-            sb.append("- **").append(skill.getName()).append("**: ").append(skill.getDescription()).append("\n");
+            sb.append(discoveryLine(skill.getName(), skill.getDescription())).append("\n");
         }
         adapter.appendSystemContent(body, sb.toString().trim());
 

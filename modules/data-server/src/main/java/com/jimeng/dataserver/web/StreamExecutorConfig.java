@@ -188,4 +188,24 @@ public class StreamExecutorConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * Skill 构建器专用（沙箱里原样跑 skill-creator，一轮常常十几二十分钟、最长 skill.builder.wall-clock-sec）。
+     *
+     * <p>与 {@code semanticGenerationExecutor} 同一个理由不用 {@code streamExecutor}：那边是 CallerRunsPolicy，
+     * 池满时几十分钟的一轮会被塞回 Tomcat 请求线程。这里小池 + 有界队列 + AbortPolicy：满了就拒，
+     * 调用方把这一轮落成「构建器繁忙，请稍后再试」。容量与边车 skill-builder 池（默认 1 个在跑 + 2 个排队）相当，
+     * 再多也只是在边车那里排队后 503。
+     */
+    @Bean("skillBuilderExecutor")
+    public ThreadPoolTaskExecutor skillBuilderExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(4);
+        executor.setThreadNamePrefix("skill-builder-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.initialize();
+        return executor;
+    }
 }

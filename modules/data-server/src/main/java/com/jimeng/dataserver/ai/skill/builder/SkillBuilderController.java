@@ -1,203 +1,124 @@
 package com.jimeng.dataserver.ai.skill.builder;
 
 import cn.hutool.core.util.StrUtil;
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
-import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.agent.builder.dto.BuilderSessionDtos.TurnRequest;
-import com.jimeng.dataserver.ai.chat.dto.ChatDtos.ConversationView;
-import com.jimeng.dataserver.ai.chat.dto.ChatDtos.CreateConversationRequest;
 import com.jimeng.dataserver.ai.chat.dto.ChatDtos.TurnStartResponse;
 import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
 import com.jimeng.dataserver.ai.run.ChatRunService;
-import com.jimeng.persistence.entity.Agent;
-import com.jimeng.dataserver.ai.skill.eval.SkillEvalGate;
-import com.jimeng.persistence.entity.AiSkill;
-import com.jimeng.persistence.mapper.AiSkillMapper;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.CreateSessionRequest;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.FeedbackRequest;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReportView;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewView;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.SessionView;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.SkillTypeRequest;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.UUID;
 
 /**
- * 对话式生成 Skill 向导后端入口。镜像 AgentBuilderController：
- * 流/取消复用 run 原语（按 runId），会话在 {@code /sessions/{id}/} 下，SSE/取消在 {@code /runs/{runId}/} 下。
- *
- * <p>额外端点（Skill-only）：
- * <ul>
- *   <li>{@code POST /sessions/{id}/test-run} — 沙箱试跑内存草稿（仅 DOER 类型）。</li>
- *   <li>{@code POST /{draftId}/finalize} — 把 DRAFT ai_skill 行翻转为 ACTIVE（按 skill 行 id）。</li>
- *   <li>{@code POST /sessions/{id}/finalize} — 同上，按构建器会话 id 查找对应草稿行再翻转。</li>
- * </ul>
+ * Skill 构建器：在沙箱里原样跑 Anthropic skill-creator，帮用户新建或改进一个 skill。
+ * 每个会话都只对属主可见（{@link SkillBuilderSessionService#requireOwned}）。
  */
-@Tag(name = "对话式生成 Skill", description = "Skill 构建器向导")
+@Tag(name = "Skill 构建器")
 @RestController
 @RequestMapping("/data/tenant/skills/builder")
 @RequiredArgsConstructor
 public class SkillBuilderController {
 
-    private final SkillBuilderService builderService;
-    private final SkillBuilderRunService runService;
-    private final SkillBuilderFinalizeService finalizeService;
+    private final SkillBuilderSessionService sessions;
+    private final SkillBuilderRunService runs;
+    private final SkillBuilderPublishService publisher;
     private final ChatConversationService conversationService;
     private final ChatRunService chatRunService;
-    private final AiSkillMapper aiSkillMapper;
 
-    // ------------------------------------------------------------------ session
-
-    @Operation(summary = "开一个 Skill 生成会话")
+    @Operation(summary = "开一个构建器会话（带 baseSkillId = 改进已有 skill；同一个 skill 有进行中的会话则返回它）")
     @PostMapping("/sessions")
-    public StartSessionResponse startSession() {
-        Agent builder = builderService.ensureBuilderAgent();
-        CreateConversationRequest req = new CreateConversationRequest();
-        req.setAgentId(String.valueOf(builder.getId()));
-        req.setAgentName(builder.getName());
-        req.setTitle("生成 Skill");
-        ConversationView c = conversationService.create(req);
-
-        StartSessionResponse resp = new StartSessionResponse();
-        resp.setConversationId(c.getId());
-        resp.setDraft(runService.currentDraft(c.getId()));
-        return resp;
+    public SessionView create(@RequestBody(required = false) CreateSessionRequest req) {
+        return sessions.create(req == null ? null : req.getBaseSkillId());
     }
 
-    // ------------------------------------------------------------------ turns
+    @Operation(summary = "读会话：聊天记录、当前草稿、最新评审页元数据、进行中的 run（刷新页面后恢复用）")
+    @GetMapping("/sessions/{id}")
+    public SessionView get(@PathVariable Long id) {
+        return sessions.get(id);
+    }
 
-    @Operation(summary = "发一轮（服务端生成，立即返回 runId）")
+    @Operation(summary = "发一轮（服务端在沙箱里跑，立即返回 runId）")
     @PostMapping("/sessions/{id}/turns")
-    public TurnStartResponse turn(@PathVariable("id") Long conversationId,
-                                  @RequestBody TurnRequest req,
-                                  HttpServletRequest request) {
-        return runService.startTurn(conversationId, req, extractTraceId(request));
+    public TurnStartResponse turn(@PathVariable Long id, @RequestBody TurnRequest req, HttpServletRequest request) {
+        return runs.startTurn(id, req, traceIdOf(request));
     }
 
-    // ------------------------------------------------------------------ stream / cancel  (mirror agent-builder exactly)
-
-    @Operation(summary = "消费/重连生成流")
+    @Operation(summary = "消费 / 重连生成流")
     @GetMapping("/runs/{runId}/stream")
     public SseEmitter stream(@PathVariable String runId,
                              @RequestParam(value = "from", required = false) String from,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
         assertRunOwner(runId);
-        String fromId = StrUtil.isNotBlank(lastEventId) ? lastEventId : from;
-        return chatRunService.attachViewer(runId, fromId);
+        return chatRunService.attachViewer(runId, StrUtil.isNotBlank(lastEventId) ? lastEventId : from);
     }
 
-    @Operation(summary = "取消生成")
+    @Operation(summary = "停止这一轮（边车 docker kill，工作区照常写回已完成的部分）")
     @PostMapping("/runs/{runId}/cancel")
     public void cancel(@PathVariable String runId) {
         assertRunOwner(runId);
         chatRunService.cancelRun(runId);
     }
 
-    // ------------------------------------------------------------------ draft
-
-    @Operation(summary = "读当前草稿（重连恢复预览）")
-    @GetMapping("/sessions/{id}/draft")
-    public SkillDraft draft(@PathVariable("id") Long conversationId) {
-        conversationService.requireConversationWithAccess(conversationId);
-        return runService.currentDraft(conversationId);
+    @Operation(summary = "最新一轮评审页（skill-creator 的 generate_review.py --static 产物）与已提交的反馈")
+    @GetMapping("/sessions/{id}/review")
+    public ReviewView review(@PathVariable Long id) {
+        return sessions.review(id);
     }
 
-    // ------------------------------------------------------------------ test-run
-
-    @Operation(summary = "沙箱试跑内存草稿（DOER 类型）")
-    @PostMapping("/sessions/{id}/test-run")
-    public SseEmitter testRun(@PathVariable("id") Long conversationId,
-                              @RequestParam(value = "sampleFileId", required = false) Long sampleFileId,
-                              HttpServletRequest request) {
-        return runService.testRun(conversationId, sampleFileId, extractTraceId(request));
+    @Operation(summary = "保存评审页提交的反馈（写成该轮的 feedback.json，下一轮 skill-creator 从那里读）")
+    @PutMapping("/sessions/{id}/review/feedback")
+    public void feedback(@PathVariable Long id, @RequestBody FeedbackRequest req) {
+        sessions.saveFeedback(id, req == null ? null : req.getIteration(), req == null ? null : req.getFeedback());
     }
 
-    // ------------------------------------------------------------------ finalize
-
-    /**
-     * 把 DRAFT ai_skill 行翻转为 ACTIVE，按 skill 行 id（推荐，前端从 draft_skill 工具回调得到该 id）。
-     */
-    @Operation(summary = "把指定 DRAFT skill 行翻转为 ACTIVE（按 skill id）")
-    @PostMapping("/{draftId}/finalize")
-    public FinalizeResponse finalize(@PathVariable Long draftId) {
-        AiSkill skill = finalizeService.finalizeDraft(
-                draftId,
-                AdminRequestContext.requireTenantId(),
-                AdminRequestContext.requireUserId());
-        return toFinalizeResponse(skill);
+    @Operation(summary = "description 触发优化报告（run_loop.py 的 --report 产物）")
+    @GetMapping("/sessions/{id}/optimization")
+    public ReportView optimization(@PathVariable Long id) {
+        return sessions.optimizationReport(id);
     }
 
-    /**
-     * 把 DRAFT ai_skill 行翻转为 ACTIVE，按构建器会话 id（通过 originRef 查找对应草稿行）。
-     */
-    @Operation(summary = "把 DRAFT skill 行翻转为 ACTIVE（按构建器会话 id）")
-    @PostMapping("/sessions/{id}/finalize")
-    public FinalizeResponse finalizeSession(@PathVariable("id") Long conversationId) {
-        conversationService.requireConversationWithAccess(conversationId);
-        String originRef = "builder:" + conversationId;
-        AiSkill draft = aiSkillMapper.selectOne(new LambdaQueryWrapper<AiSkill>()
-                .eq(AiSkill::getOriginRef, originRef)
-                .last("limit 1"));
-        if (draft == null) {
-            throw new ServiceException(ExceptionCode.NOT_FOUND, "该会话尚无关联的 skill 草稿");
-        }
-        AiSkill skill = finalizeService.finalizeDraft(
-                draft.getId(),
-                AdminRequestContext.requireTenantId(),
-                AdminRequestContext.requireUserId());
-        return toFinalizeResponse(skill);
+    @Operation(summary = "指定 skill 在产品里的运行方式（PROMPT / DOER；null = 按附带文件自动推断）")
+    @PutMapping("/sessions/{id}/skill-type")
+    public void skillType(@PathVariable Long id, @RequestBody(required = false) SkillTypeRequest req) {
+        sessions.setSkillType(id, req == null ? null : StrUtil.emptyToNull(req.getSkillType()));
     }
 
-    // ------------------------------------------------------------------ helpers
+    @Operation(summary = "发布（按 quick_validate 规则校验 → 版本化 bundle → 上线）")
+    @PostMapping("/sessions/{id}/publish")
+    public PublishResult publish(@PathVariable Long id) {
+        return publisher.publish(id);
+    }
 
-    /** 据 runId 反查会话并校验当前账号有访问权（镜像 AgentBuilderController）。 */
     private void assertRunOwner(String runId) {
         Long conversationId = conversationService.conversationIdOfRun(runId);
-        if (conversationId == null) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "run 不存在: " + runId);
-        }
+        if (conversationId == null) throw new ServiceException(ExceptionCode.INVALID_REQUEST, "run 不存在: " + runId);
         conversationService.requireConversationWithAccess(conversationId);
     }
 
-    private String extractTraceId(HttpServletRequest request) {
+    private static String traceIdOf(HttpServletRequest request) {
         String tid = request.getHeader("X-Trace-Id");
         return StrUtil.isBlank(tid) ? UUID.randomUUID().toString() : tid;
-    }
-
-    private FinalizeResponse toFinalizeResponse(AiSkill skill) {
-        FinalizeResponse resp = new FinalizeResponse();
-        resp.setSkillId(skill.getId());
-        resp.setName(skill.getName());
-        resp.setStatus(skill.getStatus());
-        // 门槛结论随发布结果一起回去。WARN 模式下 skill 确实发布了，但可能根本不会被触发——
-        // 这条只写日志的话，用户永远不知道。
-        SkillEvalGate.Verdict v = finalizeService.takeVerdict();
-        if (v != null) {
-            resp.setEvalWarning(v.warning());
-            resp.setEvalRunId(v.evalRunId());
-        }
-        return resp;
-    }
-
-    // ------------------------------------------------------------------ inner DTOs
-
-    @Data
-    public static class StartSessionResponse {
-        private Long conversationId;
-        private SkillDraft draft;
-    }
-
-    @Data
-    public static class FinalizeResponse {
-        private Long skillId;
-        private String name;
-        private String status;
-        /** 发布门槛的提示。非空表示「放行了，但这个 skill 可能不会被触发」——前端必须显示出来。 */
-        private String evalWarning;
-        /** 依据的那轮召回评测（便于前端跳过去看细节）。 */
-        private Long evalRunId;
     }
 }

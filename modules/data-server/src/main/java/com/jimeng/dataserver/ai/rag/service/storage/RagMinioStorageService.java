@@ -4,15 +4,20 @@ import cn.hutool.core.util.IdUtil;
 import com.jimeng.common.core.configuration.FileConfiguration;
 import com.jimeng.dataserver.ai.rag.config.RagProperties;
 import io.minio.BucketExistsArgs;
+import io.minio.CopyObjectArgs;
+import io.minio.CopySource;
 import io.minio.GetObjectArgs;
 import io.minio.ListObjectsArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
+import io.minio.RemoveObjectsArgs;
 import io.minio.Result;
 import io.minio.http.Method;
 import io.minio.GetPresignedObjectUrlArgs;
+import io.minio.messages.DeleteError;
+import io.minio.messages.DeleteObject;
 import io.minio.messages.Item;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -25,6 +30,7 @@ import java.io.InputStream;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -130,6 +136,65 @@ public class RagMinioStorageService {
                 ListObjectsArgs.builder().bucket(bucket).prefix(prefix).recursive(true).build());
         for (Result<Item> r : results) keys.add(r.get().objectName());
         return keys;
+    }
+
+    /** 对象的名字 / 大小 / 最后修改时间（listObjectInfos 用）。 */
+    public record ObjectInfo(String name, long size, Date lastModified) {}
+
+    /** 列出某前缀下的所有对象（递归），带大小与最后修改时间——Skill 构建器读工作区、找最新一轮评审页用。 */
+    public List<ObjectInfo> listObjectInfos(String prefix) throws Exception {
+        ensureReady();
+        List<ObjectInfo> out = new ArrayList<>();
+        Iterable<Result<Item>> results = client.listObjects(
+                ListObjectsArgs.builder().bucket(bucket).prefix(prefix).recursive(true).build());
+        for (Result<Item> r : results) {
+            Item it = r.get();
+            if (it.isDir()) continue;
+            Date modified = it.lastModified() == null ? null : Date.from(it.lastModified().toInstant());
+            out.add(new ObjectInfo(it.objectName(), it.size(), modified));
+        }
+        return out;
+    }
+
+    /** 读整个对象（调用方负责只对有上限的小对象这样做）。 */
+    public byte[] readBytes(String objectName) throws Exception {
+        try (InputStream is = download(objectName)) {
+            return is.readAllBytes();
+        }
+    }
+
+    /** 服务端复制（同 bucket），不经本进程中转字节。 */
+    public void copyObject(String sourceObject, String targetObject) throws Exception {
+        ensureReady();
+        client.copyObject(CopyObjectArgs.builder()
+                .bucket(bucket).object(targetObject)
+                .source(CopySource.builder().bucket(bucket).object(sourceObject).build())
+                .build());
+    }
+
+    /**
+     * 删除某前缀下的全部对象，返回删掉的个数。
+     *
+     * <p>★ MinIO Java SDK 的 removeObjects 是<b>惰性</b>的：返回的 Iterable 不迭代，一个对象都不会被删，
+     * 而且不报错。这里必须把结果逐个取一遍（出错的对象会以 DeleteError 出现在里面）。
+     */
+    public int deletePrefix(String prefix) throws Exception {
+        ensureReady();
+        if (prefix == null || prefix.isBlank() || !prefix.endsWith("/")) {
+            // 空前缀 = 整个 bucket；不以 / 结尾会误删同名前缀的兄弟（skills/1 会匹配 skills/10/…）。
+            throw new IllegalArgumentException("deletePrefix 需要以 / 结尾的非空前缀: " + prefix);
+        }
+        List<DeleteObject> objects = new ArrayList<>();
+        for (String key : listObjects(prefix)) objects.add(new DeleteObject(key));
+        if (objects.isEmpty()) return 0;
+        int failed = 0;
+        for (Result<DeleteError> r : client.removeObjects(
+                RemoveObjectsArgs.builder().bucket(bucket).objects(objects).build())) {
+            DeleteError err = r.get();
+            failed++;
+            log.warn("MinIO 删除失败 object={} msg={}", err.objectName(), err.message());
+        }
+        return objects.size() - failed;
     }
 
     public String getBucket() {

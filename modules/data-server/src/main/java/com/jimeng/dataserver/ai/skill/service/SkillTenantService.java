@@ -6,7 +6,9 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
 import com.jimeng.persistence.entity.AiSkill;
+import com.jimeng.persistence.entity.SkillBuilderSession;
 import com.jimeng.persistence.mapper.AiSkillMapper;
+import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,6 +21,8 @@ import java.util.Objects;
 public class SkillTenantService {
     private final AiSkillMapper aiSkillMapper;
     private final AiSkillRegistryService registry;
+    /** 只用 mapper、不依赖构建器服务：本类在对话链路上（ChatRunService → 这里），不能把构建器那一串拖进来。 */
+    private final SkillBuilderSessionMapper builderSessionMapper;
 
     @Transactional
     public AiSkill createFromMarkdown(String rawMarkdown, String tenantId, Long ownerUserId) {
@@ -78,6 +82,11 @@ public class SkillTenantService {
     @Transactional
     public void setStatus(Long id, String status, Long currentUserId) {
         AiSkill s = requireOwned(id, currentUserId);
+        // 草稿只能经构建器「发布」上线：那一步做 frontmatter 校验、生成版本化 bundle、写版本记录。
+        // 在这里直接改成 ACTIVE 会把这三步全绕过去（此前卡片上的「启用」正是这么做的）。
+        if (SkillConst.STATUS_DRAFT.equals(s.getStatus())) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "草稿请在构建器里发布，不能直接启用");
+        }
         s.setStatus(status);
         aiSkillMapper.updateById(s);
         registry.reloadAndBroadcast();
@@ -85,8 +94,16 @@ public class SkillTenantService {
 
     @Transactional
     public void delete(Long id, Long currentUserId) {
-        requireOwned(id, currentUserId);
+        AiSkill s = requireOwned(id, currentUserId);
         aiSkillMapper.deleteById(id);
+        // 删掉构建器草稿卡片 = 放弃那个会话；工作区由 SkillBuilderJanitor 按保留期回收。
+        if (SkillConst.STATUS_DRAFT.equals(s.getStatus())) {
+            SkillBuilderSession u = new SkillBuilderSession();
+            u.setStatus("ABANDONED");
+            builderSessionMapper.update(u, new LambdaQueryWrapper<SkillBuilderSession>()
+                    .eq(SkillBuilderSession::getDraftSkillId, id)
+                    .eq(SkillBuilderSession::getStatus, "ACTIVE"));
+        }
         registry.reloadAndBroadcast();
     }
 

@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.skill.service;
 
+import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.persistence.entity.AiSkill;
@@ -34,9 +35,13 @@ public class SkillBundleResolver {
         ref.setName(name);
         List<SidecarRunPayload.SkillFile> files = new ArrayList<>();
         for (String obj : objects) {
+            String rel = obj.startsWith(prefix) ? obj.substring(prefix.length()) : obj;
+            // 根目录 evals/（测试用例 + 断言）与缓存文件不下发：下发了，评测时被测模型就能读到答案，
+            // 生产运行里则是每一次都白发一份。规则见 SkillBundleRules，与 skill-creator package_skill.py 同源。
+            if (!SkillBundleRules.isRuntimeFile(rel)) continue;
             SidecarRunPayload.SkillFile f = new SidecarRunPayload.SkillFile();
             f.setObjectName(obj);
-            f.setRelPath(obj.startsWith(prefix) ? obj.substring(prefix.length()) : obj);
+            f.setRelPath(rel);
             f.setBucket(bucket);
             files.add(f);
         }

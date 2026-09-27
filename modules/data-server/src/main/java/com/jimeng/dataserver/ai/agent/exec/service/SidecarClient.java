@@ -116,4 +116,27 @@ public class SidecarClient {
         }
         return headers;
     }
+
+    /**
+     * 边车 skill-builder 形态（沙箱里原样跑 skill-creator）的契约版本，取自 capabilities 的 {@code skillBuilderVersion}。
+     * 与 {@link #connectorToolsVersion} 同一个套路：任何取不到的情形一律返回 0（不支持），不抛异常。
+     * 老边车不认识 {@code runProfile="skill-builder"} 会回 400，版本对不上时它可能照常跑、却按另一套目录约定读写工作区——
+     * 所以构建器派发前先问这里，版本不认识就不派发。
+     */
+    public int skillBuilderVersion(Duration timeout) {
+        try {
+            RequestService.HttpResp resp = capabilities(timeout);
+            if (resp == null || resp.getStatusCode() == null || resp.getStatusCode() != 200) {
+                log.warn("[sidecar] 取 skillBuilderVersion 失败：capabilities 返回 {}，按 0 处理",
+                        resp == null ? "无响应" : resp.getStatusCode());
+                return 0;
+            }
+            Object raw = JSONUtil.parseObj(resp.getBody()).get("skillBuilderVersion");
+            return raw == null ? 0 : Integer.parseInt(String.valueOf(raw).trim());
+        } catch (Exception e) {
+            log.warn("[sidecar] 取 skillBuilderVersion 异常，按 0 处理: {}", e.getMessage());
+            return 0;
+        }
+    }
+
 }

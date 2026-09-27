@@ -4,6 +4,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
+import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
 import org.junit.jupiter.api.Test;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
@@ -11,8 +12,49 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class SkillTenantServiceTest {
     private SkillTenantService newService(AiSkillMapper mapper) {
+        return newService(mapper, mock(SkillBuilderSessionMapper.class));
+    }
+
+    private SkillTenantService newService(AiSkillMapper mapper, SkillBuilderSessionMapper sessions) {
         AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
-        return new SkillTenantService(mapper, registry);
+        return new SkillTenantService(mapper, registry, sessions);
+    }
+
+    private static AiSkill owned(String status) {
+        AiSkill s = new AiSkill();
+        s.setId(11L);
+        s.setOwnerUserId(7L);
+        s.setStatus(status);
+        return s;
+    }
+
+    @Test
+    void draftCannotBeEnabledDirectly() {
+        // 草稿只能经构建器「发布」上线；直接启用会绕过 frontmatter 校验与版本化 bundle。
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        when(mapper.selectById(11L)).thenReturn(owned(SkillConst.STATUS_DRAFT));
+        SkillTenantService svc = newService(mapper);
+        assertThrows(ServiceException.class, () -> svc.setStatus(11L, SkillConst.STATUS_ACTIVE, 7L));
+        verify(mapper, never()).updateById(any(AiSkill.class));
+    }
+
+    @Test
+    void deletingDraftAbandonsItsBuilderSession() {
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        SkillBuilderSessionMapper sessions = mock(SkillBuilderSessionMapper.class);
+        when(mapper.selectById(11L)).thenReturn(owned(SkillConst.STATUS_DRAFT));
+        newService(mapper, sessions).delete(11L, 7L);
+        verify(mapper).deleteById(11L);
+        verify(sessions).update(any(), any());
+    }
+
+    @Test
+    void deletingPublishedSkillLeavesSessionsAlone() {
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        SkillBuilderSessionMapper sessions = mock(SkillBuilderSessionMapper.class);
+        when(mapper.selectById(11L)).thenReturn(owned(SkillConst.STATUS_ACTIVE));
+        newService(mapper, sessions).delete(11L, 7L);
+        verify(sessions, never()).update(any(), any());
     }
     @Test
     void createFromMarkdownSetsDefaults() {

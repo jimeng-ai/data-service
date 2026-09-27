@@ -25,10 +25,13 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -42,7 +45,7 @@ import java.util.concurrent.TimeUnit;
  *       这是本平台最需要的一类——description 写不好，skill 就等于不存在，
  *       而且请求 200、回复正常，<b>完全静默</b>。</li>
  *   <li><b>CAPABILITY</b>：明确要求用这个 skill。测的是"用了之后做得对不对"。
- *       等价于既有 {@code SkillBuilderRunService.testRun} 的语义。</li>
+ *       等价于「照 skill 指引真跑一遍」。</li>
  * </ul>
  *
  * <h3>为什么串行跑、异步返回</h3>
@@ -129,7 +132,7 @@ public class SkillEvalService {
         run.setSkillName(skillName);
         run.setMode(mode);
         run.setStatus(STATUS_RUNNING);
-        run.setContentHash(SkillEvalGate.contentHash(body, files));
+        run.setContentHash(contentHash(body, files));
         run.setTotalCases(suite.getEvals().size());
         run.setFinishedCases(0);
         run.setPassedCases(0);
@@ -378,7 +381,7 @@ public class SkillEvalService {
      * 这个 skill 是不是「没有 {@code conn_*} 工具就根本测不了」的那一类。
      *
      * <p>按<b>名字</b>判而不是按 frontmatter 的 {@code requires}：评测的输入可能是构建器里的草稿，
-     * 草稿的 body 已经被剥掉 frontmatter（{@code SkillDraft} 只有 name/description/body/files），
+     * 已入库 skill 的 body 已经被剥掉 frontmatter（库里只存正文），
      * 这里拿不到 requires。名字是两条来源（磁盘平台技能、草稿）都一定有的东西。
      */
     private static boolean requiresConnectorTools(String skillName) {
@@ -453,6 +456,30 @@ public class SkillEvalService {
         } catch (Exception e) {
             throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR,
                     "评委返回的不是合法 JSON: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 内容指纹：SKILL.md 正文 + 全部文件。文件按路径排序后参与，保证与 Map 迭代顺序无关——
+     * 否则同一份内容会算出不同的 hash，评测记录上的指纹就会莫名其妙地变。
+     */
+    static String contentHash(String body, Map<String, String> files) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update((body == null ? "" : body).getBytes(StandardCharsets.UTF_8));
+            if (files != null) {
+                for (Map.Entry<String, String> e : new TreeMap<>(files).entrySet()) {
+                    md.update((byte) 0);            // 分隔符：防止 ("ab","c") 与 ("a","bc") 撞 hash
+                    md.update(e.getKey().getBytes(StandardCharsets.UTF_8));
+                    md.update((byte) 0);
+                    md.update((e.getValue() == null ? "" : e.getValue()).getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            for (byte b : md.digest()) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return null;    // 算不出就返回 null，评测记录照常落，只是没有指纹
         }
     }
 }

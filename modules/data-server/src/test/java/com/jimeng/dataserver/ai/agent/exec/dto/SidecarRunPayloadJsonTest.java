@@ -169,6 +169,80 @@ class SidecarRunPayloadJsonTest {
         assertEquals(LLM_KEY, root.path("llm").path("authToken").asText());
     }
 
+    // ------------------------------------------------------------------ skill-builder（沙箱里原样跑 skill-creator）
+
+    /** 抄自边车 src/types.ts 的 interface WorkspaceRef / SkillBuilderContext / SkillTriggerEvalContext。改这里之前先改边车。 */
+    private static final Set<String> SANDBOX_WORKSPACE_KEYS = Set.of("bucket", "prefix");
+    private static final Set<String> SANDBOX_SKILL_BUILDER_KEYS = Set.of("triggerEval", "skillTypeOverride", "cliMaxWorkers");
+    private static final Set<String> SANDBOX_TRIGGER_EVAL_KEYS =
+            Set.of("header", "lineTemplate", "candidates", "tools", "model", "maxTokens", "activateToolName");
+
+    private static SidecarRunPayload skillBuilderPayload() {
+        SidecarRunPayload p = new SidecarRunPayload();
+        p.setRunId("0f5e6c9a-skill-builder");
+        p.setTenantId("t_review");
+        p.setPrompt("做一个把 csv 转 Excel 的 skill");
+        SidecarRunPayload.Llm llm = new SidecarRunPayload.Llm();
+        llm.setBaseUrl("https://llm.invalid/v1");
+        llm.setAuthToken(LLM_KEY);
+        llm.setModel("m");
+        p.setLlm(llm);
+        p.setRunProfile("skill-builder");
+        SidecarRunPayload.Workspace ws = new SidecarRunPayload.Workspace();
+        ws.setBucket("jm-agent");
+        ws.setPrefix("skill-builder/t_review/2099066794181541890/ws/");
+        p.setWorkspace(ws);
+        SidecarRunPayload.TriggerEval te = new SidecarRunPayload.TriggerEval();
+        te.setHeader("H");
+        te.setLineTemplate("- **{name}**: {description}");
+        SidecarRunPayload.Candidate c = new SidecarRunPayload.Candidate();
+        c.setName("other");
+        c.setDescription("d");
+        te.setCandidates(java.util.List.of(c));
+        te.setTools(java.util.List.of(java.util.Map.of("name", "activate_skills")));
+        te.setModel("prod-model");
+        te.setMaxTokens(1024);
+        te.setActivateToolName("activate_skills");
+        SidecarRunPayload.SkillBuilder sb = new SidecarRunPayload.SkillBuilder();
+        sb.setTriggerEval(te);
+        sb.setSkillTypeOverride("PROMPT");
+        sb.setCliMaxWorkers(3);
+        p.setSkillBuilder(sb);
+        return p;
+    }
+
+    @Test
+    @DisplayName("skill-builder 的 workspace / skillBuilder / triggerEval 键名与边车类型逐字段一致")
+    void skillBuilder键名与sandbox类型逐字段一致() throws IOException {
+        JsonNode root = wire(skillBuilderPayload());
+        assertEquals("skill-builder", root.path("runProfile").asText());
+        assertEquals(SANDBOX_WORKSPACE_KEYS, keys(root.get("workspace")), "workspace 的键与边车 WorkspaceRef 不一致：" + root);
+        assertEquals(SANDBOX_SKILL_BUILDER_KEYS, keys(root.get("skillBuilder")), "skillBuilder 的键与边车 SkillBuilderContext 不一致");
+        JsonNode te = root.path("skillBuilder").get("triggerEval");
+        assertEquals(SANDBOX_TRIGGER_EVAL_KEYS, keys(te), "triggerEval 的键与边车 SkillTriggerEvalContext 不一致");
+        assertEquals(Set.of("name", "description"), keys(te.path("candidates").get(0)));
+        assertTrue(te.path("maxTokens").isIntegralNumber());
+        assertTrue(root.path("skillBuilder").path("cliMaxWorkers").isIntegralNumber());
+
+        // 非构建器的请求体里不能出现这两个键：边车的 default / semantic-layer 带它们直接 400（fail-closed）
+        JsonNode legacy = wire(semanticPayload());
+        assertFalse(legacy.has("workspace") && !legacy.get("workspace").isNull(), "语义层请求体里出现了 workspace：" + legacy);
+        assertFalse(legacy.has("skillBuilder") && !legacy.get("skillBuilder").isNull(), "语义层请求体里出现了 skillBuilder：" + legacy);
+
+        Path ts = findSandboxTypesTs();
+        if (ts != null) {
+            String src = Files.readString(ts, StandardCharsets.UTF_8);
+            if (src.contains("interface WorkspaceRef")) {
+                assertEquals(interfaceFields(src, "WorkspaceRef"), keys(root.get("workspace")));
+                assertEquals(interfaceFields(src, "SkillBuilderContext"), keys(root.get("skillBuilder")));
+                assertEquals(interfaceFields(src, "SkillTriggerEvalContext"), keys(te));
+                Set<String> runRequestFields = interfaceFields(src, "RunRequest");
+                assertTrue(runRequestFields.contains("workspace") && runRequestFields.contains("skillBuilder"),
+                        "边车 RunRequest 缺 workspace / skillBuilder：" + runRequestFields);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ 本机边车仓库（可选）
 
     /** 从当前目录往上找工作区里并排的 jm-agent-sandbox/src/types.ts；找不到返回 null。 */
