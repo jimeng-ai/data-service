@@ -40,6 +40,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -312,6 +313,7 @@ public class ConnectorAdminController {
      *
      * <p><b>立刻返回，不等生成结束。</b>前置条件满足时进入 agent 的持久化队列，按表分片做多次短模型调用；
      * 不满足时回落到既有单次推导。响应额外返回实际选择的 {@code generator}。
+     * {@code started} 忠实反映生成器是否受理；未受理时 {@code note} 会说明是已有任务占用还是提交失败。
      *
      * <h3>重跑要花多少钱，取决于路径和结构快照</h3>
      * <b>已经有快照</b>（正常情况：建连时那次推导已经拉过，或者有人点过「刷新结构」）——只读我们自己库里的
@@ -360,7 +362,14 @@ public class ConnectorAdminController {
         // 不是「顺手查一下」。
         connectorService.get(id);
         GenerationAck ack = semanticGenerationService.trigger(id, GenerationTrigger.MANUAL_REGENERATE);
-        return Map.of("started", true, "generator", ack.kind().name());
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("started", ack.accepted());
+        response.put("generator", ack.kind().name());
+        response.put("note", ack.note());
+        if (ack.generationId() != null) {
+            response.put("generationId", ack.generationId());
+        }
+        return response;
     }
 
     /**

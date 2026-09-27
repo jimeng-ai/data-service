@@ -21,6 +21,8 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
@@ -80,18 +82,50 @@ class ConnectorAdminControllerGenerationTest {
     }
 
     @Test
-    @DisplayName("手工重跑先校验归属再改道并返回生成器")
-    void 手工重跑先校验归属再改道并返回生成器() {
-        GenerationAck ack = new GenerationAck(GeneratorKind.AGENT, false, 101L, "保留");
+    @DisplayName("手工重跑受理成功时返回真实结果且兼容空说明与空生成编号")
+    void 手工重跑受理成功时返回真实结果且兼容空说明与空生成编号() {
+        GenerationAck ack = new GenerationAck(GeneratorKind.SINGLE_CALL, true, null, null);
         when(generationService.trigger(7L, GenerationTrigger.MANUAL_REGENERATE)).thenReturn(ack);
 
         Map<String, Object> response = controller.deriveSemantic(7L);
 
         assertEquals(true, response.get("started"));
-        assertEquals("AGENT", response.get("generator"));
+        assertEquals("SINGLE_CALL", response.get("generator"));
+        assertTrue(response.containsKey("note"));
+        assertNull(response.get("note"));
+        assertFalse(response.containsKey("generationId"));
         var order = inOrder(connectorService, generationService);
         order.verify(connectorService).get(7L);
         order.verify(generationService).trigger(7L, GenerationTrigger.MANUAL_REGENERATE);
-        assertTrue(response.size() == 2);
+    }
+
+    @Test
+    @DisplayName("手工重跑遇到同连接已有任务时返回拒绝并保留说明与生成编号")
+    void 手工重跑遇到同连接已有任务时返回拒绝并保留说明与生成编号() {
+        GenerationAck ack = new GenerationAck(GeneratorKind.AGENT, false, 101L,
+                "同一条连接上已有一次推导在进行中，本次跳过");
+        when(generationService.trigger(7L, GenerationTrigger.MANUAL_REGENERATE)).thenReturn(ack);
+
+        Map<String, Object> response = controller.deriveSemantic(7L);
+
+        assertEquals(false, response.get("started"));
+        assertEquals("AGENT", response.get("generator"));
+        assertEquals("同一条连接上已有一次推导在进行中，本次跳过", response.get("note"));
+        assertEquals(101L, response.get("generationId"));
+    }
+
+    @Test
+    @DisplayName("手工重跑提交失败时返回拒绝并保留失败说明")
+    void 手工重跑提交失败时返回拒绝并保留失败说明() {
+        GenerationAck ack = new GenerationAck(GeneratorKind.SINGLE_CALL, false, null,
+                "单次推导提交失败：executor rejected");
+        when(generationService.trigger(7L, GenerationTrigger.MANUAL_REGENERATE)).thenReturn(ack);
+
+        Map<String, Object> response = controller.deriveSemantic(7L);
+
+        assertEquals(false, response.get("started"));
+        assertEquals("SINGLE_CALL", response.get("generator"));
+        assertEquals("单次推导提交失败：executor rejected", response.get("note"));
+        assertFalse(response.containsKey("generationId"));
     }
 }
