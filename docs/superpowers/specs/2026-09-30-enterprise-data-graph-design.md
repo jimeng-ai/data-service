@@ -1,352 +1,647 @@
-# 数据星图设计（v2）
+# 数据星图设计（v3：给人看的业务对象关系图）
 
-日期：2026-09-30
+日期：2026-10-01（v2：2026-09-30）
 
-关联仓库：`data-service`、`jm-agent-front`
+关联仓库：`data-service`、`jm-agent-front`（`jm-admin` 不改代码，只做验收）
 
-取代：本文件的上一版（`e6a4ecc`，快照 + 跨库 AI 推断方案）及其实施计划（`ff06785`）。上一版的实现在两个仓库的
-未合并分支 `codex/enterprise-data-graph` 上，**不合并**，只按 §7 带入少量前端外观。
+取代：本文件的 v2（提交 `7fc0e05`、`e7f843c`）。v2 已在两个仓库的 `feat/data-graph-v2` 分支上实现并验收（后端
+`91bf5cb..9ccddb1`，前端 `4bd9d76..6cacb44`），本版在它上面继续做。§11 列出沿用和改动的部分。
 
 ## 1. 目标与验收
 
-给客户看：每个业务系统（一条数据连接）里有哪些表、表与表之间怎样关联。看的人按「客户的企业超管 / IT 登录控制台自己看」
-设计（其他看法见 §11-4）。
+**语义层是写给 AI 的说明书；数据星图是写给人看的。** 看的人是企业里的业务人员和产品，他们自己登录来看。他们要一眼
+看懂两件事：系统里有哪些业务对象（采购订单、供应商、凭证、会计科目……），以及这些对象之间怎样关联（每条采购订单明细
+对应一个供应商，每条凭证行记在一个会计科目上）。
 
-验收全部用本地 `test` 租户现有数据逐条核对：
+验收全部在本地 `test` 租户上逐条核对，前提是「补全链」（§4）已经跑完。租户里有两个系统：连接 `test`（klny_erp 库，
+19 张表）和连接 `erp_real`（8 张表）。
 
-1. 画面上只有表与表之间的连线，没有「库包含表」之类的线。`erp_real` 画 7 条关系线（5 条多对一、2 条一对一），
-   外加 `EPS_WBSELEMENT` 的「有上下级」标记；`test` 画 2 条多对一，外加 `D1_ACCOUNT` 的「有上下级」标记，
-   另外 16 张表进「未发现关联的表」列表。
-2. 把任意一条已画出的 JOIN 行改成 `verified=CONFIRMED` 后刷新页面，这条线变实线；把它的
-   `detail_json.human_verdict` 改成 `UNRELATED` 后刷新，这条线消失。两者都不需要任何重建动作。
-3. 27 张表里 23 张以中文名作为标题（画布卡片与右侧列表同一规则）；其余 4 张——`EPS_WBSELEMENT` 没有注释，
-   两张 `D1_PROFITCENTER` 与 `EFI_VOUCHERDTL_EXT` 的注释是说明句而不是名称——以物理名作标题、注释作副标题。
-4. 点任意一张表：控制台无报错，所有卡片位置不变，右侧出现该表的注释、字段和关系说明。
-5. 同一份数据连续刷新 10 次，每张卡片的位置完全一致。
-6. 星图页面的界面文案（表名、字段名、注释等客户数据除外）不出现：`READY` / `RUNNING` / `FAILED` 等枚举原文、
-   `INSPECTOR`、`UNKNOWN`、置信度或百分比、「AI 推测」「AI 可信度」、语义层的说明 / 依据 / 核对原文。
-   只排除界面文案，是因为客户数据本身可能含这些字母，例如本地表名 `EFI_CMS_ZP0FIAIF0017A` 里就有 `AI`。
+1. **关系覆盖**：
+   - klny_erp：附录 A1 里由命名规则推出的 33 条全部出现（实线或虚线都算）；「采购订单明细 → 采购订单」「销售订单明细
+     → 销售订单」这两对对象之间各有一根线。
+   - erp_real：v2 已有的 7 条仍在；附录 A2 里命名规则推出的 16 条全部出现（其中 5 条与已有的重合），合计至少 18 条。
+   - 终点不是对方唯一键的关系，只有已确认的（数据核对通过或业务方确认）才出现。
+2. **业务名称**：两个系统全部 27 个对象的标题都来自业务视图（`nameSource=BUSINESS_VIEW`）。
+3. **默认视图里没有代码**：画布、概览、右侧面板默认展开的内容里，不出现该系统的任何物理表名，也不出现长度 ≥ 4 的
+   物理字段名（不区分大小写，按完整单词匹配）。折叠的「技术信息」区除外。
+4. **权限**：
+   - 被授予「数据星图」模块的普通成员能打开页面，看到本企业全部系统；
+   - 没被授予的成员：侧栏没有入口；直接敲地址显示「无权访问」；接口返回无权（HTTP 200 加业务码 4001，不会被踢回
+     登录页）；
+   - 企业超管始终可用；
+   - jm-admin 的角色授权里出现「数据星图」一项。
+5. **自动同步**：语义层生成完成后，补全链在后台自动跑完，本地不超过 10 分钟。跑的过程中页面照常可看，只多一行
+   「业务名称整理中」的提示。
+6. **说人话**：业务文字（名称、说明、领域、关系角色名）用附录 B 的禁用词和 §6.2 的代码扫描检查，命中数为 0。
+7. **v2 的验收继续成立**：布局确定；点选时卡片不动；界面不出现运维用语和 AI 用语；语义层一改，下次打开即生效；
+   语义层写给 AI 的原文永不出网。
 
-## 2. 为什么推翻上一版
+## 2. 背景：为什么又改
 
-2026-09-30 用本地 `test` 租户超管实测上一版（2 个连接、27 张表），并对照代码：
-
-| 现象 | 原因 |
-|---|---|
-| 48 条「关系」里 27 条是「库包含表」，关系列表第一页全是「包含」 | 每张表都生成一条 `CONTAINS` 边，而且排在最前 |
-| 表只显示物理名，如 `EFI_CMS_ZP0FIAIF0017A` | 客户的表注释存在，但没上画布 |
-| 点表节点：控制台报 `TypeError … reading 'getName'`，右侧详情不出现，整张图重排 | 鼠标松开即写位置 → 整图 `notMerge` 重建 → 力导布局重跑；节点详情请求从未发出 |
-| 关系详情显示「基数 UNKNOWN / 可信度 55% / 已探查但判不出来……验证时先统计 VENDORID=0 的占比」 | 直接搬了语义层写给 Agent 的说明 |
-| 画出 `SLOCK↔SLOCK`、`STATUS_FI↔STATUS_FI` 等语义层自己说「不构成关系」的线 | 只排除 `verified=REJECTED` |
-| 页面满是 READY、INSPECTOR、「画布对象预算」、「AI 可信度」滑杆、「重新生成」 | 按运维视角设计 |
-| 「跨库推测」恒为 0 | `candidateTopK` 默认 0，跨库推断默认不运行 |
-| （读代码确认，未实测）采样核对、对话中确认关系、删除语义行之后，星图不会更新 | 快照只在推导发布、增量补写、结构刷新时重建；采样核对回写（`validate()`）、对话里业务方确认关系（`annotateJoin`）、管理员删除语义行都不触发 |
-
-最后一条是结构性的：只要星图单独存一份副本，语义层每多一个修改入口就要多挂一个触发，漏一个就不一致。v2 不存副本。
+1. **关系太少。** v2 在本地实测，klny_erp 19 张表只画出 2 条关系，其余的表都掉进了右侧清单。业务方的反馈是：「要体现
+   对象与对象之间的关联关系，而不是单纯的列出来」。可单看字段命名就能推出 35 条关系（附录 A1）。
+2. **语义层漏推关系的根因**（2026-09-30 排查，代码位置见附录 C）：
+   - 推导按 6 万字符的摘要上限分批，按表名字母序装批。提示词要求「没出现的表不要写关系」，所以跨批次的关系在规则上
+     就被排除了。
+   - 输出顺序是 表用途 → 字段含义 → 关系。16000 的 max_tokens 一截断，最先丢的就是关系。
+   - 一张表只要有表用途就算「已覆盖」，增量补写不会回头补它的关系；也没有「只重算关系」的入口；整体重新生成又会
+     按同样的方式切批。
+   - 没有任何确定性的关系发现：声明的外键只用来给表排序，命名规律和唯一键都没用上。
+3. **已有的错关系会挡住对的关系。** 语义层每一列最多只能有一条关系（由唯一键决定）。klny_erp 的
+   `EFI_VENDOR_CPYCODEDTL.COMPANYCODEID` 已被写成指向兄弟明细表的同名列：终点不是唯一键，也没核对出结论。如果只补
+   空缺，正确的那条（指向公司代码）永远写不进去。
+4. **v2 是给 IT 看的画法。** 卡片列字段，线上标 `VENDORID → OID`，端点标 N/1。看的人换成业务人员和产品后，这些都是噪音。
 
 ## 3. 定位与非目标
 
-**定位**：星图是语义层 JOIN 行加结构快照的**只读投影**。它不产生任何新结论，只做两件事：按 §5.2 的规则筛选关系，
-把结构元数据翻译成客户看得懂的呈现（§5.4、§6）。
+**定位：同一份理解，给人另做一种呈现。** 事实只有一份（结构快照 + 语义层）。给人看的文字是这份理解的「人话版」：
+由模型按面向业务的要求改写，单独存放，不是语义层原文。人看到的就是 AI 理解的内容，只是换了说法，所以业务和产品看这张图，
+也是在检查 AI 有没有理解对他们的业务。
 
-**非目标**（本版明确不做）：
+**有意为之的连带影响：** 关系发现补的是语义层本身，所以 Agent 查数时看到的关系也会变多、变准。
 
-- 跨连接（跨系统）的关系。
-- 在星图里确认、否认、编辑关系。关系的确认只来自采样核对和对话中的业务方确认。
-- 修改语义层。关系覆盖不足是本版的已知上限（§11-1）。
-- 导出图片、分享链接、对企业超管以外的人开放。
-- 展示任何模型写的文字（语义层的 gloss、依据、注意事项、置信度）。
+**本版明确不做：**
+
+- 把几张表合成一个业务对象（比如把采购订单表头和明细合并）。一张表就是一个对象，表头和明细之间用连线表示。
+- 挑选关键字段、展示指标口径。
+- 在星图上纠正 AI 的理解。这是下一版最值得做的，业务视图已为此留出 `source=HUMAN`。
+- 按单个系统授权。被授权的成员能看本企业全部系统。
+- 跨系统的关系。
+- 客户自己修改业务名称的界面（数据层面已支持 `HUMAN` 行优先）。
 
 ## 4. 架构
 
+| 层 | 内容 | 由谁产出、何时产出 |
+|---|---|---|
+| 事实 | `connector_schema` + `connector_semantic`（含关系和核对结论） | 已有。本版新增「关系发现」（§5）补全 JOIN 行 |
+| 给人看的文字 | 业务视图 `connector_business_view`：对象的业务名、一句说明、业务领域；关系的角色名 | 新增（§6）。补全链里异步生成，只补缺的和输入变了的 |
+| 呈现 | 数据星图接口 + 前端对象地图 | 每次请求现算：关系判定沿用 v2（§7.1），文字取业务视图，缺了按 §6.3 兜底 |
+
+**补全链**（每个连接同一时刻只跑一条，跑在 `semanticStageExecutor` 上）：
+
 ```text
-connection ────────────────┐
-connector_schema ──────────┼─ 每次请求现算（纯函数投影，§5）─→ /data/admin/data-graph/* ─→ 前端画布（§6）
-connector_semantic(JOIN) ──┘
+触发：规则推导成功 / 增量补写成功 / agent 生成定稿 / 定时对账发现输入变了
+  ① 关系发现：规则候选 + 整库模型一遍 → 新增或替换 JOIN 行
+  ② 采样核对：派发原有的采样核对，范围 = 触发方原本要核对的表 ∪ ① 动过的表
+  ③ 业务文字：业务领域 → 对象名称与说明 → 关系角色名；只补缺的和输入变了的
 ```
 
-- **不落库**：没有快照表、队列、定时任务、重建触发、模型调用、Nacos 配置项、DDL。
-- **一致性**：语义层和结构快照的任何改动，下一次打开页面即生效。
-- **规模**：每条连接的结构快照最多 200 个对象（`ConnectorSchemaService.MAX_OBJECTS`）。JOIN 行每个源列最多一条：
-  唯一键 `uk_connector_semantic` 为 `(tenant_id, connector_id, scope, object_name, field_name, term)`，
-  推导和人工写入的 JOIN 行 `term` 都是空串。
-- **性能验收**：用合成数据造一条 200 张表、200 条 JOIN 行的连接，预热后连续请求 `GET /systems/{id}` 50 次，
-  本地 P95 < 300 ms。达不到再加进程内缓存
-  （键 = 租户 + 连接 + 该连接 `connector_schema.max(synced_at)` + `connector_semantic.max(update_time)`），不预先做。
-- **租户**：三张源表都在 `JimengTenantLineHandler.TENANT_AWARE_TABLES` 里，请求在调用方租户下查询，不需要 `runAsSystem`。
+**触发与顺序：**
+- ② 是异步派发的，沿用它原有的闸门和补跑机制；它和 ③ 同时进行：一个查客户库，一个调模型，互不依赖。核对范围为空时
+  （比如定时对账触发、① 又没有动任何表）不派发。
+- 规则推导成功、增量补写成功后，原来是直接派发采样核对；现在改为派发补全链，由 ② 接着派发，不会重复核对。
+- agent 生成定稿后，原来就不做采样核对（`SemanticGenerationFinalizer` 明确不派发），补全链在这条路径上跳过 ②，保持现状。
+- 已有的其他采样核对入口不变：手工「验证表关系」、连接变更后、刷新结构后补标形态。
+- 运行中又来了触发：不排队。跑完后，定时对账会按输入指纹发现变化再补跑，最多晚 10 分钟。
 
-## 5. 后端
+**定时对账：**
+- 每 10 分钟一次，每次最多处理 1 个连接。
+- 挑选条件：输入指纹与上次尝试时不同（从没跑过的也算）；或上次失败且距上次尝试已满 6 小时。
+- 线程池满被拒绝时不报错，等下一次对账。
+- 输入指纹包括：结构快照里每个对象的名称、`content_hash`、唯一键、外键；语义层 OBJECT 行的说明；JOIN 行的两端和
+  业务方结论。不含核对结论（`verified`），否则每次核对完都会触发一次重跑。
 
-### 5.1 接口
+**开关：** `connector.semantic.enrichment.enabled`，代码默认 true。关掉后：
+- 三个触发点退回原来的行为（推导成功后直接派发采样核对）；
+- 定时对账不跑；
+- 页面照常用已有的数据。
 
-控制器 `DataGraphController`，`@RequestMapping("/data/admin/data-graph")`，每个方法先调
-`superAdminGuard.requireSuperAdmin()`（与 `ConnectorAdminController` 一致）。控制器返回原始对象，由
-`GlobalResponseHandler` 包装。所有 ID 以字符串出网；`spring.jackson.write_numbers_as_strings=true` 下计数也是字符串。
+## 5. 语义层：关系发现（新增）
 
-| 方法 | 路径 | 用途 |
+### 5.1 输入
+
+当前连接结构快照里的全部对象（表名、去掉平台后缀的表注释、唯一键、声明的外键）、每个对象语义层说明的第一句，以及现有的 JOIN 行。
+
+### 5.2 规则候选（确定性、通用，不写死任何表名或业务词）
+
+1. **声明的外键。** `MySqlSession.describe` 追加读取 `information_schema.KEY_COLUMN_USAGE` 中同库的
+   `REFERENCED_TABLE_NAME` / `REFERENCED_COLUMN_NAME`，写入快照的 `detail_json.extra.foreign_keys`。
+   - 它和 `unique_keys` 放在同一处，性质也相同：刷新结构后才会有；不进 `content_hash`，不会引起漂移。
+   - 读不到时就当没有，不报错。Doris、StarRocks 这类自己实现 `information_schema` 的引擎就属于这种情况。
+2. **命名规律。** 同时满足以下条件的列，提出一条候选：
+   - 列名去掉 `_`、转小写后以 `id` 结尾，去掉这个 `id` 之后的「词干」至少 4 个字符；
+   - 该列本身不是本表的单列唯一键；
+   - 另一张表（不含本表）的表名按 `_` 切开后，某个后缀去掉 `_`、转小写后等于词干，或是词干的结尾：
+     - 这个后缀至少 4 个字符；
+     - 以 `s` 结尾的后缀，去掉 `s` 的形式也参与比较；
+     - 例如词干 `receiptvendor` 以 `vendor` 结尾，对上 `D1_VENDOR`；
+   - 多张表都对得上时，取对上的后缀最长的那张；最长的有并列就放弃，留给模型那一遍；
+   - 目标列取那张表的单列主键；没有主键时，取它唯一的那个单列唯一键；都没有就放弃。
+
+   **实测（2026-10-01，用本地两个系统的真实快照）：**
+   - klny_erp 推出 33 条，恰好是附录 A1 的前 33 条，没有一条多余；
+   - erp_real 推出 16 条（附录 A2）；
+   - 规则不连本表。试过允许连本表，会多出 `EPS_PROJECT.PROJECTID → EPS_PROJECT.OID` 这类误报（项目表里的
+     `PROJECTID` 是项目自己的编号，不是指向上级项目）。自关联只来自语义层和模型那一遍。
+
+### 5.3 模型一遍（整库一次看全）
+
+- **给模型三样东西：**
+  - 「目标索引」：所有表都给，每张表只有表名、表注释、语义层一句话说明、唯一键；
+  - 「待判列」：名字以 `id` / `code` / `no` / `num` / `key` 结尾、不是本表单列唯一键、还没有关系也没有规则候选的列，
+    附带列注释；
+  - 已知关系（现有 JOIN 行加规则候选），要求不要重复。
+- **只让它输出关系**（不写表用途和字段含义），格式为 JSON，一列最多指向一个目标。证据只允许两种：NAME（命名规律，
+  包括「明细 / 表头」这类表名成对出现的规律）和 COMMENT。不许写 GUESS。
+- **装不下就分片：** 按「待判列」分片，每一片都带完整的目标索引，保证每一片都看得见所有表。每片摘要最多 60000 字符，
+  max_tokens 为 8000。
+- 模型和调用方式与语义层推导相同：`connector.semantic.infer-model`，经 `claudeService.messagesInternal`（不带工具，只调一轮）。
+
+### 5.4 写入
+
+新增一个只写 JOIN 行的方法，逐列按下表处理：
+
+| 这一列现有的 JOIN 行 | 候选来自外键或命名规则 | 候选来自模型 |
 |---|---|---|
-| GET | `/systems` | 系统列表 |
-| GET | `/systems/{connectorId}` | 该系统的表卡片与关系 |
-| GET | `/systems/{connectorId}/tables?name=` | 单表详情 |
+| 没有 | 新增 | 新增 |
+| 人工或导入的行（`HUMAN` / `IMPORTED`），或带业务方结论 | 不动 | 不动 |
+| 推断的行，且已核对通过（`verified=CONFIRMED`） | 不动 | 不动 |
+| 推断的行，终点列不是终点表的单列唯一键（或终点已不在快照里），且未核对通过 | **替换** | 不动 |
+| 其余 | 不动 | 不动 |
 
-连接不存在或不属于当前租户：`ServiceException(NOT_FOUND, "系统不存在")`；表不存在：`ServiceException(NOT_FOUND, "表不存在")`。
+- 新增和替换都走 `SemanticRowAssembler` 的同一套过滤：两端都存在且名字完全一致、丢弃 GUESS、每列去重。新写的行
+  `status=DRAFT`、`verified=NONE`。
+- 替换时整行按候选重写，并在 `detail_json.replaced_target` 里留下原来的终点，方便排查。§2 第 3 条那一例就是这样修好的。
+- `detail_json.origin` 记录来源：`FK` / `NAME_RULE` / `RELATION_PASS`。
+- 语义层整体重新推导会擦掉这些行，补全链会紧接着重跑 ①，缺失只存在于两步之间那一小段时间。
 
-**SystemSummary**（`/systems`，按连接 id 升序；只列出结构快照里至少有一个 TABLE / VIEW 的连接）
+### 5.5 顺带修（v2 审查发现）
 
-| 字段 | 说明 |
-|---|---|
-| `connectorId` / `name` / `displayName` / `kind` / `status` | 连接基本信息；`displayName` 是连接的显示名，界面优先用它 |
-| `semanticStatus` | `READY` / `RUNNING` / `FAILED` / `null`（从未生成）。只给前端判断空状态，不上屏 |
-| `tableCount` | 结构快照里 TABLE + VIEW 的数量 |
+`annotateJoin`（业务方在对话里确认或否认一条关系）每次都新建 `detail_json`，只放终点、结论和依据，原来的
+`join_kind`、`discriminator_column`、`composite_columns` 都丢了。改为保留这些结构键。否则一条业务方确认过的多态关系
+会被画成无条件的实线，Agent 也会因此少掉判别条件。
 
-**SystemGraph**（`/systems/{connectorId}`）
+## 6. 业务视图：给人看的文字（新增）
 
-| 字段 | 说明 |
-|---|---|
-| `connectorId` / `name` / `displayName` / `semanticStatus` | 同上 |
-| `tables[]` | 全部 TABLE / VIEW，每项为 TableCard |
-| `relations[]` | 通过 §5.2 的关系，不含自关联 |
+### 6.1 数据
 
-TableCard：
+新表 `connector_business_view`（DDL 见附录 D），每行是一个对象或一条关系的「人话」：
 
-| 字段 | 说明 |
-|---|---|
-| `name` | 物理表名 |
-| `displayName` | §5.4；注释不像名称时为 `null` |
-| `comment` | 去掉平台后缀的表注释全文；没有为 `null` |
-| `objectType` | `TABLE` / `VIEW`（`BASE TABLE` 归一为 `TABLE`） |
-| `related` | 是否至少有一条非自关联的关系 |
-| `selfReferences[]` | 通过 §5.2 的自关联 `{fromColumn, toColumn}`，按 `fromColumn` 排序 |
-| `keyColumns[]` | 主键列 `{name, comment}`；没有主键时取列数最少的唯一键（并列取名字最小）；都没有为空 |
-| `relationColumns[]` | 本表作为起点**或终点**的关系列 `{name, comment}`，按列名排序。终点列也要列出：已确认关系的终点不一定是键列，连线要落在终点列那一行 |
-| `fieldCount` | 字段总数 |
+- **OBJECT 行：**
+  - `display_name`：业务名，不超过 12 个字；
+  - `summary`：一句话，不超过 50 个字，说清一条记录代表什么、主要记了什么；
+  - `domain`：业务领域，不超过 8 个字。
+- **RELATION 行：** 键是「起点表 + 起点列」，和 JOIN 行一一对应。`display_name` 是关系的角色名，不超过 10 个字，
+  比如「总账科目」「所属订单」「收款供应商」。
+- **`source`：** `MODEL` 或 `HUMAN`。`HUMAN` 行永远不会被模型覆盖。
+- **`input_hash`：** 生成时所用输入的 SHA-256，输入变了才重新生成。
+  - OBJECT 行的输入：表名、表注释、语义层说明。
+  - RELATION 行的输入：起点对象的业务名、起点列名及其注释或语义层字段说明、终点对象的业务名。
+- **不产生软删死行**，这是唯一键不含 `deleted` 的前提，做法同 `connector_semantic`：
+  - `MODEL` 行需要删除时物理删除；
+  - `HUMAN` 行只原地更新。
 
-Relation：
+新表 `connector_enrichment_state`，每个连接一行，记录：
+- 认领时间 `claim_at`，30 分钟过期；
+- 上次结果 `last_status`（`READY` / `FAILED`）；
+- 上次尝试时的输入指纹、上次尝试时间；
+- 两段说明：关系发现一段，业务文字一段。
 
-| 字段 | 说明 |
-|---|---|
-| `id` | 稳定键：`fromTable`、`fromColumn`、`toTable`、`toColumn` 做长度前缀编码后取 SHA-256 的前 16 位十六进制 |
-| `fromTable` / `fromColumn` | 起点（引用方） |
-| `toTable` / `toColumn` | 终点（被引用方） |
-| `cardinality` | `MANY_TO_ONE` / `ONE_TO_ONE` / `null`（§5.3） |
-| `tier` | `CONFIRMED`（实线）/ `INFERRED`（虚线） |
-| `confirmedBy` | `DATA`（采样核对通过）/ `BUSINESS`（业务方在对话中确认）/ `null` |
-| `label` | 起点列的注释；为空或与列名相同（忽略大小写）时为 `null` |
-| `discriminatorColumn` | 多态关系的判别列名，只出现在已确认的多态关系上。**从不返回判别值** |
+两张表都要加进 `JimengTenantLineHandler.TENANT_AWARE_TABLES`，并加单测断言。
 
-**TableDetail**（`/systems/{connectorId}/tables?name=`）
+### 6.2 生成
 
-| 字段 | 说明 |
-|---|---|
-| `name` / `displayName` / `comment` / `objectType` / `selfReferences` | 同 TableCard |
-| `fields[]` | `{name, type, nullable, comment, key, inRelation}`；`key` 为 `PRIMARY` / `UNIQUE` / `null`；按快照原顺序 |
-| `relations[]` | 以本表为起点或终点的全部 Relation |
+分三步，保证同一个连接内的叫法一致：
 
-**永不出网**：语义层的 `gloss`、`evidence`、`confidence`，`detail_json` 里的 `basis` / `note` / `care_reason` /
-`verify_note` / `discriminator_value` / 任何取值与样本，锚点哈希，`tenant_id`，连接凭据。
+1. **业务领域：** 只给还没有领域的对象分配。第一次是全部对象；以后只给新对象，同时把已有的领域清单给模型，让它尽量
+   归入已有领域。一个系统最多 8 个领域，用业务叫法，比如采购、销售、财务、主数据。
+2. **对象名称与说明：** 每批最多 50 个对象，输入表名、表注释、语义层说明和所属领域。
+3. **关系角色名：** 每批最多 150 条关系，输入见 §6.1。
 
-### 5.2 关系判定
+**提示词面向「业务人员和产品」：**
+- 用中文业务叫法；
+- 不出现表名、字段名或代码；
+- 不写「疑似」「未经验证」之类的保留措辞；
+- 一句话说明写「一条记录代表什么」。
 
-输入：该连接的 JOIN 行（`scope=JOIN`）。起点 = `object_name.field_name`，终点 = `detail_json.to_object.to_column`。
-按顺序判定，先命中者为准：
+**校验：** 以下输出不合格：
+- 超过长度上限；
+- 含本系统任一物理表名，或长度 ≥ 4 的物理字段名（不区分大小写，按完整单词匹配），即「代码扫描」；
+- 含附录 B 的禁用词。
+
+不合格的条目在同一次运行里带着原因重试一次；仍不合格就退回兜底（§6.3），并把数量记进状态说明。
+
+**范围：**
+- 只生成缺的和 `input_hash` 变了的，`HUMAN` 行跳过；
+- 对象或关系已经从快照或语义层消失的，对应的 `MODEL` 行随之删除；
+- 模型和调用方式同 §5.3。
+
+### 6.3 兜底
+
+没有业务文字时，页面照常显示：
+
+- 标题：先退回「像名称的表注释」（v2 §5.4 的规则），再退回表名；
+- 说明：留空；
+- 领域：「未分类」；
+- 关系角色名：先退回列注释，再留空。用作兜底的注释同样要过代码扫描，命中就不用。
+
+**「业务名称整理中」提示**的出现条件：有对象还没拿到业务名，并且补全链正在跑、或这个连接还从没跑过。跑完之后仍有
+对象没拿到业务名（重试后仍不合格，或这次失败了），就安静地用兜底，不挂提示，等下次输入变化或失败重试时再补。
+
+## 7. 投影与接口
+
+### 7.1 关系判定（沿用 v2，按顺序判定，先命中者为准）
+
+输入是该连接的 JOIN 行（`scope=JOIN`）。起点是 `object_name.field_name`，终点是 `detail_json.to_object.to_column`。
 
 | # | 条件 | 结果 |
 |---|---|---|
 | 1 | 起点表、起点列、终点表、终点列任一不在当前结构快照里 | 丢弃 |
+| 1′ | 起点和终点是同一张表的同一列 | 丢弃（v2 审查 #3：抽样时这种行的包含率永远是 100%） |
 | 2 | `status = STALE` | 丢弃 |
 | 3 | `detail_json.human_verdict = UNRELATED` | 丢弃 |
 | 4 | `detail_json.human_verdict = RELATED` | `CONFIRMED`，`confirmedBy=BUSINESS` |
 | 5 | `verified = CONFIRMED` | `CONFIRMED`，`confirmedBy=DATA` |
 | 6 | `verified ∈ {REJECTED, WEAK}` | 丢弃 |
-| 7 | `detail_json.join_kind = POLYMORPHIC` | 丢弃：只在判别列取特定值时成立，未确认前画成无条件的线会误导 |
-| 8 | 终点列单独构成终点表的一个唯一键（§5.3） | `INFERRED` |
+| 7 | `detail_json.join_kind = POLYMORPHIC` | 丢弃（未确认前画成无条件的线会误导人） |
+| 8 | 终点列单独构成终点表的一个唯一键 | `INFERRED` |
 | 9 | 其余 | 丢弃 |
 
-判定只看上表列出的字段；`confidence`、`source`、`evidence` 不参与。
+**两条语义层的既有约定，实现时不能读错：**
+- 业务方的任何一次确认都会把 `status` 写成 `CONFIRMED`、`verified` 写成 `NONE`，否认只记在
+  `human_verdict=UNRELATED`。所以 `status=CONFIRMED` 并不代表关系成立。
+- `verified` 取决于采样包含率：≥ 0.9 为 `CONFIRMED`，0.5–0.9 为 `WEAK`，< 0.5 为 `REJECTED`。`UNDECIDABLE` 表示查了
+  但判断不出，`NONE` 表示没查。
 
-两条语义层既有约定，实现时不能读错：
+**唯一键、基数、排序也沿用 v2：**
+- 唯一键用 `SemanticTableRenderer.namedUniqueKeys`；
+- 终点列单独构成唯一键时，起点列也单独唯一则为一对一，否则为多对一；终点列不唯一时基数为 `null`；
+- 表按 `importance_rank` 再按表名排序；关系按起点表、起点列、终点表、终点列排序。
 
-- 业务方的任何一次确认（`annotateJoin` → `upsertHuman`）都会把 `status` 写成 `CONFIRMED`、`verified` 写成 `NONE`，
-  否认只记在 `human_verdict=UNRELATED`。所以 **`status=CONFIRMED` 不代表关系成立**，只能按第 3、4 行判断。
-- `verified` 来自采样包含率：≥ 0.9 为 `CONFIRMED`，0.5–0.9 为 `WEAK`，< 0.5 为 `REJECTED`
-  （`SemanticJoinValidator.TH_CONFIRMED / TH_WEAK`）；`UNDECIDABLE` 是查了但判不出来，`NONE` 是没查。
+**自关联**不进关系列表，记在对象的 `selfReferences` 上，现在带上 `tier`、`confirmedBy`、`role`（v2 审查 #4）。
 
-自关联（起点表 = 终点表）通过判定后不进 `relations[]`，改记到该表的 `selfReferences[]`。
+### 7.2 接口
 
-### 5.3 唯一键与基数
+路径不变：`/data/admin/data-graph/systems`、`/systems/{connectorId}`、`/systems/{connectorId}/tables?name=`。
+`/data/admin` 下本来就有成员可用的接口（比如 `/data/admin/agent`、`/data/admin/me`），所以不用改路径。权限改为模块
+授权（§9）。字段变化如下：
 
-- 唯一键用 `SemanticTableRenderer.namedUniqueKeys(row)`（改为 public）：读 `detail_json.extra.unique_keys`（由
-  `MySqlSession.describe` 写入），跳过规则与 `SemanticJoinValidator.uniqueKeysByObject` 逐条一致，另外带键名和是否主键
-  （卡片的键列、详情的「主键 / 唯一」标记要用）。返回 `null` 表示「未知」（该功能上线前拉的旧快照），按「终点列不是唯一键」
-  处理，下一次刷新结构后自动恢复。
-- 「单独构成唯一键」指：该表存在一个唯一键，其列集合恰好是 `{终点列}`。终点列只是组合键的一部分不算。
-- 基数：终点列单独构成唯一键时，若起点列也单独构成起点表的唯一键则为 `ONE_TO_ONE`，否则为 `MANY_TO_ONE`；
-  终点列不构成唯一键（只可能出现在 `CONFIRMED` 关系上）则为 `null`，前端不画端点标记。
+| 对象 | 变化 |
+|---|---|
+| SystemSummary | 新增 `truncated`（v2 审查 #2）和 `viewStatus`，见下 |
+| TableCard | `displayName` 改为业务视图优先；新增 `summary`、`domain`、`nameSource`（`BUSINESS_VIEW` / `COMMENT` / `PHYSICAL`）；`keyColumns` 和 `relationColumns` 保留，给技术信息区用 |
+| Relation | 新增 `role` |
+| SelfReference | 新增 `tier`、`confirmedBy`、`role` |
+| TableDetail | 新增 `summary`、`domain` |
 
-### 5.4 表名与注释
+**SystemSummary 新增的两个字段：**
+- `truncated`：快照对象数是否达到上限 200。上限只有一个来源 `ConnectorSchemaService.MAX_OBJECTS`：把它改为 public，
+  语义层那份镜像 `SCHEMA_SNAPSHOT_CAP` 改为引用它。
+- `viewStatus`：认领未过期时为 `RUNNING`；否则取上次结果 `READY` / `FAILED`；从没跑过为 `null`。只给前端判断提示用，
+  不直接上屏。
 
-- `comment`：快照表注释去掉平台追加的「（约 N 行，InnoDB 估算值，不可当作准确计数）」后 trim，空则为 `null`。
-- `displayName`：当且仅当 `comment` 像一个名称时等于 `comment`，否则为 `null`。「像名称」= 不超过 16 个字符，
-  且不含 `，。；,;.` 和换行。本地 `D1_PROFITCENTER` 的「无公司代码字段，样本数据」和 `EFI_VOUCHERDTL_EXT` 的长说明句
-  会因此落到 `null`。
-- 字段注释：取快照 `fields[].comment` 并 trim，空则为 `null`。
-- **估算行数后缀改为唯一来源。** 现状是写入方 `MySqlSession`（字符串拼接，约第 994 行）和剥离方
-  `RuleContext.ROW_ESTIMATE_SUFFIX`（私有正则）各写一份，改一边另一边会静默失效。在 `ai/connector/model/` 新增
-  `RowEstimateNote`，同时提供 `append(comment, rows)` 和 `strip(comment)`；`MySqlSession`、`RuleContext`、星图投影
-  三处都改用它，并加往返测试 `strip(append(c, n)) == c`。
+**永不出网**的范围不变：语义层的原文说明、依据、置信度、判别值。另外新增：业务视图的 `input_hash`、`model_code`、
+`prompt_version` 等内部字段也不出网。
 
-### 5.5 排序（保证输出确定）
+### 7.3 代码位置（包前缀 `com.jimeng.dataserver.ai.connector`）
 
-- `tables[]`：`importance_rank` 升序（空值排最后），再按 `name`。
-- `relations[]`：按 `fromTable`、`fromColumn`、`toTable`、`toColumn`。
-- `fields[]`：快照原顺序。
+| 部分 | 位置 |
+|---|---|
+| 关系发现 | `service/SemanticRelationDiscovery`（规则候选 + 模型一遍 + 写入） |
+| 业务视图 | `businessview/`（生成、校验、读写） |
+| 补全链 | `service/SemanticEnrichmentService`（认领、顺序、触发、定时对账） |
+| 星图 | `graph/`（投影时合并业务视图） |
 
-### 5.6 代码位置
+## 8. 前端：对象地图
 
-`modules/data-server` 下新建 `ai/connector/graph/`：
+### 8.1 页面
 
-- `DataGraphController`：三个接口和超管校验。
-- `DataGraphService`：按连接加载 `connection`、`connector_schema`（TABLE / VIEW）、`connector_semantic`
-  （`scope=JOIN`），调用投影。
-- `DataGraphProjector`：纯静态函数，输入三组行，输出 SystemGraph / TableDetail；不访问数据库、不依赖 Spring。
-  §5.2–§5.5 的规则全部在这里。
-- `DataGraphViews`：出网用的 record。
+- **页头：** 标题「数据星图」，说明「看看业务系统里有哪些业务对象、它们之间怎样关联。内容由平台根据接入的系统自动整理，
+  并随系统更新自动同步。」
+- **系统切换：** 每项显示「连接显示名 · N 个对象」，停用的连接加「已停用」标签。切换时同步清掉选中状态（v2 审查 #11）。
+- **概览：** 对象 N ｜ 已核对的关联 a ｜ 待核对的关联 b ｜ 暂未发现关联的对象 c。关联按条数计，不是线的根数。下面一行按情况显示提示：
+  - 「业务名称整理中」（出现条件见 §6.3）；
+  - 「这个系统表很多，只整理了按重要性排前 200 个对象」（`truncated`）。
+- **领域筛选：** 「全部」加上各个领域，每个领域带颜色点。选中某个领域后，其他领域的对象变暗，布局不动。
 
-## 6. 前端
+### 8.2 画布
 
-### 6.1 入口
+- **节点是对象卡片：**
+  - 显示业务名（标题）、一句说明（最多两行）、领域色条；
+  - 有自关联时带「内部关联」徽标；
+  - 不列字段，不显示表名；所有卡片尺寸相同。
+- **边是两个对象之间的一根线：**
+  - 同一方向上的多条关系合并成一根。A→B 和 B→A 是两根，比如客户和供应商互相引用；
+  - 箭头指向被引用的对象；
+  - 线上写角色名；有多条时写「N 种关联」，悬停时列出全部角色；
+  - 其中任一条已核对就画实线，否则画虚线。
+- **布局：** dagre 从左到右排，结果确定。沿用 v2 的做法：整图一屏看不清时，放大到关联最多的对象附近，并显示小地图。
+- **交互：** 点选只改样式，不动坐标（沿用 v2）。键盘聚焦到视野外的卡片时，画布自动平移过去（v2 审查 #6）。
 
-- 路由 `/console/data-graph`（懒加载）。侧栏「数据星图」放在「数据连接」之后，`superAdminOnly: true`。导航项和图标从
-  上一版分支带入（`workbenchNav.ts` 的 `data-graph` 项、`AtlasIcons.tsx` 的 `DataGraphIcon`）。
-- 当前选中的系统记在 URL 查询参数 `?system=<connectorId>`，不用 localStorage。
+### 8.3 右侧面板
 
-### 6.2 页面结构（自上而下）
+- **未选中对象时：** 两个页签，「关联清单」（按对象两两分组的句子）和「暂未发现关联的对象」。记住上次停留的页签（v2 审查 #9）。
+- **选中对象后，依次显示：**
+  1. 它是什么：业务名、领域、一句说明；
+  2. 和谁有关：按相关对象分组，句子里只用业务名和角色名；
+  3. 技术信息：默认折叠，里面是表名、字段列表和字段搜索、每条关系的字段对应与核对状态。
 
-1. 页头卡片：标题「数据星图」，说明一句——「查看各业务系统里有哪些表、表与表之间怎样关联。关系来自数据连接的语义层，
-   语义层更新后这里自动同步。」
-2. 系统切换（多于一个系统时显示）：每项为「连接显示名（没有则连接名）· N 张表」；连接 `status=DISABLED` 时加「已停用」标签。
-3. 概览行：表 N ｜ 已确认关系 a ｜ 推断关系 b ｜ 未发现关联的表 c。
-4. 主区：左侧深色画布（§6.3），右侧面板（§6.4）。画布左上角是搜索框（在当前系统内按中文名、物理名或注释搜，选中即居中
-   并选中该表）；右上角是 React Flow 自带的放大 / 缩小 / 适应画布控件；左下角是图例——实线「已确认：数据核对通过或业务方确认」，
-   虚线「推断：按表结构，尚未核对」。整个工作区（画布、搜索框、右侧面板）用 antd 暗色算法渲染。
+  切换对象时，详情的状态（比如字段搜索词）全部重置（v2 审查 #1）。
+- 句子模板见附录 E。
 
-### 6.3 画布
-
-- 依赖：新增 `@xyflow/react`（React Flow 12）和 `@dagrejs/dagre`。换掉 ECharts 的原因：ECharts graph 的节点只能是
-  符号加文字，连线只能连到节点中心，做不出「表卡片 + 连线接在具体字段行上」。
-- 只放 `related=true` 的表。
-- 表卡片：
-  - 标题 = `displayName ?? name`。
-  - 副标题：有 `displayName` 时为物理名（等宽小字）；否则为 `comment`（单行截断，悬停看全文）。
-  - 行 = `keyColumns` + `relationColumns`，每行「列名 + 注释」，主键行带钥匙标记。
-  - 有 `selfReferences` 时，标题旁加「有上下级」徽标；底部写「共 N 个字段」。
-- 连线：从起点列那一行连到终点列那一行。`CONFIRMED` 画实线，`INFERRED` 画虚线；端点标 `N` / `1`（`ONE_TO_ONE`
-  两端都标 `1`，`cardinality=null` 不标）；`label` 非空时显示在线的中段。
-- 布局：dagre，`rankdir=LR`（引用方在左，被引用的主数据在右），`nodesep=28`、`ranksep=100`；卡片宽 240，高按行数计算
-  （头 58 + 每行 26 + 底 28，与 CSS 一致）；节点和边按 §5.5 的顺序喂入，同一份数据得到同一组坐标。卡片不可拖拽
-  （`nodesDraggable=false`），可以平移、缩放。
-- 两种显示方式，只由数据决定（与窗口大小无关）：按 800×620 的名义画布算，整图缩放到能一屏放下时比例不低于 0.55，就整图
-  显示（`fitView`）；否则不强行缩成一屏——打开即放大到关联最多的那张表附近（比例 0.9），右下角显示小地图，画布上提示
-  「表比较多，先显示「{表名}」附近。拖动画布、滚轮缩放，或用搜索找表。」。两种方式下布局本身完全相同。
-- 交互：点卡片即选中——该表和直接相连的表、线保持原样，其余降到约 25% 不透明度；右侧面板显示表详情；坐标不变。
-  点空白处取消选中。卡片可以用 Tab 聚焦、Enter 选中。
-- 尊重 `prefers-reduced-motion`：关闭视口过渡动画。
-
-### 6.4 右侧面板
-
-- 未选中表时有两个页签：
-  - 「关系清单」：全部关系的句子，按起点表排序；点击即在画布上定位并选中起点表。
-  - 「未发现关联的表」：`related=false` 的表；点击后面板直接显示该表详情（它不在画布上）。
-- 选中表时依次显示：标题和副标题（同卡片）；表注释全文；「关系」小节（句子 + 实线 / 虚线标记 + 来源说明
-  「数据核对通过」/「业务方确认」/「按表结构推断，尚未核对」）；「字段」小节（名称、类型、注释、主键 / 唯一键标记，
-  参与关系的字段高亮；字段多于 30 个时显示搜索框）。
-- 句子模板（`{A}`、`{B}` 取 `displayName ?? name`）：
-  - `MANY_TO_ONE`：每条「{A}」对应一条「{B}」（{起点列} → {终点列}）
-  - `ONE_TO_ONE`：「{A}」与「{B}」一一对应（{起点列} → {终点列}）
-  - `cardinality=null`：「{A}」的 {起点列} 关联「{B}」的 {终点列}
-  - 自关联：「{A}」内部有上下级（{起点列} → {终点列}）
-  - 已确认的多态关系：在句末加「，按 {判别列} 区分类型」
-
-### 6.5 状态
+### 8.4 状态文案与成员可见性
 
 | 情况 | 显示 |
 |---|---|
-| 没有任何系统 | 「还没有可以展示的业务系统」+ 跳转「数据连接」 |
-| `semanticStatus=null` | 「这个系统的表关系还没整理。在『数据连接』里生成语义层后会自动出现。」 |
-| `RUNNING` 且没有关系 | 「正在整理表关系，完成后刷新页面即可看到。」 |
-| `FAILED` 且没有关系 | 「表关系整理没有成功，可在『数据连接』查看原因。」 |
-| `READY` 且没有关系 | 「暂未发现可以确认的表关系。」右侧面板照常列出所有表 |
-| 有关系且 `RUNNING` | 正常显示；概览行下方一行小字「语义层正在更新，完成后刷新页面可看到最新关系」 |
-| 接口失败 | antd `Alert` + 重试 |
+| 没有任何系统 | 「还没有可以查看的业务系统。」 |
+| 语义层从未生成 | 「这个系统的业务对象还在整理中，完成后会自动出现。」 |
+| 正在生成，且还没有关联 | 「正在整理，完成后刷新页面即可看到。」 |
+| 生成失败，且没有关联 | 「整理没有成功，请联系企业管理员。」 |
+| 已完成但没有关联 | 「暂未发现可以确认的关联。」 |
 
-文案里的「数据连接」链接到该连接的语义层页面 `/console/connectors/{id}/semantic`（已有）。
+- 画布区和页签里的空状态用同一句话（v2 审查 #10）。
+- 「去数据连接」这类指向管理页面的链接只对企业超管显示，成员看不到。
 
-### 6.6 视觉
+### 8.5 视觉
 
-沿用上一版分支 `jm-agent-front@codex/enterprise-data-graph` 中 `src/pages/console/data-graph/data-graph.css` 的配色和
-质感：浅色页头卡片和统计卡片，深色画布和深色右侧面板，青色描边与发光。节点改成卡片后按同一套色值重做；实线用青色，
-虚线用同色降饱和；选中卡片加发光。文字与背景的对比度满足 WCAG AA。
+沿用 v2 的深色风格。领域颜色用固定的 8 色调色板，按领域顺序分配。新增的颜色要加进对比度清单，仍须满足 WCAG AA。
 
-## 7. 删除 / 不带入
+## 9. 权限
 
-v2 从两个仓库的 `main` 新开分支实现，上一版分支不合并。
+- **新增模块码** `DATA_GRAPH_MODULE`（显示名「数据星图」）：加进 `PlatformConstant` 的常量和 `ALL_MODULES`，并在
+  `GrantableResourceController` 的可授权列表里加一项。jm-admin 的角色授权弹窗按接口动态渲染，会自动出现这一项，不用改代码。
+- **后端必须自己检查模块。**
+  - 现状：已有的三个模块（智能体、知识库、对话）在后端只按资源实例授权把关，模块本身只在前端拦。数据星图没有实例授权，
+    所以模块检查必须放在后端。
+  - 做法：`PermissionResolver` 新增 `assertCurrentModule(moduleCode)`，不满足时抛
+    `ServiceException(AUTHENTICATION_FAIL, "没有数据星图的访问权限")`。按平台约定，它返回 HTTP 200 加业务码 4001，前端
+    不会把用户踢回登录页。超管恒通过（`canEnter` 已经这样处理）。三个接口都先调用它。
+- **前端：** `workbenchNav.ts` 的导航项把 `superAdminOnly` 换成 `module: 'DATA_GRAPH_MODULE'`；路由从 `SuperAdminRoute`
+  换成 `ModuleRoute`（没有权限时它会显示「无权访问」）。
+- **本版的取舍：** 被授权的成员能看到本企业全部系统的对象、关系，以及技术信息（表名、字段名）。给谁授权由企业超管决定；
+  按单个系统授权以后再做。
+- 数据连接、语义层这些管理入口仍然只对超管开放；星图里指向它们的链接也只对超管显示。
 
-- **不带入**：`enterprise_graph_*` 三张表及 `V20260930__enterprise_data_graph.sql`、`connector.enterprise-graph.*` 配置、
-  快照 / 队列 / 恢复 / 来源指纹 / 跨库候选召回 / AI 判定、四处重建触发、删除连接时的同步清理、ECharts 画布和 LOD
-  合并逻辑、置信度和关系类型筛选、「重新生成」按钮。
-- **带入**：导航项、图标、页面样式的视觉部分（§6.1、§6.6）。
-- `main` 上的上一版实施计划 `docs/superpowers/plans/2026-09-30-enterprise-data-graph.md` 在 v2 分支删除，由 v2 计划取代。
-- 上一版 DDL 若在任何环境执行过，那三张表可以删除，v2 代码不读写它们（本地 `dev-mysql` 里有）。
+## 10. v2 审查结论的处理
 
-## 8. 测试
+| # | 问题 | 处理 |
+|---|---|---|
+| 1 | 字段搜索词在切换表后残留 | 修（§8.3） |
+| 2 | 只显示前 200 个对象却没有告诉用户 | 修（§7.2 `truncated`、§8.1） |
+| 3 | 同一张表同一列的自关联 | 修（§7.1 第 1′ 行） |
+| 4 | 自关联不带来源 | 修（§7.1） |
+| 5 | 业务方确认时丢掉结构键 | 修（§5.5） |
+| 6 | 键盘聚焦到视野外的卡片时画布不跟随 | 修（§8.2） |
+| 7 | e2e 缺「加载后无报错」「没有任何系统」「接口失败」三项检查 | 补（§12） |
+| 8 | 性能只测了投影 | 补服务层的 200 表性能测试（§12） |
+| 9 | 从详情返回总回到第一个页签 | 修（§8.3） |
+| 10 | 两处空状态文案互相矛盾 | 修（§8.4） |
+| 11 | 切换系统时，上一个系统的选中状态会残留一瞬间 | 修（§8.1） |
+| 12 | 新依赖的版本号带 `^` | 改为精确版本 |
 
-后端（`modules/data-server`，JUnit 5）：
+## 11. 与 v2 实现的关系
 
-- `DataGraphProjectorTest`：
-  - §5.2 每一行至少一个用例；优先级：`UNRELATED` 压过 `verified=CONFIRMED`，`RELATED` 压过 `REJECTED`。
-  - 唯一键三态（缺失 / 空列表 / 存在），以及终点列只是组合键一部分时不算唯一键。
-  - 两种基数和 `null`；自关联进 `selfReferences`、不进 `relations`；`BASE TABLE` 归一。
-  - `displayName` 规则（长度、标点、空值）；输出顺序确定。
-  - 把输出序列化后断言不含 `gloss`、`confidence`、`basis`、`note`、`care_reason`、`verify_note`、`discriminator_value` 等键。
-  - 夹具一律手工构造，覆盖本地数据里出现过的每种形态；**本地真实数据只用于 §1 的手工验收，不进仓库**。
-- `RowEstimateNote`：往返测试；`MySqlSession`、`RuleContext` 的既有测试照常通过。
-- `DataGraphController`：非超管调用被拒。
+- **沿用：** 关系判定规则、`RowEstimateNote`、接口骨架、dagre 布局和「一屏看不清就放大」的逻辑、React Flow 画布框架、
+  右侧面板框架、e2e 夹具框架、深色视觉。
+- **改动：**
+  - 节点和边改为按对象画（卡片不再列字段，边按对象两两合并）；
+  - 文字来源改为业务视图；
+  - 权限改为模块授权；
+  - 按 §10 处理审查问题。
+- 两个仓库的 `feat/data-graph-v2` 分支在上面继续提交，v2 的现状不单独合并。
 
-前端：
+## 12. 测试
 
-- `npm run typecheck && npm run lint`。
-- Playwright 夹具脚本（沿用上一版 `e2e/data-graph-check.mjs` 的写法：自起临时 Vite，拦截接口返回夹具）：
-  - 加载后、逐个点击卡片后，控制台都没有报错；
-  - 连续加载 3 次，卡片坐标一致；点击前后坐标一致；
-  - 页面主体文本不含 §1-6 列出的字样（夹具数据本身不含这些字样，所以可以整页检查）；图例存在；
-  - §6.5 的每种状态各渲染一次；
-  - 中文、带空格的表名照常连线成句；同一对表之间的两条关系各自画出；
-  - 小图整图显示、没有小地图；200 张表、200 条关系的夹具能渲染，打开即放大到关联最多的表附近（卡片宽度 ≥ 200px、
-    在视野内），有小地图和提示，并记录首屏耗时。
-- 手工：§1 全部验收项，在本地全栈上逐条核对。
+**后端（`modules/data-server`，JUnit 5）：**
+- 关系发现：
+  - 命名规则：用和本地两个系统同形的夹具，断言 klny_erp 恰好 33 条、erp_real 恰好 16 条；并列时放弃；本列是单列唯一键
+    时不算；不连本表；后缀不足 4 个字符不算；
+  - 声明外键：能读出并转成候选；读不到时不报错；
+  - 写入：按 §5.4 的表逐格断言，尤其是「弱推断被替换」「已核对的不动」「模型候选不替换」；
+  - 模型输出的解析和过滤（模型用假实现代替）。
+- 业务视图：
+  - 校验能拦住长度超限、代码和禁用词；不合格的重试一次；
+  - 只生成缺的和输入变了的；`HUMAN` 行不动；
+  - 领域只给新对象分配；消失对象的 `MODEL` 行被物理删除。
+- 补全链：
+  - 三步的顺序，② 的核对范围；agent 路径跳过 ②；
+  - 同一连接只跑一条；认领过期后能接手；
+  - 定时对账按输入指纹触发，失败后 6 小时退避；
+  - 开关关掉后退回原来的行为。
+- 权限：有模块的成员放行，没有的拦住（4001），超管放行。
+- 投影：
+  - 合并业务视图，兜底顺序（包括兜底注释的代码扫描），`nameSource`；
+  - §7.1 第 1′ 行；自关联带来源；
+  - `truncated`、`viewStatus`。
+- 性能：服务层 200 张表、200 条关系的 `/systems/{id}`，P95 < 300 ms。
+- 两张新表都在租户白名单里；`MAX_OBJECTS` 只有一个来源。
 
-## 9. 上线
+**前端（夹具 e2e）：**
+- 按对象画：边已按对象两两合并，「N 种关联」正确；
+- 默认视图扫描不到代码；技术信息区默认折叠，展开后能看到表名和字段；
+- 领域筛选时其他对象变暗，坐标不变；
+- 没有模块权限的成员看到「无权访问」；
+- 页面加载后控制台无报错；
+- 「没有任何系统」「接口失败」两种状态；
+- 切换表后字段搜索词清空；页签会被记住。
 
-- 先部署 `data-service`，再部署 `jm-agent-front`；两个仓库串行 push（共用一台 runner）。
-- 无 DDL、无 Nacos 变更。
-- 回滚：前端撤掉路由和导航项即可；后端接口只读，没有副作用。
+**全栈（真实数据）：** 在本地逐条核对 §1 的验收。补全链会真实调用模型，每个连接大约 4–6 次。
 
-## 10. 待验证项（实现中用数据决定）
+## 13. 上线
 
-1. ~~一个系统有 200 张表、200 条关系时，分层图是否还读得清。~~ **已定（2026-09-30 用合成数据验证）**：扇入结构在分层
-   布局里会排成一根上百张卡片的竖列，整图缩到一屏后卡片只剩几个像素，读不清。按张数截断也不行（30 张表挂在同一张中心表上
-   照样读不清），所以改为 §6.3 的「按可读性决定显示方式」：读不清时放大到关联最多的表附近 + 小地图，不隐藏任何表。
-   200 表夹具首屏约 270–300 ms。
-2. `GET /systems/{id}` 的 P95 是否达标（§4），据此决定要不要加缓存。
+- **DDL：** 迁移脚本新增两张表（附录 D）。项目没有 Flyway，按 `docs/RELEASE-CHECKLIST-connector.md` 的顺序，先手工执行
+  DDL 再部署；同时把两张表加进它的 schema 自检和 `docs/mysql-schema.sql`。生产库由你执行；另写一份变更文档到
+  `docs/config-changes/`，只写表名和用途。
+- **配置：** 不需要改 Nacos。沿用 `connector.semantic.infer-model`；新增的 `connector.semantic.enrichment.enabled`
+  在代码里默认 true，出问题时可以用它关掉补全链。
+- **回填：** 部署后由定时对账给已有连接补跑，一次只跑一个连接。
+- **部署顺序：** 先执行 DDL，再部署 data-service，最后部署 jm-agent-front；jm-admin 不用部署。两个仓库串行推送。
+- **回滚：** 前端撤掉入口；后端关掉补全链开关。新表可以保留，不影响语义层和 Agent。
 
-## 11. 已知限制
+## 14. 待验证项
 
-1. **关系覆盖取决于语义层，这是本版有没有用的上限。** 本地 `test` 连接 19 张表只有 11 条 JOIN 行：采购订单头与明细、
-   销售订单头与明细、订单到供应商 / 客户等核心关系都没有。该连接的生成记录显示说明书是分批补写的，最后一批「关系 0」，
-   并且「模型输出疑似被 max_tokens 截断，说明书不完整」。星图如实展示后，`test` 只有 2 条线。语义层的关系推导需要单独
-   排查（不同批次之间是否不找关系、输出截断），另立项；Agent 写 SQL 时缺的也是这些关系。
-2. 唯一键未知（`extra.unique_keys` 上线前拉的旧快照）的表，指向它的推断关系不显示，直到下一次刷新结构。
-3. 靠业务编码等非唯一列关联的关系，只有采样核对通过或业务方确认后才显示；数据稀疏的库会缺。本地共 4 条属于这种情况
-   （如 `ACKMJE_CX2026.F_KMBH → D1_ACCOUNT.CODE`）。
-4. 本版按「客户的企业超管 / IT 自己看」设计。如果主要给业务负责人看，或者由我方投屏 / 发给客户，还需要：语义层为没有
-   注释或注释不像名称的表产出简短的业务名；导出图片。
+1. **业务名和领域划分准不准。** 先在本地两个系统上逐条看一遍，必要时调整提示词。
+2. **命名规则在真实客户库上的误报率。** 本地两个库是零误报，但只有两个样本；要看采样核对否掉多少条。
+3. **「明细 → 表头」靠模型那一遍推出，可能选错列。**
+   - klny_erp 的数据表明，指向表头的是 `SOID`：5 行全部落在表头 `OID` 里，`POID` 全为空；
+   - 但语义层现有的字段说明认为是 `POID`，模型可能沿用这个判断；
+   - 选错时，星图上两个对象之间的线仍然正确，但给 Agent 的这条关系查不出数据；
+   - 采样核对遇到全空的列会判为「判不出」，不会自动否掉它。这类错要靠业务方在对话里纠正，或者等下一版的纠错入口。
+4. **200 个对象时，领域筛选加对象地图还读不读得清。**
+
+## 15. 已知限制
+
+1. 本地测试库数据太少，抽样核对大多判不出结论，新补出来的关系大多显示为虚线。
+2. 每一列最多只能有一条关系（由语义层表的唯一键决定）。§5.4 的替换只处理「终点不是唯一键、也没核对通过」的推断。
+3. 旧快照里没有 `unique_keys` 或 `foreign_keys`，这些表的规则候选和推断关系会受限，刷新一次结构后恢复。
+4. 只能看到结构快照里的对象，每个连接最多 200 个。
+5. 列名没有 `id` 后缀、用拼音缩写的库，规则帮不上，只能靠模型那一遍。比如 klny_erp 的 `F_KHBH`（客户编号）、
+   `F_KMBH`（科目编号）：这两条关系语义层已经有了，但终点是编码列，不是唯一键，只有核对通过后才会出现在星图上。
+
+## 附录 A：本地两个系统的预期关系
+
+### A1. klny_erp（连接 `test`）
+
+前 33 条由 §5.2 的命名规则推出（2026-10-01 实测，一条不多一条不少）。
+
+```text
+D1_CUSTOMER.INTERNALCOMPANYCODEID → D1_COMPANYCODE.OID
+D1_CUSTOMER.VENDORID → D1_VENDOR.OID
+D1_VENDOR.CUSTOMERID → D1_CUSTOMER.OID
+D1_VENDOR.INTERNALCOMPANYCODEID → D1_COMPANYCODE.OID
+EFI_CUSTOMER_CPYCODEDTL.COMPANYCODEID → D1_COMPANYCODE.OID
+EFI_CUSTOMER_CPYCODEDTL.RECONACCOUNTID → D1_ACCOUNT.OID
+EFI_ORIGINALTRANSDTL.VOUCHERDTLID → EFI_VOUCHERDTL.OID
+EFI_VENDOR_CPYCODEDTL.COMPANYCODEID → D1_COMPANYCODE.OID      （现有一条错的推断占着这一列，靠 §5.4 的替换写入）
+EFI_VENDOR_CPYCODEDTL.RECONACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.ACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.COUNTRYACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.CUSTOMERID → D1_CUSTOMER.OID
+EFI_VOUCHERDTL.GLACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.HOUSEACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.NEWCOMPANYCODEID → D1_COMPANYCODE.OID
+EFI_VOUCHERDTL.PARTNERPROFITCENTERID → D1_PROFITCENTER.OID
+EFI_VOUCHERDTL.PROFITCENTERID → D1_PROFITCENTER.OID           （v2 已有）
+EFI_VOUCHERDTL.RECONACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.VENDORID → D1_VENDOR.OID                       （v2 已有）
+EMM_PURCHASEORDERDTL.COMPANYCODEID → D1_COMPANYCODE.OID
+EMM_PURCHASEORDERDTL.CUSTOMERID → D1_CUSTOMER.OID
+EMM_PURCHASEORDERDTL.DELIVERYCUSTOMERID → D1_CUSTOMER.OID
+EMM_PURCHASEORDERDTL.FI_ACCOUNTID → D1_ACCOUNT.OID
+EMM_PURCHASEORDERDTL.PROFITCENTERID → D1_PROFITCENTER.OID
+EMM_PURCHASEORDERDTL.VENDORID → D1_VENDOR.OID
+EMM_PURCHASEORDERHEAD.COMPANYCODEID → D1_COMPANYCODE.OID
+EMM_PURCHASEORDERHEAD.VENDORID → D1_VENDOR.OID
+EPS_PROJECT.COMPANYCODEID → D1_COMPANYCODE.OID
+ESD_SALEORDERDTL.COMPANYCODEID → D1_COMPANYCODE.OID
+ESD_SALEORDERDTL.PROFITCENTERID → D1_PROFITCENTER.OID
+ESD_SALEORDERHEAD.CREDITACCOUNTID → D1_ACCOUNT.OID
+ESD_SALEORDERHEAD.HEAD_COMPANYCODEID → D1_COMPANYCODE.OID
+ESD_SALEORDERHEAD.RECEIPTVENDORID → D1_VENDOR.OID
+```
+
+最后两条是对象层面的要求，由模型那一遍推出。数据表明列是 `SOID`，但验收不限定是哪一列（见 §14 第 3 条）：
+
+```text
+EMM_PURCHASEORDERDTL → EMM_PURCHASEORDERHEAD（数据上是 SOID → OID）
+ESD_SALEORDERDTL → ESD_SALEORDERHEAD（数据上是 SOID → OID）
+```
+
+### A2. erp_real（连接 `erp_real`）
+
+命名规则推出 16 条，其中 5 条 v2 已有：
+
+```text
+D1_VENDOR.INTERNALCOMPANYCODEID → D1_COMPANYCODE.OID
+EFI_VENDOR_CPYCODEDTL.COMPANYCODEID → D1_COMPANYCODE.OID      （v2 已有）
+EFI_VENDOR_CPYCODEDTL.RECONACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.ACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.COUNTRYACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.GLACCOUNTID → D1_ACCOUNT.OID                   （v2 已有）
+EFI_VOUCHERDTL.HOUSEACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.NEWCOMPANYCODEID → D1_COMPANYCODE.OID
+EFI_VOUCHERDTL.PARTNERPROFITCENTERID → D1_PROFITCENTER.OID
+EFI_VOUCHERDTL.PROFITCENTERID → D1_PROFITCENTER.OID           （v2 已有）
+EFI_VOUCHERDTL.RECONACCOUNTID → D1_ACCOUNT.OID
+EFI_VOUCHERDTL.VENDORID → D1_VENDOR.OID                       （v2 已有）
+EFI_VOUCHERDTL.WBSELEMENTID → EPS_WBSELEMENT.OID
+EFI_VOUCHERDTL_EXT.COMPANYCODEID → D1_COMPANYCODE.OID
+EFI_VOUCHERDTL_EXT.SRCCOMPANYCODEID → D1_COMPANYCODE.OID
+EPS_WBSELEMENT.COMPANYCODEID → D1_COMPANYCODE.OID             （v2 已有）
+```
+
+另有 2 条是 v2 已有、不靠命名规则的：
+
+```text
+EFI_VENDOR_CPYCODEDTL.OID → D1_VENDOR.OID
+EFI_VOUCHERDTL_EXT.OID → EFI_VOUCHERDTL.OID
+```
+
+合计 18 条。
+
+## 附录 B：业务文字禁用词
+
+以下词出现在业务文字里即判为不合格。它们是 AI 口吻或平台内部用语：
+
+`判不出`、`未经`、`验证`、`样本`、`采样`、`置信`、`估算`、`InnoDB`、`疑似`、`或许`、`大概`、`推测`、`语义层`、`说明书`、`主键`、`外键`、`字段`。
+
+「可能」不禁用，因为「一张订单可能有多条明细」这类说法是正常的业务描述。
+
+## 附录 C：语义层漏推关系的代码位置（以 `feat/data-graph-v2` @ `9ccddb1` 为准）
+
+包前缀 `com.jimeng.dataserver.ai.connector`。
+
+- **分批与摘要上限：**
+  - `service/ConnectorSemanticDeriveService` 的 `buildDigest`：定义在 1764 行，全量调用在 593 行，增量调用在 1245 行；
+  - `runtime/ConnectorProperties.Semantic.maxDigestChars = 60000`。
+- **「没出现的表不要写关系」：** `service/SemanticPrompts`，全量在 208–210 行，增量在 264–265 行和 271 行。
+- **输出顺序和截断：**
+  - `SemanticPrompts` 141–160 行的输出格式，顺序是 objects → fields → joins；
+  - `maxTokens = 16000`；
+  - 截断后的修补在 `ConnectorSemanticDeriveService.repairTruncatedJson`（1942 行）。
+- **覆盖判定与增量不回头：** `ConnectorSemanticDeriveService` 的 `coveredObjects`，定义在 1076 行，使用在 967 行。
+- **外键只用来排序：** `impl/mysql/MySqlSession` 129–139 行的 `REF_N`。
+- **agent 路径不做采样核对：** `generation/SemanticGenerationFinalizer` 的类注释。
+
+## 附录 D：DDL
+
+```sql
+-- 数据星图 v3：给人看的业务视图 + 语义层补全链的运行状态。
+--
+-- 没有 Flyway：这份 DDL 要手工执行（见 docs/RELEASE-CHECKLIST-connector.md 的 schema 自检）。
+-- 两张表都带 tenant_id，必须同时出现在 JimengTenantLineHandler.TENANT_AWARE_TABLES 里。
+--
+-- 唯一键刻意【不含 deleted】，做法同 connector_semantic：MODEL 行物理删除，HUMAN 行只原地更新，
+-- 表上永远不出现软删死行。不要给这两张表加逻辑删除入口。
+
+CREATE TABLE IF NOT EXISTS `connector_business_view` (
+  `id`             BIGINT        NOT NULL COMMENT '雪花ID',
+  `tenant_id`      VARCHAR(64)   NOT NULL COMMENT '租户ID',
+  `connector_id`   BIGINT        NOT NULL COMMENT 'connection.id',
+  `kind`           VARCHAR(16)   NOT NULL COMMENT 'OBJECT / RELATION',
+  `object_name`    VARCHAR(191)  NOT NULL COMMENT '表名；RELATION 为起点表',
+  `field_name`     VARCHAR(191)  NOT NULL DEFAULT '' COMMENT 'RELATION 为起点列；OBJECT 为空串',
+  `display_name`   VARCHAR(64)   DEFAULT NULL COMMENT '业务名 / 关系角色名',
+  `summary`        VARCHAR(255)  DEFAULT NULL COMMENT '一句话说明（仅 OBJECT）',
+  `domain`         VARCHAR(32)   DEFAULT NULL COMMENT '业务领域（仅 OBJECT）',
+  `source`         VARCHAR(16)   NOT NULL COMMENT 'MODEL / HUMAN',
+  `input_hash`     CHAR(64)      DEFAULT NULL COMMENT '生成时输入的 SHA-256',
+  `model_code`     VARCHAR(64)   DEFAULT NULL COMMENT '生成所用模型',
+  `prompt_version` VARCHAR(32)   DEFAULT NULL COMMENT '生成所用提示词版本',
+  `deleted`        TINYINT       NOT NULL DEFAULT 0 COMMENT 'BaseEntity 全局 @TableLogic 要求有这一列；本表不做逻辑删除',
+  `create_time`    DATETIME      DEFAULT NULL,
+  `create_user`    VARCHAR(64)   DEFAULT NULL,
+  `update_time`    DATETIME      DEFAULT NULL,
+  `update_user`    VARCHAR(64)   DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  -- 64*4 + 8 + 16*4 + 191*4*2 = 1856 字节，低于 InnoDB 索引 3072 字节上限
+  UNIQUE KEY `uk_business_view` (`tenant_id`, `connector_id`, `kind`, `object_name`, `field_name`),
+  KEY `idx_business_view_conn` (`connector_id`, `kind`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据星图：给人看的业务名称与说明';
+
+CREATE TABLE IF NOT EXISTS `connector_enrichment_state` (
+  `id`                BIGINT        NOT NULL COMMENT '雪花ID',
+  `tenant_id`         VARCHAR(64)   NOT NULL COMMENT '租户ID',
+  `connector_id`      BIGINT        NOT NULL COMMENT 'connection.id',
+  `claim_at`          DATETIME      DEFAULT NULL COMMENT '认领时间；非空且未满 30 分钟 = 正在跑',
+  `last_status`       VARCHAR(16)   DEFAULT NULL COMMENT '上次结果 READY / FAILED；NULL = 从没跑完过',
+  `input_fingerprint` CHAR(64)      DEFAULT NULL COMMENT '上次尝试时的输入指纹（设计文档 §4）',
+  `last_attempt_at`   DATETIME      DEFAULT NULL COMMENT '上次开始时间；失败后的 6 小时退避按它算',
+  `finished_at`       DATETIME      DEFAULT NULL,
+  `relation_note`     VARCHAR(500)  DEFAULT NULL COMMENT '关系发现：新增 / 替换条数、来源分布、失败原因',
+  `view_note`         VARCHAR(500)  DEFAULT NULL COMMENT '业务文字：生成条数、校验退回条数、失败原因',
+  `deleted`           TINYINT       NOT NULL DEFAULT 0 COMMENT 'BaseEntity 全局 @TableLogic 要求有这一列；本表不做逻辑删除',
+  `create_time`       DATETIME      DEFAULT NULL,
+  `create_user`       VARCHAR(64)   DEFAULT NULL,
+  `update_time`       DATETIME      DEFAULT NULL,
+  `update_user`       VARCHAR(64)   DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_enrichment_state` (`tenant_id`, `connector_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据星图：语义层补全链的运行状态';
+```
+
+## 附录 E：句子模板
+
+句子里只用业务名（`{A}`、`{B}`）和关系角色名（`{角色}`），不出现代码：
+
+| 情况 | 模板 |
+|---|---|
+| 多对一 | 每条「{A}」对应一个「{B}」 |
+| 多对一，且角色名与 B 的业务名不同 | 每条「{A}」对应一个「{B}」（作为{角色}） |
+| 一对一 | 「{A}」与「{B}」一一对应 |
+| 基数未知（只会出现在已确认的关系上） | 「{A}」与「{B}」有关联 |
+| 自关联 | 「{A}」内部有关联（{角色}）；没有角色名时去掉括号 |
+| 已确认的多态关系 | 句末加「（只对部分类型成立）」 |
+
+技术信息区另外列出每条关系的字段对应与核对状态，来源说法沿用 v2（按表结构推断，尚未核对 / 数据核对通过 / 业务方确认），
+例如：`VENDORID → OID · 按表结构推断，尚未核对`。
