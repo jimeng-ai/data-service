@@ -148,12 +148,12 @@ public class SemanticTableRenderer {
     /**
      * 带键名的唯一键。{@link SemanticJoinValidator#uniqueKeysByObject} 只给列清单、不给键名，文案要键名，所以这里自己读——
      * 但<b>跳过规则与它逐条一致</b>（没有 columns、columns 为空或含 null 的键整条跳过），否则同一张表在规则判定里「没有唯一键」、
-     * 在文案里却列出一个键。
+     * 在文案里却列出一个键。数据星图判「终点列是不是唯一键」、标主键也用这一份，不另写解析。
      *
-     * @return {@code null} = 不知道
+     * @return {@code null} = 不知道；主键排在最前
      */
     @SuppressWarnings("unchecked")
-    private static List<NamedKey> namedUniqueKeys(ConnectorSchema row) {
+    public static List<NamedKey> namedUniqueKeys(ConnectorSchema row) {
         if (row == null || row.getDetailJson() == null || row.getDetailJson().isBlank()) {
             return null;
         }
@@ -229,6 +229,6 @@ public class SemanticTableRenderer {
     public record RenderedTable(String text, boolean columnsTruncated, int totalColumns, int renderedColumns) {
     }
 
-    private record NamedKey(String name, List<String> columns, boolean primary) {
+    public record NamedKey(String name, List<String> columns, boolean primary) {
     }
 }
