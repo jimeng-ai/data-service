@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
+import com.jimeng.dataserver.ai.connector.model.RowEstimateNote;
 import com.jimeng.dataserver.ai.connector.model.WritePlan;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -988,12 +989,9 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                     // TABLE_ROWS 对 InnoDB 是估算值，差几倍很常见。附上「约」字，
                     // 免得模型把它当成 COUNT(*) 的答案直接回给用户。
                     // 未知（null）和 0 都不写行数：前者没数可写，后者可能只是没统计过，
-                    // 写「约 0 行」会让模型断言这张表是空的。
-                    String withRows = (comment == null || comment.isBlank() ? "" : comment)
-                            + (rows != null && rows > 0
-                            ? "（约 " + rows + " 行，InnoDB 估算值，不可当作准确计数）" : "");
+                    // 写「约 0 行」会让模型断言这张表是空的。文案与剥离规则只在 RowEstimateNote 一处。
                     CatalogEntry entry = new CatalogEntry(rs.getString("TABLE_NAME"),
-                            rs.getString("TABLE_TYPE"), withRows.isBlank() ? null : withRows);
+                            rs.getString("TABLE_TYPE"), RowEstimateNote.append(comment, rows));
                     // REF_N 在新 SQL 里已经 COALESCE 成 0，不会是 NULL；不声明外键的库每一行都是 0。
                     // 兜底 SQL 根本没有这一列，不能去读它（读一个不存在的列在 JDBC 里是 SQLException）。
                     ranked.add(withRefs
