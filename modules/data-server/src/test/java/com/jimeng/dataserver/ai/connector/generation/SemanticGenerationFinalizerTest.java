@@ -272,6 +272,62 @@ class SemanticGenerationFinalizerTest {
         verify(semanticService, org.mockito.Mockito.times(2)).requireOwned(20L);
     }
 
+    // ================================================================ 补全链（数据星图设计 v3 §4）
+
+    @Test
+    @DisplayName("★ DIRECT 定稿 READY 提交之后才发补全链事件（agent 路径，不派发采样核对）")
+    void directReadyPublishesEnrichment() {
+        org.springframework.context.ApplicationEventPublisher publisher =
+                mock(org.springframework.context.ApplicationEventPublisher.class);
+        finalizer.setApplicationEventPublisher(publisher);
+        ConnectorSemanticGeneration generation = generation("DIRECT");
+        stubTables(List.of(table("DONE")));
+        when(semanticMapper.selectList(any())).thenReturn(List.of(semantic("OBJECT")));
+
+        finalizer.finish(generation, 0.0);
+
+        assertEquals(1, txManager.commits);
+        verify(publisher).publishEvent(
+                com.jimeng.dataserver.ai.connector.service.SemanticEnrichmentRequest.afterAgentGeneration(20L, "tenant-a"));
+    }
+
+    @Test
+    @DisplayName("STAGED 替换成功（READY）后同样发事件")
+    void stagedReadyPublishesEnrichment() {
+        org.springframework.context.ApplicationEventPublisher publisher =
+                mock(org.springframework.context.ApplicationEventPublisher.class);
+        finalizer.setApplicationEventPublisher(publisher);
+        ConnectorSemanticGeneration generation = generation("STAGED");
+        ConnectorSchema current = schema("orders", "id", "bigint", 1L);
+        stubTables(List.of(coveredTable(current)));
+        when(schemaMapper.selectList(any())).thenReturn(List.of(current));
+        when(stagedMapper.selectCount(any())).thenReturn(2L);
+        when(semanticMapper.selectCount(any())).thenReturn(3L);
+        when(semanticMapper.selectList(any())).thenReturn(List.of(semantic("OBJECT"), semantic("FIELD")));
+
+        finalizer.finish(generation, 0.0);
+
+        verify(publisher).publishEvent(
+                com.jimeng.dataserver.ai.connector.service.SemanticEnrichmentRequest.afterAgentGeneration(20L, "tenant-a"));
+    }
+
+    @Test
+    @DisplayName("没定稿成 READY（回滚、零产出）：不发事件")
+    void noEventWithoutReady() {
+        org.springframework.context.ApplicationEventPublisher publisher =
+                mock(org.springframework.context.ApplicationEventPublisher.class);
+        finalizer.setApplicationEventPublisher(publisher);
+        ConnectorSemanticGeneration lost = generation("DIRECT");
+        stubTables(List.of(table("DONE")));
+        when(claim.release(any(), any(), any(), any(Boolean.class), any())).thenReturn(false);
+        finalizer.finish(lost, 0.0);
+
+        stubTables(List.of());
+        finalizer.finish(generation("STAGED"), 0.0);
+
+        verify(publisher, never()).publishEvent(any(Object.class));
+    }
+
     @Test
     @DisplayName("STAGED 空暂存但主表已有 INFERRED 时拒绝替换并记 FAILED(EMPTY_REPLACE)")
     void emptyReplaceFailsWithoutDeletingOldRows() {

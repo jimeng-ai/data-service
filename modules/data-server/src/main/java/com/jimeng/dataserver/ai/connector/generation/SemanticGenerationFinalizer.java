@@ -7,6 +7,7 @@ import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
 import com.jimeng.dataserver.ai.connector.service.SemanticCoverage;
+import com.jimeng.dataserver.ai.connector.service.SemanticEnrichmentRequest;
 import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.persistence.entity.ConnectorSchema;
 import com.jimeng.persistence.entity.ConnectorSemantic;
@@ -19,6 +20,8 @@ import com.jimeng.persistence.mapper.ConnectorSemanticGenerationTableMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticStagedMapper;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -32,9 +35,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Completes one owned semantic generation without ever dispatching sampling validation. */
+/**
+ * Completes one owned semantic generation without ever dispatching sampling validation.
+ *
+ * <p>定稿为 READY 并提交之后发一个 {@link SemanticEnrichmentRequest#afterAgentGeneration} 事件：补全链接着做关系发现和业务文字，
+ * 但同样不派发采样核对（这条路径原来就不做，数据星图设计 v3 §4）。
+ */
 @Component
-public class SemanticGenerationFinalizer {
+public class SemanticGenerationFinalizer implements ApplicationEventPublisherAware {
 
     private static final String RUNNING = "RUNNING";
     private static final String FINALIZING = "FINALIZING";
@@ -57,6 +65,8 @@ public class SemanticGenerationFinalizer {
     private final ConnectorSemanticService semanticService;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
+    /** 单测按构造器建本类时是 {@code null}：不发事件，行为与接入补全链之前一致。 */
+    private ApplicationEventPublisher eventPublisher;
 
     @Autowired
     public SemanticGenerationFinalizer(ConnectorSemanticGenerationMapper generationMapper,
@@ -95,6 +105,19 @@ public class SemanticGenerationFinalizer {
         this.semanticService = semanticService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.clock = clock;
+    }
+
+    @Override
+    public void setApplicationEventPublisher(ApplicationEventPublisher eventPublisher) {
+        this.eventPublisher = eventPublisher;
+    }
+
+    /** READY 已经提交之后才发：补全链读的是定稿后的语义层。 */
+    private void publishReady(ConnectorSemanticGeneration generation) {
+        if (eventPublisher != null) {
+            eventPublisher.publishEvent(SemanticEnrichmentRequest.afterAgentGeneration(
+                    generation.getConnectorId(), generation.getTenantId()));
+        }
     }
 
     public FinishResult finish(ConnectorSemanticGeneration generation, double maxGaveUpRatio) {
@@ -178,6 +201,7 @@ public class SemanticGenerationFinalizer {
         if (settleBoundary(generation, boundary())) {
             return;
         }
+        boolean[] ready = {false};
         transactionTemplate.executeWithoutResult(tx -> {
             semanticService.requireOwned(generation.getConnectorId());
             connectionClaim.lockRow(generation.getConnectorId());
@@ -188,8 +212,13 @@ public class SemanticGenerationFinalizer {
                     || !connectionClaim.release(generation.getConnectorId(), READY, note, true,
                             coverageOf(generation, stats))) {
                 tx.setRollbackOnly();
+            } else {
+                ready[0] = true;
             }
         });
+        if (ready[0]) {
+            publishReady(generation);
+        }
     }
 
     private FinishResult finishStaged(ConnectorSemanticGeneration generation) {
@@ -215,7 +244,11 @@ public class SemanticGenerationFinalizer {
                 return FinishResult.DONE;
             }
             PromoteOutcome outcome = promote(generation, precheck.version());
-            if (outcome == PromoteOutcome.READY || outcome == PromoteOutcome.LOST) {
+            if (outcome == PromoteOutcome.READY) {
+                publishReady(generation);
+                return FinishResult.DONE;
+            }
+            if (outcome == PromoteOutcome.LOST) {
                 return FinishResult.DONE;
             }
             if (outcome == PromoteOutcome.EMPTY_REPLACE) {

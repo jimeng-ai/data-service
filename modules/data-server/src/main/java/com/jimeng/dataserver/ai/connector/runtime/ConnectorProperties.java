@@ -322,6 +322,23 @@ public class ConnectorProperties {
          * 与上面几项（单次推导）互相独立；总开关默认关，见 {@link SemanticAgent#enabled}。
          */
         private SemanticAgent agent = new SemanticAgent();
+
+        /** 语义层补全链（数据星图 v3 §4）：{@code connector.semantic.enrichment.*}。 */
+        private SemanticEnrichment enrichment = new SemanticEnrichment();
+    }
+
+    /**
+     * 语义层补全链：语义层生成完成后接着跑的「关系发现 → 采样核对 → 业务文字」（数据星图设计 v3 §4）。
+     *
+     * <p>对账间隔不在这里：{@code @Scheduled} 直接读占位符 {@code connector.semantic.enrichment.reconcile-interval-ms}，改它要重启。
+     */
+    @Data
+    public static class SemanticEnrichment {
+        /**
+         * 总开关，默认<b>开</b>。关掉后推导成功照旧直接派发采样核对，定时对账不跑，星图照常用已有数据。
+         * 走配置绑定，Nacos 改完即生效。
+         */
+        private boolean enabled = true;
     }
 
     /**
