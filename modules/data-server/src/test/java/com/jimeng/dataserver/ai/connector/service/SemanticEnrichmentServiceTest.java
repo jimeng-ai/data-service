@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.service;
 
 import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.jimeng.common.core.tenant.TenantContext;
@@ -46,6 +47,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -149,7 +151,7 @@ class SemanticEnrichmentServiceTest {
             Map<String, Object> values = released();
             assertTrue(values.containsValue(ConnectorEnrichmentState.STATUS_READY));
             assertTrue(values.containsValue("pass-1"), "模型指纹前移");
-            assertTrue(values.containsValue(service.fingerprint(CONN_ID)), "记跑完时的输入指纹");
+            assertTrue(values.containsValue(service.fingerprint(CONN_ID)), "记开始时的输入指纹（这一轮里输入没变）");
             assertTrue(values.values().stream().anyMatch(v -> String.valueOf(v).startsWith("业务名 3 条")));
         }
 
@@ -211,6 +213,50 @@ class SemanticEnrichmentServiceTest {
             assertTrue(values.containsValue(ConnectorEnrichmentState.STATUS_FAILED));
             assertTrue(values.containsValue(before));
             assertTrue(values.values().stream().anyMatch(v -> String.valueOf(v).contains("模型回复解析失败")));
+            verify(deriveService, times(1)).dispatchValidation(CONN_ID, TENANT, "n", null);
+        }
+
+        @Test
+        @DisplayName("★ 跑的过程中输入变了（比如又重新生成了语义层）：收尾记开始时的指纹，定时对账才会补跑")
+        void 运行中输入变了() {
+            String before = service.fingerprint(CONN_ID);
+            when(discovery.discover(eq(CONN_ID), any())).thenAnswer(inv -> {
+                // 关系发现跑着的时候，别处改了输入；那次触发抢不到认领，只派了核对，要靠定时对账补跑。
+                when(schemaMapper.selectMaps(any())).thenReturn(List.of(
+                        Map.of("object_name", "t_order", "content_hash", "h2", "uk", "[]")));
+                return new SemanticRelationDiscovery.Result(0, 1, 0, 0, true, "pass-1", null,
+                        new ConnectorSemanticService.DiscoveryWrite(1, 0, 0, 0, 0, List.of("T_ORDER")));
+            });
+
+            service.onRequest(SemanticEnrichmentRequest.afterDerive(CONN_ID, TENANT, "n"));
+
+            Map<String, Object> values = released();
+            assertTrue(values.containsValue(before), "记开始时的输入指纹");
+            assertFalse(values.containsValue(service.fingerprint(CONN_ID)), "记跑完时的会把运行中的变化吞掉");
+        }
+
+        @Test
+        @DisplayName("★ 关系发现抛错：记 FAILED，触发方原本要派发的采样核对照样派出去")
+        void 关系发现抛错() {
+            when(discovery.discover(eq(CONN_ID), any())).thenThrow(new IllegalStateException("Lock wait timeout exceeded"));
+
+            service.onRequest(SemanticEnrichmentRequest.afterDerive(CONN_ID, TENANT, "推导完成"));
+
+            verify(deriveService, times(1)).dispatchValidation(CONN_ID, TENANT, "推导完成", null);
+            verify(generator, never()).generate(any(), any());
+            assertTrue(released().containsValue(ConnectorEnrichmentState.STATUS_FAILED));
+        }
+
+        @Test
+        @DisplayName("开头读输入指纹就抛错：照样放掉认领、记 FAILED，原本要派发的采样核对照样派出去")
+        void 指纹读失败() {
+            when(schemaMapper.selectMaps(any())).thenThrow(new IllegalStateException("Invalid JSON text"));
+
+            service.onRequest(SemanticEnrichmentRequest.afterAddedDerive(CONN_ID, TENANT, "n", Set.of("t_refund")));
+
+            verify(deriveService, times(1)).dispatchValidation(CONN_ID, TENANT, "n", Set.of("t_refund"));
+            verify(discovery, never()).discover(any(), any());
+            assertTrue(released().containsValue(ConnectorEnrichmentState.STATUS_FAILED));
         }
 
         @Test
@@ -381,6 +427,23 @@ class SemanticEnrichmentServiceTest {
             when(stateMapper.selectList(any())).thenReturn(List.of());
             assertEquals(CONN_ID, service.reconcileOnce());
             verify(discovery, never()).discover(eq(8L), any());
+        }
+
+        @Test
+        @DisplayName("★ 一条连接判断时抛错：跳过它，排在后面的连接照常派发（别让一个坏连接卡住所有租户）")
+        void 一条出错不挡后面() {
+            when(connectionMapper.selectList(any())).thenReturn(List.of(connection(CONN_ID), connection(8L)));
+            stateIs("READY", "old", NOW.minusSeconds(3600), null);
+            when(schemaMapper.selectMaps(any())).thenAnswer(inv -> {
+                QueryWrapper<?> w = inv.getArgument(0);
+                w.getSqlSegment(); // 条件里的参数在生成 SQL 片段时才填进去
+                if (w.getParamNameValuePairs().containsValue(CONN_ID)) {
+                    throw new IllegalStateException("Invalid JSON text");
+                }
+                return List.of(Map.of("object_name", "t_order", "content_hash", "h1", "uk", "[]"));
+            });
+
+            assertEquals(8L, service.reconcileOnce());
         }
     }
 

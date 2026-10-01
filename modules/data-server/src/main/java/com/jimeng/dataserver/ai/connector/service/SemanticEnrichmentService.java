@@ -155,31 +155,56 @@ public class SemanticEnrichmentService {
             return;
         }
         Claim claim = new Claim(state.getId(), claimedAt);
-        String before = fingerprint(connectorId);
+        String before = null;
         String passFingerprint = state.getRelationPassFingerprint();
         String relationNote = null;
         String viewNote = null;
+        boolean validationDispatched = false;
         try {
+            // 收尾记的是这一刻的输入指纹，不是跑完时的：跑的过程中别处落下的改动（又重新生成了语义层、刷新了结构、
+            // 业务方改了终点）那次触发抢不到认领，只能靠定时对账发现变化再补跑，跑完时的指纹会把它们一并吞掉。
+            // 代价是这一轮自己写下的关系也算「变化」，紧跟着会多一轮空跑：那一轮模型指纹没变、不问模型，业务文字也没有缺的。
+            before = fingerprint(connectorId);
             SemanticRelationDiscovery.Result rel = discovery.discover(connectorId, passFingerprint);
             relationNote = rel.note();
             passFingerprint = rel.passFingerprint();
             dispatchValidation(request, rel.write().touchedObjects());
+            validationDispatched = true;
             heartbeat(claim);
             BusinessViewGenerator.Result view = generator.generate(connectorId, () -> heartbeat(claim));
             viewNote = view.note();
             String status = rel.modelError() == null
                     ? ConnectorEnrichmentState.STATUS_READY : ConnectorEnrichmentState.STATUS_FAILED;
-            release(claim, status, fingerprint(connectorId), passFingerprint, relationNote, viewNote);
+            release(claim, status, before, passFingerprint, relationNote, viewNote);
             log.info("补全链完成 connectorId={} 触发={} 结果={}；关系：{}；业务文字：{}", connectorId,
                     request.trigger(), status, relationNote, viewNote);
         } catch (ClaimLostException e) {
             log.warn("补全链的认领被别处接走了（跑得太久过了期），这一轮不写结果 connectorId={}", connectorId);
+            if (!validationDispatched) {
+                dispatchMissedValidation(request);
+            }
         } catch (Exception e) {
             String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             log.warn("补全链失败，6 小时后或输入变化时重试 connectorId={}: {}", connectorId, reason, e);
+            if (!validationDispatched) {
+                dispatchMissedValidation(request);
+            }
             release(claim, ConnectorEnrichmentState.STATUS_FAILED, before, passFingerprint,
                     relationNote != null ? relationNote : "失败：" + reason,
                     viewNote != null ? viewNote : (relationNote != null ? "失败：" + reason : null));
+        }
+    }
+
+    /**
+     * 补全链在派发采样核对之前就停下了：触发方原本要派发的核对照原样派出去。推导成功之后本来一定会派这一次，
+     * 定时对账补跑时只核对它自己动过的表，补不回来；不派的话这批关系就一直是「没验过」，和「验过都成立」在库里长得一样。
+     * 派发本身再出错只记日志，不能挡住后面的收尾（否则认领要挂满 30 分钟）。
+     */
+    private void dispatchMissedValidation(SemanticEnrichmentRequest request) {
+        try {
+            dispatchOriginalValidation(request);
+        } catch (RuntimeException e) {
+            log.warn("补全链没跑完，补派原本的采样核对也失败了 connectorId={}", request.connectorId(), e);
         }
     }
 
@@ -252,7 +277,15 @@ public class SemanticEnrichmentService {
                 continue;
             }
             SemanticEnrichmentRequest request = SemanticEnrichmentRequest.reconcile(c.getId(), c.getTenantId());
-            boolean dispatched = asTenant(c.getTenantId(), () -> due(c.getId(), state, now) && submit(request));
+            boolean dispatched;
+            try {
+                dispatched = asTenant(c.getTenantId(), () -> due(c.getId(), state, now) && submit(request));
+            } catch (RuntimeException e) {
+                // 一条连接出错（比如快照里有一行坏数据）只跳过它：连接按 id 升序走，往外抛的话，持续出错的那一条
+                // 会让排在它后面的所有租户的连接永远轮不到，而且没有任何提示。
+                log.warn("补全链定时对账：判断这条连接要不要补跑时出错，跳过 connectorId={}", c.getId(), e);
+                continue;
+            }
             if (dispatched) {
                 log.info("补全链定时对账：派发 connectorId={}（{}）", c.getId(),
                         state == null || state.getLastStatus() == null ? "从没跑完过" : "输入变了或失败待重试");

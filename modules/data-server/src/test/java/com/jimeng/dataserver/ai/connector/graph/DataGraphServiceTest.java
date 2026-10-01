@@ -7,6 +7,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.JimengTenantLineHandler;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemSummary;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorBusinessView;
 import com.jimeng.persistence.entity.ConnectorEnrichmentState;
@@ -48,6 +49,7 @@ class DataGraphServiceTest {
     private ConnectorSemanticMapper semanticMapper;
     private ConnectorBusinessViewMapper viewMapper;
     private ConnectorEnrichmentStateMapper stateMapper;
+    private ConnectorProperties properties;
     private DataGraphService service;
 
     @BeforeEach
@@ -64,7 +66,9 @@ class DataGraphServiceTest {
         semanticMapper = mock(ConnectorSemanticMapper.class);
         viewMapper = mock(ConnectorBusinessViewMapper.class);
         stateMapper = mock(ConnectorEnrichmentStateMapper.class);
-        service = new DataGraphService(connectionMapper, schemaMapper, semanticMapper, viewMapper, stateMapper);
+        properties = new ConnectorProperties();
+        service = new DataGraphService(connectionMapper, schemaMapper, semanticMapper, viewMapper, stateMapper,
+                properties);
     }
 
     @Test
@@ -88,7 +92,17 @@ class DataGraphServiceTest {
         assertEquals("READY", systems.get(0).getSemanticStatus());
         assertEquals(2, systems.get(0).getTableCount());
         assertFalse(systems.get(0).isTruncated());
-        assertNull(systems.get(0).getViewStatus(), "补全链从没跑过");
+        assertEquals("RUNNING", systems.get(0).getViewStatus(), "补全链从没跑过、但会来跑：页面挂「业务名称整理中」");
+    }
+
+    @Test
+    @DisplayName("★ 补全链开关关着：从没跑过的连接不会再有人来整理，整理状态为 null（页面不挂「整理中」）")
+    void 开关关着不挂整理中() {
+        properties.getSemantic().getEnrichment().setEnabled(false);
+        when(connectionMapper.selectList(any())).thenReturn(List.of(connection()));
+        when(schemaMapper.selectList(any())).thenReturn(List.of(schemaRow(7L, "BASE TABLE")));
+
+        assertNull(service.systems().get(0).getViewStatus());
     }
 
     @Test
@@ -114,19 +128,28 @@ class DataGraphServiceTest {
     }
 
     @Test
-    @DisplayName("整理状态：认领未过期为 RUNNING；过期了看上次结果；没有状态行为 null")
+    @DisplayName("★ 整理状态：认领未过期为 RUNNING；过期了看上次结果；从没跑完过时，补全链会来跑才算 RUNNING，否则为 null")
     void 整理状态() {
         ConnectorEnrichmentState running = new ConnectorEnrichmentState();
         running.setClaimAt(new Date(System.currentTimeMillis() - 60_000));
         running.setLastStatus("READY");
-        assertEquals("RUNNING", DataGraphService.viewStatus(running));
+        assertEquals("RUNNING", DataGraphService.viewStatus(running, "READY", true));
 
         ConnectorEnrichmentState stale = new ConnectorEnrichmentState();
         stale.setClaimAt(new Date(System.currentTimeMillis() - 31 * 60_000));
         stale.setLastStatus("FAILED");
-        assertEquals("FAILED", DataGraphService.viewStatus(stale));
+        assertEquals("FAILED", DataGraphService.viewStatus(stale, "READY", true));
 
-        assertNull(DataGraphService.viewStatus(null));
+        // 从没跑完过：没有状态行，或者有一轮跑到一半认领过期了、还没有结果。
+        ConnectorEnrichmentState unfinished = new ConnectorEnrichmentState();
+        unfinished.setClaimAt(new Date(System.currentTimeMillis() - 31 * 60_000));
+        assertEquals("RUNNING", DataGraphService.viewStatus(null, "READY", true), "语义层已生成：定时对账会来补跑");
+        assertEquals("RUNNING", DataGraphService.viewStatus(null, "RUNNING", true), "语义层正在生成：生成完就会跑");
+        assertEquals("RUNNING", DataGraphService.viewStatus(unfinished, "READY", true));
+        assertNull(DataGraphService.viewStatus(null, "FAILED", true), "语义层没生成成功：补全链不会来跑");
+        assertNull(DataGraphService.viewStatus(null, null, true));
+        assertNull(DataGraphService.viewStatus(null, "READY", false), "补全链开关关着");
+        assertNull(DataGraphService.viewStatus(unfinished, "READY", false));
     }
 
     @Test

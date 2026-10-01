@@ -219,6 +219,13 @@ public class SemanticRelationDiscovery {
                 if (confidence == null || confidence < MIN_MODEL_CONFIDENCE) {
                     continue;
                 }
+                // 依据只收 NAME / COMMENT（spec §5.3）。这一遍模型没看过任何数据，写 DATA 就是编的：Agent 会读到
+                // 「依据：库里的数据」，推导合并时它还会压住依据更弱的关系。GUESS、没写、写了别的，一律不收。
+                String evidence = SemanticRowAssembler.evidence(m, ConnectorSemanticService.EV_GUESS);
+                if (!ConnectorSemanticService.EV_NAME.equals(evidence)
+                        && !ConnectorSemanticService.EV_COMMENT.equals(evidence)) {
+                    continue;
+                }
                 out.add(m);
             }
         }

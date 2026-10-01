@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.MybatisConfiguration;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorBusinessView;
 import com.jimeng.persistence.entity.ConnectorEnrichmentState;
@@ -79,7 +80,7 @@ class DataGraphPerformanceTest {
         when(semanticMapper.selectList(any())).thenReturn(joins);
         when(viewMapper.selectList(any())).thenReturn(views);
         DataGraphService service = new DataGraphService(connectionMapper, schemaMapper, semanticMapper, viewMapper,
-                stateMapper);
+                stateMapper, new ConnectorProperties());
 
         for (int i = 0; i < 5; i++) {
             CommonUtil.getObjectMapper().writeValueAsString(service.system("7"));

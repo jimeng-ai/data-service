@@ -129,10 +129,25 @@ class SemanticRelationDiscoveryTest {
         assertEquals(RelationCandidates.ORIGIN_RELATION_PASS, detail(model).get("origin"));
         assertEquals(ConnectorSemanticService.V_NONE, model.getVerified());
         assertEquals(1, result.nameRuleCandidates());
-        assertEquals(3, result.modelProposed(), "越界的那一条在进组装之前就丢了");
+        assertEquals(2, result.modelProposed(), "越界的、依据不是 NAME / COMMENT 的在进组装之前就丢了");
         assertEquals(1, result.modelAccepted());
         assertTrue(result.modelAsked());
         assertNotNull(result.passFingerprint());
+    }
+
+    @Test
+    @DisplayName("★ 依据只收 NAME / COMMENT：模型这一遍没看过任何数据，写 DATA 就是编的")
+    void 依据只收命名和注释() {
+        modelReplies(
+                join("T_ORDER_DTL", "SOID", "T_ORDER_HEAD", "OID", "DATA"),
+                join("T_ORDER_DTL", "POID", "T_ORDER_HEAD", "OID", "COMMENT"));
+
+        SemanticRelationDiscovery.Result result = discovery.discover(CONN_ID, null);
+
+        List<String> columns = written().stream().map(ConnectorSemantic::getFieldName).toList();
+        assertFalse(columns.contains("SOID"), "DATA 依据不收：它会让 Agent 以为这条关系有数据支撑");
+        assertTrue(columns.contains("POID"));
+        assertEquals(1, result.modelAccepted());
     }
 
     @Test

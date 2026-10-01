@@ -6,6 +6,8 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemSummary;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableDetail;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticDeriveService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorBusinessView;
@@ -46,6 +48,7 @@ public class DataGraphService {
     private final ConnectorSemanticMapper semanticMapper;
     private final ConnectorBusinessViewMapper viewMapper;
     private final ConnectorEnrichmentStateMapper stateMapper;
+    private final ConnectorProperties properties;
 
     /** 只列出结构快照里至少有一个 TABLE / VIEW 的连接，按连接 id 升序。 */
     public List<SystemSummary> systems() {
@@ -74,7 +77,7 @@ public class DataGraphService {
                 out.add(new SystemSummary(String.valueOf(c.getId()), c.getName(), c.getDisplayName(), c.getKind(),
                         c.getStatus(), c.getSemanticStatus(), tables,
                         DataGraphProjector.truncated(snapshotCounts.getOrDefault(c.getId(), 0)),
-                        viewStatus(states.get(c.getId()))));
+                        viewStatus(states.get(c.getId()), c.getSemanticStatus(), enrichmentOn())));
             }
         }
         return out;
@@ -83,7 +86,8 @@ public class DataGraphService {
     public SystemGraph system(String connectorId) {
         Connection connection = requireConnection(connectorId);
         Long id = connection.getId();
-        return DataGraphProjector.system(connection, schemas(id), joins(id), views(id), viewStatus(state(id)));
+        return DataGraphProjector.system(connection, schemas(id), joins(id), views(id),
+                viewStatus(state(id), connection.getSemanticStatus(), enrichmentOn()));
     }
 
     public TableDetail table(String connectorId, String name) {
@@ -100,17 +104,30 @@ public class DataGraphService {
     }
 
     /**
-     * 业务文字的整理状态：认领还没过期 = {@code RUNNING}；否则是上次结果 {@code READY} / {@code FAILED}；从没跑过为 {@code null}。
+     * 业务文字的整理状态，只用来决定页面挂不挂「业务名称整理中」（设计文档 §6.3、§7.2）：
+     * 认领还没过期 = {@code RUNNING}；否则是上次结果 {@code READY} / {@code FAILED}；
+     * 从没跑完过时，补全链会来跑（开关开着，语义层已生成或正在生成）也算 {@code RUNNING}，不会来跑为 {@code null}。
+     *
+     * <p>「从没跑过」不等于「马上就会跑」：开关关着（上线后回滚的手段），或者语义层没生成成功（定时对账只挑 READY 的连接，
+     * 推导失败的要等下次推导成功才会被触发），补全链都不会来。把这些也报成「在整理」，页面上的提示就会一直挂着。
      */
-    static String viewStatus(ConnectorEnrichmentState state) {
-        if (state == null) {
-            return null;
+    static String viewStatus(ConnectorEnrichmentState state, String semanticStatus, boolean enrichmentOn) {
+        if (state != null) {
+            Date claim = state.getClaimAt();
+            if (claim != null && claim.getTime() > System.currentTimeMillis() - CLAIM_STALE.toMillis()) {
+                return VIEW_RUNNING;
+            }
+            if (state.getLastStatus() != null) {
+                return state.getLastStatus();
+            }
         }
-        Date claim = state.getClaimAt();
-        if (claim != null && claim.getTime() > System.currentTimeMillis() - CLAIM_STALE.toMillis()) {
-            return VIEW_RUNNING;
-        }
-        return state.getLastStatus();
+        boolean pending = enrichmentOn && (ConnectorSemanticDeriveService.SEM_READY.equals(semanticStatus)
+                || ConnectorSemanticDeriveService.SEM_RUNNING.equals(semanticStatus));
+        return pending ? VIEW_RUNNING : null;
+    }
+
+    private boolean enrichmentOn() {
+        return properties.getSemantic().getEnrichment().isEnabled();
     }
 
     private Connection requireConnection(String connectorId) {
