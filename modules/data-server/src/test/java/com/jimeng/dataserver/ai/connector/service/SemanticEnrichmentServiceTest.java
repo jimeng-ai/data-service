@@ -421,6 +421,14 @@ class SemanticEnrichmentServiceTest {
         }
 
         @Test
+        @DisplayName("认领过期了（上一轮跑到一半挂了、30 分钟没续期）：照常接手派发")
+        void 认领过期接手() {
+            stateIs(null, null, null, NOW.minusSeconds(31 * 60));
+            assertEquals(CONN_ID, service.reconcileOnce());
+            verify(discovery).discover(eq(CONN_ID), any());
+        }
+
+        @Test
         @DisplayName("每一轮最多派发一个连接")
         void 一次一个() {
             when(connectionMapper.selectList(any())).thenReturn(List.of(connection(CONN_ID), connection(8L)));
