@@ -15,6 +15,8 @@ mvn -pl modules/data-server test -Dtest=JwtSecretProviderTest          # single 
 mvn -pl modules/data-server test -Dtest=AgentSkillVisibilityTest#emptyMeansNothingBound   # single method
 ```
 
+**Release = push a version tag.** `deploy.yml` runs only for a pushed `vX.Y.Z` tag on `main`; pushing `main` does not deploy. Release with `node scripts/release.mjs <1.2.3 | major | minor | patch>` from a clean `main` that equals `origin/main` — it runs the gate in `release.json` (`mvn -o` install + the data-server tests), pushes the tag (= deploy), writes the GitHub Release and waits for the run. Roll back by re-running the previous tag from Actions → Deploy → Run workflow. When a release needs DDL or Nacos changes, run them first and pass the notes with `--notes-file`.
+
 **Run `mvn install -DskipTests` before `mvn -pl ... test`** when you changed `common/*`: `-pl` without `-am` resolves the commons from the local repo, so a stale jar silently hides your change.
 
 Two runnable Spring Boot apps: `GatewayApplication` (gateway) and `DataServerApplication` (modules/data-server). **Note:** the README still describes a separate `sys-server` module — it does not exist. All business + admin + AI logic now lives inside `data-server`; `sys-server` capabilities were absorbed into its `admin` package. Trust the code over the README.

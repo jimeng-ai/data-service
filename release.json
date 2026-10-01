@@ -1,0 +1,7 @@
+{
+  "name": "data-service",
+  "gate": [
+    "mvn -q -B -o -DskipTests install",
+    "mvn -q -B -o -pl modules/data-server test"
+  ]
+}
