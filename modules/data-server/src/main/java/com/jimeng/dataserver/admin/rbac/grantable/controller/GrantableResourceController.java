@@ -57,7 +57,8 @@ public class GrantableResourceController {
         return List.of(
                 new ModuleOption(PlatformConstant.MODULE_AGENT, "智能体"),
                 new ModuleOption(PlatformConstant.MODULE_KB, "知识库"),
-                new ModuleOption(PlatformConstant.MODULE_CHAT, "对话")
+                new ModuleOption(PlatformConstant.MODULE_CHAT, "对话"),
+                new ModuleOption(PlatformConstant.MODULE_DATA_GRAPH, "数据星图")
         );
     }
 }

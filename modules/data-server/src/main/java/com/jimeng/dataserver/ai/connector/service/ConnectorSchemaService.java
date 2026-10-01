@@ -98,8 +98,11 @@ public class ConnectorSchemaService {
      * 目录<b>列出</b>的对象（最多 500）比这里<b>描述</b>的多。一张表的行数估算跨过一个数量级，就可能从第 200 名
      * 掉到第 201 名——它只是这次没被描述，不是被删了。漂移判定因此按四种处境走
      * （{@link ConnectorSemanticService.Presence}）：只有「确定不在了」才算 REMOVED。
+     *
+     * <p>{@code public}：语义层（{@code ConnectorSemanticDeriveService.SCHEMA_SNAPSHOT_CAP}）和数据星图都要说出「快照截断了」，
+     * 这个数只在这里写一次。
      */
-    private static final int MAX_OBJECTS = 200;
+    public static final int MAX_OBJECTS = 200;
 
     /**
      * 「这张表有没有行」整批探测的挂钟预算（毫秒）。见 {@link #probeRowPresenceQuietly}。

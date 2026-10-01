@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.connector.generation.consistency;
 
 import com.jimeng.dataserver.ai.connector.generation.SemanticTableRenderer;
 import com.jimeng.dataserver.ai.connector.model.FieldDetail;
+import com.jimeng.dataserver.ai.connector.model.RowEstimateNote;
 import com.jimeng.dataserver.ai.connector.service.SemanticJoinValidator;
 import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.persistence.entity.ConnectorSchema;
@@ -10,7 +11,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Pattern;
 
 /**
  * 一致性规则看得到的只读上下文（设计文档 7.9）。全部来自<b>同一份</b>结构快照和平台自己的库，不碰客户库、不含任何数据值。
@@ -32,14 +32,6 @@ public record RuleContext(String table,
                           Map<String, String> objectComments,
                           Set<String> answeredTerms,
                           List<ProposedEntry> submission) {
-
-    /**
-     * MySQL 连接器把 {@code TABLE_ROWS} 估算值追加在表注释末尾（{@code MySqlSession} 列目录那一段，
-     * 原文「（约 N 行，InnoDB 估算值，不可当作准确计数）」）。这段是<b>平台</b>写的，不是客户的注释：
-     * 不去掉它，一张没写注释的表会被当成「有注释」，evidence=COMMENT 的判定就失效了。
-     * 这里不 import 连接器实现（语义层不该依赖某一个连接器），按文案形状匹配，改那边的措辞要同步这里。
-     */
-    private static final Pattern ROW_ESTIMATE_SUFFIX = Pattern.compile("\\s*（约\\s*\\d+\\s*行，InnoDB\\s*估算值[^）]*）\\s*$");
 
     /** 从快照行装出上下文。四张 Map 都保持快照顺序。 */
     public static RuleContext of(String table, List<ConnectorSchema> snapshot, Set<String> answeredTerms,
@@ -84,14 +76,12 @@ public record RuleContext(String table,
         return own != null ? own : table;
     }
 
-    /** 表注释，去掉平台追加的估算行数；没有注释为 {@code null}。 */
+    /**
+     * 表注释，去掉平台追加的估算行数（{@link RowEstimateNote}）；没有注释为 {@code null}。
+     * 不去掉它，一张没写注释的表会被当成「有注释」，evidence=COMMENT 的判定就失效了。
+     */
     public String objectCommentOf(String object) {
-        String c = object == null ? null : objectComments.get(object);
-        if (c == null) {
-            return null;
-        }
-        String stripped = ROW_ESTIMATE_SUFFIX.matcher(c).replaceFirst("").trim();
-        return stripped.isEmpty() ? null : stripped;
+        return RowEstimateNote.strip(object == null ? null : objectComments.get(object));
     }
 
     /** 唯一键文本，三态之一；快照里没有这张表时按「未知」说。 */

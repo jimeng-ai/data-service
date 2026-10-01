@@ -101,6 +101,18 @@ public class PermissionResolver {
         throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "无权访问该资源");
     }
 
+    /**
+     * 断言当前账号可进入某模块（超管恒通过），否则抛 4001。
+     *
+     * <p>给<b>没有实例授权</b>、只能按模块把关的功能用（数据星图）。智能体 / 知识库 / 对话三个模块在后端靠实例授权把关，
+     * 模块本身只在前端拦；这类功能没有实例可授，不在这里查，后端就等于没有门。
+     */
+    public void assertCurrentModule(String moduleCode, String deniedMessage) {
+        if (!resolveCurrent().canEnter(moduleCode)) {
+            throw new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, deniedMessage);
+        }
+    }
+
     /** 某实例的 create_user 是否等于当前账号（按类型查对应表；表均在租户白名单内，跨租户查不到）。 */
     private boolean isOwnedByCurrent(ResourceType type, Long id) {
         if (id == null) {

@@ -25,8 +25,10 @@ public final class PlatformConstant {
     public static final String MODULE_AGENT = "AGENT_MODULE";
     public static final String MODULE_KB = "KB_MODULE";
     public static final String MODULE_CHAT = "CHAT_MODULE";
+    /** 数据星图。它没有实例授权，后端靠 {@code PermissionResolver.assertCurrentModule} 按模块把关。 */
+    public static final String MODULE_DATA_GRAPH = "DATA_GRAPH_MODULE";
 
     /** 全部可授权模块码。 */
     public static final List<String> ALL_MODULES =
-            Arrays.asList(MODULE_AGENT, MODULE_KB, MODULE_CHAT);
+            Arrays.asList(MODULE_AGENT, MODULE_KB, MODULE_CHAT, MODULE_DATA_GRAPH);
 }

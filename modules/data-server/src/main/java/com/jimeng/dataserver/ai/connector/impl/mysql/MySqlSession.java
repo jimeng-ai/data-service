@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
+import com.jimeng.dataserver.ai.connector.model.RowEstimateNote;
 import com.jimeng.dataserver.ai.connector.model.WritePlan;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
@@ -385,6 +386,26 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
     static final String UNIQUE_KEYS_SQL =
             "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS "
                     + "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0";
+
+    /**
+     * {@link ObjectDetail#extra()} 里存声明外键的键名（数据星图 v3 §5.2）。
+     *
+     * <p>与语义层读取方 {@code RelationCandidates.EXTRA_FOREIGN_KEYS} <b>刻意同名</b>，由单测钉住；不互相 import 的理由同
+     * {@link #EXTRA_UNIQUE_KEYS}。它和唯一键性质相同：刷新结构后才会有，不进 {@code content_hash}，不会引起漂移。
+     */
+    static final String EXTRA_FOREIGN_KEYS = "foreign_keys";
+
+    /**
+     * 一张表声明的外键，只看<b>同库</b>的（被引用表在别的库里时，快照里也没有它，连不上）。
+     *
+     * <p>两个库名条件都写上：只写 {@code TABLE_SCHEMA} 语义上也够，但 5.7 一系的 information_schema 靠常量条件决定只打开哪张表的定义，
+     * 条件越全越省。不在 SQL 里排序，理由同 {@link #UNIQUE_KEYS_SQL}。
+     */
+    static final String FOREIGN_KEYS_SQL =
+            "SELECT CONSTRAINT_NAME, ORDINAL_POSITION, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+                    + "FROM information_schema.KEY_COLUMN_USAGE "
+                    + "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_SCHEMA = ? "
+                    + "AND REFERENCED_TABLE_NAME IS NOT NULL";
 
     /** 只读探针用的表名。刻意取一个不可能与客户业务表重名的名字。 */
     private static final String PROBE_TABLE = "__jm_readonly_probe__";
@@ -988,12 +1009,9 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                     // TABLE_ROWS 对 InnoDB 是估算值，差几倍很常见。附上「约」字，
                     // 免得模型把它当成 COUNT(*) 的答案直接回给用户。
                     // 未知（null）和 0 都不写行数：前者没数可写，后者可能只是没统计过，
-                    // 写「约 0 行」会让模型断言这张表是空的。
-                    String withRows = (comment == null || comment.isBlank() ? "" : comment)
-                            + (rows != null && rows > 0
-                            ? "（约 " + rows + " 行，InnoDB 估算值，不可当作准确计数）" : "");
+                    // 写「约 0 行」会让模型断言这张表是空的。文案与剥离规则只在 RowEstimateNote 一处。
                     CatalogEntry entry = new CatalogEntry(rs.getString("TABLE_NAME"),
-                            rs.getString("TABLE_TYPE"), withRows.isBlank() ? null : withRows);
+                            rs.getString("TABLE_TYPE"), RowEstimateNote.append(comment, rows));
                     // REF_N 在新 SQL 里已经 COALESCE 成 0，不会是 NULL；不声明外键的库每一行都是 0。
                     // 兜底 SQL 根本没有这一列，不能去读它（读一个不存在的列在 JDBC 里是 SQLException）。
                     ranked.add(withRefs
@@ -1317,8 +1335,9 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                 throw ConnectorException.of(ConnectorErrorCode.NOT_FOUND,
                         "库中不存在名为「" + name + "」的表，或当前账号看不到它。请先用 conn_catalog 确认表名");
             }
-            // 唯一键放在列之后查：表不存在时不必多打一条。
+            // 唯一键、外键放在列之后查：表不存在时不必多打两条。
             List<UniqueKey> keys = uniqueKeys(c, name);
+            List<ForeignKey> foreignKeys = foreignKeys(c, name);
             List<FieldDetail> fields = new ArrayList<>(raw.size());
             for (RawColumn r : raw) {
                 fields.add(new FieldDetail(r.name(), r.type(), r.nullable(), r.comment(), fieldExtra(r, keys)));
@@ -1330,6 +1349,10 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
                 // ★ 读不到就不放这个键，而不是放一个空列表：空列表的意思是「这张表确实没有唯一键」，
                 //   语义层会据此认定目标列不属于任何组合键。「不知道」和「没有」必须分得开。
                 extra.put(EXTRA_UNIQUE_KEYS, uniqueKeysExtra(keys));
+            }
+            if (foreignKeys != null) {
+                // 同一条纪律：读不到就不放，空列表只表示「这张表确实没声明外键」。
+                extra.put(EXTRA_FOREIGN_KEYS, foreignKeysExtra(foreignKeys));
             }
             return new ObjectDetail(name, "TABLE", null, fields, extra);
         } catch (SQLException e) {
@@ -1453,6 +1476,77 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
             return "组合键成员，单独这一列可能重复";
         }
         return "组合键成员（" + cols + "），单独这一列可能重复";
+    }
+
+    /** {@link #FOREIGN_KEYS_SQL} 的一行。 */
+    record FkPart(String constraint, int seq, String column, String refTable, String refColumn) {}
+
+    /** 一条声明外键，列与被引用列按 {@code ORDINAL_POSITION} 一一对应。 */
+    record ForeignKey(String name, List<String> columns, String refTable, List<String> refColumns) {}
+
+    /**
+     * 读一张表声明的外键。
+     *
+     * @return 按约束名排序；{@code null} = <b>没读到</b>（不是「没有外键」）。Doris / StarRocks 这类自己实现
+     *         information_schema 的引擎可能根本没有这张视图，读不到不让整次 describe 失败。
+     */
+    private List<ForeignKey> foreignKeys(Connection c, String table) {
+        try (PreparedStatement ps = c.prepareStatement(FOREIGN_KEYS_SQL)) {
+            ps.setQueryTimeout(10);
+            ps.setString(1, database);
+            ps.setString(2, table);
+            ps.setString(3, database);
+            List<FkPart> parts = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    parts.add(new FkPart(rs.getString("CONSTRAINT_NAME"), rs.getInt("ORDINAL_POSITION"),
+                            rs.getString("COLUMN_NAME"), rs.getString("REFERENCED_TABLE_NAME"),
+                            rs.getString("REFERENCED_COLUMN_NAME")));
+                }
+            }
+            return groupForeignKeys(parts);
+        } catch (SQLException e) {
+            log.warn("读取外键失败，本表按「外键未知」处理 connectorId={} errorCode={} sqlState={}",
+                    instance.id(), e.getErrorCode(), e.getSQLState(), e);
+            return null;
+        }
+    }
+
+    /** KEY_COLUMN_USAGE 的行 → 外键列表。缺列名、缺被引用表或被引用列的约束<b>整条丢掉</b>：半截外键会连错。 */
+    static List<ForeignKey> groupForeignKeys(List<FkPart> parts) {
+        Map<String, List<FkPart>> byConstraint = new LinkedHashMap<>();
+        for (FkPart p : parts) {
+            if (p == null || p.constraint() == null) {
+                continue;
+            }
+            byConstraint.computeIfAbsent(p.constraint(), k -> new ArrayList<>()).add(p);
+        }
+        List<ForeignKey> out = new ArrayList<>(byConstraint.size());
+        for (Map.Entry<String, List<FkPart>> e : byConstraint.entrySet()) {
+            List<FkPart> ps = new ArrayList<>(e.getValue());
+            if (ps.stream().anyMatch(p -> p.column() == null || p.refTable() == null || p.refColumn() == null)) {
+                continue;
+            }
+            ps.sort(Comparator.comparingInt(FkPart::seq));
+            out.add(new ForeignKey(e.getKey(), ps.stream().map(FkPart::column).toList(), ps.get(0).refTable(),
+                    ps.stream().map(FkPart::refColumn).toList()));
+        }
+        out.sort(Comparator.comparing(ForeignKey::name));
+        return out;
+    }
+
+    /** 放进 {@link ObjectDetail#extra()} 的形状，同 {@link #uniqueKeysExtra}。 */
+    private static List<Map<String, Object>> foreignKeysExtra(List<ForeignKey> keys) {
+        List<Map<String, Object>> out = new ArrayList<>(keys.size());
+        for (ForeignKey k : keys) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", k.name());
+            m.put("columns", k.columns());
+            m.put("ref_table", k.refTable());
+            m.put("ref_columns", k.refColumns());
+            out.add(m);
+        }
+        return out;
     }
 
     /** 放进 {@link ObjectDetail#extra()} 的形状。显式拼 Map：jackson 2.11 序列化不了 record。 */

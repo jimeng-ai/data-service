@@ -225,6 +225,24 @@ class ConnectorSemanticAddedDeriveTest {
             verify(semanticStageExecutor).execute(any(Runnable.class));
         }
 
+        @Test
+        @DisplayName("★ 补全链开着：增量补写成功后发事件，原本要核对的这批表随事件带过去")
+        void handsOverScopedValidationToEnrichmentChain() {
+            modelOutputs(MODEL_OUTPUT);
+            org.springframework.context.ApplicationEventPublisher publisher =
+                    mock(org.springframework.context.ApplicationEventPublisher.class);
+            service.setApplicationEventPublisher(publisher);
+
+            service.deriveAdded(CONNECTOR_ID, Set.of("t_refund"));
+
+            ArgumentCaptor<Object> event = ArgumentCaptor.forClass(Object.class);
+            verify(publisher).publishEvent(event.capture());
+            SemanticEnrichmentRequest request = (SemanticEnrichmentRequest) event.getValue();
+            assertEquals(SemanticEnrichmentRequest.Trigger.DERIVE_ADDED, request.trigger());
+            assertEquals(Set.of("t_refund"), request.validationScope());
+            verify(semanticStageExecutor, never()).execute(any(Runnable.class));
+        }
+
         /** 增量与全量共用 sendToModel：同样必须是不带工具的内部调用、同样带夹紧后的超时。 */
         @Test
         @DisplayName("★ 增量推导同样走 messagesInternal 并带上超时，不走 messages")

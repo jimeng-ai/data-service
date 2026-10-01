@@ -400,6 +400,46 @@ class ConnectorSemanticStageWiringTest {
         }
 
         @Test
+        @DisplayName("★ 补全链开着：推导成功后把后续交给补全链（发事件，由它派发采样核对），这里不直接派发")
+        void handsOverToEnrichmentChain() {
+            defaultSnapshot();
+            modelOutputs("{\"objects\":[{\"name\":\"orders\",\"gloss\":\"订单主表\",\"evidence\":\"NAME\"}]}");
+            when(semanticService.all(CONNECTOR_ID)).thenReturn(List.of());
+            org.springframework.context.ApplicationEventPublisher publisher =
+                    mock(org.springframework.context.ApplicationEventPublisher.class);
+            service.setApplicationEventPublisher(publisher);
+
+            ConnectorSemanticDeriveService.DeriveResult r = service.derive(CONNECTOR_ID);
+
+            ArgumentCaptor<Object> event = ArgumentCaptor.forClass(Object.class);
+            verify(publisher).publishEvent(event.capture());
+            SemanticEnrichmentRequest request = (SemanticEnrichmentRequest) event.getValue();
+            assertEquals(SemanticEnrichmentRequest.Trigger.DERIVE, request.trigger());
+            assertEquals(TENANT, request.tenantId());
+            assertNull(request.validationScope(), "整体推导原本要核对全部表");
+            assertEquals(r.getNote(), request.deriveNote());
+            verify(semanticStageExecutor, never()).execute(any(Runnable.class));
+        }
+
+        @Test
+        @DisplayName("补全链关着：推导成功后照旧直接派发采样核对，不发事件")
+        void enrichmentDisabledDispatchesDirectly() {
+            defaultSnapshot();
+            modelOutputs("{\"objects\":[{\"name\":\"orders\",\"gloss\":\"订单主表\",\"evidence\":\"NAME\"}]}");
+            when(semanticService.all(CONNECTOR_ID)).thenReturn(List.of());
+            org.springframework.context.ApplicationEventPublisher publisher =
+                    mock(org.springframework.context.ApplicationEventPublisher.class);
+            service.setApplicationEventPublisher(publisher);
+            ((ConnectorProperties) org.springframework.test.util.ReflectionTestUtils.getField(service, "properties"))
+                    .getSemantic().getEnrichment().setEnabled(false);
+
+            assertTrue(service.derive(CONNECTOR_ID).isOk());
+
+            verify(publisher, never()).publishEvent(any(Object.class));
+            verify(semanticStageExecutor).execute(any(Runnable.class));
+        }
+
+        @Test
         @DisplayName("推导失败就不派发：没有说明书可验")
         void notDispatchedWhenDeriveFails() {
             when(schemaService.currentRows(CONNECTOR_ID)).thenReturn(List.of());

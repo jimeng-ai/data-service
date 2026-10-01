@@ -572,6 +572,150 @@ public class ConnectorSemanticService {
     }
 
     /**
+     * 关系发现写 JOIN 行（数据星图设计 v3 §5.4）。逐列处理，<b>只动 JOIN 行</b>：
+     *
+     * <pre>
+     * 这一列现有的 JOIN 行                                    外键 / 命名规则的候选   模型那一遍的候选
+     * 没有                                                    新增                   新增
+     * HUMAN / IMPORTED，或带业务方结论                        不动                   不动
+     * 推断的行，已核对通过（verified=CONFIRMED）              不动                   不动
+     * 推断的行，终点不是单列唯一键（或已不在快照里）、未核对通过  替换                   不动
+     * 其余                                                    不动                   不动
+     * </pre>
+     *
+     * <h3>为什么要能替换</h3>
+     * 语义层每一列只能有一条关系（唯一键决定）。一条指向兄弟明细表同名列的推断占着这一列，只补空缺的话，
+     * 指向主数据主键的那条对的关系永远写不进去。能替换的只限「终点不是唯一键、也没核对通过」的推断：
+     * 它在星图上本来就画不出来，对 Agent 也只是一句没有依据的猜测；而替换它的候选来自客户声明的外键或确定性的命名规则。
+     * 模型那一遍的候选不替换任何东西——两次模型判断之间没有谁比谁更可信。
+     *
+     * <p>替换走和 {@link #upsertInferred} 一样的写回纪律（{@link #unchangedSince}）：读与写之间被人确认、刚落了核对结论的行不覆盖。
+     *
+     * @param rows                已经过 {@link SemanticRowAssembler} 过滤的 JOIN 行，{@code detail_json.origin} 标着来源
+     * @param singleUniqueColumns 快照里每张表的单列唯一键，表名、列名都按 {@link SemanticRowAssembler#fold} 折叠；
+     *                            表不在里面 = 终点已不在快照里
+     */
+    @Transactional
+    public DiscoveryWrite mergeDiscoveredJoins(Long connectorId, List<ConnectorSemantic> rows,
+                                               Map<String, Set<String>> singleUniqueColumns) {
+        Connection conn = requireOwned(connectorId);
+        Map<String, ConnectorSemantic> byKey = new HashMap<>();
+        for (ConnectorSemantic e : semanticMapper.selectList(new LambdaQueryWrapper<ConnectorSemantic>()
+                .eq(ConnectorSemantic::getConnectorId, connectorId)
+                .eq(ConnectorSemantic::getScope, SCOPE_JOIN))) {
+            byKey.putIfAbsent(uniqueKey(e), e);
+        }
+        int inserted = 0;
+        int replaced = 0;
+        int kept = 0;
+        int conflicts = 0;
+        int concurrent = 0;
+        Set<String> touched = new LinkedHashSet<>();
+        for (ConnectorSemantic r : rows == null ? List.<ConnectorSemantic>of() : rows) {
+            if (r == null || !SCOPE_JOIN.equals(r.getScope())) {
+                continue;
+            }
+            if (r.getObjectName() == null) r.setObjectName("");
+            if (r.getFieldName() == null) r.setFieldName("");
+            r.setTerm("");
+            String key = uniqueKey(r);
+            ConnectorSemantic old = byKey.get(key);
+            if (old == null) {
+                r.setId(null);
+                r.setTenantId(conn.getTenantId());
+                r.setConnectorId(connectorId);
+                r.setSource(SOURCE_INFERRED);
+                r.setStatus(ST_DRAFT);
+                r.setVerified(V_NONE);
+                try {
+                    semanticMapper.insert(r);
+                    byKey.put(key, r);
+                    inserted++;
+                    touched.add(r.getObjectName());
+                } catch (DuplicateKeyException e) {
+                    conflicts++;
+                    log.warn("关系发现写入撞唯一键，本条跳过 connectorId={} object={} field={}",
+                            connectorId, r.getObjectName(), r.getFieldName());
+                }
+                continue;
+            }
+            if (!deterministicOrigin(r) || !weakInference(old, singleUniqueColumns)) {
+                kept++;
+                continue;
+            }
+            Map<String, Object> oldD = readDetail(old);
+            Map<String, Object> newD = new LinkedHashMap<>(readDetail(r));
+            newD.put(KEY_REPLACED_TARGET, text(oldD.get(KEY_TO_OBJECT)) + "." + text(oldD.get(KEY_TO_COLUMN)));
+            String detailJson = toJson(newD);
+            if (detailJson == null) {
+                kept++;
+                continue;
+            }
+            LambdaUpdateWrapper<ConnectorSemantic> w = new LambdaUpdateWrapper<ConnectorSemantic>()
+                    .eq(ConnectorSemantic::getId, old.getId());
+            unchangedSince(w, old);
+            // 整行按候选重写：对端换了，旧对端上的核对结论、置信度、锚点一个都不再成立，所以全部显式 set（含可能为 null 的列）。
+            w.set(ConnectorSemantic::getObjectName, r.getObjectName())
+                    .set(ConnectorSemantic::getFieldName, r.getFieldName())
+                    .set(ConnectorSemantic::getGloss, r.getGloss())
+                    .set(ConnectorSemantic::getDetailJson, detailJson)
+                    .set(ConnectorSemantic::getEvidence, r.getEvidence())
+                    .set(ConnectorSemantic::getConfidence, r.getConfidence())
+                    .set(ConnectorSemantic::getAnchorKind, r.getAnchorKind())
+                    .set(ConnectorSemantic::getAnchorHash, r.getAnchorHash())
+                    .set(ConnectorSemantic::getStatus, ST_DRAFT)
+                    .set(ConnectorSemantic::getVerified, V_NONE);
+            if (semanticMapper.update(null, w) > 0) {
+                replaced++;
+                touched.add(r.getObjectName());
+                log.info("关系发现替换了一条弱推断 connectorId={} {}.{}：{} → {}.{}（来源 {}）", connectorId,
+                        r.getObjectName(), r.getFieldName(), newD.get(KEY_REPLACED_TARGET),
+                        newD.get(KEY_TO_OBJECT), newD.get(KEY_TO_COLUMN), newD.get(KEY_ORIGIN));
+            } else {
+                concurrent++;
+            }
+        }
+        return new DiscoveryWrite(inserted, replaced, kept, conflicts, concurrent, List.copyOf(touched));
+    }
+
+    /** 被替换的弱推断原来指向哪里（{@code 表.列}）。只为排查，不参与任何判定。 */
+    static final String KEY_REPLACED_TARGET = "replaced_target";
+
+    /** 候选来自客户声明的外键或确定性的命名规则（{@link RelationCandidates}），而不是模型。 */
+    private static boolean deterministicOrigin(ConnectorSemantic r) {
+        Object origin = readDetailStatic(r.getDetailJson()).get(KEY_ORIGIN);
+        return RelationCandidates.ORIGIN_FK.equals(origin) || RelationCandidates.ORIGIN_NAME_RULE.equals(origin);
+    }
+
+    /** §5.4 表里唯一可替换的那一格：推断的、没有业务方结论、未核对通过、终点不是单列唯一键（或已不在快照里）。 */
+    private boolean weakInference(ConnectorSemantic old, Map<String, Set<String>> singleUniqueColumns) {
+        if (!SOURCE_INFERRED.equals(old.getSource()) || V_CONFIRMED.equals(old.getVerified())) {
+            return false;
+        }
+        Map<String, Object> d = readDetail(old);
+        if (d.get(KEY_HUMAN_VERDICT) != null) {
+            return false;
+        }
+        Set<String> unique = singleUniqueColumns == null ? null
+                : singleUniqueColumns.get(SemanticRowAssembler.fold(text(d.get(KEY_TO_OBJECT))));
+        return unique == null || !unique.contains(SemanticRowAssembler.fold(text(d.get(KEY_TO_COLUMN))));
+    }
+
+    private static Map<String, Object> readDetailStatic(String json) {
+        Map<String, Object> m = parseDetailOrNull(json);
+        return m == null ? Map.of() : m;
+    }
+
+    /**
+     * {@link #mergeDiscoveredJoins} 的结果。
+     *
+     * @param touchedObjects 这次新增或替换了关系的起点表（原样写法）：补全链把它们交给采样核对
+     */
+    public record DiscoveryWrite(int inserted, int replaced, int kept, int conflicts, int concurrentSkips,
+                                 List<String> touchedObjects) {
+    }
+
+    /**
      * ★ 一条已有的 INFERRED 行被同键的新推断撞上时，落库的是什么。<b>这里决定证据会不会被悄悄抹掉。</b>
      *
      * <h3>为什么不能「新的一律覆盖旧的」</h3>
@@ -901,7 +1045,19 @@ public class ConnectorSemanticService {
         private String answeredBy;
         private String answeredName;
         private String traceId;
+        /**
+         * 覆盖<b>同一条关系</b>时，从旧行带过来的 detail 键（调用方这次没给的才带）。只对 JOIN 有意义：
+         * 换了对端就不带，那是另一条关系的结构。见 {@link #JOIN_STRUCTURE_KEYS}。
+         */
+        private List<String> carryOver;
     }
+
+    /**
+     * JOIN 行上采样核对落下的<b>结构</b>：关系的形态、多态关系的判别列、组合键的成员列。业务方确认一条关系，确认的是
+     * 「这两列是同一个东西」，不是「这条关系没有条件」，所以确认时这三个键跟着旧行走（数据星图设计 v3 §5.5）。
+     * 采样数字（包含率、样本数）不在其中：那是数据的结论，人的一句话不该替它背书。
+     */
+    static final List<String> JOIN_STRUCTURE_KEYS = List.of("join_kind", "discriminator_column", "composite_columns");
 
     /**
      * 写下一条人确认过的语义（任意 scope）。<b>这是全仓库唯一一条从对话写 {@code source=HUMAN} 的路。</b>
@@ -1002,7 +1158,7 @@ public class ConnectorSemanticService {
 
             // 覆盖：先把旧值留痕，再改。
             String history = appendHistory(existing, w.getAnsweredBy(), w.getAnsweredName(), w.getTraceId(), now);
-            String newDetail = overwriteDetail(existing, w.getDetail(), columns);
+            String newDetail = overwriteDetail(existing, w.getDetail(), columns, w.getCarryOver());
             String setKind = null;
             String setHash = null;
             if (w.getOnOverwrite() == HumanAnchor.SET) {
@@ -1207,6 +1363,7 @@ public class ConnectorSemanticService {
                 .anchorKind(anchorHash == null ? ANCHOR_NONE : ANCHOR_JOIN)
                 .anchorHash(anchorHash)
                 .onOverwrite(HumanAnchor.SET)
+                .carryOver(JOIN_STRUCTURE_KEYS)
                 .subject("关系「" + objectName + "." + columnName + " → " + toObject + "." + toColumn + "」")
                 .answeredBy(answeredBy)
                 .answeredName(answeredName)
@@ -1262,18 +1419,38 @@ public class ConnectorSemanticService {
      *
      * <p>三种情形刻意分开：这次给了 detail 就整份替换；没给但补了依赖列，就<b>只</b>换掉依赖列名单、
      * 其余键一个字不动（「重新确认一次口径」不等于「把我没提的那些细节清空」）；两样都没给就沿用既有的，
-     * 只去掉过期名单。
+     * 只去掉过期名单。给了 detail 又给了 {@code carryOver} 的，同一条关系上旧行的那几个键跟着走。
      */
     private String overwriteDetail(ConnectorSemantic existing, Map<String, Object> detail,
-                                   List<AnchorColumn> columns) {
+                                   List<AnchorColumn> columns, List<String> carryOver) {
         if (detail != null) {
-            return humanDetailJson(detail, columns);
+            return humanDetailJson(withCarriedOver(existing, detail, carryOver), columns);
         }
         if (!columns.isEmpty()) {
             return withAnchorColumns(withoutStaleRemoved(existing.getDetailJson(), existing.getId()),
                     existing.getId(), columns);
         }
         return withoutStaleRemoved(existing.getDetailJson(), existing.getId());
+    }
+
+    /** 见 {@link HumanWrite#carryOver}：对端没变才带，调用方这次给了的键不覆盖。 */
+    private Map<String, Object> withCarriedOver(ConnectorSemantic existing, Map<String, Object> detail,
+                                                List<String> keys) {
+        if (keys == null || keys.isEmpty()) {
+            return detail;
+        }
+        Map<String, Object> old = readDetail(existing);
+        if (!sameName(old.get(KEY_TO_OBJECT), detail.get(KEY_TO_OBJECT))
+                || !sameName(old.get(KEY_TO_COLUMN), detail.get(KEY_TO_COLUMN))) {
+            return detail;
+        }
+        Map<String, Object> merged = new LinkedHashMap<>(detail);
+        for (String k : keys) {
+            if (!merged.containsKey(k) && old.get(k) != null) {
+                merged.put(k, old.get(k));
+            }
+        }
+        return merged;
     }
 
     /** 在既有 detail 上原地换掉依赖列名单。序列化失败就原样返回——少一次 re-baseline，好过把整份 detail 写丢。 */

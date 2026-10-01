@@ -38,6 +38,17 @@ docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 d
   < modules/data-server/docs/ops-20260614-product-feedback.sql
 ```
 
+### 数据星图 v3（2026-10-01）
+
+```bash
+docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 data-server \
+  < modules/data-server/src/main/resources/db/migration/V20261001__data_graph_business_view.sql
+```
+
+新表 `connector_business_view` / `connector_enrichment_state`。漏跑的症状：应用照常 `Started`，
+数据星图接口 500（`Table ... doesn't exist`），补全链每次触发都失败、定时对账每 10 分钟报一次。
+详见 `docs/config-changes/2026-10-01-data-graph-v3.md`。
+
 跑完用下面 ⑥ 的自检脚本确认，不要凭"应该跑过了"。
 
 ## ② Nacos 配置（不配则能力静默不可用）

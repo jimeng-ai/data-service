@@ -26,6 +26,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBucket;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
@@ -113,7 +115,7 @@ import static com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler.to
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class ConnectorSemanticDeriveService {
+public class ConnectorSemanticDeriveService implements ApplicationEventPublisherAware {
 
     // ── connection.semantic_status ──
     public static final String SEM_RUNNING = "RUNNING";
@@ -131,13 +133,13 @@ public class ConnectorSemanticDeriveService {
     public static final String SEM_NOT_APPLICABLE = "NOT_APPLICABLE";
 
     /**
-     * {@code ConnectorSchemaService.MAX_OBJECTS} 的镜像（那边是 private）。
+     * 就是 {@link ConnectorSchemaService#MAX_OBJECTS}（引用它，不再各写一份）。
      *
-     * <p>为什么要在这里再写一遍这个数：快照本身就是<b>按对象名字母序截到前 200 个</b>的，字母序靠后的表
+     * <p>为什么语义层这一侧要用到这个数：快照本身就是<b>按重要性截到前 200 个</b>的，排在后面的表
      * 根本没有进过 connector_schema，于是也不会有语义、漂移检测对它们永远沉默。这件事在语义层这一侧
-     * 必须说出来——「沉默」会被管理台读成「都覆盖了」。两边的值要一起改。
+     * 必须说出来——「沉默」会被管理台读成「都覆盖了」。
      */
-    static final int SCHEMA_SNAPSHOT_CAP = 200;
+    static final int SCHEMA_SNAPSHOT_CAP = ConnectorSchemaService.MAX_OBJECTS;
 
     // GLOSS_MAX / NAME_MAX / DETAIL_TEXT_MAX / DETAIL_LIST_MAX / CARDINALITIES 连同 toRows、parseFields、renderObject 与那批小工具
     // 已原样迁到 SemanticRowAssembler（静态导入），本类只委托：语义层生成 agent 的逐表提交要走同一套过滤，两份实现迟早分叉。
@@ -316,6 +318,19 @@ public class ConnectorSemanticDeriveService {
      * （经 {@code ObjectProvider}）{@code ConnectorSchemaService}，加这条边闭合不了任何环。
      */
     private final RedissonClient redissonClient;
+
+    /**
+     * 推导写完之后把后续交给补全链的事件总线（数据星图设计 v3 §4）。
+     *
+     * <p>不走构造器注入：补全链要回调本类的 {@link #dispatchValidation} 派发采样核对，构造器互相依赖会闭合启动期的环；
+     * 事件是单向的。单测按位置构造本类时这里是 {@code null}，推导成功后照旧直接派发采样核对。
+     */
+    private ApplicationEventPublisher eventPublisher;
+
+    @Override
+    public void setApplicationEventPublisher(ApplicationEventPublisher eventPublisher) {
+        this.eventPublisher = eventPublisher;
+    }
 
     /**
      * 推导用的模型。留空即<b>不下发 model</b>，由 {@code GenericChatClient} 回落到
@@ -649,7 +664,7 @@ public class ConnectorSemanticDeriveService {
 
             // ★ 说明书【已经可用了】才派发验证阶段：READY 已经写下去，关系那一栏如实写着「未经数据验证」。
             //   验证是把那句话往前推一格，不是这份说明书能不能用的前提——所以它绝不该挂在 READY 前面。
-            dispatchValidation(connectorId, tenantOf(conn), note);
+            afterDerive(connectorId, tenantOf(conn), note, null, false);
 
             log.info("语义层推导完成 connectorId={} 写入 {} 行：表用途 {} / 字段 {} / 关系 {} / 待确认口径 {}；"
                             + "丢弃：无依据 {}、名字对不上 {}、重复 {}、超长 {}；已答过的口径跳过 {}",
@@ -1305,9 +1320,7 @@ public class ConnectorSemanticDeriveService {
             // ★ 验证只派给这次真的多出了行的表（理由见 tablesWithNewRows）。一行都没多出来就不派：
             //   按「送进过模型的表」派，一张模型写不出东西的表会每个冷却期都在客户库上重跑一遍表形态测量和列取值采集。
             Set<String> toValidate = tablesWithNewRows(scoped, existing, updatableNames, w);
-            if (!toValidate.isEmpty()) {
-                dispatchValidation(connectorId, tenantOf(conn), note, toValidate);
-            }
+            afterDerive(connectorId, tenantOf(conn), note, toValidate, true);
 
             log.info("语义层增量推导完成 connectorId={} 待补写 {} 张（其中新增 {}，本次覆盖 {}） 插入 {} 原地更新 {} "
                             + "未动人工 {} 保持原样 {} 撞键 {} 超范围丢弃 {}",
@@ -2274,7 +2287,7 @@ public class ConnectorSemanticDeriveService {
      * @param scope 只验这些表（折叠过大小写的表名）；{@code null} = 全部。
      *              增量推导传它：为 3 张新表把 200 张老表的列取值再全量采一遍，花的是客户的库。
      */
-    private void dispatchValidation(Long connectorId, String tenantId, String deriveNote, Set<String> scope) {
+    public void dispatchValidation(Long connectorId, String tenantId, String deriveNote, Set<String> scope) {
         if (!validateStageEnabled || connectorId == null) {
             return;
         }
@@ -2294,6 +2307,24 @@ public class ConnectorSemanticDeriveService {
             writeStageNote(connectorId, notePrefix(deriveNote),
                     "采样验证没有派发出去（后台队列已满），表关系仍全部是未经数据验证；"
                             + "可在管理台点「验证表关系」重试");
+        }
+    }
+
+    /**
+     * 推导（整体 / 增量）写完之后：补全链开着，就把后续交给它——它先做关系发现，再由它派发采样核对（范围并上它新补出关系的表），
+     * 然后生成业务文字；关着（或单测里没接事件总线），照旧直接派发采样核对。
+     *
+     * @param scope 原本要核对的表（折叠名）；{@code null} = 全部，空 = 这次没有要核对的
+     */
+    private void afterDerive(Long connectorId, String tenantId, String note, Set<String> scope, boolean added) {
+        if (eventPublisher != null && properties.getSemantic().getEnrichment().isEnabled() && !blank(tenantId)) {
+            eventPublisher.publishEvent(added
+                    ? SemanticEnrichmentRequest.afterAddedDerive(connectorId, tenantId, note, scope)
+                    : SemanticEnrichmentRequest.afterDerive(connectorId, tenantId, note));
+            return;
+        }
+        if (scope == null || !scope.isEmpty()) {
+            dispatchValidation(connectorId, tenantId, note, scope);
         }
     }
 

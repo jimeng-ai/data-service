@@ -46,6 +46,9 @@ public class JimengTenantLineHandler implements TenantLineHandler {
             "connector_semantic_generation",
             "connector_semantic_generation_table",
             "connector_semantic_staged",
+            // 数据星图：给人看的业务名称与说明、补全链的运行状态（同样是客户的表名、列名与对它们的说明）
+            "connector_business_view",
+            "connector_enrichment_state",
             "skill_eval_run",
             "chat_conversation",
             "chat_message",
