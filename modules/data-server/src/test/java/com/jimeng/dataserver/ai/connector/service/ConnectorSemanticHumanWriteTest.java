@@ -334,6 +334,69 @@ class ConnectorSemanticHumanWriteTest {
         }
     }
 
+    // ================================================================ 确认关系时保留结构键（数据星图设计 v3 §5.5）
+
+    /**
+     * 业务方确认一条关系，确认的是「这两列是同一个东西」，不是「这条关系没有条件」。多态关系的判别列、组合键的成员列
+     * 是采样核对落下的结构；确认时把它们丢了，星图会把一条多态关系画成无条件的实线，Agent 也少了判别条件。
+     */
+    @Nested
+    @DisplayName("确认关系时保留结构键")
+    class JoinStructure {
+
+        private ConnectorSemantic polymorphicJoin() {
+            ConnectorSemantic j = new ConnectorSemantic();
+            j.setId(8L);
+            j.setTenantId(TENANT);
+            j.setConnectorId(CONN_ID);
+            j.setScope(ConnectorSemanticService.SCOPE_JOIN);
+            j.setObjectName("t_ord");
+            j.setFieldName("cust_id");
+            j.setTerm("");
+            j.setGloss("关联 t_cust.id");
+            j.setSource(ConnectorSemanticService.SOURCE_INFERRED);
+            j.setStatus(ConnectorSemanticService.ST_DRAFT);
+            j.setVerified(ConnectorSemanticService.V_UNDECIDABLE);
+            Map<String, Object> d = new LinkedHashMap<>();
+            d.put(ConnectorSemanticService.KEY_TO_OBJECT, "t_cust");
+            d.put(ConnectorSemanticService.KEY_TO_COLUMN, "id");
+            d.put("join_kind", "POLYMORPHIC");
+            d.put("discriminator_column", "owner_type");
+            d.put("composite_columns", List.of("cust_id", "owner_type"));
+            d.put("containment", 0.4);
+            j.setDetailJson(json(d));
+            return j;
+        }
+
+        @Test
+        @DisplayName("★ 确认同一条关系：join_kind / discriminator_column / composite_columns 原样留下")
+        void 同一对端保留() {
+            when(semanticMapper.selectOne(any())).thenReturn(polymorphicJoin());
+
+            ConnectorSemantic out = service.annotateJoin(CONN_ID, "t_ord", "cust_id", "t_cust", "id",
+                    true, "按客户类型区分", "h", "u9", "张三", null);
+
+            Map<String, Object> d = detailOf(out);
+            assertEquals("POLYMORPHIC", d.get("join_kind"));
+            assertEquals("owner_type", d.get("discriminator_column"));
+            assertEquals(List.of("cust_id", "owner_type"), d.get("composite_columns"));
+            assertEquals(ConnectorSemanticService.HV_RELATED, d.get(ConnectorSemanticService.KEY_HUMAN_VERDICT));
+            assertNull(d.get("containment"), "只带结构键，采样数字不跟着人的确认走");
+        }
+
+        @Test
+        @DisplayName("改挂到别的对端：旧关系的结构键不带过去")
+        void 换了对端不带() {
+            when(semanticMapper.selectOne(any())).thenReturn(polymorphicJoin());
+
+            ConnectorSemantic out = service.annotateJoin(CONN_ID, "t_ord", "cust_id", "t_member", "uid",
+                    true, "其实是会员", "h", "u9", "张三", null);
+
+            assertNull(detailOf(out).get("join_kind"));
+            assertNull(detailOf(out).get("discriminator_column"));
+        }
+    }
+
     // ================================================================ 口径的列集合锚点
 
     @Nested
