@@ -1275,8 +1275,12 @@ class MySqlConnectorTest {
             when(conn.createStatement()).thenReturn(mock(Statement.class));
             PreparedStatement colPs = mock(PreparedStatement.class);
             PreparedStatement keyPs = mock(PreparedStatement.class);
+            PreparedStatement fkPs = mock(PreparedStatement.class);
             when(conn.prepareStatement(anyString())).thenAnswer(inv ->
-                    MySqlSession.UNIQUE_KEYS_SQL.equals(inv.getArgument(0)) ? keyPs : colPs);
+                    MySqlSession.UNIQUE_KEYS_SQL.equals(inv.getArgument(0)) ? keyPs
+                            : MySqlSession.FOREIGN_KEYS_SQL.equals(inv.getArgument(0)) ? fkPs : colPs);
+            ResultSet fkRs = resultSet(List.of());
+            when(fkPs.executeQuery()).thenReturn(fkRs);
             ResultSet colRs = resultSet(columns);
             when(colPs.executeQuery()).thenReturn(colRs);
             if (keyFailure != null) {
@@ -1341,6 +1345,105 @@ class MySqlConnectorTest {
         @DisplayName("快照里的键名与语义层读取的键名一致")
         void 键名两边一致() {
             assertEquals(SemanticJoinValidator.DETAIL_UNIQUE_KEYS, MySqlSession.EXTRA_UNIQUE_KEYS);
+        }
+    }
+
+    // ================================================================ 声明外键采集（数据星图 v3 §5.2）
+
+    /**
+     * 声明外键是关系发现里最硬的一条依据（客户自己在库里写下的约束）。和唯一键同一个纪律：
+     * 读不到 ≠ 没有；读失败不能让「看结构」本身失败。
+     */
+    @Nested
+    @DisplayName("声明外键采集")
+    class ForeignKeyCapture {
+
+        private ObjectDetail describeWith(SQLException fkFailure, List<Map<String, Object>> fkRows)
+                throws SQLException {
+            DataSource ds = mock(DataSource.class);
+            Connection conn = mock(Connection.class);
+            when(ds.getConnection()).thenReturn(conn);
+            when(conn.createStatement()).thenReturn(mock(Statement.class));
+            PreparedStatement colPs = mock(PreparedStatement.class);
+            PreparedStatement keyPs = mock(PreparedStatement.class);
+            PreparedStatement fkPs = mock(PreparedStatement.class);
+            when(conn.prepareStatement(anyString())).thenAnswer(inv ->
+                    MySqlSession.UNIQUE_KEYS_SQL.equals(inv.getArgument(0)) ? keyPs
+                            : MySqlSession.FOREIGN_KEYS_SQL.equals(inv.getArgument(0)) ? fkPs : colPs);
+            ResultSet colRs = resultSet(List.of(
+                    row("COLUMN_NAME", "id", "COLUMN_TYPE", "bigint(20)", "IS_NULLABLE", "NO", "COLUMN_KEY", "PRI"),
+                    row("COLUMN_NAME", "cust_id", "COLUMN_TYPE", "bigint(20)", "IS_NULLABLE", "YES",
+                            "COLUMN_KEY", "MUL")));
+            when(colPs.executeQuery()).thenReturn(colRs);
+            ResultSet keyRs = resultSet(List.of(row("INDEX_NAME", "PRIMARY", "SEQ_IN_INDEX", 1, "COLUMN_NAME", "id")));
+            when(keyPs.executeQuery()).thenReturn(keyRs);
+            if (fkFailure != null) {
+                when(fkPs.executeQuery()).thenThrow(fkFailure);
+            } else {
+                ResultSet fkRs = resultSet(fkRows);
+                when(fkPs.executeQuery()).thenReturn(fkRs);
+            }
+            return new MySqlSession(inst(baseParams(), "pwd"), ds, "shop", new ReadOnlySqlGuard())
+                    .describe("t_ord");
+        }
+
+        @Test
+        @DisplayName("组合外键按约束分组、列按 ORDINAL_POSITION 排；约束之间按名字排")
+        void 分组与排序() {
+            List<MySqlSession.ForeignKey> keys = MySqlSession.groupForeignKeys(List.of(
+                    new MySqlSession.FkPart("fk_z", 1, "cust_id", "t_cust", "id"),
+                    new MySqlSession.FkPart("fk_a", 2, "line_no", "t_ord_dtl", "line_no"),
+                    new MySqlSession.FkPart("fk_a", 1, "ord_id", "t_ord_dtl", "ord_id")));
+
+            assertEquals(List.of(
+                    new MySqlSession.ForeignKey("fk_a", List.of("ord_id", "line_no"), "t_ord_dtl",
+                            List.of("ord_id", "line_no")),
+                    new MySqlSession.ForeignKey("fk_z", List.of("cust_id"), "t_cust", List.of("id"))), keys);
+        }
+
+        @Test
+        @DisplayName("缺列名或缺目标的约束整条丢掉，不拼一个半截外键")
+        void 残缺约束整条丢() {
+            List<MySqlSession.ForeignKey> keys = MySqlSession.groupForeignKeys(List.of(
+                    new MySqlSession.FkPart("fk_bad", 1, null, "t_cust", "id"),
+                    new MySqlSession.FkPart("fk_ok", 1, "cust_id", "t_cust", "id")));
+            assertEquals(1, keys.size());
+            assertEquals("fk_ok", keys.get(0).name());
+        }
+
+        @Test
+        @DisplayName("★ describe 把外键放进对象级 extra.foreign_keys")
+        void describe带回外键() throws SQLException {
+            ObjectDetail d = describeWith(null, List.of(row("CONSTRAINT_NAME", "fk_cust", "ORDINAL_POSITION", 1,
+                    "COLUMN_NAME", "cust_id", "REFERENCED_TABLE_NAME", "t_cust", "REFERENCED_COLUMN_NAME", "id")));
+
+            assertEquals(List.of(Map.of("name", "fk_cust", "columns", List.of("cust_id"),
+                            "ref_table", "t_cust", "ref_columns", List.of("id"))),
+                    d.extra().get(MySqlSession.EXTRA_FOREIGN_KEYS));
+            assertEquals(2, d.fields().size());
+        }
+
+        @Test
+        @DisplayName("★ 读外键失败（Doris / StarRocks 这类引擎没有这张视图）：describe 照常返回，extra 里没有 foreign_keys")
+        void 读不到外键不等于没有() throws SQLException {
+            ObjectDetail d = describeWith(new SQLException("Unknown table 'KEY_COLUMN_USAGE'", "42S02", 1109), null);
+
+            assertEquals(2, d.fields().size());
+            assertFalse(d.extra().containsKey(MySqlSession.EXTRA_FOREIGN_KEYS), d.extra().toString());
+            assertTrue(d.extra().containsKey(MySqlSession.EXTRA_UNIQUE_KEYS), "外键读失败不影响唯一键");
+        }
+
+        @Test
+        @DisplayName("表确实没有外键：放空列表，与「读不到」区分开")
+        void 没有外键是空列表() throws SQLException {
+            assertEquals(List.of(), describeWith(null, List.of()).extra().get(MySqlSession.EXTRA_FOREIGN_KEYS));
+        }
+
+        @Test
+        @DisplayName("只查同库的外键：SQL 同时限定本表所在库和被引用表所在库")
+        void 只查同库() {
+            assertTrue(MySqlSession.FOREIGN_KEYS_SQL.contains("TABLE_SCHEMA = ?"));
+            assertTrue(MySqlSession.FOREIGN_KEYS_SQL.contains("REFERENCED_TABLE_SCHEMA = ?"));
         }
     }
 
