@@ -6,7 +6,6 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.tenant.JimengTenantLineHandler;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
-import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemSummary;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorBusinessView;
@@ -72,59 +71,45 @@ class DataGraphServiceTest {
     }
 
     @Test
-    @DisplayName("系统列表：只列出至少有一个 TABLE / VIEW 的连接，计数不含其他对象类型")
-    void 系统列表() {
-        Connection http = new Connection();
-        http.setId(8L);
-        http.setName("http");
-        Connection seqOnly = new Connection();
-        seqOnly.setId(9L);
-        seqOnly.setName("seq-only");
-        when(connectionMapper.selectList(any())).thenReturn(List.of(connection(), http, seqOnly));
-        when(schemaMapper.selectList(any())).thenReturn(List.of(
-                schemaRow(7L, "BASE TABLE"), schemaRow(7L, "VIEW"), schemaRow(9L, "SEQUENCE")));
+    @DisplayName("★ 还没有结构快照的库：图是空的，照样带出语义层和整理状态（数据连接里每个库都有「查看星图」，进来要说得清这个库的状态）")
+    void 没有快照的库() {
+        when(connectionMapper.selectById(7L)).thenReturn(connection());
+        when(schemaMapper.selectList(any())).thenReturn(List.of());
+        when(semanticMapper.selectList(any())).thenReturn(List.of());
 
-        List<SystemSummary> systems = service.systems();
+        SystemGraph g = service.system("7");
 
-        assertEquals(1, systems.size());
-        assertEquals("7", systems.get(0).getConnectorId());
-        assertEquals("ERP 系统", systems.get(0).getDisplayName());
-        assertEquals("READY", systems.get(0).getSemanticStatus());
-        assertEquals(2, systems.get(0).getTableCount());
-        assertFalse(systems.get(0).isTruncated());
-        assertEquals("RUNNING", systems.get(0).getViewStatus(), "补全链从没跑过、但会来跑：页面挂「业务名称整理中」");
+        assertEquals("ERP 系统", g.getDisplayName());
+        assertTrue(g.getTables().isEmpty());
+        assertTrue(g.getRelations().isEmpty());
+        assertEquals("READY", g.getSemanticStatus());
+        assertFalse(g.isTruncated());
+        assertEquals("RUNNING", g.getViewStatus(), "补全链从没跑过、但会来跑：页面挂「业务名称整理中」");
     }
 
     @Test
     @DisplayName("★ 补全链开关关着：从没跑过的连接不会再有人来整理，整理状态为 null（页面不挂「整理中」）")
     void 开关关着不挂整理中() {
         properties.getSemantic().getEnrichment().setEnabled(false);
-        when(connectionMapper.selectList(any())).thenReturn(List.of(connection()));
-        when(schemaMapper.selectList(any())).thenReturn(List.of(schemaRow(7L, "BASE TABLE")));
+        when(connectionMapper.selectById(7L)).thenReturn(connection());
+        when(schemaMapper.selectList(any())).thenReturn(List.of(table("t_order", "订单表", 1, List.of(pk("id")), "id")));
+        when(semanticMapper.selectList(any())).thenReturn(List.of());
 
-        assertNull(service.systems().get(0).getViewStatus());
+        assertNull(service.system("7").getViewStatus());
     }
 
     @Test
-    @DisplayName("系统列表：快照达到 200 个对象（含非表对象）为 truncated；带上业务文字的整理状态")
-    void 截断与整理状态() {
-        when(connectionMapper.selectList(any())).thenReturn(List.of(connection()));
-        List<ConnectorSchema> rows = new java.util.ArrayList<>();
-        for (int i = 0; i < 199; i++) {
-            rows.add(schemaRow(7L, "BASE TABLE"));
-        }
-        rows.add(schemaRow(7L, "SEQUENCE"));
-        when(schemaMapper.selectList(any())).thenReturn(rows);
+    @DisplayName("系统图：带上业务文字的整理状态（上次结果）")
+    void 整理状态带出() {
+        when(connectionMapper.selectById(7L)).thenReturn(connection());
+        when(schemaMapper.selectList(any())).thenReturn(List.of(table("t_order", "订单表", 1, List.of(pk("id")), "id")));
+        when(semanticMapper.selectList(any())).thenReturn(List.of());
         ConnectorEnrichmentState state = new ConnectorEnrichmentState();
         state.setConnectorId(7L);
         state.setLastStatus("READY");
-        when(stateMapper.selectList(any())).thenReturn(List.of(state));
+        when(stateMapper.selectOne(any())).thenReturn(state);
 
-        SystemSummary s = service.systems().get(0);
-
-        assertEquals(199, s.getTableCount());
-        assertTrue(s.isTruncated());
-        assertEquals("READY", s.getViewStatus());
+        assertEquals("READY", service.system("7").getViewStatus());
     }
 
     @Test
@@ -226,12 +211,5 @@ class DataGraphServiceTest {
         assertEquals("7", g.getConnectorId());
         assertEquals(2, g.getTables().size());
         assertEquals(1, g.getRelations().size());
-    }
-
-    private static ConnectorSchema schemaRow(long connectorId, String objectType) {
-        ConnectorSchema row = new ConnectorSchema();
-        row.setConnectorId(connectorId);
-        row.setObjectType(objectType);
-        return row;
     }
 }

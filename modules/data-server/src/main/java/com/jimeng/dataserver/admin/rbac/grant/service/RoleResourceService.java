@@ -44,7 +44,13 @@ public class RoleResourceService {
         List<Long> kbs = new ArrayList<>();
         for (SysRoleResource r : rows) {
             switch (r.getResourceType()) {
-                case "MENU" -> { if (r.getResourceCode() != null) modules.add(r.getResourceCode()); }
+                // 只回显仍然可授权的模块码。jm-admin 拿这里当勾选初值、保存时原样提交，而保存按 ALL_MODULES 校验：
+                // 已经下线的模块（插件、数据星图）要是回显出去，弹窗里没有它的勾选框去不掉，这个角色就再也保存不了。
+                case "MENU" -> {
+                    if (PlatformConstant.ALL_MODULES.contains(r.getResourceCode())) {
+                        modules.add(r.getResourceCode());
+                    }
+                }
                 case "AGENT" -> agents.add(r.getResourceId());
                 case "KNOWLEDGE_BASE" -> kbs.add(r.getResourceId());
                 default -> { /* ignore unknown（含历史 PLUGIN 授权行，插件下线后忽略） */ }

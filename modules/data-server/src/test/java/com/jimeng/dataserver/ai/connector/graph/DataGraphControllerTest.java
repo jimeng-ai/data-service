@@ -1,57 +1,51 @@
 package com.jimeng.dataserver.ai.connector.graph;
 
-import com.jimeng.common.core.constant.PlatformConstant;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
-import com.jimeng.dataserver.admin.rbac.permission.PermissionResolver;
+import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+/** 星图从「数据连接」里每个库的卡片进，和数据连接一样只给企业超管（设计文档 §9）。 */
 class DataGraphControllerTest {
 
-    private static final String DENIED = "没有数据星图的访问权限";
-
     @Test
-    @DisplayName("没有「数据星图」模块：三个接口都被拒，而且一行数据都不查")
-    void 没有模块被拒() {
-        PermissionResolver resolver = mock(PermissionResolver.class);
+    @DisplayName("非企业超管：两个接口都被拒，而且一行数据都不查")
+    void 非超管被拒() {
+        SuperAdminGuard guard = mock(SuperAdminGuard.class);
         DataGraphService service = mock(DataGraphService.class);
-        doThrow(new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, DENIED))
-                .when(resolver).assertCurrentModule(PlatformConstant.MODULE_DATA_GRAPH, DENIED);
-        DataGraphController controller = new DataGraphController(resolver, service);
+        when(guard.requireSuperAdmin())
+                .thenThrow(new ServiceException(ExceptionCode.AUTHENTICATION_FAIL, "需要企业超级管理员权限"));
+        DataGraphController controller = new DataGraphController(guard, service);
 
-        assertEquals(DENIED, assertThrows(ServiceException.class, controller::systems).getRespMsg());
         assertThrows(ServiceException.class, () -> controller.system("7"));
         assertThrows(ServiceException.class, () -> controller.table("7", "t_order"));
         verifyNoInteractions(service);
     }
 
     @Test
-    @DisplayName("有模块（或企业超管）：每个接口先查模块，再原样交给服务")
-    void 有模块放行() {
-        PermissionResolver resolver = mock(PermissionResolver.class);
+    @DisplayName("企业超管：每个接口先过超管校验，再原样交给服务")
+    void 超管放行() {
+        SuperAdminGuard guard = mock(SuperAdminGuard.class);
         DataGraphService service = mock(DataGraphService.class);
-        List<DataGraphViews.SystemSummary> systems = List.of();
-        when(service.systems()).thenReturn(systems);
-        DataGraphController controller = new DataGraphController(resolver, service);
+        DataGraphViews.SystemGraph graph = new DataGraphViews.SystemGraph(
+                "7", "erp", null, "READY", false, null, List.of(), List.of());
+        when(service.system("7")).thenReturn(graph);
+        DataGraphController controller = new DataGraphController(guard, service);
 
-        assertSame(systems, controller.systems());
-        controller.system("7");
+        assertSame(graph, controller.system("7"));
         controller.table("7", "t_order");
-        verify(resolver, times(3)).assertCurrentModule(PlatformConstant.MODULE_DATA_GRAPH, DENIED);
-        verify(service).system("7");
+        verify(guard, times(2)).requireSuperAdmin();
         verify(service).table("7", "t_order");
     }
 }

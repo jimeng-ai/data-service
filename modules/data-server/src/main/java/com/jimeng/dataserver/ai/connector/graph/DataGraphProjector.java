@@ -113,7 +113,7 @@ public final class DataGraphProjector {
     /**
      * @param schemas    这条连接的全部快照行（含 TABLE / VIEW 之外的对象：它们也占快照的名额）
      * @param views      这条连接的业务视图行
-     * @param viewStatus 业务文字的整理状态，原样带出（{@link DataGraphViews.SystemSummary}）
+     * @param viewStatus 业务文字的整理状态，原样带出（{@link DataGraphViews.SystemGraph}）
      */
     public static SystemGraph system(Connection connection, List<ConnectorSchema> schemas,
                                      List<ConnectorSemantic> joins, List<ConnectorBusinessView> views,

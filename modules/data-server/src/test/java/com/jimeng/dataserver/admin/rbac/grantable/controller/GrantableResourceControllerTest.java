@@ -20,7 +20,7 @@ class GrantableResourceControllerTest {
      * 两边少一个，这个模块就授不出去；多一个，勾上之后保存会被拒。
      */
     @Test
-    @DisplayName("可授权模块与 ALL_MODULES 一一对应，数据星图在列")
+    @DisplayName("可授权模块与 ALL_MODULES 一一对应：智能体、知识库、对话（数据星图在数据连接里，只给超管，不单独授权）")
     void 模块列表() {
         GrantableResourceController controller = new GrantableResourceController(
                 mock(AgentMapper.class), mock(KnowledgeBaseMapper.class), mock(SuperAdminGuard.class));
@@ -28,8 +28,6 @@ class GrantableResourceControllerTest {
         List<ModuleOption> modules = controller.modules();
 
         assertEquals(PlatformConstant.ALL_MODULES, modules.stream().map(ModuleOption::getCode).toList());
-        assertEquals("数据星图", modules.stream()
-                .filter(m -> PlatformConstant.MODULE_DATA_GRAPH.equals(m.getCode()))
-                .findFirst().orElseThrow().getName());
+        assertEquals(List.of("智能体", "知识库", "对话"), modules.stream().map(ModuleOption::getName).toList());
     }
 }

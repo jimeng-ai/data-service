@@ -4,7 +4,6 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
-import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemSummary;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableDetail;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticDeriveService;
@@ -23,11 +22,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * 数据星图的读取：每次请求从 {@code connection} + {@code connector_schema} + {@code connector_semantic(JOIN)}
@@ -49,39 +45,6 @@ public class DataGraphService {
     private final ConnectorBusinessViewMapper viewMapper;
     private final ConnectorEnrichmentStateMapper stateMapper;
     private final ConnectorProperties properties;
-
-    /** 只列出结构快照里至少有一个 TABLE / VIEW 的连接，按连接 id 升序。 */
-    public List<SystemSummary> systems() {
-        List<Connection> connections = connectionMapper.selectList(new LambdaQueryWrapper<Connection>()
-                .orderByAsc(Connection::getId));
-        Map<Long, Integer> tableCounts = new HashMap<>();
-        Map<Long, Integer> snapshotCounts = new HashMap<>();
-        for (ConnectorSchema row : schemaMapper.selectList(new LambdaQueryWrapper<ConnectorSchema>()
-                .select(ConnectorSchema::getConnectorId, ConnectorSchema::getObjectType))) {
-            if (row.getConnectorId() == null) {
-                continue;
-            }
-            snapshotCounts.merge(row.getConnectorId(), 1, Integer::sum);
-            if (DataGraphProjector.objectType(row.getObjectType()) != null) {
-                tableCounts.merge(row.getConnectorId(), 1, Integer::sum);
-            }
-        }
-        Map<Long, ConnectorEnrichmentState> states = new HashMap<>();
-        for (ConnectorEnrichmentState s : stateMapper.selectList(new LambdaQueryWrapper<ConnectorEnrichmentState>())) {
-            states.put(s.getConnectorId(), s);
-        }
-        List<SystemSummary> out = new ArrayList<>();
-        for (Connection c : connections) {
-            int tables = tableCounts.getOrDefault(c.getId(), 0);
-            if (tables > 0) {
-                out.add(new SystemSummary(String.valueOf(c.getId()), c.getName(), c.getDisplayName(), c.getKind(),
-                        c.getStatus(), c.getSemanticStatus(), tables,
-                        DataGraphProjector.truncated(snapshotCounts.getOrDefault(c.getId(), 0)),
-                        viewStatus(states.get(c.getId()), c.getSemanticStatus(), enrichmentOn())));
-            }
-        }
-        return out;
-    }
 
     public SystemGraph system(String connectorId) {
         Connection connection = requireConnection(connectorId);

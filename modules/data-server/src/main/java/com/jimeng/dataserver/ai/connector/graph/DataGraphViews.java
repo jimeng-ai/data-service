@@ -16,26 +16,13 @@ public final class DataGraphViews {
     }
 
     /**
-     * {@code /systems} 的一项。{@code semanticStatus}、{@code viewStatus} 只给前端判断空状态和提示，不上屏。
+     * {@code /systems/{connectorId}}：一个库的全部对象卡片 + 通过判定的关系（不含自关联）。
+     * {@code semanticStatus}、{@code viewStatus} 只给前端判断空状态和提示，不上屏。
      *
      * <p>{@code truncated}：结构快照达到 200 个对象的上限，按重要性排后面的表没进来。
-     * {@code viewStatus}：业务文字的整理状态——{@code RUNNING}（补全链正在跑）/ {@code READY} / {@code FAILED}（上次结果）/
-     * {@code null}（从没跑过）。
+     * {@code viewStatus}：业务文字的整理状态——{@code RUNNING}（补全链正在跑，或者从没跑完过、但会来跑）/
+     * {@code READY} / {@code FAILED}（上次结果）/ {@code null}（不会有人来跑）。
      */
-    @Value
-    public static class SystemSummary {
-        String connectorId;
-        String name;
-        String displayName;
-        String kind;
-        String status;
-        String semanticStatus;
-        int tableCount;
-        boolean truncated;
-        String viewStatus;
-    }
-
-    /** {@code /systems/{connectorId}}：全部对象卡片 + 通过判定的关系（不含自关联）。两个状态字段同 {@link SystemSummary}。 */
     @Value
     public static class SystemGraph {
         String connectorId;
