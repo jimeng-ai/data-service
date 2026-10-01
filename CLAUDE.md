@@ -15,7 +15,7 @@ mvn -pl modules/data-server test -Dtest=JwtSecretProviderTest          # single 
 mvn -pl modules/data-server test -Dtest=AgentSkillVisibilityTest#emptyMeansNothingBound   # single method
 ```
 
-**Release = push a version tag.** `deploy.yml` runs only for a pushed `vX.Y.Z` tag on `main`; pushing `main` does not deploy. Release with `node scripts/release.mjs <1.2.3 | major | minor | patch>` from a clean `main` that equals `origin/main` — it runs the gate in `release.json` (`mvn -o` install + the data-server tests), pushes the tag (= deploy), writes the GitHub Release and waits for the run. Roll back by re-running the previous tag from Actions → Deploy → Run workflow. When a release needs DDL or Nacos changes, run them first and pass the notes with `--notes-file`.
+**Tags are automatic, deploys are manual.** Every push to `main` gets the next `vX.Y.Z` tag from `.github/workflows/tag.yml`; nothing deploys on its own. Deploy only when the user says so: Actions → Deploy → Run workflow with the tag picked in "Use workflow from", or `node scripts/release.mjs deploy [vX.Y.Z]` with `HEAD` at that tag on a clean tree — it runs the gate in `release.json` (`mvn -o` install + the data-server tests), dispatches the deploy, waits for it and writes a GitHub Release as the go-live record. Roll back by deploying the previous tag the same way. When a deploy needs DDL or Nacos changes, run them first and pass the notes with `--notes-file`.
 
 **Run `mvn install -DskipTests` before `mvn -pl ... test`** when you changed `common/*`: `-pl` without `-am` resolves the commons from the local repo, so a stale jar silently hides your change.
 

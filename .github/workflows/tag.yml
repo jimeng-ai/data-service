@@ -1,0 +1,34 @@
+name: Tag
+
+# 每次推 main，给推上去的那个提交打下一个版本号的 tag。只打 tag：不部署，也不建 GitHub Release；
+# 什么时候上线由人决定（Actions → Deploy → Run workflow 里选 tag）。版本号怎么算见 scripts/release.mjs 开头。
+on:
+  push:
+    branches: [main]
+
+# 推 tag 要写权限；仓库默认给工作流的只有读权限。
+permissions:
+  contents: write
+
+# 不设 concurrency：每个仓库只有一个 runner，同一仓库的任务本来就一个一个跑；concurrency 反而会把排队中的任务
+# 直接取消，连着推几次时中间那次就没有 tag 了。
+jobs:
+  tag:
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # tag 带说明（annotated），要有署名；用环境变量给，不往 runner 留着的仓库配置里写。
+      - name: Tag this push
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: node scripts/release.mjs tag

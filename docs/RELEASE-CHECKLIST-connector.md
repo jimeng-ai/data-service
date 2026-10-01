@@ -1,6 +1,6 @@
 # 上线清单（本轮连接器/语义层改动）
 
-> 本仓库**推送 `vX.Y.Z` 版本 tag 即部署**（推 main 不上线；发版用 `node scripts/release.mjs <版本号>`），且**没有 Flyway**。
+> 本仓库**每次推 main 自动打 `vX.Y.Z` 版本 tag，但不部署**；上线由人决定（Actions → Deploy → Run workflow 选 tag，或 `node scripts/release.mjs deploy [版本号]`），且**没有 Flyway**。
 > 下面两件事漏做会直接 500 或静默失效，顺序不能反。
 
 ## ① 先跑 DDL，再部署新后端（必须）
@@ -61,7 +61,7 @@ docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 d
 
 跑完用下面 ⑥ 的自检脚本确认，不要凭"应该跑过了"。
 
-> 2026-10-01 这一轮（data-service v1.1.0）上线时，生产库要补的正是上面最后两份；完整步骤（含发版顺序）见 `docs/releases/v1.1.0.md`。
+> 2026-10-01 这一轮（data-service v1.1.0）上线时，生产库要补的正是上面最后两份；完整步骤（含上线顺序）见 `docs/releases/v1.1.0.md`。
 
 ## ② Nacos 配置（不配则能力静默不可用）
 

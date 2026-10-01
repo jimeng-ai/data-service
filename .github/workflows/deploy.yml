@@ -1,7 +1,8 @@
 name: Deploy
 
-# 推送 v* 版本 tag 才部署，推 main 不上线。发版：node scripts/release.mjs <版本号>（npm 仓库是 npm run release -- <版本号>），
-# 规则见 scripts/release.mjs 开头。回滚：Actions → Deploy → Run workflow，在 Use workflow from 里选上一个 tag。
+# 只在有人决定上线时跑：推 main、推 tag 都不部署（推 main 只会由 tag.yml 自动打一个版本号 tag）。
+# 上线：Actions → Deploy → Run workflow，在 Use workflow from 里选要上线的 tag；或本地 node scripts/release.mjs deploy [版本号]
+# （npm 仓库是 npm run deploy -- [版本号]）。回滚同样选上一个 tag。规则见 scripts/release.mjs 开头。
 #
 # data-service 容器化部署（与本地 IDE 隔离）：
 #   • 两个 Spring Boot 应用（gateway / data-server）打成镜像，跑在基础设施所在的
@@ -11,14 +12,12 @@ name: Deploy
 #     （localhost），两套互不影响。
 #   • 基础设施（Nacos/MySQL/...）由 docker/docker-compose.yml 常驻；这里幂等确保其在线。
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# 同一仓库的部署排队、不互相取消：发版是有意为之的，一次部署跑到一半（旧容器已删、新容器还没起）
+# 同一仓库的部署排队、不互相取消：上线是有意为之的，一次部署跑到一半（旧容器已删、新容器还没起）
 # 被取消，线上就挂了。
 concurrency:
   group: deploy-data-service
@@ -39,7 +38,7 @@ jobs:
           fetch-depth: 0
 
       # 只部署 v* 版本 tag，而且 tag 指向的提交必须已经在 main 上：线上永远是 main 上某个有版本号的提交。
-      # 手动触发也一样（Use workflow from 里选的是分支就直接失败），回滚就是手动重跑上一个 tag。
+      # Use workflow from 里选的是分支就直接失败；回滚就是再选上一个 tag 跑一次。
       - name: Only release tags on main
         run: |
           set -euo pipefail
@@ -49,7 +48,7 @@ jobs:
           esac
           git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
-            || { echo "::error::$GITHUB_REF_NAME 指向的提交不在 main 上，不部署：先合进 main 再发版"; exit 1; }
+            || { echo "::error::$GITHUB_REF_NAME 指向的提交不在 main 上，不部署：先合进 main 再上线"; exit 1; }
           echo "部署 $GITHUB_REF_NAME（$GITHUB_SHA）"
 
       # JDK 17 + Maven 来自宿主（deploy.sh 已装）。launchd 后台会话 PATH 较干净，显式补上
