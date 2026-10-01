@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.connector.graph;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jimeng.persistence.entity.Connection;
+import com.jimeng.persistence.entity.ConnectorBusinessView;
 import com.jimeng.persistence.entity.ConnectorSchema;
 import com.jimeng.persistence.entity.ConnectorSemantic;
 
@@ -123,6 +124,31 @@ final class DataGraphFixtures {
         row.setStatus("DRAFT");
         row.setSource("INFERRED");
         return row;
+    }
+
+    /** 一个对象的业务视图行（补全链写的 MODEL 行）。 */
+    static ConnectorBusinessView objectView(String table, String displayName, String summary, String domain) {
+        ConnectorBusinessView v = new ConnectorBusinessView();
+        v.setConnectorId(CONNECTOR_ID);
+        v.setKind(ConnectorBusinessView.KIND_OBJECT);
+        v.setObjectName(table);
+        v.setFieldName("");
+        v.setDisplayName(displayName);
+        v.setSummary(summary);
+        v.setDomain(domain);
+        v.setSource(ConnectorBusinessView.SOURCE_MODEL);
+        v.setInputHash("HASH_SECRET");
+        v.setModelCode("MODEL_SECRET");
+        v.setPromptVersion("PV_SECRET");
+        return v;
+    }
+
+    /** 一条关系的角色名。 */
+    static ConnectorBusinessView relationView(String table, String column, String role) {
+        ConnectorBusinessView v = objectView(table, role, null, null);
+        v.setKind(ConnectorBusinessView.KIND_RELATION);
+        v.setFieldName(column);
+        return v;
     }
 
     static String json(Object value) {

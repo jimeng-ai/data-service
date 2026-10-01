@@ -133,13 +133,13 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
     public static final String SEM_NOT_APPLICABLE = "NOT_APPLICABLE";
 
     /**
-     * {@code ConnectorSchemaService.MAX_OBJECTS} 的镜像（那边是 private）。
+     * 就是 {@link ConnectorSchemaService#MAX_OBJECTS}（引用它，不再各写一份）。
      *
-     * <p>为什么要在这里再写一遍这个数：快照本身就是<b>按对象名字母序截到前 200 个</b>的，字母序靠后的表
+     * <p>为什么语义层这一侧要用到这个数：快照本身就是<b>按重要性截到前 200 个</b>的，排在后面的表
      * 根本没有进过 connector_schema，于是也不会有语义、漂移检测对它们永远沉默。这件事在语义层这一侧
-     * 必须说出来——「沉默」会被管理台读成「都覆盖了」。两边的值要一起改。
+     * 必须说出来——「沉默」会被管理台读成「都覆盖了」。
      */
-    static final int SCHEMA_SNAPSHOT_CAP = 200;
+    static final int SCHEMA_SNAPSHOT_CAP = ConnectorSchemaService.MAX_OBJECTS;
 
     // GLOSS_MAX / NAME_MAX / DETAIL_TEXT_MAX / DETAIL_LIST_MAX / CARDINALITIES 连同 toRows、parseFields、renderObject 与那批小工具
     // 已原样迁到 SemanticRowAssembler（静态导入），本类只委托：语义层生成 agent 的逐表提交要走同一套过滤，两份实现迟早分叉。

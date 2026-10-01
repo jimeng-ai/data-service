@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.ColumnRef;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.Field;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.Relation;
+import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SelfReference;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.SystemGraph;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableCard;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableDetail;
@@ -23,6 +24,8 @@ import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.MAPPER;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.connection;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.join;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.json;
+import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.objectView;
+import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.relationView;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.pk;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.schemas;
 import static com.jimeng.dataserver.ai.connector.graph.DataGraphFixtures.table;
@@ -32,7 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 设计文档 §5.2–§5.5：关系判定、唯一键与基数、表名与注释、排序，以及「永不出网」。 */
+/** 设计文档 §7：关系判定、唯一键与基数、业务文字与兜底、排序，以及「永不出网」。 */
 class DataGraphProjectorTest {
 
     @Nested
@@ -108,6 +111,21 @@ class DataGraphProjectorTest {
         }
 
         @Test
+        @DisplayName("7′. 关系发现里模型那一遍推出的：未确认不画（终点是主键也不画）；核对通过或业务方确认后照常画")
+        void 模型那一遍() {
+            Map<String, Object> pass = Map.of("origin", "RELATION_PASS");
+            assertTrue(system(join("t_item", "order_id", "t_order", "id", "UNDECIDABLE", pass)).getRelations().isEmpty());
+            assertTrue(system(join("t_region", "parent_id", "t_region", "id", "NONE", pass)).getTables().stream()
+                    .allMatch(t -> t.getSelfReferences().isEmpty()), "自关联同样不画");
+            assertEquals("DATA", system(join("t_item", "order_id", "t_order", "id", "CONFIRMED", pass))
+                    .getRelations().get(0).getConfirmedBy());
+            assertEquals("BUSINESS", system(join("t_item", "order_id", "t_order", "id", "NONE",
+                    Map.of("origin", "RELATION_PASS", "human_verdict", "RELATED"))).getRelations().get(0).getConfirmedBy());
+            assertEquals("INFERRED", system(join("t_item", "order_id", "t_order", "id", "NONE",
+                    Map.of("origin", "NAME_RULE"))).getRelations().get(0).getTier(), "外键、命名规则推出的照旧画虚线");
+        }
+
+        @Test
         @DisplayName("8. 未核对 / 判不出来：终点列单独构成唯一键才画虚线（主键或唯一键都算）")
         void 结构推断() {
             SystemGraph g = system(
@@ -127,7 +145,7 @@ class DataGraphProjectorTest {
         void 组合键() {
             List<ConnectorSchema> rows = new ArrayList<>(schemas());
             rows.add(table("t_price", "价格", 7, List.of(pk("sku_id", "region_id")), "sku_id", "region_id", "price"));
-            SystemGraph g = DataGraphProjector.system(connection(), rows,
+            SystemGraph g = project(rows,
                     List.of(join("t_item", "sku_id", "t_price", "sku_id")));
             assertTrue(g.getRelations().isEmpty());
         }
@@ -206,7 +224,7 @@ class DataGraphProjectorTest {
             ConnectorSchema seq = table("s_seq", "序列", 0, List.of(), "id");
             seq.setObjectType("SEQUENCE");
             rows.add(seq);
-            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of());
+            SystemGraph g = project(rows, List.of());
             assertTrue(g.getTables().stream().noneMatch(t -> t.getName().equals("s_seq")));
         }
 
@@ -215,7 +233,7 @@ class DataGraphProjectorTest {
         void 卡片行() {
             List<ConnectorSchema> rows = new ArrayList<>(schemas());
             rows.add(table("t_code", "编码", 8, List.of(uk("uk_b", "a", "b"), uk("uk_a", "code")), "a", "b", "code|编码"));
-            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of(
+            SystemGraph g = project(rows, List.of(
                     join("t_item", "order_id", "t_order", "id"),
                     join("t_order", "customer_code", "t_customer", "code")));
             assertEquals(List.of("id"), names(card(g, "t_order").getKeyColumns()));
@@ -230,15 +248,15 @@ class DataGraphProjectorTest {
         }
 
         @Test
-        @DisplayName("线上的字：起点列注释；为空或与列名相同（忽略大小写）时不写")
+        @DisplayName("没有业务视图时，关系角色名退回起点列注释；为空或与列名相同（忽略大小写）时不写")
         void 标签() {
             SystemGraph g = system(
                     join("t_item", "order_id", "t_order", "id"),
                     join("t_ext", "id", "t_order", "id"),
                     join("t_item", "sku_id", "t_sku", "id", "CONFIRMED", Map.of()));
-            assertEquals("所属订单", relation(g, "t_item.order_id→t_order.id").getLabel());
-            assertNull(relation(g, "t_ext.id→t_order.id").getLabel());
-            assertNull(relation(g, "t_item.sku_id→t_sku.id").getLabel());
+            assertEquals("所属订单", relation(g, "t_item.order_id→t_order.id").getRole());
+            assertNull(relation(g, "t_ext.id→t_order.id").getRole());
+            assertNull(relation(g, "t_item.sku_id→t_sku.id").getRole());
         }
     }
 
@@ -249,12 +267,12 @@ class DataGraphProjectorTest {
                 join("t_order", "customer_code", "t_customer", "code"),
                 join("t_item", "order_id", "t_order", "id"),
                 join("t_ext", "id", "t_order", "id"));
-        SystemGraph a = DataGraphProjector.system(connection(), schemas(), joins);
+        SystemGraph a = project(schemas(), joins);
         List<ConnectorSemantic> reversedJoins = new ArrayList<>(joins);
         Collections.reverse(reversedJoins);
         List<ConnectorSchema> reversedSchemas = new ArrayList<>(schemas());
         Collections.reverse(reversedSchemas);
-        SystemGraph b = DataGraphProjector.system(connection(), reversedSchemas, reversedJoins);
+        SystemGraph b = project(reversedSchemas, reversedJoins);
 
         assertEquals(List.of("t_order", "t_customer", "t_item", "t_ext", "t_region", "t_log", "t_sku", "v_sales"),
                 tableNames(a));
@@ -275,7 +293,7 @@ class DataGraphProjectorTest {
                 join("t_order", "customer_code", "t_customer", "code"),
                 join("t_region", "parent_id", "t_region", "id"),
                 join("t_ext", "id", "t_order", "id"));
-        TableDetail order = DataGraphProjector.table(schemas(), joins, "t_order");
+        TableDetail order = detail(schemas(), joins, "t_order");
         assertEquals(List.of("id", "customer_id", "customer_code", "shop_code", "status"),
                 order.getFields().stream().map(Field::getName).toList());
         assertEquals("PRIMARY", field(order, "id").getKey());
@@ -286,18 +304,18 @@ class DataGraphProjectorTest {
         assertNull(field(order, "shop_code").getComment());
         assertEquals(3, order.getRelations().size());
 
-        TableDetail customer = DataGraphProjector.table(schemas(), joins, "t_customer");
+        TableDetail customer = detail(schemas(), joins, "t_customer");
         assertEquals("PRIMARY", field(customer, "id").getKey());
         assertEquals("UNIQUE", field(customer, "code").getKey());
         assertNull(field(customer, "region_id").getKey());
         assertEquals(1, customer.getRelations().size());
 
-        TableDetail region = DataGraphProjector.table(schemas(), joins, "t_region");
+        TableDetail region = detail(schemas(), joins, "t_region");
         assertTrue(region.getRelations().isEmpty());
         assertEquals(1, region.getSelfReferences().size());
         assertTrue(field(region, "parent_id").isInRelation());
 
-        assertNull(DataGraphProjector.table(schemas(), joins, "t_nope"));
+        assertNull(detail(schemas(), joins, "t_nope"));
     }
 
     @Nested
@@ -310,7 +328,7 @@ class DataGraphProjectorTest {
             List<ConnectorSchema> rows = List.of(
                     table("t_order", "订单表", 1, null, "id", "customer_id"),
                     table("t_customer", "客户表", 2, null, "id"));
-            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of(
+            SystemGraph g = project(rows, List.of(
                     join("t_order", "customer_id", "t_customer", "id"),
                     join("t_order", "id", "t_customer", "id", "CONFIRMED", Map.of())));
             assertEquals(List.of("t_order.id→t_customer.id"), edges(g));
@@ -325,13 +343,13 @@ class DataGraphProjectorTest {
                     table("采购 单", "采购单", 1, List.of(pk("编号")), "编号", "客户 编号|客户编号"),
                     table("客户", "客户", 2, List.of(pk("编号")), "编号", "名称"));
             List<ConnectorSemantic> joins = List.of(join("采购 单", "客户 编号", "客户", "编号"));
-            SystemGraph g = DataGraphProjector.system(connection(), rows, joins);
+            SystemGraph g = project(rows, joins);
             Relation r = g.getRelations().get(0);
             assertEquals("MANY_TO_ONE", r.getCardinality());
             assertEquals("INFERRED", r.getTier());
-            assertEquals("客户编号", r.getLabel());
+            assertEquals("客户编号", r.getRole());
             assertTrue(r.getId().matches("[0-9a-f]{16}"), r.getId());
-            assertEquals(1, DataGraphProjector.table(rows, joins, "采购 单").getRelations().size());
+            assertEquals(1, detail(rows, joins, "采购 单").getRelations().size());
         }
 
         @Test
@@ -368,7 +386,7 @@ class DataGraphProjectorTest {
         row.setEvidence("NAME");
         row.setTenantId("tenant-x");
         SystemGraph g = system(row);
-        TableDetail d = DataGraphProjector.table(schemas(), List.of(row), "t_item");
+        TableDetail d = detail(schemas(), List.of(row), "t_item");
         for (String out : List.of(json(g), json(d))) {
             for (String banned : List.of("\"gloss\"", "\"confidence\"", "\"basis\"", "\"note\"", "\"care_reason\"",
                     "\"verify_note\"", "\"discriminator_value\"", "\"evidence\"", "\"tenantId\"",
@@ -382,18 +400,152 @@ class DataGraphProjectorTest {
     @DisplayName("出网对象能被项目的 Jackson（2.11，不认 record）序列化，布尔字段名不带 is")
     void 序列化() throws Exception {
         List<ConnectorSemantic> joins = List.of(join("t_item", "order_id", "t_order", "id"));
-        JsonNode g = MAPPER.readTree(json(DataGraphProjector.system(connection(), schemas(), joins)));
+        JsonNode g = MAPPER.readTree(json(project(schemas(), joins)));
         assertEquals("7", g.get("connectorId").asText());
         assertTrue(g.get("tables").get(0).has("related"));
-        JsonNode d = MAPPER.readTree(json(DataGraphProjector.table(schemas(), joins, "t_item")));
+        JsonNode d = MAPPER.readTree(json(detail(schemas(), joins, "t_item")));
         assertTrue(d.get("fields").get(0).has("inRelation"));
         assertTrue(d.get("fields").get(0).has("nullable"));
+    }
+
+    @Nested
+    @DisplayName("v3：业务视图与兜底（§6.3、§7）")
+    class BusinessView {
+
+        private SystemGraph withViews(List<ConnectorSemantic> joins, com.jimeng.persistence.entity.ConnectorBusinessView... views) {
+            return DataGraphProjector.system(connection(), schemas(), joins, List.of(views), "READY");
+        }
+
+        @Test
+        @DisplayName("★ 标题、说明、领域取业务视图，来源标 BUSINESS_VIEW；客户原注释留给技术信息区")
+        void 业务视图优先() {
+            TableCard order = card(withViews(List.of(),
+                    objectView("t_order", "销售订单", "一条记录是一张销售订单。", "销售")), "t_order");
+            assertEquals("销售订单", order.getDisplayName());
+            assertEquals("BUSINESS_VIEW", order.getNameSource());
+            assertEquals("一条记录是一张销售订单。", order.getSummary());
+            assertEquals("销售", order.getDomain());
+            assertEquals("订单表", order.getComment());
+        }
+
+        @Test
+        @DisplayName("没有业务名：退回像名称的表注释（COMMENT）；说明句、空注释、夹着代码或禁用词的注释都退回表名（PHYSICAL）")
+        void 标题兜底() {
+            List<ConnectorSchema> rows = new ArrayList<>(schemas());
+            rows.add(table("t_code", "t_order 的编码", 9, List.of(pk("id")), "id"));
+            rows.add(table("t_est", "估算表", 10, List.of(pk("id")), "id"));
+            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of(),
+                    List.of(objectView("t_customer", null, null, "主数据")), null);
+            assertEquals("COMMENT", card(g, "t_order").getNameSource());
+            assertEquals("订单表", card(g, "t_order").getDisplayName());
+            assertNull(card(g, "t_order").getSummary());
+            assertNull(card(g, "t_order").getDomain());
+            assertEquals("COMMENT", card(g, "t_customer").getNameSource(), "只有领域、没有业务名的行不算业务名");
+            assertEquals("主数据", card(g, "t_customer").getDomain());
+            assertEquals("PHYSICAL", card(g, "t_ext").getNameSource());
+            assertNull(card(g, "t_ext").getDisplayName());
+            assertEquals("PHYSICAL", card(g, "t_region").getNameSource());
+            assertEquals("PHYSICAL", card(g, "t_code").getNameSource(), "注释夹着表名，不拿来当业务名");
+            assertNull(card(g, "t_code").getDisplayName());
+            assertEquals("PHYSICAL", card(g, "t_est").getNameSource(), "注释带禁用词，同样不用");
+        }
+
+        @Test
+        @DisplayName("★ 关系角色名：业务视图优先；没有就退回起点列注释，注释夹着代码或带禁用词时不用")
+        void 角色名() {
+            List<ConnectorSchema> rows = new ArrayList<>(schemas());
+            rows.add(table("t_pay", "付款", 9, List.of(pk("id")), "id", "order_id|关联 t_order.id"));
+            rows.add(table("t_refund", "退款", 10, List.of(pk("id")), "id", "order_id|估算的原订单"));
+            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of(
+                            join("t_item", "order_id", "t_order", "id"),
+                            join("t_order", "customer_code", "t_customer", "code"),
+                            join("t_pay", "order_id", "t_order", "id"),
+                            join("t_refund", "order_id", "t_order", "id")),
+                    List.of(relationView("t_order", "customer_code", "下单客户")), null);
+            assertEquals("下单客户", relation(g, "t_order.customer_code→t_customer.code").getRole());
+            assertEquals("所属订单", relation(g, "t_item.order_id→t_order.id").getRole());
+            assertNull(relation(g, "t_pay.order_id→t_order.id").getRole(), "注释夹着代码");
+            assertNull(relation(g, "t_refund.order_id→t_order.id").getRole(), "注释带禁用词");
+        }
+
+        @Test
+        @DisplayName("自关联带上可信度、来源与角色名（v2 审查 #4）")
+        void 自关联() {
+            SelfReference confirmed = card(withViews(
+                    List.of(join("t_region", "parent_id", "t_region", "id", "CONFIRMED", Map.of())),
+                    relationView("t_region", "parent_id", "上级地区")), "t_region").getSelfReferences().get(0);
+            assertEquals("CONFIRMED", confirmed.getTier());
+            assertEquals("DATA", confirmed.getConfirmedBy());
+            assertEquals("上级地区", confirmed.getRole());
+            SelfReference inferred = card(system(join("t_region", "parent_id", "t_region", "id")), "t_region")
+                    .getSelfReferences().get(0);
+            assertEquals("INFERRED", inferred.getTier());
+            assertNull(inferred.getConfirmedBy());
+            assertEquals("上级地区", inferred.getRole(), "没有业务视图时退回列注释");
+        }
+
+        @Test
+        @DisplayName("1′. 起点和终点是同一张表的同一列：丢弃（v2 审查 #3）")
+        void 同表同列() {
+            SystemGraph g = system(join("t_order", "id", "t_order", "id", "CONFIRMED", Map.of()));
+            assertTrue(card(g, "t_order").getSelfReferences().isEmpty());
+            assertTrue(g.getRelations().isEmpty());
+        }
+
+        @Test
+        @DisplayName("快照达到 200 个对象：truncated（v2 审查 #2）；整理状态原样带出")
+        void 截断与状态() {
+            List<ConnectorSchema> rows = new ArrayList<>();
+            for (int i = 0; i < 199; i++) {
+                rows.add(table(String.format("t_%03d", i), "表", i, List.of(pk("id")), "id"));
+            }
+            assertFalse(DataGraphProjector.system(connection(), rows, List.of(), List.of(), null).isTruncated());
+            rows.add(table("t_199", "表", 199, List.of(pk("id")), "id"));
+            SystemGraph g = DataGraphProjector.system(connection(), rows, List.of(), List.of(), "RUNNING");
+            assertTrue(g.isTruncated());
+            assertEquals("RUNNING", g.getViewStatus());
+        }
+
+        @Test
+        @DisplayName("单表详情同样带业务名、说明、领域")
+        void 单表详情() {
+            TableDetail d = DataGraphProjector.table(schemas(), List.of(),
+                    List.of(objectView("t_item", "订单明细", "一条记录是订单里的一行商品。", "销售")), "t_item");
+            assertEquals("订单明细", d.getDisplayName());
+            assertEquals("BUSINESS_VIEW", d.getNameSource());
+            assertEquals("一条记录是订单里的一行商品。", d.getSummary());
+            assertEquals("销售", d.getDomain());
+        }
+
+        @Test
+        @DisplayName("★ 业务视图的输入指纹、模型、提示词版本、来源都不出网")
+        void 内部字段不出网() {
+            List<ConnectorSemantic> joins = List.of(join("t_item", "order_id", "t_order", "id"));
+            SystemGraph g = withViews(joins, objectView("t_order", "销售订单", "说明", "销售"),
+                    relationView("t_item", "order_id", "所属订单"));
+            TableDetail d = DataGraphProjector.table(schemas(), joins,
+                    List.of(objectView("t_order", "销售订单", "说明", "销售")), "t_order");
+            for (String out : List.of(json(g), json(d))) {
+                for (String banned : List.of("HASH_SECRET", "MODEL_SECRET", "PV_SECRET", "\"inputHash\"",
+                        "\"modelCode\"", "\"promptVersion\"", "\"source\"")) {
+                    assertFalse(out.contains(banned), banned + " 出现在 " + out);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ helpers
 
     private static SystemGraph system(ConnectorSemantic... joins) {
-        return DataGraphProjector.system(connection(), schemas(), List.of(joins));
+        return project(schemas(), List.of(joins));
+    }
+
+    private static SystemGraph project(List<ConnectorSchema> rows, List<ConnectorSemantic> joins) {
+        return DataGraphProjector.system(connection(), rows, joins, List.of(), null);
+    }
+
+    private static TableDetail detail(List<ConnectorSchema> rows, List<ConnectorSemantic> joins, String name) {
+        return DataGraphProjector.table(rows, joins, List.of(), name);
     }
 
     private static List<String> edges(SystemGraph g) {

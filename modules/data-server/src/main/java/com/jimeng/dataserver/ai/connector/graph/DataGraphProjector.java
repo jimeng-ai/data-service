@@ -1,6 +1,7 @@
 package com.jimeng.dataserver.ai.connector.graph;
 
 import com.jimeng.common.core.utils.CommonUtil;
+import com.jimeng.dataserver.ai.connector.businessview.BusinessTextRules;
 import com.jimeng.dataserver.ai.connector.generation.SemanticTableRenderer;
 import com.jimeng.dataserver.ai.connector.generation.SemanticTableRenderer.NamedKey;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.ColumnRef;
@@ -12,10 +13,13 @@ import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableCard;
 import com.jimeng.dataserver.ai.connector.graph.DataGraphViews.TableDetail;
 import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.model.RowEstimateNote;
+import com.jimeng.dataserver.ai.connector.service.ConnectorSchemaService;
 import com.jimeng.dataserver.ai.connector.service.ConnectorSemanticService;
+import com.jimeng.dataserver.ai.connector.service.RelationCandidates;
 import com.jimeng.dataserver.ai.connector.service.SemanticJoinValidator;
 import com.jimeng.dataserver.ai.connector.service.SemanticRowAssembler;
 import com.jimeng.persistence.entity.Connection;
+import com.jimeng.persistence.entity.ConnectorBusinessView;
 import com.jimeng.persistence.entity.ConnectorSchema;
 import com.jimeng.persistence.entity.ConnectorSemantic;
 
@@ -24,6 +28,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -34,10 +39,11 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * 数据星图的全部规则（设计文档 §5.2–§5.5）：把一条连接的结构快照和语义层 JOIN 行投影成客户视图。
+ * 数据星图的全部规则（设计文档 §7）：把一条连接的结构快照、语义层 JOIN 行和业务视图投影成给人看的对象关系图。
  *
  * <p>纯函数：不访问数据库、不依赖 Spring，同样的输入永远得到同样的输出（顺序也一样）。
- * 它不产生任何新结论，只做两件事——按固定顺序筛关系、把结构元数据翻译成客户看得懂的呈现。
+ * 它不产生任何新结论，只做三件事——按固定顺序筛关系、给对象和关系配上业务文字（缺了按 §6.3 兜底）、
+ * 把结构元数据留给折叠的技术信息区。
  */
 public final class DataGraphProjector {
 
@@ -49,6 +55,10 @@ public final class DataGraphProjector {
     public static final String ONE_TO_ONE = "ONE_TO_ONE";
     public static final String KEY_PRIMARY = "PRIMARY";
     public static final String KEY_UNIQUE = "UNIQUE";
+    /** 对象标题来自哪一档（§6.3）：业务视图 → 像名称的表注释 → 表名。 */
+    public static final String NAME_BUSINESS_VIEW = "BUSINESS_VIEW";
+    public static final String NAME_COMMENT = "COMMENT";
+    public static final String NAME_PHYSICAL = "PHYSICAL";
 
     /** 表注释「像名称」的长度上限（字符数），超过就只当说明、不当标题。 */
     static final int NAME_MAX_CHARS = 16;
@@ -58,6 +68,8 @@ public final class DataGraphProjector {
     // 各读取方（推导、工具执行器）都各自声明常量，这里同样。
     private static final String KEY_JOIN_KIND = "join_kind";
     private static final String KEY_DISCRIMINATOR_COLUMN = "discriminator_column";
+    /** 关系是谁提出来的（{@code RelationCandidates.ORIGIN_*}），写入方是关系发现。 */
+    private static final String KEY_ORIGIN = "origin";
 
     private static final Comparator<Relation> RELATION_ORDER = Comparator
             .comparing(Relation::getFromTable)
@@ -93,20 +105,33 @@ public final class DataGraphProjector {
         return true;
     }
 
+    /** 结构快照是否达到了对象数上限（上限只有一个来源：{@link ConnectorSchemaService#MAX_OBJECTS}）。 */
+    public static boolean truncated(int snapshotObjects) {
+        return snapshotObjects >= ConnectorSchemaService.MAX_OBJECTS;
+    }
+
+    /**
+     * @param schemas    这条连接的全部快照行（含 TABLE / VIEW 之外的对象：它们也占快照的名额）
+     * @param views      这条连接的业务视图行
+     * @param viewStatus 业务文字的整理状态，原样带出（{@link DataGraphViews.SystemSummary}）
+     */
     public static SystemGraph system(Connection connection, List<ConnectorSchema> schemas,
-                                     List<ConnectorSemantic> joins) {
-        Projection p = project(schemas, joins);
+                                     List<ConnectorSemantic> joins, List<ConnectorBusinessView> views,
+                                     String viewStatus) {
+        Projection p = project(schemas, joins, views);
         List<TableCard> cards = new ArrayList<>(p.tables().size());
         for (Table t : p.tables().values()) {
             cards.add(card(t, p));
         }
         return new SystemGraph(String.valueOf(connection.getId()), connection.getName(),
-                connection.getDisplayName(), connection.getSemanticStatus(), List.copyOf(cards), p.relations());
+                connection.getDisplayName(), connection.getSemanticStatus(),
+                truncated(schemas == null ? 0 : schemas.size()), viewStatus, List.copyOf(cards), p.relations());
     }
 
     /** @return 表不在快照里（或不是 TABLE / VIEW）时为 {@code null} */
-    public static TableDetail table(List<ConnectorSchema> schemas, List<ConnectorSemantic> joins, String name) {
-        Projection p = project(schemas, joins);
+    public static TableDetail table(List<ConnectorSchema> schemas, List<ConnectorSemantic> joins,
+                                    List<ConnectorBusinessView> views, String name) {
+        Projection p = project(schemas, joins, views);
         Table t = name == null ? null : p.tables().get(name);
         if (t == null) {
             return null;
@@ -136,14 +161,22 @@ public final class DataGraphProjector {
             fields.add(new Field(f.name(), f.type(), f.nullable(), text(f.comment()), key,
                     involved.contains(f.name())));
         }
-        return new TableDetail(t.name(), t.displayName(), t.comment(), t.objectType(), selfRefs,
-                List.copyOf(fields), incident);
+        return new TableDetail(t.name(), t.displayName(), t.nameSource(), t.summary(), t.domain(), t.comment(),
+                t.objectType(), selfRefs, List.copyOf(fields), incident);
     }
 
     // ------------------------------------------------------------------ 投影
 
-    private static Projection project(List<ConnectorSchema> schemas, List<ConnectorSemantic> joins) {
-        Map<String, Table> tables = tables(schemas);
+    private static Projection project(List<ConnectorSchema> schemas, List<ConnectorSemantic> joins,
+                                      List<ConnectorBusinessView> views) {
+        Map<String, ConnectorBusinessView> byKey = new HashMap<>();
+        for (ConnectorBusinessView v : views == null ? List.<ConnectorBusinessView>of() : views) {
+            if (v != null && v.getKind() != null) {
+                byKey.putIfAbsent(viewKey(v.getKind(), v.getObjectName(), v.getFieldName()), v);
+            }
+        }
+        Words words = new Words(byKey, identifiers(schemas));
+        Map<String, Table> tables = tables(schemas, words);
         Map<String, List<SelfReference>> selfRefs = new LinkedHashMap<>();
         List<Relation> relations = new ArrayList<>();
         for (ConnectorSemantic row : joins == null ? List.<ConnectorSemantic>of() : joins) {
@@ -151,11 +184,13 @@ public final class DataGraphProjector {
             if (j == null) {
                 continue;
             }
+            Table from = tables.get(j.fromTable());
             if (j.fromTable().equals(j.toTable())) {
                 selfRefs.computeIfAbsent(j.fromTable(), k -> new ArrayList<>())
-                        .add(new SelfReference(j.fromColumn(), j.toColumn()));
+                        .add(new SelfReference(j.fromColumn(), j.toColumn(), j.tier(), j.confirmedBy(),
+                                words.role(from, j.fromColumn())));
             } else {
-                relations.add(relation(j, tables));
+                relations.add(relation(j, tables, words));
             }
         }
         relations.sort(RELATION_ORDER);
@@ -168,7 +203,7 @@ public final class DataGraphProjector {
     }
 
     /** 只收 TABLE / VIEW；按 {@code importance_rank} 升序（空值排最后）再按表名，保证输出顺序确定。 */
-    private static Map<String, Table> tables(List<ConnectorSchema> schemas) {
+    private static Map<String, Table> tables(List<ConnectorSchema> schemas, Words words) {
         List<ConnectorSchema> rows = (schemas == null ? List.<ConnectorSchema>of() : schemas).stream()
                 .filter(r -> r != null && r.getObjectName() != null && objectType(r.getObjectType()) != null)
                 .sorted(Comparator.comparing(ConnectorSchema::getImportanceRank,
@@ -179,8 +214,22 @@ public final class DataGraphProjector {
         Map<String, Table> out = new LinkedHashMap<>();
         for (ConnectorSchema r : rows) {
             String comment = RowEstimateNote.strip(r.getObjectComment());
+            ConnectorBusinessView view = words.object(r.getObjectName());
+            String displayName;
+            String nameSource;
+            if (view != null && text(view.getDisplayName()) != null) {
+                displayName = text(view.getDisplayName());
+                nameSource = NAME_BUSINESS_VIEW;
+            } else if (looksLikeName(comment) && BusinessTextRules.fitsFallback(comment, words.identifiers())) {
+                displayName = comment;
+                nameSource = NAME_COMMENT;
+            } else {
+                displayName = null;
+                nameSource = NAME_PHYSICAL;
+            }
             out.put(r.getObjectName(), new Table(r.getObjectName(), objectType(r.getObjectType()), comment,
-                    looksLikeName(comment) ? comment : null,
+                    displayName, nameSource, view == null ? null : text(view.getSummary()),
+                    view == null ? null : text(view.getDomain()),
                     fields.getOrDefault(r.getObjectName(), Map.of()),
                     SemanticTableRenderer.namedUniqueKeys(r)));
         }
@@ -188,7 +237,7 @@ public final class DataGraphProjector {
     }
 
     /**
-     * 设计文档 §5.2 的判定表，按顺序、先命中者为准。{@code confidence}、{@code source}、{@code evidence} 不参与。
+     * §7.1 的判定表，按顺序、先命中者为准。{@code confidence}、{@code source}、{@code evidence} 不参与。
      *
      * <p>★ 业务方的任何一次确认（{@code annotateJoin} → {@code upsertHuman}）都会把 {@code status} 写成 CONFIRMED、
      * {@code verified} 写成 NONE，否认只记在 {@code human_verdict=UNRELATED}——所以绝不能用 {@code status} 判「已确认」。
@@ -209,6 +258,10 @@ public final class DataGraphProjector {
         // 1. 两端的表和列都得在当前快照里
         if (from == null || to == null || fromColumn == null || toColumn == null
                 || !from.fields().containsKey(fromColumn) || !to.fields().containsKey(toColumn)) {
+            return null;
+        }
+        // 1′. 同一张表的同一列：抽样时这种行的包含率永远是 100%，画出来是一个指向自己的圈
+        if (fromTable.equals(toTable) && fromColumn.equals(toColumn)) {
             return null;
         }
         // 2. 结构已变、待重判
@@ -239,6 +292,11 @@ public final class DataGraphProjector {
         if (polymorphic) {
             return null;
         }
+        // 7′. 关系发现里模型那一遍推出的：只给 Agent 当线索。真实库试跑里它把「币种 → 公司代码」这类错线也报了高把握，
+        //     终点又常是主键——不挡的话第 8 行会把它们画成虚线。核对通过（第 5 行）或业务方确认（第 4 行）之后照常画。
+        if (RelationCandidates.ORIGIN_RELATION_PASS.equals(text(detail.get(KEY_ORIGIN)))) {
+            return null;
+        }
         // 8. 结构上成立：终点列单独构成终点表的一个唯一键
         if (singleColumnUnique(to, toColumn)) {
             return new Judged(fromTable, fromColumn, toTable, toColumn, TIER_INFERRED, null, null);
@@ -247,13 +305,13 @@ public final class DataGraphProjector {
         return null;
     }
 
-    private static Relation relation(Judged j, Map<String, Table> tables) {
+    private static Relation relation(Judged j, Map<String, Table> tables, Words words) {
         Table from = tables.get(j.fromTable());
         Table to = tables.get(j.toTable());
         return new Relation(relationId(j.fromTable(), j.fromColumn(), j.toTable(), j.toColumn()),
                 j.fromTable(), j.fromColumn(), j.toTable(), j.toColumn(),
                 cardinality(from, j.fromColumn(), to, j.toColumn()), j.tier(), j.confirmedBy(),
-                label(from, j.fromColumn()), j.discriminatorColumn());
+                words.role(from, j.fromColumn()), j.discriminatorColumn());
     }
 
     /** 终点列单独唯一：起点列也单独唯一为一对一，否则多对一；终点列不唯一（只会出现在已确认关系上）为 {@code null}。 */
@@ -318,7 +376,8 @@ public final class DataGraphProjector {
                 related = true;
             }
         }
-        return new TableCard(t.name(), t.displayName(), t.comment(), t.objectType(), related,
+        return new TableCard(t.name(), t.displayName(), t.nameSource(), t.summary(), t.domain(), t.comment(),
+                t.objectType(), related,
                 p.selfReferences().getOrDefault(t.name(), List.of()),
                 keyColumns(t).stream().map(c -> columnRef(t, c)).toList(),
                 relationColumns.stream().map(c -> columnRef(t, c)).toList(),
@@ -328,13 +387,6 @@ public final class DataGraphProjector {
     private static ColumnRef columnRef(Table t, String column) {
         FieldDetail f = t.fields().get(column);
         return new ColumnRef(column, f == null ? null : text(f.comment()));
-    }
-
-    /** 线上的字：起点列的客户注释；为空或与列名相同（忽略大小写）时不写。 */
-    private static String label(Table from, String column) {
-        FieldDetail f = from.fields().get(column);
-        String comment = f == null ? null : text(f.comment());
-        return comment == null || comment.equalsIgnoreCase(column) ? null : comment;
     }
 
     /** 四段做长度前缀编码后取 SHA-256 的前 16 位十六进制：表名、列名里的任何字符都不会让两条关系撞成同一个 id。 */
@@ -350,6 +402,15 @@ public final class DataGraphProjector {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 unavailable", e);
         }
+    }
+
+    /** 这个系统的物理标识符：兜底用的客户注释里夹着它们就不拿来当业务文字（§6.3）。 */
+    private static Set<String> identifiers(List<ConnectorSchema> schemas) {
+        List<ConnectorSchema> rows = schemas == null ? List.of() : schemas.stream()
+                .filter(r -> r != null && r.getObjectName() != null).toList();
+        List<String> columns = new ArrayList<>();
+        SemanticRowAssembler.parseFields(rows).values().forEach(cols -> columns.addAll(cols.keySet()));
+        return BusinessTextRules.identifiers(rows.stream().map(ConnectorSchema::getObjectName).toList(), columns);
     }
 
     @SuppressWarnings("unchecked")
@@ -374,12 +435,42 @@ public final class DataGraphProjector {
         return s.isEmpty() ? null : s;
     }
 
-    private record Table(String name, String objectType, String comment, String displayName,
-                 Map<String, FieldDetail> fields, List<NamedKey> keys) {
+    private static String viewKey(String kind, String object, String field) {
+        return kind + '\u0001' + SemanticRowAssembler.fold(object) + '\u0001'
+                + SemanticRowAssembler.fold(field == null ? "" : field);
+    }
+
+    /** 业务视图的查法与兜底。 */
+    private record Words(Map<String, ConnectorBusinessView> views, Set<String> identifiers) {
+
+        ConnectorBusinessView object(String table) {
+            return views.get(viewKey(ConnectorBusinessView.KIND_OBJECT, table, ""));
+        }
+
+        /**
+         * 关系角色名：业务视图的优先；缺了退回起点列的客户注释（不能等于列名，还得过 {@link BusinessTextRules#fitsFallback}：
+         * 不夹代码、不带禁用词），再缺为 null。
+         */
+        String role(Table from, String column) {
+            ConnectorBusinessView v = views.get(viewKey(ConnectorBusinessView.KIND_RELATION, from.name(), column));
+            if (v != null && text(v.getDisplayName()) != null) {
+                return text(v.getDisplayName());
+            }
+            FieldDetail f = from.fields().get(column);
+            String comment = f == null ? null : text(f.comment());
+            if (comment == null || comment.equalsIgnoreCase(column) || !BusinessTextRules.fitsFallback(comment, identifiers)) {
+                return null;
+            }
+            return comment;
+        }
+    }
+
+    private record Table(String name, String objectType, String comment, String displayName, String nameSource,
+                         String summary, String domain, Map<String, FieldDetail> fields, List<NamedKey> keys) {
     }
 
     private record Judged(String fromTable, String fromColumn, String toTable, String toColumn,
-                  String tier, String confirmedBy, String discriminatorColumn) {
+                          String tier, String confirmedBy, String discriminatorColumn) {
     }
 
     private record Projection(Map<String, Table> tables, List<Relation> relations,
