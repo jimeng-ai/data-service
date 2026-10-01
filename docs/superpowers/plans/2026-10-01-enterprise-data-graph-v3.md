@@ -824,7 +824,7 @@ cd $DS && rm -rf modules/data-server/target/surefire-reports && \
   cd modules/data-server/target/surefire-reports && for f in TEST-*.xml; do echo "$f cases=$(grep -c '<testcase' $f) failures=$(grep -c '<failure\|<error' $f)"; done; \
   grep -c 'classname="声明外键采集"' TEST-com.jimeng.dataserver.ai.connector.impl.mysql.MySqlConnectorTest.xml
 ```
-Expected: 每个文件 `failures=0`；MySqlConnectorTest @@N:MySqlConnectorTest@2@@ 个用例；最后一行（外键那组）是 6。
+Expected: 每个文件 `failures=0`；MySqlConnectorTest 101 个用例；最后一行（外键那组）是 6。
 
 - [ ] **Step 5: 提交**
 
