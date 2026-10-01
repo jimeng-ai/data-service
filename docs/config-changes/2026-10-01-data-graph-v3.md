@@ -3,6 +3,8 @@
 > 本目录的约定见 `2026-09-21-enable-connector-agent-plane.md` 开头：改了数据库结构或运行时配置就留一份记录，
 > 只写键名、语义与回滚办法，绝不写任何真实密钥值。设计见 `docs/superpowers/specs/2026-09-30-enterprise-data-graph-design.md`。
 
+> 上线步骤（和 AI 生成 Skill 的 DDL 一起执行、四个仓库的发版顺序、上线后核对）见 `docs/releases/v1.1.0.md`。
+
 ## 一、数据库（生产由你执行，先于部署）
 
 | 文件 | 内容 | 漏跑时的症状 |
@@ -35,6 +37,7 @@
 
 ## 五、回滚
 
-- data-service：把 `connector.semantic.enrichment.enabled` 设为 `false` 即可停掉补全链；回滚代码也行，两张新表是纯新增，留着不影响旧代码。
+- data-service：把 `connector.semantic.enrichment.enabled` 设为 `false` 并重启 data-server（配置类没有标 `@RefreshScope`，以重启为准）即可停掉补全链；
+  也可以回滚代码：GitHub → Actions → Deploy → Run workflow，选上一个版本 tag。两张新表是纯新增，留着不影响旧代码。
   关系发现写进语义层的 JOIN 行是普通的推断行（`detail_json.origin` = `FK` / `NAME_RULE` / `RELATION_PASS`），旧代码照常读。
-- 前端：回滚代码即可。
+- 前端：同样在 Actions 里选上一个版本 tag 重跑。

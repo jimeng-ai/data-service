@@ -38,6 +38,16 @@ docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 d
   < modules/data-server/docs/ops-20260614-product-feedback.sql
 ```
 
+### AI 生成 Skill 改走沙箱 skill-creator（2026-09-27）
+
+```bash
+docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 data-server \
+  < modules/data-server/src/main/resources/db/migration/V20260927__skill_builder_session.sql
+```
+
+新表 `skill_builder_session` / `ai_skill_version`。漏跑的症状：应用照常 `Started`，AI 生成 Skill 的接口全部 500
+（`Table ... doesn't exist`）。详见 `docs/config-changes/2026-09-27-skill-builder-skill-creator.md`。
+
 ### 数据星图 v3（2026-10-01）
 
 ```bash
@@ -50,6 +60,8 @@ docker exec -i dev-mysql mysql --default-character-set=utf8mb4 -uroot -p123456 d
 详见 `docs/config-changes/2026-10-01-data-graph-v3.md`。
 
 跑完用下面 ⑥ 的自检脚本确认，不要凭"应该跑过了"。
+
+> 2026-10-01 这一轮（data-service v1.1.0）上线时，生产库要补的正是上面最后两份；完整步骤（含发版顺序）见 `docs/releases/v1.1.0.md`。
 
 ## ② Nacos 配置（不配则能力静默不可用）
 
