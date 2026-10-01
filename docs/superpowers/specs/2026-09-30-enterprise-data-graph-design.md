@@ -17,9 +17,14 @@
 19 张表）和连接 `erp_real`（8 张表）。
 
 1. **关系覆盖**：
-   - klny_erp：附录 A1 里由命名规则推出的 33 条全部出现（实线或虚线都算）；「采购订单明细 → 采购订单」「销售订单明细
-     → 销售订单」这两对对象之间各有一根线。
-   - erp_real：v2 已有的 7 条仍在；附录 A2 里命名规则推出的 16 条全部出现（其中 5 条与已有的重合），合计至少 18 条。
+   - klny_erp：附录 A1 里由命名规则推出的 33 条，除了被采样核对否掉的（数据不支持，§7.1 第 6 行不画），全部出现在
+     星图上（实线或虚线都算）；被否掉的那几条连同包含率写进验收记录。2026-10-01 本地库上否掉 1 条
+     （`EFI_ORIGINALTRANSDTL.VOUCHERDTLID`：采样 20 个取值、命中 0——本地库各表的样例行是分别抽的，彼此不连着）。
+   - 记录项（不算通过与否）：模型那一遍这次找出了「采购订单明细 → 采购订单」「销售订单明细 → 销售订单」里的哪几对，
+     写进验收记录。它们在语义层里，星图上要等采样核对通过或业务方确认才画（§7.1 第 7′ 行）；模型那一遍有随机性，
+     2026-10-01 三次试跑分别找出了 0、1、1 对（见 §14 第 3 条）。
+   - erp_real：v2 已有的 7 条仍在；附录 A2 里命名规则推出的 16 条（其中 5 条与已有的重合），除了被采样核对否掉的，
+     全部出现，合计至少 18 条减去被否掉的条数。
    - 终点不是对方唯一键的关系，只有已确认的（数据核对通过或业务方确认）才出现。
 2. **业务名称**：两个系统全部 27 个对象的标题都来自业务视图（`nameSource=BUSINESS_VIEW`）。
 3. **默认视图里没有代码**：画布、概览、右侧面板默认展开的内容里，不出现该系统的任何物理表名，也不出现长度 ≥ 4 的
@@ -146,6 +151,15 @@
 - **装不下就分片：** 按「待判列」分片，每一片都带完整的目标索引，保证每一片都看得见所有表。每片摘要最多 60000 字符，
   max_tokens 为 8000。
 - 模型和调用方式与语义层推导相同：`connector.semantic.infer-model`，经 `claudeService.messagesInternal`（不带工具，只调一轮）。
+- **这一遍的产出只进语义层，给 Agent 当线索；星图要等采样核对通过或业务方确认之后才画**（§7.1 第 7′ 行）。
+  2026-10-01 用本地两个真实库试跑了三次：
+  - 模型会把找不到对象的列也写进来，随手指向公司代码表的主键，备注写着「库中无对应主数据表」「宁缺毋滥」，
+    自报把握 0–50；
+  - 提示词要求「把握不低于 70 才写」之后，它把错线（「币种 → 公司代码」「物料 → 销售订单明细」）也报成 70；
+  - 它推对的也不少：「售达方、送达方、付款方 → 客户」「明细的来源单 → 单据头」「上级 → 自身」。
+
+  所以只靠提示词和自报把握挡不住误报。这些终点又多是主键，不挡的话 §7.1 第 8 行会把它们画成虚线。
+  保留两道过滤：自报把握低于 60 的不收（挡的是「占位条目」），每片最多问 200 列（答案要装得进 max_tokens）。
 
 ### 5.4 写入
 
@@ -195,6 +209,9 @@
 - 认领时间 `claim_at`，30 分钟过期；
 - 上次结果 `last_status`（`READY` / `FAILED`）；
 - 上次尝试时的输入指纹、上次尝试时间；
+- 上次模型关系那一遍的输入指纹：输入没变就不再问模型（§5.3），免得每轮采样核对之后都重问一遍。指纹按这一遍**写完之后**的
+  样子算——它自己写下的关系（规则候选、模型产出）不算输入变化，否则之后不管因为什么重跑，都会把模型答过的列和没把握不答的列
+  再问一遍（真实库试跑时，一次定时刷新结构就引出了这样一轮）；模型那一遍失败时仍存上一次的，下次照样再问；
 - 两段说明：关系发现一段，业务文字一段。
 
 两张表都要加进 `JimengTenantLineHandler.TENANT_AWARE_TABLES`，并加单测断言。
@@ -254,6 +271,7 @@
 | 5 | `verified = CONFIRMED` | `CONFIRMED`，`confirmedBy=DATA` |
 | 6 | `verified ∈ {REJECTED, WEAK}` | 丢弃 |
 | 7 | `detail_json.join_kind = POLYMORPHIC` | 丢弃（未确认前画成无条件的线会误导人） |
+| 7′ | `detail_json.origin = RELATION_PASS`（模型那一遍推出） | 丢弃（只给 Agent 当线索，见 §5.3；核对通过或业务方确认后由第 4、5 行画出） |
 | 8 | 终点列单独构成终点表的一个唯一键 | `INFERRED` |
 | 9 | 其余 | 丢弃 |
 
@@ -421,7 +439,7 @@
 - 权限：有模块的成员放行，没有的拦住（4001），超管放行。
 - 投影：
   - 合并业务视图，兜底顺序（包括兜底注释的代码扫描），`nameSource`；
-  - §7.1 第 1′ 行；自关联带来源；
+  - §7.1 第 1′、7′ 行；自关联带来源；
   - `truncated`、`viewStatus`。
 - 性能：服务层 200 张表、200 条关系的 `/systems/{id}`，P95 < 300 ms。
 - 两张新表都在租户白名单里；`MAX_OBJECTS` 只有一个来源。
@@ -440,8 +458,8 @@
 ## 13. 上线
 
 - **DDL：** 迁移脚本新增两张表（附录 D）。项目没有 Flyway，按 `docs/RELEASE-CHECKLIST-connector.md` 的顺序，先手工执行
-  DDL 再部署；同时把两张表加进它的 schema 自检和 `docs/mysql-schema.sql`。生产库由你执行；另写一份变更文档到
-  `docs/config-changes/`，只写表名和用途。
+  DDL 再部署；清单 ① 里加上这份 DDL，⑥ 的自检会自动扫到新文件（`modules/data-server/docs/mysql-schema.sql` 是插件下线前的
+  全量导出，早已不随迁移更新，不改它）。生产库由你执行；另写一份变更文档到 `docs/config-changes/`，只写表名和用途。
 - **配置：** 不需要改 Nacos。沿用 `connector.semantic.infer-model`；新增的 `connector.semantic.enrichment.enabled`
   在代码里默认 true，出问题时可以用它关掉补全链。
 - **回填：** 部署后由定时对账给已有连接补跑，一次只跑一个连接。
@@ -452,10 +470,11 @@
 
 1. **业务名和领域划分准不准。** 先在本地两个系统上逐条看一遍，必要时调整提示词。
 2. **命名规则在真实客户库上的误报率。** 本地两个库是零误报，但只有两个样本；要看采样核对否掉多少条。
-3. **「明细 → 表头」靠模型那一遍推出，可能选错列。**
+3. **「明细 → 表头」靠模型那一遍推出，可能选错列，而且上图要等核对。**
    - klny_erp 的数据表明，指向表头的是 `SOID`：5 行全部落在表头 `OID` 里，`POID` 全为空；
-   - 但语义层现有的字段说明认为是 `POID`，模型可能沿用这个判断；
-   - 选错时，星图上两个对象之间的线仍然正确，但给 Agent 的这条关系查不出数据；
+   - 但语义层现有的字段说明认为是 `POID`，模型可能沿用这个判断，也可能选 `SRCSOID` 这类来源列；
+   - 模型那一遍的产出要核对通过才上星图（§7.1 第 7′ 行）。本地库每张表只有几行，核对判不出，所以本地星图上看不到这两对；
+     真实客户库数据量够，选对了列就会核对通过、画成实线；
    - 采样核对遇到全空的列会判为「判不出」，不会自动否掉它。这类错要靠业务方在对话里纠正，或者等下一版的纠错入口。
 4. **200 个对象时，领域筛选加对象地图还读不读得清。**
 
@@ -467,6 +486,8 @@
 4. 只能看到结构快照里的对象，每个连接最多 200 个。
 5. 列名没有 `id` 后缀、用拼音缩写的库，规则帮不上，只能靠模型那一遍。比如 klny_erp 的 `F_KHBH`（客户编号）、
    `F_KMBH`（科目编号）：这两条关系语义层已经有了，但终点是编码列，不是唯一键，只有核对通过后才会出现在星图上。
+6. 模型那一遍推出的关系（比如「售达方 → 客户」），核对通过之前不上星图。数据量太小的库（比如本地测试库）核对判不出，
+   这类关系就一直只在语义层里。
 
 ## 附录 A：本地两个系统的预期关系
 
@@ -510,7 +531,8 @@ ESD_SALEORDERHEAD.HEAD_COMPANYCODEID → D1_COMPANYCODE.OID
 ESD_SALEORDERHEAD.RECEIPTVENDORID → D1_VENDOR.OID
 ```
 
-最后两条是对象层面的要求，由模型那一遍推出。数据表明列是 `SOID`，但验收不限定是哪一列（见 §14 第 3 条）：
+最后两条是对象层面的记录项，由模型那一遍推出，验收时在语义层里查、只记录不判通过（星图上要等核对通过，见 §14 第 3 条）。
+数据表明列是 `SOID`：
 
 ```text
 EMM_PURCHASEORDERDTL → EMM_PURCHASEORDERHEAD（数据上是 SOID → OID）
@@ -575,14 +597,17 @@ EFI_VOUCHERDTL_EXT.OID → EFI_VOUCHERDTL.OID
 
 ## 附录 D：DDL
 
+以 `modules/data-server/src/main/resources/db/migration/V20261001__data_graph_business_view.sql` 为准，全文如下：
+
 ```sql
--- 数据星图 v3：给人看的业务视图 + 语义层补全链的运行状态。
+-- 数据星图 v3：给人看的业务视图 + 语义层补全链的运行状态（设计文档 docs/superpowers/specs/2026-09-30-enterprise-data-graph-design.md §6、附录 D）。
 --
--- 没有 Flyway：这份 DDL 要手工执行（见 docs/RELEASE-CHECKLIST-connector.md 的 schema 自检）。
--- 两张表都带 tenant_id，必须同时出现在 JimengTenantLineHandler.TENANT_AWARE_TABLES 里。
+-- 没有 Flyway：这份 DDL 要手工执行（见 docs/RELEASE-CHECKLIST-connector.md 的 ① 与 ⑥ schema 自检）。
+-- 两张表都带 tenant_id，已登记进 JimengTenantLineHandler.TENANT_AWARE_TABLES。
+-- CREATE TABLE IF NOT EXISTS，重复执行无害。
 --
 -- 唯一键刻意【不含 deleted】，做法同 connector_semantic：MODEL 行物理删除，HUMAN 行只原地更新，
--- 表上永远不出现软删死行。不要给这两张表加逻辑删除入口。
+-- 表上永远不出现软删死行。不要给这两张表加逻辑删除入口。deleted 列只是 BaseEntity 的全局 @TableLogic 要求它存在。
 
 CREATE TABLE IF NOT EXISTS `connector_business_view` (
   `id`             BIGINT        NOT NULL COMMENT '雪花ID',
@@ -594,8 +619,8 @@ CREATE TABLE IF NOT EXISTS `connector_business_view` (
   `display_name`   VARCHAR(64)   DEFAULT NULL COMMENT '业务名 / 关系角色名',
   `summary`        VARCHAR(255)  DEFAULT NULL COMMENT '一句话说明（仅 OBJECT）',
   `domain`         VARCHAR(32)   DEFAULT NULL COMMENT '业务领域（仅 OBJECT）',
-  `source`         VARCHAR(16)   NOT NULL COMMENT 'MODEL / HUMAN',
-  `input_hash`     CHAR(64)      DEFAULT NULL COMMENT '生成时输入的 SHA-256',
+  `source`         VARCHAR(16)   NOT NULL COMMENT 'MODEL / HUMAN；HUMAN 行永远不被模型覆盖',
+  `input_hash`     CHAR(64)      DEFAULT NULL COMMENT '生成名称 / 说明 / 角色名时输入的 SHA-256，输入变了才重新生成',
   `model_code`     VARCHAR(64)   DEFAULT NULL COMMENT '生成所用模型',
   `prompt_version` VARCHAR(32)   DEFAULT NULL COMMENT '生成所用提示词版本',
   `deleted`        TINYINT       NOT NULL DEFAULT 0 COMMENT 'BaseEntity 全局 @TableLogic 要求有这一列；本表不做逻辑删除',
@@ -604,27 +629,28 @@ CREATE TABLE IF NOT EXISTS `connector_business_view` (
   `update_time`    DATETIME      DEFAULT NULL,
   `update_user`    VARCHAR(64)   DEFAULT NULL,
   PRIMARY KEY (`id`),
-  -- 64*4 + 8 + 16*4 + 191*4*2 = 1856 字节，低于 InnoDB 索引 3072 字节上限
+  -- 64*4 + 8 + 16*4 + 191*4*2 = 1856 字节，低于 InnoDB 索引 3072 字节上限（191 的来历同 connector_semantic）
   UNIQUE KEY `uk_business_view` (`tenant_id`, `connector_id`, `kind`, `object_name`, `field_name`),
   KEY `idx_business_view_conn` (`connector_id`, `kind`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据星图：给人看的业务名称与说明';
 
 CREATE TABLE IF NOT EXISTS `connector_enrichment_state` (
-  `id`                BIGINT        NOT NULL COMMENT '雪花ID',
-  `tenant_id`         VARCHAR(64)   NOT NULL COMMENT '租户ID',
-  `connector_id`      BIGINT        NOT NULL COMMENT 'connection.id',
-  `claim_at`          DATETIME      DEFAULT NULL COMMENT '认领时间；非空且未满 30 分钟 = 正在跑',
-  `last_status`       VARCHAR(16)   DEFAULT NULL COMMENT '上次结果 READY / FAILED；NULL = 从没跑完过',
-  `input_fingerprint` CHAR(64)      DEFAULT NULL COMMENT '上次尝试时的输入指纹（设计文档 §4）',
-  `last_attempt_at`   DATETIME      DEFAULT NULL COMMENT '上次开始时间；失败后的 6 小时退避按它算',
-  `finished_at`       DATETIME      DEFAULT NULL,
-  `relation_note`     VARCHAR(500)  DEFAULT NULL COMMENT '关系发现：新增 / 替换条数、来源分布、失败原因',
-  `view_note`         VARCHAR(500)  DEFAULT NULL COMMENT '业务文字：生成条数、校验退回条数、失败原因',
-  `deleted`           TINYINT       NOT NULL DEFAULT 0 COMMENT 'BaseEntity 全局 @TableLogic 要求有这一列；本表不做逻辑删除',
-  `create_time`       DATETIME      DEFAULT NULL,
-  `create_user`       VARCHAR(64)   DEFAULT NULL,
-  `update_time`       DATETIME      DEFAULT NULL,
-  `update_user`       VARCHAR(64)   DEFAULT NULL,
+  `id`                        BIGINT        NOT NULL COMMENT '雪花ID',
+  `tenant_id`                 VARCHAR(64)   NOT NULL COMMENT '租户ID',
+  `connector_id`              BIGINT        NOT NULL COMMENT 'connection.id',
+  `claim_at`                  DATETIME      DEFAULT NULL COMMENT '认领时间（秒）；非空且未满 30 分钟 = 正在跑，跑的过程中每步续期',
+  `last_status`               VARCHAR(16)   DEFAULT NULL COMMENT '上次结果 READY / FAILED；NULL = 从没跑完过',
+  `input_fingerprint`         CHAR(64)      DEFAULT NULL COMMENT '上次尝试时的输入指纹（设计文档 §4），定时对账据此判断要不要补跑',
+  `relation_pass_fingerprint` CHAR(64)      DEFAULT NULL COMMENT '上次模型关系那一遍的输入指纹；没变就不再问模型',
+  `last_attempt_at`           DATETIME      DEFAULT NULL COMMENT '上次开始时间；失败后的 6 小时退避按它算',
+  `finished_at`               DATETIME      DEFAULT NULL,
+  `relation_note`             VARCHAR(500)  DEFAULT NULL COMMENT '关系发现：新增 / 替换条数、来源分布、失败原因',
+  `view_note`                 VARCHAR(500)  DEFAULT NULL COMMENT '业务文字：生成条数、校验退回条数、失败原因',
+  `deleted`                   TINYINT       NOT NULL DEFAULT 0 COMMENT 'BaseEntity 全局 @TableLogic 要求有这一列；本表不做逻辑删除',
+  `create_time`               DATETIME      DEFAULT NULL,
+  `create_user`               VARCHAR(64)   DEFAULT NULL,
+  `update_time`               DATETIME      DEFAULT NULL,
+  `update_user`               VARCHAR(64)   DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_enrichment_state` (`tenant_id`, `connector_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据星图：语义层补全链的运行状态';
