@@ -11,6 +11,7 @@ import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.ReadOnlyVerdict;
 import com.jimeng.dataserver.ai.connector.pool.CustomerDataSourceManager;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
+import com.jimeng.dataserver.ai.connector.service.RelationCandidates;
 import com.jimeng.dataserver.ai.connector.service.SemanticJoinValidator;
 import com.jimeng.dataserver.ai.connector.spi.ConnectorInstance;
 import org.junit.jupiter.api.AfterEach;
@@ -1437,6 +1438,13 @@ class MySqlConnectorTest {
         @DisplayName("表确实没有外键：放空列表，与「读不到」区分开")
         void 没有外键是空列表() throws SQLException {
             assertEquals(List.of(), describeWith(null, List.of()).extra().get(MySqlSession.EXTRA_FOREIGN_KEYS));
+        }
+
+        /** 两边互不 import，靠这一条保证写进快照的键名和关系发现读的是同一个。 */
+        @Test
+        @DisplayName("快照里的键名与关系发现读取的键名一致")
+        void 键名两边一致() {
+            assertEquals(RelationCandidates.EXTRA_FOREIGN_KEYS, MySqlSession.EXTRA_FOREIGN_KEYS);
         }
 
         @Test
