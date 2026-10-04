@@ -1,0 +1,18 @@
+# 管理端点（健康检查）。
+# 放在仓库而不是 Nacos：部署脚本（.github/workflows/deploy.yml）依赖这几个值，必须和代码一起评审、一起回滚。
+# 管理端口只在 Docker 网络内可达：容器不发布它，网关也不路由到它。
+management:
+  server:
+    port: 8021
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          # 就绪 = 应用已启动完成 + 数据库能连 + Redis 能连。缺任何一个，部署都应判失败。
+          include: readinessState,db,redis

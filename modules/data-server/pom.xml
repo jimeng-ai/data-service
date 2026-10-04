@@ -17,6 +17,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <!-- 健康检查：部署脚本据 /actuator/health/readiness 判断新版本是否真的起来了。
+             管理端点在独立端口 8021，容器不发布这个端口，网关也不路由到它，见 application.yml。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
         <!-- loadbalancer -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
