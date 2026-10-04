@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/wait-ready.sh 的测试：起一个本地 HTTP 服务，分别让它返回 200、返回 503、不监听，看脚本的退出码。
+# scripts/wait-ready.sh 的测试：起一个本地 HTTP 服务，让它返回不同的状态码或者干脆不监听，看脚本的退出码。
 set -euo pipefail
 cd "$(dirname "$0")"
 PORT=18765
@@ -36,6 +36,18 @@ if bash wait-ready.sh "http://127.0.0.1:${PORT}/ready" 4 2>"$err_file" >/dev/nul
 fi
 grep -q "超时" "$err_file" || { echo "FAIL: 503 超时后应提示'超时'"; cat "$err_file"; exit 1; }
 echo "ok   503 -> 超时判失败"
+
+# 第三个参数给了期望的状态码时，只认这一个码：网关对未登录请求回 401 才算起来了，回 200 反而说明没在验签。
+echo 401 > "$status_file"
+bash wait-ready.sh "http://127.0.0.1:${PORT}/ready" 10 401 >/dev/null || { echo "FAIL: 期望 401、实际 401，应判为就绪"; exit 1; }
+echo "ok   期望 401、实际 401 -> 就绪"
+
+echo 200 > "$status_file"
+if bash wait-ready.sh "http://127.0.0.1:${PORT}/ready" 4 401 2>"$err_file" >/dev/null; then
+  echo "FAIL: 期望 401、实际 200，不应判为就绪"; exit 1
+fi
+grep -q "HTTP 200" "$err_file" || { echo "FAIL: 超时提示里应带上最后一次的状态码"; cat "$err_file"; exit 1; }
+echo "ok   期望 401、实际 200 -> 超时判失败"
 
 kill "$server_pid"; server_pid=""
 if bash wait-ready.sh "http://127.0.0.1:${PORT}/ready" 4 2>/dev/null >/dev/null; then

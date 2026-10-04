@@ -35,6 +35,9 @@ jobs:
   deploy:
     # 跑在本机（Mac）上的自托管 Runner，与其它仓库共用同一台机器
     runs-on: [self-hosted, macOS]
+    # 正常一次部署 10 分钟左右。必须有上限：Docker 卡住时 job 会一直挂着（GitHub 默认 6 小时），
+    # 而五个仓库共用这一台 runner，期间谁都部署不了。测试：bash scripts/deploy-workflow-test.sh
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -162,7 +165,9 @@ jobs:
       # 判定标准：data-server 自己报告就绪（应用启动完成、数据库和 Redis 都连得上），并且网关在验签。
       # 任何一项不满足，部署就判失败：宁可红，也不能把一个没起来的版本记成上线（发版脚本只在成功时写上线记录）。
       # data-server 的管理端口只在 Docker 网络里，所以探活请求从同一个网络里的 curl 容器发出。
+      # 时间上限：两段等待最多 4 分钟，每次探测是一次 docker run；Docker 卡住时到点判失败，不会一直挂着。
       - name: Readiness check
+        timeout-minutes: 8
         run: |
           set -euo pipefail
           if ! CURL="docker run --rm --network $NET $CURL_IMAGE" \
@@ -171,9 +176,9 @@ jobs:
             echo "----- ds-data-server -----"; docker logs --tail 120 ds-data-server 2>&1 || true
             exit 1
           fi
-          code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:20011/data/admin/auth/me)" || code="000"
-          if [ "$code" != "401" ]; then
-            echo "::error::网关没有按预期拒绝未登录请求（期望 HTTP 401，实际 ${code}）"
+          # 网关可能比 data-server 起得晚，所以反复探，等到它对未登录请求回 401 为止，最多 60 秒。
+          if ! bash scripts/wait-ready.sh "http://127.0.0.1:20011/data/admin/auth/me" 60 401; then
+            echo "::error::网关 60 秒内没有按预期拒绝未登录请求（期望 HTTP 401，实际状态码见上一行）"
             echo "----- ds-gateway -----"; docker logs --tail 120 ds-gateway 2>&1 || true
             exit 1
           fi
