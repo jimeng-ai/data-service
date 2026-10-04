@@ -9,13 +9,15 @@ mvn clean install -DskipTests      # build all modules (or: ./deploy.sh build)
 ./deploy.sh infra                  # start Nacos/MySQL/Redis/RabbitMQ/Elasticsearch via docker/docker-compose.yml
 ./deploy.sh down                   # stop infra containers (keeps volumes)
 
-# tests live only under modules/data-server (JUnit 5 + jqwik property tests)
-mvn -pl modules/data-server test                          # all tests
+# Java tests live under modules/data-server (JUnit 5 + jqwik property tests) and gateway (auth filter, JWT verification)
+mvn -pl modules/data-server test                          # all data-server tests
+mvn -pl gateway test                                      # gateway tests
+# deploy / infra scripts have their own shell tests: scripts/*-test.sh (release.json runs the ones that need no PyYAML)
 mvn -pl modules/data-server test -Dtest=JwtSecretProviderTest          # single class
 mvn -pl modules/data-server test -Dtest=AgentSkillVisibilityTest#emptyMeansNothingBound   # single method
 ```
 
-**Tags are automatic, deploys are manual.** Every push to `main` gets the next `vX.Y.Z` tag from `.github/workflows/tag.yml`; nothing deploys on its own. Deploy only when the user says so: Actions → Deploy → Run workflow with the tag picked in "Use workflow from", or `node scripts/release.mjs deploy [vX.Y.Z]` with `HEAD` at that tag on a clean tree — it runs the gate in `release.json` (`mvn -o` install + the data-server tests), dispatches the deploy, waits for it and writes a GitHub Release as the go-live record. Roll back by deploying the previous tag the same way. When a deploy needs DDL or Nacos changes, run them first and pass the notes with `--notes-file`.
+**Tags are automatic, deploys are manual.** Every push to `main` gets the next `vX.Y.Z` tag from `.github/workflows/tag.yml`; nothing deploys on its own. Deploy only when the user says so: Actions → Deploy → Run workflow with the tag picked in "Use workflow from", or `node scripts/release.mjs deploy [vX.Y.Z]` with `HEAD` at that tag on a clean tree — it runs the gate in `release.json` (`mvn -o` install, the gateway + data-server tests, and the infra/deploy script tests), dispatches the deploy, waits for it and writes a GitHub Release as the go-live record. Roll back by deploying the previous tag the same way. When a deploy needs DDL or Nacos changes, run them first and pass the notes with `--notes-file`.
 
 **Run `mvn install -DskipTests` before `mvn -pl ... test`** when you changed `common/*`: `-pl` without `-am` resolves the commons from the local repo, so a stale jar silently hides your change.
 
@@ -37,14 +39,14 @@ None of these have a default. That is deliberate: a "configure it or you silentl
 
 ## Local infrastructure (docker/docker-compose.yml)
 
-All infra runs in Docker (`./deploy.sh infra` brings it up). **Credentials come from `docker/.env`** (git-ignored; copy `docker/.env.example`) — `deploy.sh` refuses to run without it, and the compose file has no defaults. **Every published port is bound to `127.0.0.1`**: this host is on the LAN and Tailscale, and binding to all interfaces handed Nacos (which holds `jwt.secret`) to anyone who could reach it. From another machine use an SSH tunnel (`ssh -L 9001:127.0.0.1:9001 <host>`). `scripts/check-compose.sh` enforces both rules. Rotating credentials on existing volumes: `docs/config-changes/2026-10-04-p0-hardening.md`.
+All infra runs in Docker (`./deploy.sh infra` brings it up). **Credentials come from `docker/.env`** (git-ignored; copy `docker/.env.example`) — `deploy.sh` refuses to run without it, and the compose file has no defaults. **Every published port is bound to `127.0.0.1`**: this host is on the LAN and Tailscale, and binding to all interfaces handed Nacos (which holds `jwt.secret`) to anyone who could reach it. From another machine use an SSH tunnel (`ssh -L 9001:127.0.0.1:9001 <host>`). `scripts/check-compose.sh` enforces both rules (plus a memory-limit knob on every service: `mem_limit: ${<SERVICE>_MEMORY:-0}`, unset = no limit), and `./deploy.sh infra` refuses to start anything when it fails. Rotating credentials on existing volumes and setting the memory limits: `docs/config-changes/2026-10-04-p0-hardening.md`.
 
 | Service | Host:Port | Credentials / Notes |
 |---|---|---|
 | Nacos | `127.0.0.1:8848` (gRPC `9848`) | auth disabled (localhost-only; slated for removal); console `http://127.0.0.1:8848/nacos`. Namespace `fe9e39ae-06af-49c3-9c5b-6060df2cf93e`, group `DEFAULT_GROUP`. All runtime config lives here as `*.yml` data-ids. |
 | MySQL | `127.0.0.1:3306` | user `root` / `MYSQL_ROOT_PASSWORD` from `docker/.env` (only applied when the volume is first initialized), tz `Asia/Shanghai`, utf8mb4. |
 | Redis | `127.0.0.1:6379` | `--requirepass $REDIS_PASSWORD`, AOF on. `REDISCLI_AUTH` is set inside the container, so `docker exec ds-redis redis-cli …` just works. |
-| RabbitMQ | `127.0.0.1:5672` (UI `15672`) | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` (first init only; existing brokers change via `rabbitmqctl`). Loopback restriction lifted so host apps can connect. |
+| RabbitMQ | `127.0.0.1:5672` (UI `15672`) | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` is the admin account for the UI (first init only; existing brokers change via `rabbitmqctl`). data-server uses its own `jm-app` account with no management tag (change doc §1). Loopback restriction lifted so host apps can connect. |
 | MinIO | `127.0.0.1:9000` (S3), `127.0.0.1:9001` (console) | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`. The sandbox uses its own restricted account, not root. |
 | Elasticsearch | `localhost:9200` (`9300`) | security disabled, single-node, ES 8.13.4. Auto-installs the `analysis-ik` Chinese tokenizer plugin on first boot — data-server **hard-validates** its presence at startup. |
 | Kibana | `localhost:5601` | for browsing logs/ES; zh-CN locale. |

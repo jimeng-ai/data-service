@@ -42,6 +42,7 @@
 - **端口只绑 127.0.0.1。**
 - **Redis 必须带密码。** 新版 compose 要求 `REDIS_PASSWORD` 非空。
 - **RabbitMQ 固定 hostname。** 节点名会从随机的容器 ID 变成 `rabbitmq`，broker 换一个空的数据目录，并按 `.env` 里的账号初始化。旧的 guest 账号和队列里的消息都会消失。这一步是一次性的，固定 hostname 之后再重建就不会丢了。
+- **RabbitMQ 分成两个账号。** `.env` 里的是管理账号，只用来登录管理界面；data-server 用另建的 `jm-app`，它只能收发消息，没有管理权限。Nacos 里存的是 `jm-app` 的密码，泄露了也碰不到管理接口。
 
 **前提：** data-service 已合入本次全部 compose 改动，第 0 节都确认过。
 
@@ -62,15 +63,21 @@
    | `MYSQL_ROOT_PASSWORD` | 现有密码。第 2.3 节再换 |
    | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | 现有账号，也就是 minioadmin。第 2.2 节再换 |
    | `REDIS_PASSWORD` | 新值 |
-   | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | 新账号名和新密码（不要用 guest） |
+   | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | 新的管理账号和密码（不要用 guest），只用来登录管理界面 |
 
 3. **改 Nacos**（prod 命名空间）：
    - `default-redis.yml`：
      - 设 `spring.data.redis.password` 为上面的 `REDIS_PASSWORD`。Redisson 读的是同一个键。
      - 再加一行 `spring.data.redis.timeout: 2s`。默认是 60 秒，Redis 断线时所有用到 Redis 的请求都会卡这么久。代码里没有阻塞式的 Redis 命令，全局设 2 秒是安全的。
-   - `default-rabbitmq.yml`：把 `spring.rabbitmq.username` / `spring.rabbitmq.password` 改成上面的 `RABBITMQ_USER` / `RABBITMQ_PASSWORD`。
-4. **重建基础设施**：在 data-service 目录执行 `git pull`，然后执行 `./deploy.sh infra`。它会重建所有配置有变化的容器（数据卷保留），Elasticsearch 会在这一次把 IK 装进新卷。
-5. **重启 data-server**：`docker restart ds-data-server`。网关不连 Redis 和 RabbitMQ，不用重启；如果网关日志里有连不上 Nacos 的报错，再执行 `docker restart ds-gateway`。
+   - `default-rabbitmq.yml`：把 `spring.rabbitmq.username` 改成 `jm-app`，`spring.rabbitmq.password` 改成给它新生成的密码（`openssl rand -hex 24`）。这个密码第 5 步建账号时还要用一次。
+4. **重建基础设施**：在 data-service 目录执行 `git pull`，然后执行 `./deploy.sh infra`。它先用 `scripts/check-compose.sh` 检查 compose 文件，不通过就什么都不动；通过后重建所有配置有变化的容器（数据卷保留），Elasticsearch 会在这一次把 IK 装进新卷。
+5. **建 data-server 用的 RabbitMQ 账号**（只能收发消息，没有管理权限）。密码从标准输入传进去，不出现在命令行里：
+   ```bash
+   read -rs APP_MQ_PASS     # 输入第 3 步写进 Nacos 的那个密码
+   echo "$APP_MQ_PASS" | docker exec -i ds-rabbitmq rabbitmqctl add_user jm-app
+   docker exec ds-rabbitmq rabbitmqctl set_permissions -p / jm-app '.*' '.*' '.*'
+   ```
+6. **重启 data-server**：`docker restart ds-data-server`。网关不连 Redis 和 RabbitMQ，不用重启；如果网关日志里有连不上 Nacos 的报错，再执行 `docker restart ds-gateway`。
 
 **验证：**
 - **端口：**
@@ -85,7 +92,7 @@
   - `docker exec ds-redis redis-cli ping` 返回 `PONG`（容器里已经带了 REDISCLI_AUTH）。
 - **RabbitMQ：**
   - `docker inspect -f '{{.Config.Hostname}}' ds-rabbitmq` 返回 `rabbitmq`；
-  - `docker exec ds-rabbitmq rabbitmqctl list_users` 里只有新账号，没有 guest。
+  - `docker exec ds-rabbitmq rabbitmqctl list_users` 里有两个账号：`.env` 里的管理账号（标签 `administrator`）和 `jm-app`（没有标签），没有 guest。
 - **Elasticsearch：** `docker exec ds-elasticsearch ./bin/elasticsearch-plugin list` 里有 `analysis-ik`。
 - **业务：**
   - 登录一次、发一条对话；
@@ -257,6 +264,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://atlas.heartbeat.ren/dat
 
 ## 5. 内存上限
 
+### 5.1 两个应用容器（data-server、网关）
+
 **步骤：**
 1. 正常运行一天之后，记下 ds-data-server 和 ds-gateway 的 MEM USAGE 峰值。也可以直接看每次部署日志最后一步 "Memory snapshot"。
 2. 打开仓库 jimeng-ai/data-service → Settings → Secrets and variables → Actions → Variables，新建两个变量：
@@ -274,6 +283,32 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://atlas.heartbeat.ren/dat
   ```
 
 **回退：** 删掉这两个变量，重新部署。
+
+### 5.2 基础设施容器
+
+compose 里每个服务都有内存上限的配置项，值来自 `docker/.env` 里的 `<服务名>_MEMORY`，不设就是不限。
+
+**步骤：**
+1. 正常运行一天之后，用 `docker stats --no-stream` 记下 ds-nacos、ds-mysql、ds-redis、ds-rabbitmq、ds-minio、ds-elasticsearch、ds-filebeat、ds-kibana 的 MEM USAGE 峰值。
+2. 在 `docker/.env` 里设 `NACOS_MEMORY`、`MYSQL_MEMORY` 等变量，取峰值 × 1.5，再向上取整到 256m 的倍数。两个 JVM 服务的堆是固定的，上限要比堆大得多：
+   - Nacos 的堆是 512m（`JVM_XMX`），上限至少 `1g`；
+   - Elasticsearch 的堆是 512m（`ES_JAVA_OPTS`），上限至少 `1536m`，因为它还要用堆外内存。
+3. 在维护窗口里执行 `./deploy.sh infra`。设了值的容器会重建；MySQL、Redis、RabbitMQ 重建期间，data-server 会短暂报错。
+
+**验证：**
+- `docker stats --no-stream` 的 LIMIT 列显示出上限。
+- RabbitMQ 要能认出这个上限，否则它不会在接近上限时自己限流，而是直接被杀掉。执行 `docker exec ds-rabbitmq rabbitmq-diagnostics -q status`，看 "Memory high watermark" 那一段算出来的值，它应当小于上限。如果没有变小，把 `RABBITMQ_MEMORY` 改回空，再执行一次 `./deploy.sh infra`。
+- 之后一周，按 5.1 的方法留意有没有被 OOM 杀掉的容器。
+
+**回退：** 把 `docker/.env` 里对应的 `*_MEMORY` 清空，再执行 `./deploy.sh infra`。
+
+### 5.3 前端和沙箱的容器
+
+- 三个前端容器（10012、10013、10014）固定 256m：nginx 只托管静态文件和转发请求，上传的文件写在磁盘上，不占内存。
+- 沙箱的 egress 代理容器默认 512m，可以用环境变量 `EGRESS_MEMORY` 改。
+- 沙箱每个任务的一次性容器本来就有上限（1g）。
+
+这些随各自仓库的下一次部署生效，不用单独操作。用 `docker stats --no-stream` 的 LIMIT 列确认。
 
 ## 6. 入库失败不再无限重试
 
@@ -309,7 +344,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://atlas.heartbeat.ren/dat
    ```
 
 **上线后的部署行为：**
-- 新版本必须在 180 秒内报告就绪（数据库和 Redis 都连得上），而且网关要对未登录请求返回 401。任何一条不满足，部署都判为失败，发版脚本也不会写上线记录。
+- 新版本必须在 180 秒内报告就绪（数据库和 Redis 都连得上），然后网关要在 60 秒内对未登录请求返回 401。任何一条不满足，部署都判为失败，发版脚本也不会写上线记录。
+- 就绪检查限时 8 分钟，整个部署限时 45 分钟。Docker 卡住时会到点判失败，不会占着五个仓库共用的 runner 一直不放。
 - 部署失败时，线上跑的是新版本的容器，可能没起来。回滚办法不变：部署上一个版本号。
 - 第一次部署会拉取 `curlimages/curl:8.10.1` 镜像，需要外网。
 
@@ -322,4 +358,6 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://atlas.heartbeat.ren/dat
 | 2.2、2.3 | 见各小节 |
 | 3 | 部署 jm-agent-front 的上一个版本 |
 | 4、6、7 | 部署 data-service 的上一个版本 |
-| 5 | 删掉仓库变量，重新部署 |
+| 5.1 | 删掉仓库变量，重新部署 |
+| 5.2 | `docker/.env` 里对应的 `*_MEMORY` 清空，执行 `./deploy.sh infra` |
+| 5.3 | 部署对应仓库的上一个版本 |
