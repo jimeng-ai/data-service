@@ -165,7 +165,8 @@ jobs:
       # 判定标准：data-server 自己报告就绪（应用启动完成、数据库和 Redis 都连得上），并且网关在验签。
       # 任何一项不满足，部署就判失败：宁可红，也不能把一个没起来的版本记成上线（发版脚本只在成功时写上线记录）。
       # data-server 的管理端口只在 Docker 网络里，所以探活请求从同一个网络里的 curl 容器发出。
-      # 时间上限：两段等待最多 4 分钟，每次探测是一次 docker run；Docker 卡住时到点判失败，不会一直挂着。
+      # 时间上限：两段等待最多 4 分钟，每次探测是一次 docker run；Docker 卡住时到点判失败，不会一直挂着
+      # （后面两个 if: always() 的收尾步骤也调 Docker，各自另有 2 分钟上限）。
       - name: Readiness check
         timeout-minutes: 8
         run: |
@@ -188,9 +189,11 @@ jobs:
       - name: Memory snapshot
         if: always()
         continue-on-error: true
+        timeout-minutes: 2
         run: docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}'
 
       - name: Cleanup old images
         if: always()
         continue-on-error: true
+        timeout-minutes: 2
         run: docker image prune -f

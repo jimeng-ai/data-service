@@ -34,7 +34,7 @@
    - `connector.agent.callback-base-url`
    - `connector.semantic.agent.callback-base-url`
 
-   值应当指向宿主机上的网关，推荐 `http://localhost:20011/data`（见 `docs/sandbox-connector-plane.md`）；为空表示这项能力没开，也没问题。如果是 `https://atlas.heartbeat.ren/data` 这类公网地址，先改掉再做第 3 节，否则这两类回调会全部被拒（403）。
+   值应当直接指向宿主机上的网关，推荐 `http://localhost:20011/data`（见 `docs/sandbox-connector-plane.md`）；为空表示这项能力没开，也没问题。只要经过 jm-agent-front 的 nginx 就不行：`https://atlas.heartbeat.ren/data` 这类公网地址、宿主机的 10012 端口都算。遇到这种值，先改掉再做第 3 节，否则这两类回调会全部被拒（403）。
 
 ## 1. 第一个维护窗口：端口只绑本机 + Redis 加密码 + RabbitMQ 换账号
 
@@ -74,9 +74,12 @@
 5. **建 data-server 用的 RabbitMQ 账号**（只能收发消息，没有管理权限）。密码从标准输入传进去，不出现在命令行里：
    ```bash
    read -rs APP_MQ_PASS     # 输入第 3 步写进 Nacos 的那个密码
+   # 先删后建，重做也不出错：之前做过一次又回退过的话，固定的 hostname 会让 broker 用回那一次的数据目录，jm-app 已经在了
+   docker exec ds-rabbitmq rabbitmqctl delete_user jm-app >/dev/null 2>&1 || true
    echo "$APP_MQ_PASS" | docker exec -i ds-rabbitmq rabbitmqctl add_user jm-app
    docker exec ds-rabbitmq rabbitmqctl set_permissions -p / jm-app '.*' '.*' '.*'
    ```
+   用回旧数据目录时，`.env` 里的管理账号也还是那一次的（只在第一次初始化时生效）。如果两次之间改过 `.env`，管理界面要用第一次的账号密码登录。
 6. **重启 data-server**：`docker restart ds-data-server`。网关不连 Redis 和 RabbitMQ，不用重启；如果网关日志里有连不上 Nacos 的报错，再执行 `docker restart ds-gateway`。
 
 **验证：**
@@ -97,12 +100,13 @@
 - **业务：**
   - 登录一次、发一条对话；
   - 上传一个小文档，状态能走到"完成"；
-  - 跑一个带上传文件的智能体任务，确认沙箱经 localhost:9000 仍能读写 MinIO。
+  - 跑一个带上传文件的智能体任务，确认沙箱仍能经本机 9000 端口读写 MinIO。
 
 **回退：**
-1. 执行 `git checkout <上一个版本> -- docker/docker-compose.yml`。
+1. 执行 `git checkout <上一个版本> -- docker/docker-compose.yml deploy.sh`。两个文件都要恢复：新版 `deploy.sh` 启动前会先检查 compose，旧版 compose 过不了检查，它会拒绝启动。
 2. Nacos 改回原值：删掉 Redis 密码；RabbitMQ 账号改回 guest/guest。
 3. 执行 `./deploy.sh infra && docker restart ds-data-server`。
+4. 以后重做第 1 节之前，先把这两个文件恢复成当前版本：`git checkout HEAD -- docker/docker-compose.yml deploy.sh`。
 
 注意，回退时 RabbitMQ 会再换一次空的数据目录（旧 compose 没有固定 hostname，会按 guest 初始化），所以回退前也要先确认入库队列是空的。
 
@@ -300,12 +304,14 @@ compose 里每个服务都有内存上限的配置项，值来自 `docker/.env` 
 - RabbitMQ 要能认出这个上限，否则它不会在接近上限时自己限流，而是直接被杀掉。执行 `docker exec ds-rabbitmq rabbitmq-diagnostics -q status`，看 "Memory high watermark" 那一段算出来的值，它应当小于上限。如果没有变小，把 `RABBITMQ_MEMORY` 改回空，再执行一次 `./deploy.sh infra`。
 - 之后一周，按 5.1 的方法留意有没有被 OOM 杀掉的容器。
 
-**回退：** 把 `docker/.env` 里对应的 `*_MEMORY` 清空，再执行 `./deploy.sh infra`。
+**开发那套也跑在这台机器上时**（`docker ps` 里有 dev-* 容器）：它们和生产容器共用同一个 Docker VM，也要设上限。在 `docker/.env` 里设 `DEV_NACOS_MEMORY`、`DEV_MYSQL_MEMORY` 等变量，取值方法同上，然后执行 `docker compose --env-file docker/.env -f docker/docker-compose.dev.yml up -d`。
+
+**回退：** 把 `docker/.env` 里对应的 `*_MEMORY` 清空，再执行 `./deploy.sh infra`（开发那套用上面那条命令）。
 
 ### 5.3 前端和沙箱的容器
 
 - 三个前端容器（10012、10013、10014）固定 256m：nginx 只托管静态文件和转发请求，上传的文件写在磁盘上，不占内存。
-- 沙箱的 egress 代理容器默认 512m，可以用环境变量 `EGRESS_MEMORY` 改。
+- 沙箱的 egress 代理容器默认 512m。这个值没有实测过：部署新版沙箱之前，先在第 0 节存的 `p0-before-mem.txt` 里看 `jm-egress-proxy` 的用量，峰值 × 1.5 超过 512m 的话，先在 jm-agent-sandbox 仓库设仓库变量 `EGRESS_MEMORY`（例如 `1g`）再部署。前端三个容器的 256m 同样没实测，也在那份记录里核对一眼。
 - 沙箱每个任务的一次性容器本来就有上限（1g）。
 
 这些随各自仓库的下一次部署生效，不用单独操作。用 `docker stats --no-stream` 的 LIMIT 列确认。
@@ -353,7 +359,7 @@ compose 里每个服务都有内存上限的配置项，值来自 `docker/.env` 
 
 | 节 | 回退方式 |
 |---|---|
-| 1 | compose 和 Nacos 改回原值，执行 `./deploy.sh infra`，重启 data-server（先确认入库队列为空） |
+| 1 | compose 和 `deploy.sh` 一起恢复成上一个版本、Nacos 改回原值，执行 `./deploy.sh infra`，重启 data-server（先确认入库队列为空）；重做前把两个文件恢复成当前版本 |
 | 2.1 | 部署 jm-agent-sandbox 的上一个版本 |
 | 2.2、2.3 | 见各小节 |
 | 3 | 部署 jm-agent-front 的上一个版本 |

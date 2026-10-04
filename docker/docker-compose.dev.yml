@@ -10,11 +10,15 @@
 # 本地 IDE 跑 data-server / gateway 时,只需加环境变量:NACOS_SERVER_ADDR=localhost:8849
 name: data-service-dev
 
+# 每个服务都有内存上限的配置项：DEV_<服务名>_MEMORY（例如 DEV_MYSQL_MEMORY=1g），不设 = 不限。
+# 只有这套和生产跑在同一个 Docker 里时才需要设，做法见变更文档第 5.2 节；scripts/check-compose.sh 规则 6 保证新服务不漏。
 services:
   nacos:
     image: nacos/nacos-server:v2.4.3
     container_name: dev-nacos
     restart: unless-stopped
+    mem_limit: ${DEV_NACOS_MEMORY:-0}
+    memswap_limit: ${DEV_NACOS_MEMORY:-0}
     environment:
       MODE: standalone
       PREFER_HOST_MODE: hostname
@@ -37,6 +41,8 @@ services:
     image: mysql:8.0
     container_name: dev-mysql
     restart: unless-stopped
+    mem_limit: ${DEV_MYSQL_MEMORY:-0}
+    memswap_limit: ${DEV_MYSQL_MEMORY:-0}
     environment:
       MYSQL_ROOT_PASSWORD: 123456
       TZ: Asia/Shanghai
@@ -58,6 +64,8 @@ services:
     image: redis:7-alpine
     container_name: dev-redis
     restart: unless-stopped
+    mem_limit: ${DEV_REDIS_MEMORY:-0}
+    memswap_limit: ${DEV_REDIS_MEMORY:-0}
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:6380:6379"
@@ -73,6 +81,8 @@ services:
     image: rabbitmq:3.13-management
     container_name: dev-rabbitmq
     restart: unless-stopped
+    mem_limit: ${DEV_RABBITMQ_MEMORY:-0}
+    memswap_limit: ${DEV_RABBITMQ_MEMORY:-0}
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
@@ -92,6 +102,8 @@ services:
     image: minio/minio:latest
     container_name: dev-minio
     restart: unless-stopped
+    mem_limit: ${DEV_MINIO_MEMORY:-0}
+    memswap_limit: ${DEV_MINIO_MEMORY:-0}
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -111,6 +123,8 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
     container_name: dev-elasticsearch
     restart: unless-stopped
+    mem_limit: ${DEV_ELASTICSEARCH_MEMORY:-0}
+    memswap_limit: ${DEV_ELASTICSEARCH_MEMORY:-0}
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -146,6 +160,8 @@ services:
     image: docker.elastic.co/kibana/kibana:8.13.4
     container_name: dev-kibana
     restart: unless-stopped
+    mem_limit: ${DEV_KIBANA_MEMORY:-0}
+    memswap_limit: ${DEV_KIBANA_MEMORY:-0}
     depends_on:
       elasticsearch:
         condition: service_healthy
