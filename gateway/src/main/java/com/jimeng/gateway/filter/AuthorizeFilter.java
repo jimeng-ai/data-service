@@ -53,6 +53,9 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
     /** 租户头。所有非白名单请求都由网关从 JWT 解出后强制注入；客户端传入的同名头会被丢弃。 */
     private static final String HEADER_TENANT_ID = "X-Tenant-Id";
 
+    /** 用户头，data-server 靠它认人。和租户头一样只能由网关注入，客户端传入的一律丢弃。 */
+    private static final String HEADER_USER_ID = "user-id";
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         ServerHttpRequest request = exchange.getRequest();
@@ -62,10 +65,14 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
         // 判断是否在白名单
         if (!whetherThePathIsNotVerified(urlPath)) {
             // 白名单路径也注入 trace-id，确保下游服务日志可追踪；
-            // 同时剥离客户端可能带的 X-Tenant-Id，避免绕过租户校验。
+            // 同时剥离客户端可能带的 X-Tenant-Id 和 user-id：下游按这两个头认租户、认人，
+            // 白名单路径不验令牌，留着它们，白名单一放宽就等于谁都能冒充任意用户。
             ServerWebExchange whiteListExchange = exchange.mutate()
                     .request(builder -> builder
-                            .headers(h -> h.remove(HEADER_TENANT_ID))
+                            .headers(h -> {
+                                h.remove(HEADER_TENANT_ID);
+                                h.remove(HEADER_USER_ID);
+                            })
                             .header("x-trace-id", UUID.randomUUID().toString()))
                     .build();
             return chain.filter(whiteListExchange);
@@ -125,7 +132,7 @@ public class AuthorizeFilter implements GlobalFilter, Ordered {
             ServerWebExchange modifiedExchange = exchange.mutate()
                     .request(builder -> {
                         builder.headers(h -> h.remove(HEADER_TENANT_ID));
-                        builder.header("user-id", userId);
+                        builder.header(HEADER_USER_ID, userId);
                         builder.header(HEADER_TENANT_ID, tenantId);
                         builder.header("x-trace-id", UUID.randomUUID().toString());
                     })
