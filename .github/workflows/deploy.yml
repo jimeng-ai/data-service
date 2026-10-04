@@ -114,6 +114,21 @@ jobs:
           DS_GATEWAY_MEMORY: ${{ vars.DS_GATEWAY_MEMORY }}
         run: |
           set -euo pipefail
+          # 先校验内存变量：写错了必须在删旧容器之前失败——否则会停服，而且回滚到上个 tag 也同样失败。
+          # 测试：bash scripts/deploy-redeploy-test.sh
+          to_mib() { local n="${1%[mMgG]}"; case "${1: -1}" in [gG]) echo $((n * 1024)) ;; *) echo "$n" ;; esac; }
+          for var in DS_DATA_SERVER_MEMORY DS_GATEWAY_MEMORY; do
+            val="${!var:-}"
+            [ -z "$val" ] && continue
+            if ! [[ "$val" =~ ^[0-9]+[mMgG]$ ]]; then
+              echo "::error::仓库变量 ${var}=${val} 格式不对，要写成 2304m 或 3g 这种；旧容器没动"
+              exit 1
+            fi
+            if [ "$(to_mib "$val")" -lt 512 ]; then
+              echo "::error::仓库变量 ${var}=${val} 太小（至少 512m），JVM 起不来；旧容器没动"
+              exit 1
+            fi
+          done
           # 两个数组都至少有一个元素：macOS 自带的 bash 3.2 在 set -u 下展开空数组会报错。
           if [ -n "${DS_DATA_SERVER_MEMORY:-}" ]; then
             ds_mem=(--memory "$DS_DATA_SERVER_MEMORY" --memory-swap "$DS_DATA_SERVER_MEMORY" \
