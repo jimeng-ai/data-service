@@ -4,9 +4,12 @@ import com.jimeng.dataserver.admin.auth.dto.ChangePasswordRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginResponse;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
+import com.jimeng.dataserver.admin.common.ClientIpResolver;
+import com.jimeng.dataserver.admin.common.LoginAttemptGuard;
 import com.jimeng.dataserver.admin.operator.auth.service.OperatorAuthService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -29,11 +32,14 @@ import java.util.Map;
 public class OperatorAuthController {
 
     private final OperatorAuthService operatorAuthService;
+    private final LoginAttemptGuard loginAttemptGuard;
 
     @Operation(summary = "运营登录")
     @PostMapping("/login")
-    public LoginResponse login(@RequestBody LoginRequest req) {
-        return operatorAuthService.login(req);
+    public LoginResponse login(@RequestBody LoginRequest req, HttpServletRequest http) {
+        return loginAttemptGuard.guard(LoginAttemptGuard.Realm.OPERATOR,
+                req == null ? null : req.getUsername(), ClientIpResolver.resolve(http),
+                () -> operatorAuthService.login(req));
     }
 
     @Operation(summary = "修改密码")

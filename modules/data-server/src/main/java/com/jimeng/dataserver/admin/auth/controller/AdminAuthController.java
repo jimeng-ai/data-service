@@ -7,8 +7,11 @@ import com.jimeng.dataserver.admin.auth.dto.ChangePasswordRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginRequest;
 import com.jimeng.dataserver.admin.auth.dto.LoginResponse;
 import com.jimeng.dataserver.admin.auth.service.AdminAuthService;
+import com.jimeng.dataserver.admin.common.ClientIpResolver;
+import com.jimeng.dataserver.admin.common.LoginAttemptGuard;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -32,11 +35,14 @@ import java.util.Map;
 public class AdminAuthController {
 
     private final AdminAuthService adminAuthService;
+    private final LoginAttemptGuard loginAttemptGuard;
 
     @Operation(summary = "管理员登录")
     @PostMapping("/login")
-    public LoginResponse login(@RequestBody LoginRequest req) {
-        return adminAuthService.login(req);
+    public LoginResponse login(@RequestBody LoginRequest req, HttpServletRequest http) {
+        return loginAttemptGuard.guard(LoginAttemptGuard.Realm.ENTERPRISE,
+                req == null ? null : req.getUsername(), ClientIpResolver.resolve(http),
+                () -> adminAuthService.login(req));
     }
 
     @Operation(summary = "修改密码")
