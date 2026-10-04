@@ -4,6 +4,7 @@ import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.rag.model.IngestionMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
@@ -28,8 +29,9 @@ public class IngestionQueueConsumer {
         try {
             ingestionService.ingest(msg.getDocId());
         } catch (Exception e) {
-            // 抛出让 RabbitMQ 重试 / 进 DLQ
-            throw new RuntimeException("入库失败 docId=" + msg.getDocId(), e);
+            // 拒绝且不回队列 → 进死信队列 rag.ingestion.dlq。文档在 ingest() 里已经标成 FAILED，用户可以手动重试。
+            // 不能抛普通 RuntimeException：Spring 默认会立刻把消息放回队列，失败的文档会无限重跑、每次都重新计费。
+            throw new AmqpRejectAndDontRequeueException("入库失败 docId=" + msg.getDocId(), e);
         } finally {
             if (tenantSet) {
                 TenantContext.clear();
