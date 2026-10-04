@@ -37,9 +37,10 @@ public class OperatorAuthController {
     @Operation(summary = "运营登录")
     @PostMapping("/login")
     public LoginResponse login(@RequestBody LoginRequest req, HttpServletRequest http) {
+        // 限流按库认定的账号计数（ádmin、ＡＤＭＩＮ 与 admin 是同一个账号），见 OperatorAuthService.loginAttemptKey
+        String accountId = operatorAuthService.loginAttemptKey(req == null ? null : req.getUsername());
         return loginAttemptGuard.guard(LoginAttemptGuard.Realm.OPERATOR,
-                req == null ? null : req.getUsername(), ClientIpResolver.resolve(http),
-                () -> operatorAuthService.login(req));
+                accountId, ClientIpResolver.resolve(http), () -> operatorAuthService.login(req));
     }
 
     @Operation(summary = "修改密码")

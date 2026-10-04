@@ -34,11 +34,14 @@ class LoginControllersGuardTest {
         return http;
     }
 
-    /** 只有 realm、用户名、IP 都对上时才执行真正的登录；任何一项不对，mock 返回 null，断言失败。 */
+    /**
+     * 只有 realm、账号标识、IP 都对上时才执行真正的登录；任何一项不对，mock 返回 null，断言失败。
+     * 账号标识必须是 service 按库查出来的（这里是 id:42），不能是请求里原样的用户名——见 LoginAttemptKeyTest。
+     */
     @SuppressWarnings("unchecked")
     private static LoginAttemptGuard passThrough(LoginAttemptGuard.Realm realm) {
         LoginAttemptGuard guard = mock(LoginAttemptGuard.class);
-        when(guard.guard(eq(realm), eq("alice"), eq("203.0.113.9"), any(Supplier.class)))
+        when(guard.guard(eq(realm), eq("id:42"), eq("203.0.113.9"), any(Supplier.class)))
                 .thenAnswer(inv -> inv.<Supplier<Object>>getArgument(3).get());
         return guard;
     }
@@ -48,6 +51,7 @@ class LoginControllersGuardTest {
         AdminAuthService service = mock(AdminAuthService.class);
         LoginRequest req = alice();
         LoginResponse expected = new LoginResponse();
+        when(service.loginAttemptKey("alice")).thenReturn("id:42");
         when(service.login(req)).thenReturn(expected);
         AdminAuthController controller =
                 new AdminAuthController(service, passThrough(LoginAttemptGuard.Realm.ENTERPRISE));
@@ -59,6 +63,7 @@ class LoginControllersGuardTest {
         OperatorAuthService service = mock(OperatorAuthService.class);
         LoginRequest req = alice();
         LoginResponse expected = new LoginResponse();
+        when(service.loginAttemptKey("alice")).thenReturn("id:42");
         when(service.login(req)).thenReturn(expected);
         OperatorAuthController controller =
                 new OperatorAuthController(service, passThrough(LoginAttemptGuard.Realm.OPERATOR));

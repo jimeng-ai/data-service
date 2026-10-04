@@ -40,9 +40,10 @@ public class AdminAuthController {
     @Operation(summary = "管理员登录")
     @PostMapping("/login")
     public LoginResponse login(@RequestBody LoginRequest req, HttpServletRequest http) {
+        // 限流按库认定的账号计数（ádmin、ＡＤＭＩＮ 与 admin 是同一个账号），见 AdminAuthService.loginAttemptKey
+        String accountId = adminAuthService.loginAttemptKey(req == null ? null : req.getUsername());
         return loginAttemptGuard.guard(LoginAttemptGuard.Realm.ENTERPRISE,
-                req == null ? null : req.getUsername(), ClientIpResolver.resolve(http),
-                () -> adminAuthService.login(req));
+                accountId, ClientIpResolver.resolve(http), () -> adminAuthService.login(req));
     }
 
     @Operation(summary = "修改密码")

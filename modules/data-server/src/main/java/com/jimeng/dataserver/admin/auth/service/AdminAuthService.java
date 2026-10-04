@@ -23,6 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Date;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -78,6 +79,23 @@ public class AdminAuthService {
     private final SysEnterpriseMapper sysEnterpriseMapper;
     private final BCryptPasswordEncoder passwordEncoder;
     private final JwtSecretProvider jwtSecretProvider;
+
+    /**
+     * 登录限流用的账号标识：库里查得到就是 {@code id:<id>}，查不到用归一化后的输入（{@code name:<小写去空格>}）。
+     *
+     * <p>必须按库认定的身份计数：username 列是 utf8mb4_unicode_ci，不区分大小写、重音和全角半角，
+     * ádmin、ＡＤＭＩＮ、admin 命中的是同一行、校验的是同一个密码。只按输入字符串计数的话，
+     * 换个写法就是一本新账，限流形同虚设（见 {@link com.jimeng.dataserver.admin.common.LoginAttemptGuard}）。
+     * 查不到的账号猜不出任何东西，按输入计数即可。
+     */
+    public String loginAttemptKey(String username) {
+        if (StrUtil.isBlank(username)) {
+            return "name:";
+        }
+        SysUser row = sysUserMapper.selectOne(
+                Wrappers.<SysUser>lambdaQuery().eq(SysUser::getUsername, username));
+        return row != null ? "id:" + row.getId() : "name:" + username.trim().toLowerCase(Locale.ROOT);
+    }
 
     @Transactional
     public LoginResponse login(LoginRequest req) {
