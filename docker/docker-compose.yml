@@ -65,9 +65,12 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     container_name: ds-rabbitmq
+    # 必须固定：节点名是 rabbit@<hostname>，不固定的话每次重建容器 hostname 都变，broker 会换一个空的数据目录，
+    # 队列里的消息、用户和权限全部丢失。加上它之后的第一次重建仍会换一次（旧节点名是随机的容器 ID），见变更文档第 1 节。
+    hostname: rabbitmq
     restart: unless-stopped
     environment:
-      # 只在数据卷第一次初始化时生效；已有 broker 改账号要用 rabbitmqctl，见变更文档第 2.2 节。
+      # 只在 broker 第一次初始化（数据目录为空）时生效；之后改账号要用 rabbitmqctl。
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?在 docker/.env 里设置 RABBITMQ_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?在 docker/.env 里设置 RABBITMQ_PASSWORD}
       # 本地 IDE 跑的 data-server 走端口映射，在 broker 看来是远端连接，所以不限制只能本机登录。
@@ -123,6 +126,8 @@ services:
       - "127.0.0.1:9300:9300"
     volumes:
       - es_data:/usr/share/elasticsearch/data
+      # 插件目录挂卷：IK 只在卷为空时下载一次，之后重建容器不再依赖外网（下载失败 ES 起不来，data-server 也起不来）
+      - es_plugins:/usr/share/elasticsearch/plugins
     # 首次启动自动安装 analysis-ik 中文分词插件（data-server 启动会强校验）
     # 插件版本必须与 ES 镜像主版本号严格一致
     command: >
@@ -179,4 +184,5 @@ volumes:
   redis_data:
   rabbitmq_data:
   es_data:
+  es_plugins:
   minio_data:
