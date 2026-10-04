@@ -247,6 +247,12 @@ compose() {
 # ---------- 起基础设施 ----------
 start_infra() {
   step "启动基础设施（Nacos / MySQL / Redis / RabbitMQ / Elasticsearch / MinIO）"
+  # compose 文件过不了安全检查（端口只绑本机、凭据从 docker/.env 读、每个服务都有内存上限配置项……）就不起，
+  # 规则见 scripts/check-compose.sh。测试：bash scripts/deploy-infra-gate-test.sh
+  if ! bash "${PROJECT_ROOT}/scripts/check-compose.sh" "$COMPOSE_FILE"; then
+    err "${COMPOSE_FILE} 没通过 scripts/check-compose.sh，没有启动或重建任何容器。"
+    exit 1
+  fi
   if ! compose up -d; then
     err "docker compose up 失败。常见原因："
     err "  1) Docker Desktop 未真正就绪，重试一次；"

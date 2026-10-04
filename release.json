@@ -2,6 +2,10 @@
   "name": "data-service",
   "gate": [
     "mvn -q -B -o -DskipTests install",
-    "mvn -q -B -o -pl modules/data-server test"
+    "mvn -q -B -o -pl gateway,modules/data-server test",
+    "bash scripts/check-compose.sh",
+    "bash scripts/check-compose-test.sh",
+    "bash scripts/deploy-infra-gate-test.sh",
+    "bash scripts/wait-ready-test.sh"
   ]
 }
