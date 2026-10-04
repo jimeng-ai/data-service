@@ -33,3 +33,6 @@ build/
 /.trae/
 /.claude/
 .jqwik-database
+
+### 基础设施凭据（docker/.env.example 是模板，docker/.env 只在部署机上）###
+docker/.env

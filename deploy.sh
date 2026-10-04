@@ -229,11 +229,18 @@ check_existing_nacos() {
 }
 
 # ---------- docker compose 工具兼容 ----------
+# 基础设施的凭据从 docker/.env 读，仓库里不再写死；没有这个文件就拒绝启动，免得用空密码重建容器。
+ENV_FILE="${PROJECT_ROOT}/docker/.env"
 compose() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    err "缺少 ${ENV_FILE}：基础设施的账号密码从这里读取。"
+    err "按 docker/.env.example 建一份再重试（步骤见 docs/config-changes/2026-10-04-p0-hardening.md）。"
+    exit 1
+  fi
   if docker compose version >/dev/null 2>&1; then
-    docker compose -f "$COMPOSE_FILE" "$@"
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
   else
-    docker-compose -f "$COMPOSE_FILE" "$@"
+    docker-compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
   fi
 }
 
@@ -269,14 +276,15 @@ start_infra() {
   done
   printf "\n%s基础设施访问入口:%s\n" "$C_BOLD" "$C_RESET"
   cat <<EOF
-  - Nacos      : http://localhost:8848/nacos        (无鉴权 / 默认)
-  - MySQL      : localhost:3306    root / root123456
-  - Redis      : localhost:6379    无密码
-  - RabbitMQ   : http://localhost:15672              guest / guest
-  - Elasticsearch : http://localhost:9200
-  - Kibana     : http://localhost:5601              (ES 可视化 UI，首次启动 ~30s)
-  - MinIO API  : http://localhost:9000              minioadmin / minioadmin
-  - MinIO Console : http://localhost:9001            minioadmin / minioadmin
+  - Nacos      : http://127.0.0.1:8848/nacos
+  - MySQL      : 127.0.0.1:3306        root / 密码见 docker/.env
+  - Redis      : 127.0.0.1:6379        密码见 docker/.env
+  - RabbitMQ   : http://127.0.0.1:15672 账号见 docker/.env
+  - Elasticsearch : http://127.0.0.1:9200
+  - Kibana     : http://127.0.0.1:5601
+  - MinIO API  : http://127.0.0.1:9000  账号见 docker/.env
+  - MinIO Console : http://127.0.0.1:9001 账号见 docker/.env
+  （端口只绑本机；从别的机器访问请走 SSH 隧道，例如 ssh -L 9001:127.0.0.1:9001 <这台机器>）
 
 EOF
 }
