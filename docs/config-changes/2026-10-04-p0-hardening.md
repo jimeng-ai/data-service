@@ -30,6 +30,11 @@
    docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' > ~/p0-before-mem.txt
    docker inspect -f '{{.Config.Hostname}}' ds-rabbitmq      # 现在是随机的容器 ID
    ```
+6. **连接器的回调地址不能走公网域名。** 第 3 节会让公网入口拒绝 `/data/internal/**`，而沙箱回调连接器和语义生成走的正是这条路径。在 prod 命名空间的 `data-server.yml` 里看这两个键：
+   - `connector.agent.callback-base-url`
+   - `connector.semantic.agent.callback-base-url`
+
+   值应当指向宿主机上的网关，推荐 `http://localhost:20011/data`（见 `docs/sandbox-connector-plane.md`）；为空表示这项能力没开，也没问题。如果是 `https://atlas.heartbeat.ren/data` 这类公网地址，先改掉再做第 3 节，否则这两类回调会全部被拒（403）。
 
 ## 1. 第一个维护窗口：端口只绑本机 + Redis 加密码 + RabbitMQ 换账号
 
@@ -205,6 +210,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jimeng.jm-agent-sand
 - 如果生产库里还有开发时建的 `test` 企业和它的 `admin` 账号（开发文档里的默认密码是 admin123），把密码改掉，或者直接停用。
 
 ## 3. 公网入口拦掉运营接口和内部接口
+
+**部署前：** 确认第 0 节第 6 条：连接器回调地址不走公网域名。
 
 **前提：** jm-agent-front 已合入改动并部署。部署流程会先用真实的 nginx 跑一遍拦截测试。
 
