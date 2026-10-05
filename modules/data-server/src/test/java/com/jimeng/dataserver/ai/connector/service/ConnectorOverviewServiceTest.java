@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
+import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
@@ -68,9 +69,11 @@ class ConnectorOverviewServiceTest {
         schemaMapper = mock(ConnectorSchemaMapper.class);
         semanticMapper = mock(ConnectorSemanticMapper.class);
         properties = new ConnectorProperties();
+        ConnectorRegistry registry = mock(ConnectorRegistry.class);
+        when(registry.supports("MYSQL")).thenReturn(true);
         // MetricRewriter 没有任何注入依赖，直接 new：它的上限字段有默认值，不经 Spring 也能用。
         service = new ConnectorOverviewService(agentConnectionMapper, connectionMapper,
-                schemaMapper, semanticMapper, properties, new MetricRewriter());
+                schemaMapper, semanticMapper, properties, new MetricRewriter(), registry);
 
         TenantContext.set("t1");
         AgentContext.set(AgentRuntimeView.builder().agentId(7L).tenantId("t1").build());
@@ -357,5 +360,33 @@ class ConnectorOverviewServiceTest {
         s.setAnsweredName(answeredName);
         s.setAnsweredAt(answeredAt);
         return s;
+    }
+
+    @org.junit.jupiter.api.Test
+    @org.junit.jupiter.api.DisplayName("★ 只授了已下线类型（kind=HTTP）的连接：不算有授权，不给 conn_* 工具")
+    void 只授了已下线类型不算有授权() {
+        AgentConnection g = new AgentConnection();
+        g.setConnectionId(9L);
+        when(agentConnectionMapper.selectList(any())).thenReturn(List.of(g));
+        Connection legacy = new Connection();
+        legacy.setId(9L);
+        legacy.setKind("HTTP");
+        when(connectionMapper.selectList(any())).thenReturn(List.of(legacy));
+
+        assertThat(service.hasGrantedConnections(7L)).isFalse();
+    }
+
+    @org.junit.jupiter.api.Test
+    @org.junit.jupiter.api.DisplayName("授了数据库类连接：算有授权")
+    void 授了数据库类连接算有授权() {
+        AgentConnection g = new AgentConnection();
+        g.setConnectionId(1L);
+        when(agentConnectionMapper.selectList(any())).thenReturn(List.of(g));
+        Connection row = new Connection();
+        row.setId(1L);
+        row.setKind("MYSQL");
+        when(connectionMapper.selectList(any())).thenReturn(List.of(row));
+
+        assertThat(service.hasGrantedConnections(7L)).isTrue();
     }
 }

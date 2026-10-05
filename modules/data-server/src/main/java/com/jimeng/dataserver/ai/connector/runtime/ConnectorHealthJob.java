@@ -327,6 +327,11 @@ public class ConnectorHealthJob {
             if (transport != null && !transport.isBlank() && !"direct".equalsIgnoreCase(transport)) {
                 continue;
             }
+            // 已下线的类型（2026-10 删掉了 HTTP）不探：探了只会把 registry.require 的「不支持的类型」
+            // 写成 UNHEALTHY，在界面上制造一条永远修不好的告警。这种遗留行由变更文档删除。
+            if (!registry.supports(ConnectorInstanceLoader.normalizeKind(row.getKind()))) {
+                continue;
+            }
             if (probeOne(row)) {
                 ok++;
             } else {

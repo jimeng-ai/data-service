@@ -67,7 +67,8 @@ class ConnectorOverviewMetricContextTest {
         semanticMapper = mock(ConnectorSemanticMapper.class);
         properties = new ConnectorProperties();
         service = new ConnectorOverviewService(agentConnectionMapper, connectionMapper,
-                schemaMapper, semanticMapper, properties, new MetricRewriter());
+                schemaMapper, semanticMapper, properties, new MetricRewriter(),
+                org.mockito.Mockito.mock(com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry.class));
 
         TenantContext.set("t1");
         AgentContext.set(AgentRuntimeView.builder().agentId(7L).tenantId("t1").build());

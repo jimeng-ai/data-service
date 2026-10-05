@@ -156,8 +156,9 @@ class ConnectorHealthJobSchemaRefreshTest {
         mysql = mock(Connector.class);
         when(mysql.declaredCapabilities()).thenReturn(Set.of(Capability.QUERY, Capability.DESCRIBE, Capability.HEALTH));
         when(registry.require("MYSQL")).thenReturn(mysql);
+        when(registry.supports("MYSQL")).thenReturn(true);
         Connector http = mock(Connector.class);
-        // 与 HttpConnector 的真实声明一致：没有 DESCRIBE。
+        // 模拟一种不能自描述的类型（借用 2026-10 已下线的 HTTP 类型名当夹具）：没有 DESCRIBE。
         when(http.declaredCapabilities()).thenReturn(Set.of(Capability.INVOKE, Capability.HEALTH));
         when(registry.require("HTTP")).thenReturn(http);
 
@@ -1638,5 +1639,30 @@ class ConnectorHealthJobSchemaRefreshTest {
             assertEquals(1, t.failed);
             verify(bucketFor(100L)).set(any(), eq(6L), eq(TimeUnit.HOURS));
         }
+    }
+
+    @Test
+    @DisplayName("★ 已下线类型的遗留行（kind=HTTP）：健康探测跳过，不写 UNHEALTHY")
+    void 已下线类型的遗留行不探测() throws Exception {
+        Connection legacy = givenMysql(9L, "t1");
+        legacy.setKind("HTTP");
+
+        job.sweep();
+
+        verify(loader, never()).load(any());
+        verify(connectionMapper, never()).update(any(), any());
+    }
+
+    @Test
+    @DisplayName("支持的类型照常探测，写回 HEALTHY")
+    void 支持的类型照常探测() throws Exception {
+        Connection row = givenMysql(1L, "t1");
+        when(loader.load(row)).thenReturn(new com.jimeng.dataserver.ai.connector.spi.ConnectorInstance(
+                1L, "t1", "MYSQL", "conn1", null, java.util.Map.of(), null, "direct", null));
+        when(mysql.open(any())).thenReturn(mock(ConnectorSession.class));
+
+        job.sweep();
+
+        verify(connectionMapper).update(any(), any());
     }
 }

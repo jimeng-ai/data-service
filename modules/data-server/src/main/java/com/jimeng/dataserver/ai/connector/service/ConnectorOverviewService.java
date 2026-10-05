@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.tenant.TenantContext;
 import com.jimeng.dataserver.ai.agent.dto.AgentRuntimeView;
 import com.jimeng.dataserver.ai.agent.runtime.AgentContext;
+import com.jimeng.dataserver.ai.connector.registry.ConnectorRegistry;
+import com.jimeng.dataserver.ai.connector.runtime.ConnectorInstanceLoader;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.Connection;
@@ -48,7 +50,8 @@ import java.util.Set;
  * <h3>★ 这个类必须保持"不能回到模型"</h3>
  * 它被 {@code SkillRuntimeService} 注入，而那条链是
  * {@code ProviderRegistry → ChatClient → AiConversationLoop → SkillRuntimeService}。
- * 本类只注入四个 mapper 和 {@code ConnectorProperties}（一个 {@code @ConfigurationProperties} 叶子），
+ * 本类只注入四个 mapper、{@code ConnectorProperties}（一个 {@code @ConfigurationProperties} 叶子）
+ * 和 {@code ConnectorRegistry}（依赖链见该字段的注释），
  * 没有任何一条边能回到 {@code ProviderRegistry} / {@code ClaudeService} / {@code ChatClient}，
  * 所以环闭不上。<b>以后往这里加依赖，先把这条链重新走一遍</b>——仓库已经被同一个环咬过两次。
  * 特别地：不要图省事注入 {@code ConnectorGateway}（它拖着 registry / loader / audit / redis 一串东西）
@@ -104,6 +107,13 @@ public class ConnectorOverviewService {
      * 所以这条新边过得了类注释里那条「不能回到 {@code ProviderRegistry}」的判据。
      */
     private final MetricRewriter metricRewriter;
+    /**
+     * 只用来判断「这条连接的类型平台还支持吗」。依赖链 2026-10 核过：
+     * {@code ConnectorRegistry → 各 Connector 实现}，现存的 {@code MySqlConnector} 只依赖
+     * {@code CustomerDataSourceManager} / {@code ReadOnlySqlGuard} / {@code WriteSqlGuard} /
+     * {@code ConnectorProperties}，全是叶子，回不到 {@code ProviderRegistry}。新增连接器类型时把这条链再走一遍。
+     */
+    private final ConnectorRegistry registry;
 
     // ================================================================ 对外
 
@@ -208,7 +218,17 @@ public class ConnectorOverviewService {
      */
     public boolean hasGrantedConnections(Long agentId) {
         if (agentId == null) return false;
-        return !grantedConnectionIds(agentId).isEmpty();
+        Set<Long> ids = grantedConnectionIds(agentId);
+        if (ids.isEmpty()) return false;
+        // 只算平台还支持的类型：2026-10 下线的 HTTP 类连接如果没被变更文档删干净，
+        // 只授了它的 Agent 不该因此拿到 conn_* 工具——拿到了也调不通，模型只会反复试。
+        List<Connection> rows = connectionMapper.selectList(new LambdaQueryWrapper<Connection>()
+                .select(Connection::getId, Connection::getKind)
+                .in(Connection::getId, ids));
+        for (Connection r : rows) {
+            if (registry.supports(ConnectorInstanceLoader.normalizeKind(r.getKind()))) return true;
+        }
+        return false;
     }
 
     /** 与 {@code ConnectorGateway.grantedConnectionIds} 同形：授权只认 {@code agent_connection}。 */
