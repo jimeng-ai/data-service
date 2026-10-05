@@ -28,7 +28,9 @@ DELETE FROM connection WHERE kind = 'HTTP';
 
 ## 二、上线顺序
 
-按 data-service → jm-agent-sandbox → jm-agent-front 的顺序，一次上一个仓库。
+一次上一个仓库。S0 本身对先后没有硬要求：三个仓库的新旧版本怎么搭配都能用（S0 整体评审逐个组合核过），唯一看得见的影响是下面这条。
+
+合并后 main 上的新 tag 会把还没上线的 v1.1.0 和 P0 一起带上。如果一起上，按 `docs/releases/v1.1.0.md` 第三节的顺序走：沙箱 → data-service → 前端。
 
 data-service 上线之后、前端上线之前，「HTTP 出站（兼容）」页面会因为接口已删而报错。这个页面只有超管能看到，线上也没人在用。
 
