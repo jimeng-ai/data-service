@@ -57,7 +57,7 @@ import java.util.Map;
  * <b>在连接器进入 RBAC 资源体系之前，权限上的默认值取最严的那个——收紧容易，放开难。</b>
  */
 @Slf4j
-@Tag(name = "连接器", description = "客户系统接入：数据库 / HTTP 接口等外部资源的注册与探测")
+@Tag(name = "连接器", description = "客户数据库接入：连接的注册与探测")
 @RestController
 @RequestMapping("/data/admin/connectors")
 @RequiredArgsConstructor

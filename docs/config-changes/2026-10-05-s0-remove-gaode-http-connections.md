@@ -24,7 +24,7 @@ DELETE ac FROM agent_connection ac JOIN connection c ON c.id = ac.connection_id 
 DELETE FROM connection WHERE kind = 'HTTP';
 ```
 
-不删也不会出错，新代码对这些遗留行做了容错：不探测、不能再授权，只授了遗留行的 Agent 也拿不到 `conn_*` 工具。但界面上会一直挂着这些用不了的连接。
+不删也不影响其他功能，新代码对这些遗留行做了容错：不探测、不能再授权，模型调 `conn_list` 时看不到它们，只授了遗留行的 Agent 也拿不到 `conn_*` 工具。但「数据连接」页上会一直挂着这些用不了的连接，对它们点「测试连接」会报错，所以还是建议删掉。
 
 ## 二、上线顺序
 

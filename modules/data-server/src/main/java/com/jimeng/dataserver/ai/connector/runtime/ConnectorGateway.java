@@ -230,6 +230,11 @@ public class ConnectorGateway {
                 .orderByAsc(Connection::getName));
         List<ConnectorSummary> out = new ArrayList<>(rows.size());
         for (Connection row : rows) {
+            // 2026-10 下线的 HTTP 类连接如果没被变更文档删干净，不列给模型：列出来也调不通，
+            // 模型只会拿它去试，或者跟用户说「有一条连接用不了」。与 hasGrantedConnections 同一条规则。
+            if (!registry.supports(ConnectorInstanceLoader.normalizeKind(row.getKind()))) {
+                continue;
+            }
             out.add(new ConnectorSummary(
                     row.getName(),
                     row.getDisplayName(),

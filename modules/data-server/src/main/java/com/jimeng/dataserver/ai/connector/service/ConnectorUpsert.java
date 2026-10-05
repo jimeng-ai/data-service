@@ -21,13 +21,13 @@ import java.util.Map;
 @Data
 public class ConnectorUpsert {
 
-    @Schema(description = "实例名，租户内唯一；^[A-Za-z0-9_-]{1,64}$。它是 egress 的 URL 路径段，也是模型调工具时的寻址键")
+    @Schema(description = "实例名，租户内唯一；^[A-Za-z0-9_-]{1,64}$。模型调工具时按它寻址")
     private String name;
 
     @Schema(description = "给人看的名字")
     private String displayName;
 
-    @Schema(description = "连接器类型标识，如 MYSQL / HTTP。新建必填；编辑时不可改（config_json 的形状是按类型定的）")
+    @Schema(description = "连接器类型标识，目前只有 MYSQL。新建必填；编辑时不可改（config_json 的形状是按类型定的）")
     private String kind;
 
     @Schema(description = "该类型声明的全部参数（含敏感参数）。编辑时敏感参数留空表示沿用原值")

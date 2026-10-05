@@ -259,6 +259,27 @@ class ConnectorGatewayTest {
         assertTrue(gateway.listAuthorized().isEmpty());
     }
 
+    @Test
+    @DisplayName("★ listAuthorized：授权里混着已下线类型（kind=HTTP）的遗留行 → 不列给模型")
+    void 列表不含已下线类型的遗留行() {
+        AgentConnection mysqlGrant = new AgentConnection();
+        mysqlGrant.setConnectionId(100L);
+        AgentConnection legacyGrant = new AgentConnection();
+        legacyGrant.setConnectionId(9L);
+        when(agentConnectionMapper.selectList(any(LambdaQueryWrapper.class)))
+                .thenReturn(List.of(mysqlGrant, legacyGrant));
+        Connection legacy = row();
+        legacy.setId(9L);
+        legacy.setName("old-api");
+        legacy.setKind("HTTP");
+        legacy.setCapabilityFlags("INVOKE,HEALTH");
+        when(connectionMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(row(), legacy));
+        when(registry.supports("MYSQL")).thenReturn(true);
+
+        List<String> names = gateway.listAuthorized().stream().map(ConnectorSummary::name).toList();
+        assertEquals(List.of("crm"), names);
+    }
+
     // ---------------------------------------------------------------- 能力标记解析
 
     @Test

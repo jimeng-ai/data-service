@@ -109,7 +109,10 @@ public class ConnectorInstanceLoader {
         }
     }
 
-    /** kind 为空按 HTTP 处理：存量行是在 kind 列存在之前建的，回填脚本没跑到的也不该失效。 */
+    /**
+     * kind 为空归一成 HTTP：kind 列出现之前建的存量行都是 HTTP 类。HTTP 类 2026-10 已下线，
+     * 所以这样的行按已下线类型对待（不探测、不能授权、不列给模型）。
+     */
     public static String normalizeKind(String kind) {
         return kind == null || kind.isBlank() ? "HTTP" : kind.trim().toUpperCase(Locale.ROOT);
     }

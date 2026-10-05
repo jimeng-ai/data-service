@@ -36,7 +36,7 @@ public class ConnectorAuditView {
     @Schema(description = "Agent 名称。Agent 已删除时为空——审计记录不随 Agent 消失")
     private String agentName;
 
-    @Schema(description = "用到的能力：QUERY / DESCRIBE / INVOKE …")
+    @Schema(description = "用到的能力：QUERY / DESCRIBE / WRITE …（2026-10 之前的历史行可能是 INVOKE）")
     private String capability;
 
     @Schema(description = "具体操作，即工具名：conn_query / conn_catalog / conn_describe / conn_execute 等")
