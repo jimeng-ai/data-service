@@ -12,7 +12,7 @@ import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.skill.service.SkillTenantService;
 import com.jimeng.persistence.entity.AgentConnection;
 import com.jimeng.persistence.entity.AgentSkill;
-import com.jimeng.dataserver.ai.connection.ConnectionService;
+import com.jimeng.dataserver.ai.connector.service.ConnectorService;
 import com.jimeng.dataserver.admin.rbac.common.SuperAdminGuard;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -44,7 +44,7 @@ public class AgentAdminController {
     private final PermissionResolver permissionResolver;
     private final UserNameResolver userNameResolver;
     private final SkillTenantService skillTenantService;
-    private final ConnectionService connectionService;
+    private final ConnectorService connectorService;
     private final SuperAdminGuard superAdminGuard;
 
     @Operation(summary = "创建 Agent")
@@ -154,7 +154,7 @@ public class AgentAdminController {
         // 技能只是"怎么调"的说明，连接才是"能不能调"。
         superAdminGuard.requireSuperAdmin();
         permissionResolver.assertCurrentAccess(ResourceType.AGENT, id);
-        connectionService.get(req.getConnectionId());   // 不存在则抛
+        connectorService.requireGrantable(req.getConnectionId());   // 不存在、或类型已下线则抛
         return agentService.grantConnection(id, req.getConnectionId());
     }
 

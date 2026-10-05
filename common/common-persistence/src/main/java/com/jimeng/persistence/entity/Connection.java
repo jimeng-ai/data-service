@@ -26,18 +26,18 @@ public class Connection extends BaseEntity {
     @TableField("tenant_id")
     private String tenantId;
 
-    @Schema(description = "容器可见标识，也是 $JM_CONN_BASE/<name>/ 里的那一段")
+    @Schema(description = "连接名：企业内唯一，模型调 conn_* 工具时按它找连接")
     @TableField("name")
     private String name;
 
     @TableField("display_name")
     private String displayName;
 
-    @Schema(description = "真实上游 base URL，容器不可见")
+    @Schema(description = "（已废弃，不再读写）2026-10 之前 HTTP 类连接的上游地址")
     @TableField("base_url")
     private String baseUrl;
 
-    @Schema(description = "bearer | api-key")
+    @Schema(description = "（已废弃，不再读写）2026-10 之前 HTTP 类连接的认证方式")
     @TableField("auth_scheme")
     private String authScheme;
 
@@ -48,11 +48,11 @@ public class Connection extends BaseEntity {
     @TableField("encryption_version")
     private Integer encryptionVersion;
 
-    @Schema(description = "逗号分隔的允许方法，默认 GET")
+    @Schema(description = "（已废弃，不再读写）2026-10 之前 HTTP 类连接允许的方法")
     @TableField("allow_methods")
     private String allowMethods;
 
-    @Schema(description = "JSON 数组的路径 glob")
+    @Schema(description = "（已废弃，不再读写）2026-10 之前 HTTP 类连接允许的路径")
     @TableField("allow_paths")
     private String allowPaths;
 
@@ -70,12 +70,12 @@ public class Connection extends BaseEntity {
     // 系统注册表并存：租户隔离、凭据加解密、Agent 授权、审计这些横切的事要写两遍，然后分叉。
 
     /**
-     * 连接器类型标识，对应 {@code Connector#kind()}。存量行全部回填成 {@code HTTP}。
+     * 连接器类型标识，对应 {@code Connector#kind()}。目前只有 {@code MYSQL}。
      *
-     * <p><b>HTTP 类型继续用旧列</b>（base_url / auth_scheme / allow_methods / allow_paths），
-     * 沙箱 egress 代理那条链路一个字节都不用改；新类型的参数一律进 {@link #configJson}。
+     * <p>2026-10 之前还有 {@code HTTP}，参数存在 base_url / auth_scheme / allow_methods / allow_paths 这几列，
+     * 已随 HTTP 类连接一起下线，这几列不再读写。各类型的参数一律在 {@link #configJson}。
      */
-    @Schema(description = "连接器类型：HTTP | MYSQL")
+    @Schema(description = "连接器类型：MYSQL")
     @TableField("kind")
     private String kind;
 

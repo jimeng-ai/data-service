@@ -9,9 +9,9 @@ import java.util.List;
  * data-service -> 边车 /sandbox/run 的请求体。字段名（camelCase）须与边车 TS 的 RunRequest 一致。
  * 用 Hutool JSONUtil 序列化（数字按数字输出，不受 spring.jackson.write_numbers_as_strings 影响）。
  *
- * <p><b>字段名拼错不会报错</b>：边车对未知字段静默忽略。{@link Conn#scheme} 就是现成的例子——边车读的是
- * {@code authScheme}，api-key 连接被静默当成 bearer。新字段因此有 {@code SidecarRunPayloadJsonTest} 按边车
- * {@code src/types.ts} 逐字段对拍。
+ * <p><b>字段名拼错不会报错</b>：边车对未知字段静默忽略。已经删掉的出站连接就是现成的例子——Java 发 {@code scheme}，
+ * 边车读 {@code authScheme}，api-key 连接被静默当成 bearer。所以 {@code SidecarRunPayloadJsonTest} 按边车
+ * {@code src/types.ts} 对拍：新字段逐字段对，顶层字段一个都不能是边车不认识的。
  *
  * <p>密钥字段（{@code authToken}、{@code accessToken}、{@code token}）一律 {@link ToString.Exclude}：
  * {@code @Data} 生成的 toString 会被顺手打进日志（{@code log.info("{}", payload)}），而这些是真实计费的模型 key
@@ -49,12 +49,6 @@ public class SidecarRunPayload {
     private ImageGen imageGen;
     /** 非空且 baseUrl/authToken 齐全时，边车注册 web search+fetch MCP 工具。字段名须与边车 TS 的 WebSearchConfig 一致。 */
     private WebSearch webSearch;
-    /**
-     * 本次 run 被授予的外部系统连接。边车转注册给 egress 代理；容器只见 name，
-     * 真实 baseUrl 与 token 只存在于代理内存里，按源 IP 注入。
-     */
-    private List<Conn> connections;
-
     private Limits limits;
     /** 本次 run 可用的 DOER skill（编排者从 MinIO 列出文件，边车物化到 .claude/skills）。 */
     private List<SkillRef> skills;
@@ -78,14 +72,11 @@ public class SidecarRunPayload {
      *
      * <h3>为什么需要它</h3>
      * 带附件的会话整轮走沙箱平面，而那边过去<b>一个 conn_* 工具都没有</b>。后果不是报错，是
-     * 模型只能拿历史数据讲、或者自己编——HTTP 类连接器还能经 egress 代理够到，彻底零路径的
-     * 恰恰是 MYSQL，也就是语义层真正服务的那一类。
+     * 模型只能拿历史数据讲、或者自己编——而数据库类连接器正是语义层真正服务的那一类。
      *
-     * <h3>它与 {@link #connections} 是两条不同的链路，不要混</h3>
-     * {@code connections} 是 egress 代理的 <b>HTTP 出口</b>：凭据按源 IP 注入，不经 ConnectorGateway
-     * 的任何护栏（只有方法/路径白名单）。{@code connectorContext} 走<b>宿主回调</b>：工具定义在沙箱、
-     * 执行留在 data-service，ReadOnlySqlGuard / WriteSqlGuard / 限流 / 审计 / agent_connection 实时授权
-     * 全部照常生效，容器连客户库的地址都不知道。
+     * <h3>执行留在宿主</h3>
+     * 工具定义在沙箱、执行留在 data-service：ReadOnlySqlGuard / WriteSqlGuard / 限流 / 审计 /
+     * agent_connection 实时授权全部照常生效，容器连客户库的地址都不知道。
      */
     private ConnectorContext connectorContext;
 
@@ -208,20 +199,6 @@ public class SidecarRunPayload {
         private String description;
         /** 对应 tools.json 的 {@code input_schema}（这里是 camelCase，边车按 inputSchema 读）。 */
         private java.util.Map<String, Object> inputSchema;
-    }
-
-    @Data
-    public static class Conn {
-        /** 容器可见标识，也是 $JM_CONN_BASE/<name>/ 里的那一段 */
-        private String name;
-        private String baseUrl;
-        @ToString.Exclude
-        private String token;
-        private String scheme;
-        /** 允许的方法；空则边车按默认 ["GET"] 处理（只读） */
-        private List<String> allowMethods;
-        /** 允许的路径 glob；空则边车按默认 ["/**"] 处理 */
-        private List<String> allowPaths;
     }
 
     /** 字段名须与边车 TS 的 {@code WorkspaceRef} 一致。 */

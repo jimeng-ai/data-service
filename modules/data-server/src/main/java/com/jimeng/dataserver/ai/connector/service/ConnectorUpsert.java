@@ -15,8 +15,7 @@ import java.util.Map;
  * 下次加 Elasticsearch 就得再加一批——那正是抽象切错了的信号。
  *
  * <p>敏感参数（{@code ParamSpec.secretNames()}）也走 {@code params}，它们不进 {@code config_json}，
- * 只进 AES-GCM 密文，且<b>永不回读</b>。编辑时某个敏感参数留空 = 沿用原值，
- * 与 {@code ConnectionService.apply} 的语义一致。
+ * 只进 AES-GCM 密文，且<b>永不回读</b>。编辑时某个敏感参数留空 = 沿用原值。
  */
 @Schema(description = "连接器实例录入")
 @Data

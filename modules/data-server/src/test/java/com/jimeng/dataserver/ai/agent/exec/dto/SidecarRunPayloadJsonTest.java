@@ -7,6 +7,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,6 +16,7 @@ import java.nio.file.Paths;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,13 +24,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * {@link SidecarRunPayload} 的语义层新字段与边车 TS 类型的对拍（设计文档 5.1、10.1）。
  *
  * <h3>为什么要对拍</h3>
- * 边车对未知字段<b>静默忽略</b>，所以 Java 这边字段名拼错不会报错，只会「不生效」。{@code SidecarRunPayload.Conn}
- * 就是现成的例子：Java 叫 {@code scheme}，边车读 {@code authScheme}，api-key 连接被静默当成 bearer，直到有人去翻两边的代码。
+ * 边车对未知字段<b>静默忽略</b>，所以 Java 这边字段名拼错不会报错，只会「不生效」。已经删掉的出站连接就是现成的例子：
+ * Java 发 {@code scheme}，边车读 {@code authScheme}，api-key 连接被静默当成 bearer，直到有人去翻两边的代码。
  * 语义层这几个字段错了的后果更隐蔽：{@code semanticContext} 的某个键对不上，边车的校验回 400，编排器把它当成
  * 「sandbox 拒绝语义层运行」降级——看起来像边车版本问题。
  *
@@ -274,5 +278,20 @@ class SidecarRunPayloadJsonTest {
             }
         }
         return out;
+    }
+
+    @Test
+    @DisplayName("★ 运行请求的每个顶层字段，边车 RunRequest 都认识（认不出的字段会被静默忽略）")
+    void 顶层字段都在边车RunRequest里() throws IOException {
+        Path typesTs = findSandboxTypesTs();
+        assumeTrue(typesTs != null, "本机工作区没有并排的边车仓库，跳过");
+        Set<String> runRequestFields = interfaceFields(Files.readString(typesTs, StandardCharsets.UTF_8), "RunRequest");
+        Set<String> unknown = new TreeSet<>();
+        for (Field f : SidecarRunPayload.class.getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            if (!runRequestFields.contains(f.getName())) unknown.add(f.getName());
+        }
+        assertTrue(unknown.isEmpty(),
+                "这些字段 data-service 会发，" + typesTs + " 的 RunRequest 却不认识（会被静默忽略）：" + unknown);
     }
 }

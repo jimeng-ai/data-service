@@ -48,6 +48,15 @@ class RemovedCapabilitiesGuardTest {
                 "HttpCallGuard", "InvokeCapable", "InvokeResult", "pluginHttpClient"));
     }
 
+    @Test
+    @DisplayName("出站连接已下线：技能脚本调外部 HTTP 以后走通用网关，不再经 egress 代理按连接名注入凭据")
+    void outboundConnectionsAreGone() throws IOException {
+        assertAbsent(List.of("ConnectionResolver", "ConnectionService", "ConnectionAdminController",
+                "ConnectionUpsert", "JM_CONN_BASE", "/data/admin/connections",
+                // 只认被删掉的那个 Conn 类的写法；SidecarRunPayload.ConnectorContext 是保留的，不能误伤。
+                "SidecarRunPayload.Conn>", "List<Conn>", "class Conn {"));
+    }
+
     static void assertAbsent(List<String> needles) throws IOException {
         // 工作目录不对时扫描范围是空的，守卫会白白变绿——先把这件事钉死。
         assertTrue(Files.isDirectory(MODULE.resolve("src/main")),

@@ -83,7 +83,6 @@ public class AgentExecService {
     private final AgentArtifactMapper artifactMapper;
     private final RagMinioStorageService storage;
     private final AgentRuntimeService agentRuntimeService;
-    private final com.jimeng.dataserver.ai.connection.ConnectionResolver connectionResolver;
     private final AdminAuthService adminAuthService;
     private final AiModelCallRecordService recordService;
     private final UsageExtractor usageExtractor;
@@ -280,13 +279,6 @@ public class AgentExecService {
         limits.setMaxBudgetUsd(props.getMaxBudgetUsd());
         payload.setLimits(limits);
         // DOER skills：把租户可见的活跃 DOER skill bundle 列出并下发给边车（边车物化到 .claude/skills）。
-        // 外部连接：按 Agent 授权下发。技能脚本用 $JM_CONN_BASE/<name>/... 调用，
-        // 真实地址与凭据只到边车+egress 代理为止，不进容器。
-        List<SidecarRunPayload.Conn> conns =
-                connectionResolver.resolveForAgent(view == null ? null : view.getAgentId());
-        if (!conns.isEmpty()) {
-            payload.setConnections(conns);
-        }
         // 按 Agent 绑定收窄：view 为空（无 agentId）时传 null，保持旧的"租户内全量"行为。
         List<AiSkill> doerSkills = skillTenantService.listActiveDoerForRun(
                 tenantId, AdminRequestContext.findUserIdOrNull(),
@@ -295,8 +287,8 @@ public class AgentExecService {
             payload.setSkills(skillBundleResolver.resolve(doerSkills));
         }
 
-        // 3b. 连接器工具代理：让沙箱平面也有 conn_*（数据库类连接器只有这一条路，egress 代理那条
-        //     只管 HTTP）。工具定义在沙箱、执行留在宿主，经 /data/internal/connector-agent/** 回调。
+        // 3b. 连接器工具代理：让沙箱平面也有 conn_*。工具定义在沙箱、执行留在宿主，
+        //     经 /data/internal/connector-agent/** 回调。
         //
         //     判定 + 登记 + 签发全在 ConnectorAgentContextFactory 里（评测平面共用同一份，见该类注释）。
         //     租约未授予时 close() 是空操作，所以这里不再自己记 connectorRegistered 布尔——

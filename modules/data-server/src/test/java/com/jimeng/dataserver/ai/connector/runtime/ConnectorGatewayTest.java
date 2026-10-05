@@ -200,8 +200,7 @@ class ConnectorGatewayTest {
     }
 
     /**
-     * ★ 隧道未实现时要<b>明确报错</b>。{@code ConnectionResolver} 对这种行只 warn 后静默跳过，
-     * 表现为「连接明明配好了却不生效」，排查成本极高。
+     * ★ 隧道未实现时要<b>明确报错</b>。静默跳过的表现是「连接明明配好了却不生效」，排查成本极高。
      */
     @Test
     @DisplayName("transport=tunnel → 明确报错，不静默跳过")

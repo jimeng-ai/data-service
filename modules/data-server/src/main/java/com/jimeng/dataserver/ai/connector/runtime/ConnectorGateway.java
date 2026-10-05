@@ -95,14 +95,13 @@ import java.util.concurrent.TimeUnit;
  *       探能力（一条 {@code information_schema} 查询）。没有审计、不占速率桶、不抢并发许可。
  *       它走不了本类：第 3 步按 {@code connection} 表里<b>已落库</b>的行寻址，而试连的配置根本没落库、
  *       编辑时要验的新参数在探测通过之前刻意不落库；第 6 步看那一行的 {@code capability_flags}，
- *       而那一列正是这次探测要写出来的——新连接和从旧入口（{@code ConnectionService}）建的连接这一列是空的，
+ *       而那一列正是这次探测要写出来的——新连接这一列是空的，
  *       本类对它们的拒绝文案恰好是「请在管理台点一次『测试连接』」，而「测试连接」就是这个探测。
  *       它能被接受，是因为只由超管手点触发、每次至多三条语句；<b>绝不能被定时任务调用</b>。完整理由在它的类注释里。</li>
  * </ol>
  * 读结构、读数据、采样探查——凡是针对已落库连接的动作——一律走本类（后台任务走 {@link #executeAsPlatform}）。
  *
- * <p><b>「所有」的范围</b>是 data-server 进程里经 {@code Connector} SPI 的访问。沙箱里的代码经 egress 代理调用 HTTP 连接，
- * 是另一个进程里的另一条链路（凭据由 {@code ConnectionResolver} 随派发载荷交给边车），不经过本类，也不在上面那份清单里。
+ * <p><b>「所有」的范围</b>是 data-server 进程里经 {@code Connector} SPI 的访问。
  *
  * <h3>★ 三个必须 fail-closed 的地方</h3>
  * <ul>
@@ -113,8 +112,8 @@ import java.util.concurrent.TimeUnit;
  *       {@code agent_id} 时就是这种情况。绝不能照抄 {@code SkillRuntimeService.filterByAgentAllowlist}
  *       的 {@code if (agent == null) return packages;}（那是「不过滤」）——连接器一旦不过滤，
  *       等于任何一次匿名对话都能碰客户的生产库。</li>
- *   <li><b>{@code transport != direct}</b>：隧道尚未实现。{@code ConnectionResolver} 对这种行是
- *       warn 后静默跳过，于是表现为「连接明明配好了却不生效」。这里改成明确报错。</li>
+ *   <li><b>{@code transport != direct}</b>：隧道尚未实现。这里明确报错，
+ *       不能静默跳过——静默跳过的表现是「连接明明配好了却不生效」。</li>
  * </ul>
  *
  * <h3>授权只能查 agent_connection</h3>
@@ -519,7 +518,7 @@ public class ConnectorGateway {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "缺少连接名");
         }
         // 租户过滤由 JimengTenantLineHandler 注入（connection 在 TENANT_AWARE_TABLES 里）。
-        // 这里不写 eq(tenantId)，与 ConnectionResolver 的做法一致——写两遍反而会在将来改白名单时分叉。
+        // 这里不写 eq(tenantId)——写两遍反而会在将来改白名单时分叉。
         Connection row = connectionMapper.selectOne(new LambdaQueryWrapper<Connection>()
                 .eq(Connection::getName, connectorName.trim())
                 .last("LIMIT 1"));
@@ -571,7 +570,7 @@ public class ConnectorGateway {
         }
         String transport = row.getTransport();
         if (transport != null && !transport.isBlank() && !"direct".equalsIgnoreCase(transport)) {
-            // 明确报错而不是静默跳过：ConnectionResolver 对这种行只 warn，表现为「配好了却不生效」。
+            // 明确报错而不是静默跳过：静默跳过的表现是「配好了却不生效」。
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
                     "连接「" + row.getName() + "」配置为经内网隧道访问，但隧道功能尚未实现");
         }

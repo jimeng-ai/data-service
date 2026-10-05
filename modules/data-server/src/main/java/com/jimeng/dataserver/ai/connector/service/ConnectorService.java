@@ -160,6 +160,20 @@ public class ConnectorService {
     }
 
     /**
+     * 授权前的校验：连接要在当前租户里存在（{@link #requireRow} 带租户过滤），而且类型平台还支持。
+     *
+     * <p>第二条是给 2026-10 下线的 HTTP 类遗留行准备的：变更文档会删掉它们，没删干净时，
+     * 不能再把它们授给 Agent——授了也调不通，只会让模型拿到一个永远失败的连接器。
+     */
+    public void requireGrantable(Long id) {
+        Connection row = requireRow(id);
+        if (!registry.supports(ConnectorInstanceLoader.normalizeKind(row.getKind()))) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
+                    "这条连接的类型（" + row.getKind() + "）已经下线，不能授权给 Agent");
+        }
+    }
+
+    /**
      * 「这条连接允许我读到哪一层？」——数据出库档位的<b>唯一查询入口</b>。
      *
      * <p>后续要去客户库里做事的代码（S3 采样验证算包含率、将来取 top-k 维值）在动手之前问这里，
@@ -507,8 +521,8 @@ public class ConnectorService {
         if (cleanup != null) {
             cleanup.onConnectorDeleted(row.getTenantId(), id);
         }
-        // 顺序照抄 ConnectionService.delete 的理由：先摘授权再删连接。反过来的话，
-        // 中间失败会留下指向不存在连接的授权行，而解析那一步对这种行只会跳过——又一处静默失效。
+        // 先摘授权再删连接。反过来的话，中间失败会留下指向不存在连接的授权行，
+        // 而读授权的地方对这种行只会跳过——又一处静默失效。
         agentConnectionMapper.delete(new LambdaQueryWrapper<AgentConnection>()
                 .eq(AgentConnection::getConnectionId, id));
         // 自描述缓存走物理删除：它的唯一键不含 deleted，软删的行会占住键位，
@@ -663,8 +677,8 @@ public class ConnectorService {
     /**
      * 多个敏感参数时序列化成一段 JSON 再整体加密；<b>单个时直接存那个值</b>。
      *
-     * <p>单值不套 JSON 是刻意的：现有的 HTTP 连接（沙箱那条路）存的就是裸令牌，
-     * {@code ConnectionResolver} 直接把它当 token 下发。套上 JSON 会让所有存量行解不出来。
+     * <p>单值不套 JSON 是刻意的：存量的单凭据连接（比如 MySQL 的密码）存的就是裸值，
+     * 读取方按裸值解密后直接使用。改成套 JSON 会让所有存量行解不出来。
      */
     private String buildSecretPayload(Collection<String> secretNames, Map<String, Object> incoming) {
         if (secretNames.isEmpty()) {
