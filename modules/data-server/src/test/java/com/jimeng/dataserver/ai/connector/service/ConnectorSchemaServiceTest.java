@@ -369,7 +369,7 @@ class ConnectorSchemaServiceTest {
         /**
          * 「这种类型压根不提供自描述」要在开连接<b>之前</b>判掉，而且必须继续抛
          * {@code OPERATION_UNSUPPORTED}：语义层靠这个码把「对它不适用」与「真失败」分开，
-         * 归错了会让每一条 HTTP 连接在界面上显示成「语义层：失败」。
+         * 归错了会让这种类型的每一条连接在界面上显示成「语义层：失败」。
          */
         @Test
         @DisplayName("类型不支持自描述 → 不惊动网关，且仍是 OPERATION_UNSUPPORTED")

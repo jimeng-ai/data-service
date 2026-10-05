@@ -703,7 +703,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
      * 没有这一步，「接入即触发」的那次推导<b>必然</b>读到空快照、必然写 FAILED——
      * 于是每一条新建的连接都显示「语义层：失败」，而 P1 的主打卖点正是「给个只读账号就能用」。
      *
-     * @return {@code applicable=false} 表示这种连接器根本不提供自描述（HTTP 只有 INVOKE/HEALTH），
+     * @return {@code applicable=false} 表示这种连接器根本不提供自描述（不声明 DESCRIBE），
      *         该记 {@link #SEM_NOT_APPLICABLE} 而不是 FAILED；{@code failure!=null} 才是真失败
      */
     private Bootstrap bootstrapSnapshot(Long connectorId) {

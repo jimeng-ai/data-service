@@ -911,7 +911,7 @@ public class ConnectorSchemaService {
         try {
             Map<String, Boolean> probed = describe.probeRowPresence(names, ROW_PRESENCE_BUDGET_MILLIS);
             if (probed == null) {
-                // 连接器答不了（HTTP 连接器、老实现）。全是「不知道」，不是「全是空的」。
+                // 连接器答不了（不支持这项探测的类型或老实现）。全是「不知道」，不是「全是空的」。
                 return Map.of();
             }
             long empty = probed.values().stream().filter(v -> Boolean.FALSE.equals(v)).count();

@@ -44,16 +44,16 @@ import static org.mockito.Mockito.mock;
  */
 class GrantScriptServiceTest {
 
-    /** 一个声明了能力、但不提供授权脚本的类型（现实里就是 HTTP：授权发生在对方系统里，没有 SQL 可给）。 */
+    /** 一个声明了能力、但不提供授权脚本的类型：授权发生在对方系统里，没有 SQL 可给。2026-10 下线的 HTTP 类连接器就是这样。 */
     private static final Connector NO_SCRIPT_CONNECTOR = new Connector() {
         @Override
         public String kind() {
-            return "HTTP";
+            return "NO_SCRIPT";
         }
 
         @Override
         public String displayName() {
-            return "HTTP 接口";
+            return "外部接口（测试用）";
         }
 
         @Override
@@ -408,7 +408,7 @@ class GrantScriptServiceTest {
         @DisplayName("类型存在但不提供脚本（default 返回 null）也是「不支持此操作」，不是失败")
         void connectorWithoutScript() {
             ServiceException e = assertThrows(ServiceException.class,
-                    () -> service.generate("HTTP", readonlyWholeDb()));
+                    () -> service.generate("NO_SCRIPT", readonlyWholeDb()));
 
             assertEquals(ExceptionCode.OPERATION_UNSUPPORTED.getResultCode(), e.getRespCode());
             assertTrue(e.getRespMsg().contains(NO_SCRIPT_CONNECTOR.displayName()), e.getRespMsg());

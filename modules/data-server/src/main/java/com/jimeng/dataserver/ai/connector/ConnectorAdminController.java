@@ -335,7 +335,7 @@ public class ConnectorAdminController {
      * 只想重跑采样、不想再花一次模型调用的，走 {@code POST /{id}/semantic/validate}。
      *
      * <p><b>{@code NOT_APPLICABLE} 不是失败，重跑也不会变。</b>连接器类型不支持自描述
-     * （今天的 HTTP 就是，它只声明 INVOKE / HEALTH）就没有结构可推，语义层对这种连接本来就不适用。
+     * （不声明 DESCRIBE）就没有结构可推，语义层对这种连接本来就不适用。
      * 它和 {@code FAILED} 分开成两个状态，就是为了让人别在这里做无意义的重试。
      *
      * <p>真实进度写在连接详情的 {@code semanticStatus} / {@code semanticNote} 上，前端轮询那里。
