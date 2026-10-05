@@ -1,5 +1,8 @@
 # data-server Skill 体系设计（Codex/Claude Code 形态）
 
+> **2026-10 说明**：这是早期设计稿，通篇以 `gaode-poi` 为例。高德能力已在「一切皆可 skills」S0 中删除，
+> 见工作区 `docs/superpowers/specs/2026-10-05-everything-is-skills-design.md`。文中的机制描述仍可参考，例子已不存在。
+
 ## 1. 你要的“同款形态”定义
 
 目标不是只做 `tools` 注册，而是做“技能包（Skill Package）”机制：

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS `sys_dict` (
     KEY `idx_sys_dict_deleted` (`deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统字典表';
 
+-- 2026-10：高德能力已删除，代码不再读写这张表；是否 DROP 见 docs/config-changes/2026-10-05-s0-remove-gaode-http-connections.md
 CREATE TABLE IF NOT EXISTS `adcode_citycode_dict` (
     `id` BIGINT NOT NULL COMMENT '主键，MyBatis-Plus 雪花算法生成',
     `sort_no` INT DEFAULT NULL COMMENT '序号',
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS `adcode_citycode_dict` (
     KEY `idx_adcode_citycode_dict_deleted` (`deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='高德行政区 adcode-citycode 字典表';
 
+-- 2026-10：高德能力已删除，代码不再读写这张表；是否 DROP 见 docs/config-changes/2026-10-05-s0-remove-gaode-http-connections.md
 CREATE TABLE IF NOT EXISTS `poi_category_dict` (
     `id` BIGINT NOT NULL COMMENT '主键，MyBatis-Plus 雪花算法生成',
     `sort_no` INT DEFAULT NULL COMMENT '序号',

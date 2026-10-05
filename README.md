@@ -2,17 +2,16 @@
 
 `data-service` 是一个基于 **Spring Boot 3 + Spring Cloud Alibaba + Nacos** 的多租户 AI Agent 平台后端。
 
-它最初只做高德地图数据查询与 POI 分析，目前核心已经演进为一套**与厂商无关的 LLM 网关**：支持多轮工具调用、技能（Skill）扩展、连接器（读写客户自有系统）、RAG 知识库、对话式 Agent 构建、计费与调用链追踪，并在网关层做统一鉴权与租户隔离。
+它的核心是一套**与厂商无关的 LLM 网关**：支持多轮工具调用、技能（Skill）扩展、连接器（读写客户自有系统）、RAG 知识库、对话式 Agent 构建、计费与调用链追踪，并在网关层做统一鉴权与租户隔离。
 
 > **接手提示**：仓库历史上还存在过一个独立的 `sys-server` 模块，**现已不存在**。所有业务 + 管理后台 + AI 能力都收敛到了 `data-server` 这一个业务模块里（原 `sys-server` 能力并入其 `admin` 包）。文档与代码冲突时，**以代码和 `bootstrap.yml` 为准**。
 
 ## 项目定位
 
-当前仓库已落地的能力大致分四块：
+当前仓库已落地的能力大致分三块：
 
-- **AI 平台（核心）**：provider 抽象的 LLM 网关、多轮工具调用循环、技能体系、连接器（客户自有 MySQL / HTTP 系统的受控读写）、RAG 知识库、对话式 Agent 构建、模型管理、按「模型 × 功能」计费、调用链 Trace。
+- **AI 平台（核心）**：provider 抽象的 LLM 网关、多轮工具调用循环、技能体系、连接器（客户自有 MySQL 的受控读写）、RAG 知识库、对话式 Agent 构建、模型管理、按「模型 × 功能」计费、调用链 Trace。
 - **管理后台**：两层管理模型（运营 operator / 企业租户）、基于 RBAC 的资源授权、企业（租户）与成员管理、产品反馈、运营统计。
-- **地图数据（早期能力，保留）**：对接高德开放接口的关键词 / 周边 POI 查询，按 `typecode` 分类后做 DBSCAN 聚类与周边分析，行政区编码 / POI 分类字典维护。
 - **通用基础设施**：统一响应 / 异常、JWT、Redis/Redisson、OkHttp、Knife4j、Snowflake ID、MyBatis-Plus、多租户拦截、SSE 工具等。
 
 ## 架构概览
@@ -20,7 +19,7 @@
 两个可运行的 Spring Boot 应用：
 
 - **`GatewayApplication`**（`gateway`）—— Spring Cloud Gateway，统一路由 + JWT 鉴权过滤器。
-- **`DataServerApplication`**（`modules/data-server`）—— 唯一的业务模块，承载 `gaode` / `admin` / `ai` 全部逻辑。
+- **`DataServerApplication`**（`modules/data-server`）—— 唯一的业务模块，承载 `admin` / `ai` 全部逻辑。
 
 配置统一从 **Nacos** 加载（不在仓库里）。各服务 `bootstrap.yml` 声明要拉取的 `data-id`（如 `data-server.yml`、`gateway.yml`、`default-mysql.yml`、`knife4j.yml`），命名空间 `fe9e39ae-06af-49c3-9c5b-6060df2cf93e`，分组 `DEFAULT_GROUP`。改运行时配置请改 Nacos，不要改仓库。
 
@@ -53,12 +52,11 @@ data-service
 ├── export                  # 对外暴露的 Feign API 接口（如 SysApi）
 ├── gateway                 # Spring Cloud Gateway：路由 + JWT 鉴权过滤器
 └── modules
-    └── data-server         # 唯一业务模块，三大包：gaode / admin / ai
+    └── data-server         # 唯一业务模块，两大包：admin / ai
 ```
 
 `modules/data-server` 内部主要包：
 
-- `gaode` —— 高德 POI 查询 + DBSCAN 聚类（早期能力）。
 - `admin` —— 鉴权 / RBAC / 多租户运营后台（`auth`、`operator`、`rbac`）。
 - `ai` —— 平台核心：`provider`、`protocol`、`conversation`、`resilience`、`skill`、`connection`、`connector`、`rag`、`agent`（含 `builder`、`exec`）、`chat`、`run`、`claude`、`openai`、`model`、`billing`、`trace`、`stats`、`search`、`feedback`、`image`、`web`、`support` 等。
 
@@ -94,22 +92,9 @@ data-service
 
 > **流式 / 异步注意**：流式端点在独立 `streamExecutor` 线程跑，请求作用域的 ThreadLocal（`RequestContextHolder` / `TenantContext` / MDC / `AdminRequestContext`）**不会自动传播**。新增异步 / 流式逻辑时用 `MdcAsyncSupport.wrap(...)` 包装任务，否则租户过滤与用户解析会失败。
 
-### 3. 地图数据（`gaode`，早期能力）
-
-| 端点 | 说明 |
-|---|---|
-| `POST /data/gaode/get-poi-by-keyword` | 关键词检索高德 POI |
-| `POST /data/gaode/get-poi-by-around` | 按坐标 + 半径检索周边 POI |
-| `POST /data/gaode/get-poi-cluster` | 按 `typecode` 分类后做 DBSCAN 聚类 |
-| `POST /data/gaode/analysis-around-poi` | 先聚类，再分析聚类中心周边 POI 与写字楼分布 |
-| `/data/adcode-citycode-dict/*` | 行政区编码字典查询 / 更新 |
-| `/data/poi-category-dict/*` | POI 分类字典查询 / 更新 |
-
-聚类：经纬度球面距离，默认 `eps = 3000m`、`minPoints = 3`，输出聚类中心点、簇内 POI 与噪声点。
-
 ## 网关与路由
 
-仓库 `gateway/bootstrap.yml` 中声明的路由：`/data/**` → `lb://data-server`（并开启 discovery locator）。所有业务 / 管理 / AI 端点都挂在 `/data/**` 下（如 `/data/gaode/*`、`/data/rag/*`、`/data/admin/*`、`/data/skills/*` 等）。鉴权：网关统一校验 `Authorization` 中的 JWT，白名单路径放行，校验通过后注入 `user-id` / `X-Tenant-Id` / `x-trace-id`。
+仓库 `gateway/bootstrap.yml` 中声明的路由：`/data/**` → `lb://data-server`（并开启 discovery locator）。所有业务 / 管理 / AI 端点都挂在 `/data/**` 下（如 `/data/rag/*`、`/data/admin/*`、`/data/skills/*` 等）。鉴权：网关统一校验 `Authorization` 中的 JWT，白名单路径放行，校验通过后注入 `user-id` / `X-Tenant-Id` / `x-trace-id`。
 
 ## 本地开发
 

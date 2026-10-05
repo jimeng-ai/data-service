@@ -9,8 +9,8 @@
 **会话里曾经有过 `agent_input_file` 行**、或者 Agent 绑了 DOER 技能。
 
 而沙箱平面过去**一个 `conn_*` 工具都没有**（`jm-agent-sandbox/src` 与 `skills` 全域零 `conn_` 命中）。
-后果不是报错：模型只会拿历史数据讲、或者自己编。HTTP 类连接器还能经 egress 代理够到，
-**彻底零路径的恰恰是 MYSQL**——语义层真正服务的那一类。
+后果不是报错：模型只会拿历史数据讲、或者自己编。
+而数据库类连接器正是语义层真正服务的那一类。
 
 叠加缺陷 B12「一次上传，永久沙箱」，用户的实际体感是：传过一次附件之后，
 这个会话的 Agent **突然不会查数据库了**，而且没有任何提示。
@@ -89,11 +89,11 @@ connector:
 
 ## 工具名与文档
 
-沙箱侧 server 名 `connector`，八个短名**原样保留 `conn_` 前缀**：
+沙箱侧 server 名 `connector`，七个短名**原样保留 `conn_` 前缀**：
 
 ```
 mcp__connector__conn_list      mcp__connector__conn_catalog   mcp__connector__conn_describe
-mcp__connector__conn_query     mcp__connector__conn_invoke    mcp__connector__conn_execute
+mcp__connector__conn_query     mcp__connector__conn_execute
 mcp__connector__conn_define_metric                            mcp__connector__conn_annotate
 ```
 
