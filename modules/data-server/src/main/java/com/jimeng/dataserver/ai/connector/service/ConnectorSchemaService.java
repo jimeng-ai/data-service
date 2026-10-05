@@ -437,8 +437,8 @@ public class ConnectorSchemaService {
         assertUsable(row);
 
         // 「这种类型压根不提供自描述」必须在开连接之前判掉，而且必须是 OPERATION_UNSUPPORTED：
-        // 语义层靠这个码把「对它不适用」（HTTP 只声明 INVOKE/HEALTH）与「真失败」分开，
-        // 归错了会让每一条 HTTP 连接在界面上显示成「语义层：失败」。
+        // 语义层靠这个码把「对它不适用」与「真失败」分开，
+        // 归错了会让这种类型的每一条连接在界面上显示成「语义层：失败」。
         //
         // 用 normalizeKind(row.getKind()) 而不是 loader.load(row).kind()：只为读一个类型名
         // 就解密一次凭据，等于让明文凭据在内存里多出现一次，没有道理。凭据的解密留给网关，

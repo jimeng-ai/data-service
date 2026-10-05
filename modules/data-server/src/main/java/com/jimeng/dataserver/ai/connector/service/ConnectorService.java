@@ -49,18 +49,9 @@ import java.util.stream.Collectors;
 /**
  * 连接器实例的录入与维护（类型感知）。
  *
- * <h3>与 ConnectionService 的关系：两个入口，一张表</h3>
- * 旧的 {@code ConnectionService} / {@code /data/admin/connections} <b>原样保留</b>，
- * 它服务沙箱 egress 那条链路，写出来的行 {@code kind} 默认是 {@code HTTP}。
- * 本类是类型感知的新入口，覆盖全部 kind。两者读写<b>同一张 {@code connection} 表</b>——
- * 这正是「演化而不是并存」这个决策的落点：两个 API 入口，一张表，<b>一套横切</b>。
- *
- * <h3>★ HTTP 类型必须双写</h3>
- * {@code kind=HTTP} 时，参数除了写进 {@code config_json}，还要<b>同时写回旧列</b>
- * （{@code base_url} / {@code auth_scheme} / {@code allow_methods} / {@code allow_paths}）。
- * 因为 {@code ConnectionResolver}（下发给沙箱边车的那条路）读的是旧列——不双写，
- * 从新界面建的 HTTP 连接在沙箱里<b>就是不存在的</b>，而且不报错。
- * 这是「演化」必须付的代价，<b>改这里之前先想清楚沙箱那条路会不会断</b>。
+ * <h3>connection 表的唯一写入方</h3>
+ * 2026-10 之前还有一个专门服务沙箱 egress 链路的旧入口，写出来的是 HTTP 类连接；
+ * 它和 HTTP 类连接器一起下线了。现在 {@code connection} 表只由本类写入。
  *
  * <h3>新建必须探测通过才准保存</h3>
  * 配错的东西必须<b>当场报错</b>，而不是等到 Agent 回答不对时才发现。
@@ -667,7 +658,6 @@ public class ConnectorService {
             }
         }
 
-        applyLegacyColumnsForHttp(row, connector, nonSecret);
     }
 
     /**
@@ -797,24 +787,6 @@ public class ConnectorService {
                 ConnectorAuditService.OP_CREDENTIAL_REVEAL,
                 "取回了这条连接的凭据明文（" + String.join("、", out.keySet()) + "）", true, null);
         return out;
-    }
-
-    /**
-     * ★ HTTP 类型双写旧列。见类注释——不写，沙箱那条路就看不到这条连接，且不报错。
-     */
-    private void applyLegacyColumnsForHttp(Connection row, Connector connector, Map<String, Object> params) {
-        if (!"HTTP".equalsIgnoreCase(connector.kind())) {
-            return;
-        }
-        row.setBaseUrl(str(params.get(ConnectorInstanceLoader.P_BASE_URL)));
-        row.setAuthScheme(str(params.getOrDefault(ConnectorInstanceLoader.P_AUTH_SCHEME, "bearer")));
-        Object methods = params.get(ConnectorInstanceLoader.P_ALLOW_METHODS);
-        row.setAllowMethods(methods instanceof List<?> l && !l.isEmpty()
-                ? l.stream().map(String::valueOf).map(s -> s.toUpperCase(Locale.ROOT))
-                   .distinct().collect(Collectors.joining(","))
-                : "GET");
-        Object paths = params.get(ConnectorInstanceLoader.P_ALLOW_PATHS);
-        row.setAllowPaths(paths instanceof List<?> l && !l.isEmpty() ? toJson(l) : null);
     }
 
     private ConnectorProbeService.ProbeReport probeOrThrow(Connection row) {

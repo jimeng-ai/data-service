@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>名字漂一个字母的表现不是启动失败，而是：<b>模型看得见这个工具、每次调用都被拒，
  * 直到轮次耗尽</b>——既不报错也不降级，排查起来只能靠逐条肉眼比对。
  *
- * <p>★ 控制器那一侧刻意用<b>反射读注解</b>，不把八个字符串再抄一遍来自我对拍：
+ * <p>★ 控制器那一侧刻意用<b>反射读注解</b>，不把七个字符串再抄一遍来自我对拍：
  * 抄一遍等于把「测试」变成「第四份副本」，改名时它会跟着一起错。
  */
 class ConnectorAgentToolNameParityTest {
@@ -44,7 +44,7 @@ class ConnectorAgentToolNameParityTest {
             Path.of("data-service/modules/data-server/skills/connector/tools.json")
     };
 
-    private static final int EXPECTED_COUNT = 8;
+    private static final int EXPECTED_COUNT = 7;
 
     @Test
     @DisplayName("★ 执行器常量 / tools.json / 回调路由，三处工具名必须是同一个集合")
@@ -128,7 +128,7 @@ class ConnectorAgentToolNameParityTest {
         return names;
     }
 
-    /** (c) 反射读回调控制器八个 {@code @PostMapping} 的 path 段（不硬编码字符串）。 */
+    /** (c) 反射读回调控制器七个 {@code @PostMapping} 的 path 段（不硬编码字符串）。 */
     private static Set<String> callbackRoutePathSegments() {
         Set<String> segments = new LinkedHashSet<>();
         for (Method method : ConnectorAgentCallbackController.class.getDeclaredMethods()) {

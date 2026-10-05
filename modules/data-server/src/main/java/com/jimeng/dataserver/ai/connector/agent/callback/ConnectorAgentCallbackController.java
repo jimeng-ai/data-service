@@ -23,7 +23,7 @@ import java.util.Map;
  * {@code WriteSqlGuard}、租户隔离、审计<b>一行都不用动</b>，也不会分叉出第二套护栏。
  *
  * <h3>★ 路径段就是工具名，就是白名单</h3>
- * 八个方法各占一个固定 path，刻意<b>不</b>写成 {@code /{toolName}} 再转发：
+ * 七个方法各占一个固定 path，刻意<b>不</b>写成 {@code /{toolName}} 再转发：
  * 有了 {@code @PathVariable} 就得在方法体里再维护一份白名单，而那份白名单和路由必然会分叉。
  * 这样写，Spring 的路由表本身就是白名单，多一个工具就必须多一个方法。
  *
@@ -58,12 +58,6 @@ public class ConnectorAgentCallbackController {
     public Object connQuery(HttpServletRequest request,
                             @RequestBody(required = false) ConnectorToolCallRequest body) {
         return invoke(request, ConnectorToolExecutor.TOOL_QUERY, body);
-    }
-
-    @PostMapping("/conn_invoke")
-    public Object connInvoke(HttpServletRequest request,
-                             @RequestBody(required = false) ConnectorToolCallRequest body) {
-        return invoke(request, ConnectorToolExecutor.TOOL_INVOKE, body);
     }
 
     @PostMapping("/conn_execute")

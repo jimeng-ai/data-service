@@ -35,7 +35,6 @@ public class ConnectorProperties {
     private Query query = new Query();
     private Pool pool = new Pool();
     private Limit limit = new Limit();
-    private Invoke invoke = new Invoke();
     private Write write = new Write();
     private Health health = new Health();
     private SchemaRefresh schemaRefresh = new SchemaRefresh();
@@ -162,13 +161,6 @@ public class ConnectorProperties {
         private int timeoutSeconds = 10;
         /** 待审批项的有效期。过期未处理即作废，避免队列里堆着一堆没人记得的陈年请求。 */
         private int approvalTtlHours = 24;
-    }
-
-    /** 「能调用」的护栏。 */
-    @Data
-    public static class Invoke {
-        private int timeoutSeconds = 20;
-        private int maxResponseBytes = 262144;
     }
 
     /**

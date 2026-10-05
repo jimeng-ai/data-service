@@ -1,6 +1,6 @@
 ---
 name: connector
-description: 访问企业已接入的外部系统——查客户的业务数据库、调客户的 HTTP 接口，在被授权时还能修改这些系统里的数据（改状态、补字段、删记录）。当用户的问题需要真实业务数据（订单、退款、库存、工单、客户信息等）、需要调用企业内部接口，或要求变更这些系统里的某些记录时使用。
+description: 访问企业已接入的业务数据库——查客户的业务数据，在被授权时还能修改库里的数据（改状态、补字段、删记录）。当用户的问题需要真实业务数据（订单、退款、库存、工单、客户信息等），或要求变更库里的某些记录时使用。
 requires: connections
 ---
 
@@ -15,7 +15,7 @@ requires: connections
 1. `conn_list` — 先看有哪些连接器可用、各自有什么能力、健不健康
 2. `conn_catalog` — 看某个连接器里有哪些表 / 对象（只给名字和注释，很便宜）
 3. `conn_describe` — 看某张表的字段、类型、注释
-4. `conn_query` — 写查询语句执行；或 `conn_invoke` — 调接口
+4. `conn_query` — 写查询语句执行
 5. `conn_execute` — **只有在真的要改数据时**才走到这一步，而且必须先用第 4 步查清楚会影响哪些行（见下面「写操作」）
 
 > **第 2 步常常可以跳过。** 如果上下文里已经给了**「已接入数据源的表清单」**，那就是
@@ -235,7 +235,7 @@ SELECT COUNT(*) FROM t_ord_dtl d JOIN t_ord_mst m ON d.order_id = m.id;
 
 ### SQL 按什么方言写
 
-数据库连接器目前**只有 MySQL 一种**（另一种连接器是 HTTP，不写 SQL）。所以 `conn_query` / `conn_execute` 里的语句一律按 **MySQL 方言**写：
+数据库连接器目前**只有 MySQL 一种**。所以 `conn_query` / `conn_execute` 里的语句一律按 **MySQL 方言**写：
 
 - 标识符用反引号 `` ` ``，不要用双引号；
 - 分页用 `LIMIT n` / `LIMIT n OFFSET m`，不要用 `TOP` 或 `FETCH FIRST`；
@@ -293,7 +293,7 @@ SELECT COUNT(*) FROM t_ord_dtl d JOIN t_ord_mst m ON d.order_id = m.id;
 
 每条连接的写策略默认是「只读」，改成「写需审批」或「写自动」要企业超管亲自动手；平台在接入时还会实际验证账号能不能写。没有 `write` 能力时 `conn_execute` 会被直接拒绝——这不是 bug，不要换个写法再试，也不要退回去用 `conn_query` 硬塞一条 UPDATE（那条路同样会被拒）。
 
-建表、改表、`TRUNCATE`、`REPLACE`、存储过程调用**在任何档位都不开放**。`conn_invoke` 的可用 HTTP 方法由管理员在连接上显式配置，默认只有 `GET`。
+建表、改表、`TRUNCATE`、`REPLACE`、存储过程调用**在任何档位都不开放**。
 
 ### 2. 先查后改，每次都要
 

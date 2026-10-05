@@ -39,7 +39,7 @@ public class ConnectorAuditView {
     @Schema(description = "用到的能力：QUERY / DESCRIBE / INVOKE …")
     private String capability;
 
-    @Schema(description = "具体操作，即工具名：conn_query / conn_catalog / conn_describe / conn_invoke")
+    @Schema(description = "具体操作，即工具名：conn_query / conn_catalog / conn_describe / conn_execute 等")
     private String operation;
 
     @Schema(description = "本次调用所属的 trace，可据此回到完整调用链路")

@@ -41,6 +41,13 @@ class RemovedCapabilitiesGuardTest {
         assertAbsent(List.of("GaoDe", "Gaode", "gaode", "PoiCategoryDict", "AdcodeCitycodeDict", "PoiClusterAlgorithm"));
     }
 
+    @Test
+    @DisplayName("conn_invoke 和 HTTP 类连接器已下线：外部 HTTP 以后走通用网关，不再是连接器框架里的一种类型")
+    void connInvokeAndHttpConnectorAreGone() throws IOException {
+        assertAbsent(List.of("conn_invoke", "TOOL_INVOKE", "connector.impl.http", "HttpConnector",
+                "HttpCallGuard", "InvokeCapable", "InvokeResult", "pluginHttpClient"));
+    }
+
     static void assertAbsent(List<String> needles) throws IOException {
         // 工作目录不对时扫描范围是空的，守卫会白白变绿——先把这件事钉死。
         assertTrue(Files.isDirectory(MODULE.resolve("src/main")),

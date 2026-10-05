@@ -85,8 +85,8 @@ import java.util.concurrent.TimeUnit;
  * 要么改走本类，要么把理由写进这一节。两个例外的理由<b>不同</b>，不能互相援引，
  * 更不是「后台任务可以不走网关」的先例。
  * <ol>
- *   <li><b>{@code ConnectorHealthJob} 的 ping——刻意选择。</b>定时健康探测发一句 {@code SELECT 1}
- *       （HTTP 是对 base_url 的一次 {@code HEAD}），不走这里的九步：走网关的话，每条连接每 5 分钟往
+ *   <li><b>{@code ConnectorHealthJob} 的 ping——刻意选择。</b>定时健康探测发一句 {@code SELECT 1}，
+ *       不走这里的九步：走网关的话，每条连接每 5 分钟往
  *       {@code connector_audit} 写一行、把客户 DBA 真正要查的访问记录淹掉，还要去抢每实例并发许可，
  *       一条忙而健康的连接抢不到许可就会被记成 UNHEALTHY。这条例外<b>只覆盖 ping 这一个不碰任何数据的动作</b>。
  *       完整理由在 {@code ConnectorHealthJob} 的类注释里。</li>

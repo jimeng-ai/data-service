@@ -11,7 +11,6 @@ import com.jimeng.dataserver.ai.connector.error.ConnectorException;
 import com.jimeng.dataserver.ai.connector.model.CatalogEntry;
 import com.jimeng.dataserver.ai.connector.model.CatalogView;
 import com.jimeng.dataserver.ai.connector.model.FieldDetail;
-import com.jimeng.dataserver.ai.connector.model.InvokeResult;
 import com.jimeng.dataserver.ai.connector.model.ObjectDetail;
 import com.jimeng.dataserver.ai.connector.model.QueryResult;
 import com.jimeng.dataserver.ai.connector.model.WriteOutcome;
@@ -24,7 +23,6 @@ import com.jimeng.dataserver.ai.connector.service.SemanticJoinValidator;
 import com.jimeng.dataserver.ai.connector.service.SemanticValueProfiler;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
 import com.jimeng.dataserver.ai.connector.spi.cap.DescribeCapable;
-import com.jimeng.dataserver.ai.connector.spi.cap.InvokeCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryCapable;
 import com.jimeng.dataserver.ai.connector.spi.cap.QueryOptions;
 import com.jimeng.dataserver.ai.connector.spi.cap.WriteOptions;
@@ -64,7 +62,7 @@ import java.util.regex.Pattern;
  * <b>这是一处刻意的偏离，不是漏读文档。</b>若将来改走内置工具（有运行期注入点），可以把它退回
  * 成上下文注入、并删掉这个工具。
  *
- * <h3>为什么写操作是第六个独立工具，而不是把 conn_query 放宽</h3>
+ * <h3>为什么写操作是第五个独立工具，而不是把 conn_query 放宽</h3>
  * <ol>
  *   <li>放宽 {@code conn_query} 意味着 {@code ReadOnlySqlGuard} 要长出「有时允许写」的分支，
  *       而那道护栏的价值恰恰在于它<b>没有例外</b>：把「这条路绝对写不了」这个一眼可验的性质，
@@ -162,7 +160,7 @@ import java.util.regex.Pattern;
  * <b>{@code ConnectorSemanticDeriveService} 永远不准注进来</b>——它要叫 {@code ClaudeService} 做推导，
  * 正好闭合上面那条链。语义层的"读"和"推"分成两个类，就是为了让这条线一眼可判。
  *
- * <h3>第七、八个工具 conn_define_metric / conn_annotate：为什么是显式工具而不是对话嗅探</h3>
+ * <h3>第六、七个工具 conn_define_metric / conn_annotate：为什么是显式工具而不是对话嗅探</h3>
  * 模型现在已经在问「销售额要不要扣退款」了（{@code SKILL.md} 写着要问），缺的不是问，是<b>问完之后记住</b>。
  * 那为什么不在对话历史里认一下「用户刚刚回答了一个口径问题」然后自动落库？因为设计自己的规矩是
  * 「口径这类必须 100% 正确的东西，用确定性规则做，不要交给模型理解」——嗅探恰恰是交给模型理解。
@@ -187,7 +185,7 @@ import java.util.regex.Pattern;
  *   <li>该写 METRIC 的写成了 FIELD → 它只在 {@code conn_describe} 那一张表上出现，
  *       口径从此失去强制力，而没有任何地方看得出来。</li>
  * </ul>
- * 工具名本身就是一次意图确认（与上面「写操作为什么是第六个独立工具」同一条论证）：
+ * 工具名本身就是一次意图确认（与上面「写操作为什么是第五个独立工具」同一条论证）：
  * {@code conn_define_metric} 只写口径，{@code conn_annotate} 只写结构上的说明，谁也不会走错。
  *
  * <h3>execute() 为什么从不抛异常</h3>
@@ -204,13 +202,12 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class ConnectorToolExecutor implements SkillToolExecutor {
 
-    // 这八个常量是 public 的：沙箱回调面（ConnectorAgentCallbackController）的八个 path 段就是工具名，
+    // 这七个常量是 public 的：沙箱回调面（ConnectorAgentCallbackController）的七个 path 段就是工具名，
     // 必须引用同一份字面量。两边各写一份字符串，改名时只改一边的表现是「那个工具在沙箱平面静默失效」。
     public static final String TOOL_LIST = "conn_list";
     public static final String TOOL_CATALOG = "conn_catalog";
     public static final String TOOL_DESCRIBE = "conn_describe";
     public static final String TOOL_QUERY = "conn_query";
-    public static final String TOOL_INVOKE = "conn_invoke";
     /** 写操作单独一个名字。{@code conn_} 前缀已与既有工具做过撞名检查——撞名会被 mergeTools <b>静默丢弃</b>。 */
     public static final String TOOL_EXECUTE = "conn_execute";
     /** 口径沉淀。与 {@link #TOOL_ANNOTATE} 一样<b>不碰客户系统</b>：只写我们自己的 {@code connector_semantic}。 */
@@ -225,7 +222,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
      * <b>读</b>工具：只取信息，没有副作用。超时自动重发最多是多读一次，代价只有一次往返。
      */
     public static final Set<String> READ_TOOLS = Set.of(
-            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY, TOOL_INVOKE);
+            TOOL_LIST, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_QUERY);
 
     /**
      * <b>写</b>工具：调用一次就留下痕迹，所以<b>超时一律不得自动重发</b>。
@@ -252,7 +249,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             TOOL_EXECUTE, TOOL_DEFINE_METRIC, TOOL_ANNOTATE);
 
     /**
-     * 只认这八个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
+     * 只认这七个精确名字，<b>不做前缀匹配</b>。{@code SkillToolExecutorRegistryService.findExecutor}
      * 是线性扫描 first-match，既无 {@code @Order} 也无冲突检测：两个执行器的 supports() 区间一旦重叠，
      * 胜者由 Spring 注入顺序静默决定。前缀匹配（{@code startsWith("conn_")}）就是在给未来埋这种雷。
      *
@@ -533,8 +530,6 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
                     return doDescribe(args);
                 case TOOL_QUERY:
                     return doQuery(args);
-                case TOOL_INVOKE:
-                    return doInvoke(args);
                 case TOOL_EXECUTE:
                     return doExecute(args);
                 case TOOL_DEFINE_METRIC:
@@ -585,8 +580,8 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             out.put("hint", "当前 Agent 没有被授权任何连接器。请如实告诉用户「尚未接入可查询的外部系统」，"
                     + "不要猜测连接器名称，也不要凭空作答。");
         } else {
-            out.put("hint", "capabilities 决定可用工具：query → conn_query，describe → conn_catalog / conn_describe，"
-                    + "invoke → conn_invoke。health_state 非健康时调用很可能失败，请先向用户说明。");
+            out.put("hint", "capabilities 决定可用工具：query → conn_query，describe → conn_catalog / conn_describe。"
+                    + "health_state 非健康时调用很可能失败，请先向用户说明。");
         }
         return out;
     }
@@ -824,24 +819,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         return out;
     }
 
-    private Map<String, Object> doInvoke(Map<String, Object> args) {
-        String connector = requireString(args, "connector");
-        String operation = requireString(args, "operation");
-        Map<String, Object> params = mapOrEmpty(args.get("params"));
-
-        InvokeResult result = connectorGateway.execute(connector, Capability.INVOKE, TOOL_INVOKE,
-                session -> invokeCapable(session).invoke(operation, params));
-
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("connector", connector);
-        out.put("operation", operation);
-        if (result != null) {
-            out.putAll(result.toModelPayload());
-        }
-        return out;
-    }
-
-    // ------------------------------------------------------------------ 第六个工具：写
+    // ------------------------------------------------------------------ 第五个工具：写
 
     /**
      * 写操作。与 {@link #doQuery} 最大的差别是<b>这里没有「夹到上限继续跑」这种善意的自动修正</b>：
@@ -890,7 +868,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         return out;
     }
 
-    // ------------------------------------------------------------------ 第七个工具：口径沉淀
+    // ------------------------------------------------------------------ 第六个工具：口径沉淀
 
     /**
      * 把用户刚刚澄清的一条业务口径记下来，下次不必再问。
@@ -990,7 +968,7 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         return out;
     }
 
-    // ------------------------------------------------------------------ 第八个工具：结构上的说明（缺陷 B4）
+    // ------------------------------------------------------------------ 第七个工具：结构上的说明（缺陷 B4）
 
     /** {@code conn_annotate} 的四类。小写，与 tools.json 的 enum 逐字一致。 */
     private static final String K_OBJECT = "object";
@@ -2370,11 +2348,6 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
         throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持查询（query）能力");
     }
 
-    private static InvokeCapable invokeCapable(Object session) {
-        if (session instanceof InvokeCapable c) return c;
-        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "该连接器不支持调用（invoke）能力");
-    }
-
     // ------------------------------------------------------------------ 入参与错误
 
     /** 入参校验失败也走同一套错误形状，模型才不用分辨两种失败长相。 */
@@ -2457,13 +2430,6 @@ public class ConnectorToolExecutor implements SkillToolExecutor {
             }
         }
         return null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> mapOrEmpty(Object v) {
-        if (v == null) return Map.of();
-        if (v instanceof Map<?, ?> m) return (Map<String, Object>) m;
-        throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR, "参数 params 必须是一个对象");
     }
 
     /** 模型偶尔会把单元素数组写成裸字符串，顺手认一下——认不了就明确报错，不静默丢掉。 */

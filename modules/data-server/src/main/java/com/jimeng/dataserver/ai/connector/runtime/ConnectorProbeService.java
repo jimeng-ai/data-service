@@ -39,7 +39,6 @@ import java.util.Set;
  *   <li><b>MySQL</b>：从连接池借连接（必要时先建池）；{@code SELECT 1}（探活）；
  *       {@code UPDATE <探针表> SET x = 1 WHERE 1 = 0}（验只读——<b>一次写尝试</b>，期望被权限拒绝）；
  *       一条 {@code information_schema.TABLES ... LIMIT 1}（探自描述能力）。至多三条语句。</li>
- *   <li><b>HTTP</b>：只有探活那一次对 base_url 的 {@code HEAD}。验只读看的是我们自己的方法白名单、能力是类型写死的，都不发请求。</li>
  * </ul>
  * 网关那几道闸这里<b>一道都没有</b>：不写 {@code connector_audit}、不占每租户速率桶、不抢每实例并发许可。
  * 客户 DBA 在自己库的审计日志里看得到那条 UPDATE 尝试，在我们的审计表里却找不到对应的一行——
@@ -150,7 +149,7 @@ public class ConnectorProbeService {
             }
             // 写能力是【策略 ∧ 类型支持 ∧ 账号确实能写】三者的交集，缺一不可：
             //   - 策略不开 → 平台侧就不放行
-            //   - 类型不支持 → 比如 HTTP 连接器的写由 allowMethods 管，不走这条
+            //   - 类型不支持 → 这种类型压根没有写能力
             //   - 账号只读 → 平台放行了数据库也会拒，此时声明「能写」是在骗人
             // 三者都满足才回填 WRITE，界面与 conn_list 看到的就是真实可用的能力。
             caps = new java.util.LinkedHashSet<>(caps);

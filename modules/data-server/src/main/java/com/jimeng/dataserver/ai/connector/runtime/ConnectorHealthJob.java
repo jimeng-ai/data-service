@@ -72,7 +72,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <b>两者不经网关的理由不同，不能互相援引</b>：接入探测是网关<b>无从下手</b>——试连的配置根本没落库、
  * 新连接还没有能力标记，理由在它自己的类注释里；ping 是<b>刻意选择</b>——连接行好好地在库里，网关完全走得通，不走是因为：
  * <ul>
- *   <li><b>它不碰客户的数据。</b>MySQL 是一句 {@code SELECT 1}，HTTP 是对 base_url 的一次 {@code HEAD}——
+ *   <li><b>它不碰客户的数据。</b>MySQL 是一句 {@code SELECT 1}——
  *       读不到任何一张表、拿不到任何响应体。网关那几道闸保护的东西（数据、写入、查询额度）它一样都不涉及。</li>
  *   <li><b>走网关会把审计表淹掉。</b>网关第 9 步每次调用写一行 {@code connector_audit}：5 分钟一次，
  *       就是<b>每条连接每天约 288 行</b>。客户 DBA 用那张表的方式是按 operation 过滤，去回答
@@ -495,10 +495,10 @@ public class ConnectorHealthJob {
      *
      * <h3>★ 刷之前先判掉的几种（不算失败、不写标记、不占名额）</h3>
      * <ul>
-     *   <li><b>类型不提供自描述（HTTP）/ 接入探测没确认 DESCRIBE / 已停用 / 走隧道 / 行上没有租户。</b>
+     *   <li><b>类型不提供自描述 / 接入探测没确认 DESCRIBE / 已停用 / 走隧道 / 行上没有租户。</b>
      *       必须在调 {@code refresh()} <b>之前</b>判掉，不能靠 catch：{@code refresh()} 对这些情况抛
      *       {@code ServiceException}，而 {@code ServiceException} 的<b>构造器自己就 log.error</b>——
-     *       catch 住也拦不下那一行。对 HTTP 连接那就是每个到期周期一条 ERROR，
+     *       catch 住也拦不下那一行。对这种连接那就是每个到期周期一条 ERROR，
      *       而一条每轮都响的 ERROR 很快就会让所有人学会无视日志。</li>
      *   <li><b>健康探测判为 UNHEALTHY</b>（只在 ping 开着时才信这个态——关着时它可能是很久以前的）。
      *       连不上的库刷了也是失败。它仍然到期、仍然排在前面，恢复健康后的下一次检查就会被刷。</li>

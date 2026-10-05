@@ -123,10 +123,10 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
     public static final String SEM_FAILED = "FAILED";
 
     /**
-     * 这种连接器压根不提供结构自描述（{@code HttpConnector} 只声明 {@code INVOKE, HEALTH}），
-     * 语义层对它<b>不适用</b>——不是失败。
+     * 这种连接器压根不提供结构自描述（不声明 {@code DESCRIBE}），语义层对它<b>不适用</b>——不是失败。
+     * 现有类型（MySQL）都能自描述；2026-10 下线的 HTTP 类连接器曾是唯一的来源，这个状态留给以后的类型。
      *
-     * <p>为什么不复用 FAILED：一条健康的 HTTP 连接被标成「语义层：失败」，人第一反应是去修一个
+     * <p>为什么不复用 FAILED：一条健康的连接被标成「语义层：失败」，人第一反应是去修一个
      * 根本没坏的东西；而真正失败的那几条混在一堆假警报里，反而不会有人看。
      * 一个开始喊狼来了的状态字段就不再是状态字段了。
      */

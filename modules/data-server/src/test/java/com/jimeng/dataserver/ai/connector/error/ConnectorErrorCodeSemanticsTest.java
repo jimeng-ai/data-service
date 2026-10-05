@@ -66,20 +66,4 @@ class ConnectorErrorCodeSemanticsTest {
         assertFalse(e.getSafeDetail().contains("只被授予了只读权限"),
                 "这句话会被读成权限问题：" + e.getSafeDetail());
     }
-
-    /**
-     * ★ 对 HTTP 连接来说 {@code allow_methods} <b>就是写策略本身</b>
-     *（{@code HttpSession.verifyReadOnly} 正是拿方法白名单减去幂等方法来判只读，
-     * 而 {@code ConnectorGateway} 的写策略闸只对 {@code Capability.WRITE} 触发、
-     * HTTP 走的是 {@code INVOKE}，永远到不了那一步）。
-     * 它是整条 HTTP 通路上唯一的写授权闸，所以必须落 FORBIDDEN——
-     * 落成 GUARD_BLOCKED 会让模型 POST → PUT → PATCH 一路撞同一个 admin 配置项。
-     */
-    @Test
-    @DisplayName("HTTP 的方法白名单是写策略，不是可改写的护栏")
-    void HTTP方法白名单落权限档() {
-        // 具体断言在 HttpCallGuardTest.默认只读_POST被拒_按权限而非护栏，
-        // 这里只留这段说明与交叉引用：两个码的分界在这一处最容易被改错。
-        assertFalse(ConnectorErrorCode.FORBIDDEN == ConnectorErrorCode.GUARD_BLOCKED);
-    }
 }
