@@ -9,8 +9,8 @@ import java.util.List;
  *
  * <p>当前实现：
  * <ul>
- *   <li>{@link FileSkillSourceProvider}：磁盘上的 SKILL.md / tools.json（gaode-poi / rag-knowledge 等）</li>
- *   <li>{@link com.jimeng.dataserver.ai.plugin.source.DbPluginSourceProvider}：DB 里的 HTTP 插件</li>
+ *   <li>{@link FileSkillSourceProvider}：磁盘上的 SKILL.md / tools.json（connector / rag-knowledge 等）</li>
+ *   <li>{@link DbTenantSkillSourceProvider}：DB 里的企业 skill（ai_skill）</li>
  * </ul>
  *
  * <p>未来加 MCP 来源时实现新的 Provider 即可，{@code ToolPackageRegistry} 自动聚合。

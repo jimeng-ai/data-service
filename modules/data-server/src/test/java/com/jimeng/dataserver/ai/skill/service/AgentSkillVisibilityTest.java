@@ -22,7 +22,7 @@ import static org.mockito.Mockito.mock;
  *
  * <ol>
  *   <li><b>判别依据必须是 tenantId 而非 kind。</b> 磁盘上的平台技能
- *       （gaode-poi / rag-knowledge / design-system）也是 kind==SKILL，但没有 ai_skill 行、
+ *       （connector / rag-knowledge / design-system）也是 kind==SKILL，但没有 ai_skill 行、
  *       永远绑不上 agent_skill。按 kind 判会让每个 agent 同时丢掉这三个（含 RAG 提升）。</li>
  *   <li><b>allowedSkillIds 是三态。</b> null（老发布快照没有 skillIds 键）= 无信息、不过滤；
  *       空集 = 明确不绑。把 null 当空集，库里 8 个已发布 agent 会在上线瞬间全部丢光租户技能。</li>

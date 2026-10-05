@@ -633,7 +633,7 @@ public class SkillRuntimeService {
      * 一个工具包对当前 Agent 是否可见。
      *
      * <p><b>判别依据是 {@code getTenantId()==null}，不是 {@code getKind()}。</b>
-     * 磁盘上的平台技能（gaode-poi / rag-knowledge / design-system）也是 kind==SKILL，
+     * 磁盘上的平台技能（connector / rag-knowledge / design-system）也是 kind==SKILL，
      * 但它们没有 ai_skill 行、永远绑不上 agent_skill；按 kind 判会让每个 agent 同时丢掉这三个
      * （含 RAG 提升），而且不报错。
      *

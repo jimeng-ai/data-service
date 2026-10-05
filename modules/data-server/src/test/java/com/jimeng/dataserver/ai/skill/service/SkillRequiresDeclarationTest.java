@@ -50,11 +50,10 @@ class SkillRequiresDeclarationTest {
     }
 
     @Test
-    @DisplayName("没有前置资源的 Skill 不写 requires（gaode-poi 是这一类的样例）")
+    @DisplayName("没有前置资源的 Skill 不写 requires（design-system 是这一类的样例）")
     void skillsWithoutResourcesDeclareNothing() throws IOException {
-        assumeTrue(Files.isDirectory(SKILLS_DIR.resolve("gaode-poi")), "gaode-poi 不在，跳过");
-        assertEquals(null, requiresOf("gaode-poi"),
-                "gaode-poi 不依赖 Agent 绑定任何资源，不该声明 requires");
+        assertEquals(null, requiresOf("design-system"),
+                "design-system 不依赖 Agent 绑定任何资源，不该声明 requires");
     }
 
     @Test
