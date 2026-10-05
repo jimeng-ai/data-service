@@ -25,7 +25,7 @@ public class ConnectorView {
     private String name;
     private String displayName;
 
-    @Schema(description = "类型标识，如 MYSQL / HTTP")
+    @Schema(description = "类型标识，目前只有 MYSQL")
     private String kind;
 
     @Schema(description = "类型的中文名，直接展示")
@@ -81,7 +81,7 @@ public class ConnectorView {
 
     // 这里把后端能产出的状态【一个不漏地列全】，是因为前端多半写成一张 code→文案 的映射表：
     // 漏掉一个，界面上那一格就是空白——而「空白」和「没跑过」在人眼里是一回事，
-    // 于是一条根本推不了语义层的 HTTP 连接，会被当成一条推导卡住了的连接，有人去点重试，永远点不出结果。
+    // 于是一条根本推不了语义层的连接（类型不支持自描述），会被当成一条推导卡住了的连接，有人去点重试，永远点不出结果。
     @Schema(description = "语义层推导状态，后端只会产出这五个值之一，且永远不为 null"
             + "（存量行上的 NULL 在 ConnectorService.toView 里归一成 NONE）："
             + "NONE=没跑过 / RUNNING=生成中 / READY=已生成 / FAILED=失败 / "

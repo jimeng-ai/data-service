@@ -53,8 +53,8 @@ public class ConnectorAudit extends BaseEntity {
     @TableField("trace_id")
     private String traceId;
 
-    /** QUERY / DESCRIBE / INVOKE / HEALTH，对应 {@code Capability}。 */
-    @Schema(description = "能力：QUERY / DESCRIBE / INVOKE / HEALTH")
+    /** QUERY / DESCRIBE / WRITE / HEALTH，对应 {@code Capability}；2026-10 之前的历史行可能是 INVOKE。 */
+    @Schema(description = "能力：QUERY / DESCRIBE / WRITE / HEALTH（2026-10 之前的历史行可能是 INVOKE）")
     @TableField("capability")
     private String capability;
 

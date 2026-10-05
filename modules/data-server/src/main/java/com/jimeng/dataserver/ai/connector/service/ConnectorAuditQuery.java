@@ -22,7 +22,7 @@ public class ConnectorAuditQuery {
     @Schema(description = "只看成功 / 只看失败。不传则都要——排查时通常先看失败，但「谁查了什么」要看全部")
     private Boolean success;
 
-    @Schema(description = "能力：QUERY / DESCRIBE / INVOKE")
+    @Schema(description = "能力：QUERY / DESCRIBE / WRITE …（2026-10 之前的历史行可能是 INVOKE）")
     private String capability;
 
     @Schema(description = "起始时间（含）")

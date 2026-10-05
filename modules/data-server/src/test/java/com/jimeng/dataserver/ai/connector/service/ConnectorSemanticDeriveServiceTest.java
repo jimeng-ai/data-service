@@ -1473,7 +1473,7 @@ class ConnectorSemanticDeriveServiceTest {
         }
 
         /**
-         * ★ HTTP 连接器只声明 {INVOKE, HEALTH}，refresh 会抛「不支持自描述」。
+         * ★ 不声明 DESCRIBE 的类型，refresh 会抛「不支持自描述」。
          * 那不是故障——它是一条<b>完全健康</b>的连接，只是语义层对它不适用。
          * 标成「失败」会让人去修一个没坏的东西，而真失败的那几条混在假警报里没人看。
          */

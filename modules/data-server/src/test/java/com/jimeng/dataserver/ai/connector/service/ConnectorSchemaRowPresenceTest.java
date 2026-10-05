@@ -169,7 +169,7 @@ class ConnectorSchemaRowPresenceTest {
         assertTrue(m.isEmpty(), "没探到就什么都不说。实际盖了: " + m);
     }
 
-    /** 连接器压根答不了（HTTP 连接器、老实现）：同样是「不知道」，不是「全都空」。 */
+    /** 连接器压根答不了（不支持这项探测的类型或老实现）：同样是「不知道」，不是「全都空」。 */
     @Test
     @DisplayName("★ 连接器答不了（返回 null）→ 一个标记都不盖")
     void 连接器答不了时不盖标记() {

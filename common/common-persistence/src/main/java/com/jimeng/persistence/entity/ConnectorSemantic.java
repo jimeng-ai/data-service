@@ -47,7 +47,7 @@ public class ConnectorSemantic extends BaseEntity {
 
     /**
      * 判别符。刻意<b>一张表 + scope</b>，而不是实体/关系/指标/样例四张表：
-     * JOIN 对 HTTP 连接器是「接口调用链」、GLOSSARY 对所有类型同形、FIELD 对没有 QUERY 能力的
+     * JOIN 的含义随连接器类型变（数据库是表关系，非数据库类型可能是调用链）、GLOSSARY 对所有类型同形、FIELD 对没有 QUERY 能力的
      * 连接器天然为空。建四张表等于先赌一个还没被验证的模型。
      * 与 {@code WritePolicy} 做成枚举而不是四个布尔是同一条纪律。
      */

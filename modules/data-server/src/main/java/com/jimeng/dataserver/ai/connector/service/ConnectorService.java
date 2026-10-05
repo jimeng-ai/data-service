@@ -63,7 +63,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ConnectorService {
 
-    /** 与 egress 代理的 {@code /api/<name>/} 路由正则一致，也是模型调工具时的寻址键。 */
+    /** 连接名的格式。它是模型调工具时的寻址键。 */
     private static final Pattern NAME_RE = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
 
     private final ConnectionMapper connectionMapper;
@@ -390,7 +390,7 @@ public class ConnectorService {
             Connection row = requireRow(id);
             boolean samplesBefore = SemanticDataTier.parse(row.getSemanticDataTier()).allowsSampleValues();
             // kind 不可改：config_json 的形状是按类型定的，改 kind 等于把一堆 MySQL 参数
-            // 交给 HTTP 连接器去解释。要换类型就删了重建。
+            // 交给另一种连接器去解释。要换类型就删了重建。
             if (req.getKind() != null && !req.getKind().isBlank()
                     && !ConnectorRegistry.normalize(req.getKind()).equals(ConnectorRegistry.normalize(row.getKind()))) {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST,

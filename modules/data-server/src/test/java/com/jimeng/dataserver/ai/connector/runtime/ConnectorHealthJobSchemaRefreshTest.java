@@ -464,12 +464,12 @@ class ConnectorHealthJobSchemaRefreshTest {
     class Skips {
 
         /**
-         * ★ HTTP 没有 DESCRIBE。必须在调 refresh() 之前判掉：refresh() 抛的 ServiceException
+         * ★ 类型不提供自描述（夹具借用已下线的 HTTP 类型名）。必须在调 refresh() 之前判掉：refresh() 抛的 ServiceException
          * 在<b>构造器里</b>就 log.error 了，catch 住也拦不下那一行。
          */
         @Test
-        @DisplayName("★ HTTP 连接器静默跳过，连 refresh 都不调")
-        void HTTP跳过() {
+        @DisplayName("★ 不能自描述的类型静默跳过，连 refresh 都不调")
+        void 不能自描述的类型跳过() {
             Connection c = givenMysql(1L, "t1");
             c.setKind("HTTP");
             c.setCapabilityFlags("INVOKE,HEALTH");

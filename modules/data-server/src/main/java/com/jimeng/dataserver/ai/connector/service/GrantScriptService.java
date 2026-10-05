@@ -55,7 +55,7 @@ public class GrantScriptService {
                     e.getSafeDetail() == null ? e.getCode().title() : e.getSafeDetail());
         }
 
-        // null 是 SPI 约定的「本类型不提供」（如 HTTP 连接器：授权发生在对方系统里，没有一段 SQL 可给）。
+        // null 是 SPI 约定的「本类型不提供」（比如授权发生在对方系统里的类型，没有一段 SQL 可给）。
         // 顺手把「返回了空脚本」也归到这一档：给界面一个空代码框，比明说不提供更让人摸不着头脑。
         if (script == null || script.getSql() == null || script.getSql().isBlank()) {
             throw new ServiceException(ExceptionCode.OPERATION_UNSUPPORTED,
