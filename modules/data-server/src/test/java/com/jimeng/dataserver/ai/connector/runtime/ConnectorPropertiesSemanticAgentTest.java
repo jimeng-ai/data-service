@@ -33,7 +33,7 @@ class ConnectorPropertiesSemanticAgentTest {
     void 不配置时默认值与设计一致() {
         for (ConnectorProperties props : new ConnectorProperties[]{new ConnectorProperties(), bind(Map.of())}) {
             ConnectorProperties.SemanticAgent a = props.getSemantic().getAgent();
-            assertFalse(a.isEnabled(), "agent 生成默认必须关闭");
+            assertTrue(a.isEnabled(), "agent 生成默认开启（2026-10-06 用户定）");
             assertEquals("", a.getCallbackBaseUrl(), "callback-base-url 故意不给默认值（防跨平面回调）");
             assertEquals("", a.getLlm().getBaseUrl());
             assertEquals("", a.getLlm().getAuthToken());

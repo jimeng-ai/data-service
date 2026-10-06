@@ -352,12 +352,15 @@ public class ConnectorProperties {
     @Data
     public static class SemanticAgent {
         /**
-         * 总开关，默认<b>关</b>。关闭时建连与「重新生成」一律走现有单次推导，不建批次行。
+         * 总开关，默认<b>开</b>（2026-10-06 用户定：默认走 agent 生成）。
          *
-         * <p>默认关的理由就是本类开头那条纪律的另一面：push main 即部署生产，代码合入那一刻行为必须与现状一致，
-         * 在 Nacos 打开才生效。关闭时正在跑的批次在片边界停下（转 INTERRUPTED），不会半片中断。
+         * <p>从前默认关、又没有任何变更文档让人打开，结果各环境一直在走单次推导：一次调用写完整个库，
+         * 表一多就被 max_tokens 截断。开着时如果回调地址、模型配置或沙箱不满足，照样回落单次推导，
+         * 说明里写「已用备用方式生成」，原因进日志。
+         *
+         * <p>显式配 {@code false} 即一律走单次推导、不建批次行；关闭时正在跑的批次在片边界停下（转 INTERRUPTED），不会半片中断。
          */
-        private boolean enabled = false;
+        private boolean enabled = true;
 
         /**
          * 按运行下发给沙箱的回调根地址，含 {@code /data}：dev {@code http://localhost:10011/data}；

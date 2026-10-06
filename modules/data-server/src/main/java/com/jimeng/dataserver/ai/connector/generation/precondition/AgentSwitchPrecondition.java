@@ -22,7 +22,7 @@ public class AgentSwitchPrecondition implements AgentPathPrecondition {
     @Override
     public PreconditionVerdict check(ConnectorView connector) {
         // silent：开关关着时走单次推导是配置出来的常态，不是降级，管理台的说明里不写这句内部话。
-        // 原因照写，trigger 会打进日志——「分批生成一直没开」只能从那里看出来（2026-10 就是这么发现的）。
+        // 原因照写，trigger 会打进日志——「agent 生成一直没开」只能从那里看出来（2026-10 就是这么发现的）。
         return properties.getSemantic().getAgent().isEnabled()
                 ? PreconditionVerdict.allowed()
                 : PreconditionVerdict.rejected(true, "agent 生成未开启");

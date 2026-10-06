@@ -246,12 +246,26 @@ class SemanticGeneratorSelectorTest {
         verifyNoInteractions(sidecar);
     }
 
+    /** 用户定的（2026-10-06）：默认走 agent 生成，不用在 Nacos 里显式打开开关。 */
+    @Test
+    void 默认走agent生成() {
+        ConnectorProperties fresh = new ConnectorProperties();
+        ConnectorProperties.SemanticAgent agent = fresh.getSemantic().getAgent();
+        agent.setCallbackBaseUrl("http://localhost:10011/data");
+        agent.getLlm().setBaseUrl("https://api.deepseek.com/anthropic");
+        agent.getLlm().setAuthToken("sk-test");
+        properties = fresh;
+        healthProbe = new SandboxHealthProbe(sidecar, properties, nowMs::get);
+
+        assertEquals(GeneratorKind.AGENT, selector().select(connector).kind());
+    }
+
     @Test
     void agent开关关闭走单次推导且不写原因() {
         properties.getSemantic().getAgent().setEnabled(false);
 
         // 开关关着时单次推导是配置出来的常态，不是降级：silent，管理台的说明里不写这句内部话；
-        // 但原因留着，trigger 会把它打进日志——「分批生成一直没开」只能从日志里看出来。
+        // 但原因留着，trigger 会把它打进日志——「agent 生成一直没开」只能从日志里看出来。
         assertSingleCall(selector().select(connector), true,
                 "agent 生成未开启", InterruptedBatchPolicy.SUPERSEDE);
         verifyNoInteractions(sidecar);

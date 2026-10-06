@@ -69,7 +69,7 @@ public class ConnectorSemanticGenerationService {
         SemanticGeneratorSelector.Selection selection = selector.select(connector);
 
         if (selection.kind() == GeneratorKind.SINGLE_CALL) {
-            // 管理台的说明里不写这句（见 AgentSwitchPrecondition），日志里必须有，否则没人知道分批生成没开。
+            // 管理台的说明里不写这句（见 AgentSwitchPrecondition），日志里必须有，否则没人知道 agent 生成没开。
             log.info("语义层生成走单次推导 connectorId={} 原因={}", connectorId, selection.verdict().reason());
             ConnectorSemanticGeneration interrupted = findInterrupted(connectorId);
             if (interrupted != null) {
