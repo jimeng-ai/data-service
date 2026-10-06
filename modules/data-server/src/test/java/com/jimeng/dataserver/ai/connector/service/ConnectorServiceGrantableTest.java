@@ -61,7 +61,7 @@ class ConnectorServiceGrantableTest {
     void legacyHttpRowIsRejected() {
         row(9L, "HTTP");
         ServiceException e = assertThrows(ServiceException.class, () -> service.requireGrantable(9L));
-        assertTrue(e.getMessage().contains("已经下线"), e.getMessage());
+        assertTrue(e.getMessage().contains("已下线"), e.getMessage());
     }
 
     @Test

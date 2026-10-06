@@ -28,7 +28,7 @@ public class SingleCallSemanticGenerator implements SemanticGenerator {
             String reason = request.degradeReason();
             String prefix = reason == null || reason.isBlank()
                     ? null
-                    : "降级原因：" + reason.trim();
+                    : "已用备用方式生成";
             Long connectorId = request.connectorId();
             semanticFallbackExecutor.execute(MdcAsyncSupport.wrap(
                     "semantic-fallback-" + connectorId,
@@ -40,7 +40,7 @@ public class SingleCallSemanticGenerator implements SemanticGenerator {
                     : e.getMessage();
             log.warn("单次语义推导提交失败 connectorId={}: {}",
                     request == null ? null : request.connectorId(), detail, e);
-            return new GenerationAck(kind(), false, null, "单次推导提交失败：" + detail);
+            return new GenerationAck(kind(), false, null, "提交失败，请稍后重试");
         }
     }
 }

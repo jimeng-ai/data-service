@@ -188,7 +188,7 @@ class ConnectorServiceDataTierTest {
                 r.setSemanticDataTier(bad);
                 ServiceException e = assertThrows(ServiceException.class, () -> service.create(r),
                         "这个值不该被接受：" + bad);
-                assertTrue(e.getMessage().contains("semanticDataTier"),
+                assertTrue(e.getMessage().contains("数据出库档位"),
                         "报错要说清是哪个字段错了，否则超管只能猜：" + e.getMessage());
             }
             verify(connectionMapper, never()).insert(any(Connection.class));

@@ -3,36 +3,23 @@ package com.jimeng.dataserver.ai.connector.generation;
 import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
 import org.springframework.stereotype.Component;
 
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
-
 /** 语义层 agent 生成在排队、运行和异常终止阶段写给管理台的安全说明模板。 */
 @Component
 public class SemanticGenerationNotes {
 
     private static final int NOTE_MAX = 500;
     private static final int REASON_MAX = 80;
-    private static final DateTimeFormatter STARTED_AT = DateTimeFormatter.ofPattern("MM-dd HH:mm")
-            .withZone(ZoneId.systemDefault());
 
     public String queued(long aheadInTenant) {
-        String note = "语义层生成已排队（agent，全平台串行执行）";
-        return aheadInTenant > 0 ? note + "，本租户前面还有 " + aheadInTenant + " 个" : note;
+        return aheadInTenant > 0 ? "已排队，前面还有 " + aheadInTenant + " 个" : "已排队，等待生成";
     }
 
     public String progress(ConnectorSemanticGeneration generation, ProgressCounts progress) {
-        String started = generation.getStartedAt() == null
-                ? "未知"
-                : STARTED_AT.format(generation.getStartedAt().toInstant());
-        StringBuilder note = new StringBuilder("正在生成语义层（agent，开始于 ")
-                .append(started)
-                .append("）：已完成 ")
+        StringBuilder note = new StringBuilder("正在生成：已完成 ")
                 .append(progress.doneTables()).append('/').append(number(generation.getTotalTables()))
-                .append(" 张表（第 ")
-                .append(number(generation.getCurrentSliceNo())).append('/')
-                .append(number(generation.getSliceCount())).append(" 片）");
+                .append(" 张表");
         if (progress.gaveUpTables() > 0) {
-            note.append("，放弃 ").append(progress.gaveUpTables()).append(" 张");
+            note.append("，").append(progress.gaveUpTables()).append(" 张未成功");
         }
         return safe(note.toString());
     }
@@ -42,18 +29,15 @@ public class SemanticGenerationNotes {
         StringBuilder note = new StringBuilder("覆盖 ")
                 .append(number(generation.getDoneTables())).append('/')
                 .append(number(generation.getTotalTables()))
-                .append(" 张表：表用途 ").append(stats.objectCount())
-                .append("、字段含义 ").append(stats.fieldCount())
+                .append(" 张表：表说明 ").append(stats.objectCount())
+                .append("、字段 ").append(stats.fieldCount())
                 .append("、关系 ").append(stats.joinCount())
-                .append("（均未经数据验证）、待确认口径 ").append(stats.caveatCount())
-                .append(" 条；放弃 ").append(number(generation.getGaveUpTables()))
-                .append(" 张。由 agent 分 ").append(number(generation.getSliceCount()))
-                .append(" 片生成，未做采样验证。");
-        if (stats.snapshotTruncated()) {
-            note.append("结构快照在 200 个对象处按重要性截断，其余表没有进过快照，也不会有语义。");
+                .append("（未经数据核对）。");
+        if (number(generation.getGaveUpTables()) > 0) {
+            note.append("另有 ").append(number(generation.getGaveUpTables())).append(" 张未能生成。");
         }
-        if (staged(generation)) {
-            note.append("上一版机器生成的说明已替换，人工口径未动。");
+        if (stats.snapshotTruncated()) {
+            note.append("表太多，只覆盖了最重要的 200 张。");
         }
         return safe(note.toString());
     }
@@ -62,23 +46,26 @@ public class SemanticGenerationNotes {
         int done = number(generation.getDoneTables());
         int total = number(generation.getTotalTables());
         if (staged(generation)) {
-            return safe("重新生成已中断（" + shortReason(reason) + "）：新一轮已完成 " + done + "/" + total
-                    + " 张表（暂存中，未替换），当前仍是上一版说明书。点「重新生成」继续。");
+            return safe("重新生成中断（" + shortReason(reason) + "）：已完成 " + done + "/" + total
+                    + " 张，仍用上一版。点「重新生成」继续。");
         }
-        return safe("语义层生成已中断（" + shortReason(reason) + "）：已完成 " + done + "/" + total
-                + " 张表，已生成的部分照常可用。点「重新生成」只补其余表。");
+        // 还没列出任何表就中断时（total=0），「已完成 0/0」只会让人困惑，直接不说。
+        String progress = total > 0 ? "已完成 " + done + "/" + total + " 张表。" : "";
+        return safe("生成中断（" + shortReason(reason) + "）：" + progress + "点「重新生成」补其余。");
     }
 
     public String failed(ConnectorSemanticGeneration generation, String reason) {
         if (staged(generation)) {
-            return safe("重新生成未完成（agent）：" + shortReason(reason) + "。新说明已丢弃，上一版原样保留。");
+            return safe("重新生成失败：" + shortReason(reason) + "。仍用上一版。");
         }
-        return safe("语义层生成失败（agent）：" + shortReason(reason) + "。已完成 "
-                + number(generation.getDoneTables()) + "/" + number(generation.getTotalTables()) + " 张表。");
+        int total = number(generation.getTotalTables());
+        String progress = total > 0 ? "已完成 " + number(generation.getDoneTables()) + "/" + total + " 张表。" : "";
+        return safe("生成失败：" + shortReason(reason) + "。" + progress);
     }
 
+    /** 回落的内部原因只留在批次行里，不在界面说明上复述：超管看到也没法处理。 */
     public String fellBack(String reason) {
-        return safe("agent 生成未进行：" + shortReason(reason) + "，已改走单次推导。");
+        return safe("已改用备用方式生成。");
     }
 
     private static boolean staged(ConnectorSemanticGeneration generation) {

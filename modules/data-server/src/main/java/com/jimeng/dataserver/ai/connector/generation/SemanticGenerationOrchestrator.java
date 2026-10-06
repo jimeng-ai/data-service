@@ -317,14 +317,14 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
         }
 
         SemanticConnectionClaim.Credential credential = connectionClaim.claim(generation.getConnectorId(),
-                generation.getClaimAt(), "正在生成语义层（agent）……");
+                generation.getClaimAt(), "正在生成语义层……");
         if (credential == null) {
             handleClaimBusy(generation);
             return null;
         }
         if (!persistClaim(generation, credential)) {
             connectionClaim.release(generation.getConnectorId(), restoredStatus(generation),
-                    "语义层生成认领已失效", false);
+                    "生成任务已失效，请点「重新生成」重试", false);
             return null;
         }
 
@@ -355,7 +355,7 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
                 ConnectorProperties.SemanticAgent liveConfig = agent();
                 if (!liveConfig.isEnabled()) {
                     interruptOwned(generation, GenerationReasonCode.AGENT_DISABLED,
-                            "agent 生成已关闭，再点重新生成将走单次推导");
+                            "生成方式已调整");
                     return null;
                 }
                 if (!reconcile(generation)) {
@@ -368,7 +368,7 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
                 copyRuntimeState(generation, live);
                 if (tokenCapReached(generation, normalizedTokenLimit(liveConfig.getMaxTokensPerTable()))) {
                     interruptOwned(generation, GenerationReasonCode.TOKEN_CAP,
-                            "超出本轮 token 上限；确认后点重新生成继续（每次续跑重新计额）");
+                            "本轮用量已达上限");
                     return null;
                 }
 
@@ -446,7 +446,7 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
                         }
                         if (waited == WaitOutcome.SHUTDOWN) {
                             interruptOwned(generation, GenerationReasonCode.SHUTDOWN,
-                                    "服务关停，语义层生成已中断");
+                                    "服务重启");
                             return null;
                         }
                         heartbeat.forceProgressNote();
@@ -515,21 +515,21 @@ public class SemanticGenerationOrchestrator implements SemanticGenerationKick {
                 return true;
             }
             failOwned(generation, GenerationReasonCode.SNAPSHOT_REFRESH_FAILED,
-                    "结构补拉后快照仍为空", restoredStatus(generation));
+                    "账号看不到任何表", restoredStatus(generation));
             return false;
         } catch (ServiceException failure) {
             if (ExceptionCode.OPERATION_UNSUPPORTED.getResultCode().equals(failure.getRespCode())) {
                 failOwned(generation, GenerationReasonCode.SNAPSHOT_NOT_APPLICABLE,
-                        "该连接器不提供结构自描述，语义层不适用",
+                        "这种连接不适用语义层",
                         ConnectorSemanticDeriveService.SEM_NOT_APPLICABLE);
             } else {
                 failOwned(generation, GenerationReasonCode.SNAPSHOT_REFRESH_FAILED,
-                        "结构补拉失败：" + failure.getClass().getSimpleName(), restoredStatus(generation));
+                        "读取表结构失败", restoredStatus(generation));
             }
             return false;
         } catch (RuntimeException failure) {
             failOwned(generation, GenerationReasonCode.SNAPSHOT_REFRESH_FAILED,
-                    "结构补拉失败：" + failure.getClass().getSimpleName(), restoredStatus(generation));
+                    "读取表结构失败", restoredStatus(generation));
             return false;
         }
     }

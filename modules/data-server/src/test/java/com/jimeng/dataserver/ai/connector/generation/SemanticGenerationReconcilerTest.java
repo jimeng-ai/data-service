@@ -154,7 +154,7 @@ class SemanticGenerationReconcilerTest {
         order.verify(connectionMapper).update(connectionUpdate.capture(), connectionWhere.capture());
         assertEquals("FAILED", connectionUpdate.getValue().getSemanticStatus());
         assertNull(connectionUpdate.getValue().getSemanticSyncedAt());
-        assertTrue(connectionUpdate.getValue().getSemanticNote().startsWith("语义层生成已中断"));
+        assertTrue(connectionUpdate.getValue().getSemanticNote().startsWith("生成中断"));
         connectionWhere.getValue().getSqlSegment();
         assertTrue(connectionWhere.getValue().getParamNameValuePairs().containsValue(41L));
         assertTrue(connectionWhere.getValue().getParamNameValuePairs().containsValue("RUNNING"));
@@ -176,8 +176,8 @@ class SemanticGenerationReconcilerTest {
         verify(connectionMapper).update(update.capture(), any());
         assertEquals("READY", update.getValue().getSemanticStatus());
         assertNull(update.getValue().getSemanticSyncedAt());
-        assertTrue(update.getValue().getSemanticNote().startsWith("重新生成已中断"));
-        assertTrue(update.getValue().getSemanticNote().contains("当前仍是上一版说明书"));
+        assertTrue(update.getValue().getSemanticNote().startsWith("重新生成中断"));
+        assertTrue(update.getValue().getSemanticNote().contains("仍用上一版"));
     }
 
     @Test

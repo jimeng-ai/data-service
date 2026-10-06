@@ -11,6 +11,7 @@ import com.jimeng.persistence.entity.ConnectorSemanticGeneration;
 import com.jimeng.persistence.mapper.ConnectionMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticGenerationMapper;
 import com.jimeng.persistence.mapper.ConnectorSemanticStagedMapper;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -23,6 +24,7 @@ import java.util.Date;
  * <p>租户内存在性校验和用户身份都在请求线程完成；门面只选择 agent 或既有单次推导路径，
  * 不在请求线程执行生成本身。
  */
+@Slf4j
 @Service
 public class ConnectorSemanticGenerationService {
 
@@ -30,7 +32,7 @@ public class ConnectorSemanticGenerationService {
     private static final String STATUS_CANCELLED = "CANCELLED";
     private static final String MODE_STAGED = "STAGED";
     private static final String KEEP_NOTE =
-            "sandbox 暂不可用，保留上次未完成的生成，稍后再点重新生成继续";
+            "生成服务暂不可用，请稍后点「重新生成」继续";
     private static final String MERGED_NOTE = "已有一次生成在排队或进行中，本次合并";
 
     private final ConnectorService connectorService;
@@ -67,6 +69,8 @@ public class ConnectorSemanticGenerationService {
         SemanticGeneratorSelector.Selection selection = selector.select(connector);
 
         if (selection.kind() == GeneratorKind.SINGLE_CALL) {
+            // 管理台的说明里不写这句（见 AgentSwitchPrecondition），日志里必须有，否则没人知道分批生成没开。
+            log.info("语义层生成走单次推导 connectorId={} 原因={}", connectorId, selection.verdict().reason());
             ConnectorSemanticGeneration interrupted = findInterrupted(connectorId);
             if (interrupted != null) {
                 GenerationAck disposition = disposeInterrupted(interrupted, selection.interruptedBatchPolicy());

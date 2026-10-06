@@ -68,7 +68,7 @@ public class MySqlConnector implements Connector {
 
     @Override
     public String displayName() {
-        return "MySQL / 兼容 MySQL 协议的库（含 Doris、StarRocks）";
+        return "MySQL（兼容 Doris、StarRocks）";
     }
 
     /**
@@ -97,23 +97,21 @@ public class MySqlConnector implements Connector {
     public ParamSpec paramSpec() {
         return ParamSpec.of(
                 ParamField.of("host", "主机地址", ParamType.STRING, true,
-                                "数据库的域名或 IP。平台从公网直连，请确保已对平台出口 IP 放行")
+                                "数据库的域名或 IP，需允许平台访问")
                         .withPattern(HOST_RE.pattern()),
                 ParamField.of("port", "端口", ParamType.INT, false, "默认 3306")
                         .withDefault("3306").withRange(1, 65535),
                 ParamField.of("database", "库名", ParamType.STRING, true,
-                                "要访问的数据库名。一条连接只对应一个库；需要多个库请建多条连接")
+                                "只能填一个库，多个库请分别建连接")
                         .withPattern(DB_RE.pattern()),
                 ParamField.of("username", "用户名", ParamType.STRING, true,
-                        "★ 必须是只读账号（数据库侧只 GRANT SELECT）。保存时平台会实际验证它写不了，"
-                                + "验不过会拒绝保存"),
+                        "用只读账号，保存时会验证它写不了数据"),
                 ParamField.secret("password", "密码", true,
-                        "加密存储。已保存的密码可以在编辑里查看，每次查看都会记一条使用记录；"
-                                + "不主动更换就不会改动它"),
+                        "加密保存；编辑时不改请留空"),
                 ParamField.of("useSsl", "启用 SSL", ParamType.BOOL, false,
-                        "公网直连建议开启。客户库没配证书时开启会连不上").withDefault("false"),
+                        "建议开启；数据库没配证书时会连不上").withDefault("false"),
                 ParamField.of("connectTimeoutSec", "连接超时（秒）", ParamType.INT, false,
-                        "建立 TCP 连接的超时。查询本身的超时由平台统一控制，不在这里配")
+                        "建立连接的最长等待时间")
                         .withDefault("10").withRange(1, 60)
         );
     }
@@ -136,15 +134,15 @@ public class MySqlConnector implements Connector {
         String password = instance.credential();
         if (password == null || password.isBlank()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    "这条连接没有保存密码，请在管理台重新填写");
+                    "没有保存密码，请重新填写");
         }
         if (!HOST_RE.matcher(host).matches()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    "主机地址含有非法字符，只允许字母、数字、点、短横线和下划线");
+                    "主机地址只能含字母、数字、点、短横线和下划线");
         }
         if (!DB_RE.matcher(database).matches()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    "库名含有非法字符，只允许字母、数字、下划线、$ 和短横线");
+                    "库名只能含字母、数字、下划线、$ 和短横线");
         }
         int port = instance.intVal("port", 3306);
         if (port < 1 || port > 65535) {
@@ -198,8 +196,8 @@ public class MySqlConnector implements Connector {
         String account = "'" + user + "'@'" + host + "'";
 
         StringBuilder sql = new StringBuilder();
-        sql.append("-- 请用有授权权限的数据库账号（如 root）整段执行\n");
-        sql.append("-- 平台侧写策略：").append(policy.label()).append("，对应权限：").append(privileges).append("\n");
+        sql.append("-- 请用有授权权限的账号（如 root）整段执行\n");
+        sql.append("-- 写策略：").append(policy.label()).append("，授予权限：").append(privileges).append("\n");
         sql.append("CREATE USER ").append(account)
                 .append(" IDENTIFIED BY '").append(PASSWORD_PLACEHOLDER).append("';\n");
         if (tables.isEmpty()) {
@@ -239,9 +237,7 @@ public class MySqlConnector implements Connector {
         String v = raw.trim();
         if (!allowed.matcher(v).matches()) {
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    label + "含有非法字符，已拒绝生成脚本。" + label
-                            + "只允许字母、数字、下划线、$ 和短横线（登录地址另可用点、冒号和 %）；"
-                            + "带引号、反引号、分号、空格的输入一律不接受");
+                    label + "含有不支持的字符，请检查后重试");
         }
         return v;
     }
@@ -250,38 +246,26 @@ public class MySqlConnector implements Connector {
     private static List<String> grantNotes(String db, String account, String host,
                                            List<String> tables, WritePolicy policy) {
         List<String> notes = new ArrayList<>();
-        notes.add("把脚本里的「" + PASSWORD_PLACEHOLDER + "」换成一个随机生成的强口令，"
-                + "且不要与其它系统复用——替换后的真实密码只填进平台的密码框，不要写回这段脚本、更不要贴进聊天或工单。");
+        notes.add("把「" + PASSWORD_PLACEHOLDER + "」换成强密码，只填进平台密码框，别贴到聊天或工单。");
         if ("%".equals(host)) {
-            notes.add("账号写成了 " + account + "，其中 @'%' 表示允许从任意地址登录；"
-                    + "如果能拿到平台的出口 IP，请把它收紧成具体 IP（如 '...'@'203.0.113.10'），这是成本最低的一道防线。");
+            notes.add("账号允许从任意地址登录，建议改成平台的出口 IP。");
         } else {
-            notes.add("账号已限定只能从 " + host + " 登录；"
-                    + "将来平台出口 IP 变更时这个账号会突然连不上（表现为凭据/网络类报错），届时改这一处即可。");
+            notes.add("账号只能从 " + host + " 登录；平台出口 IP 变了需同步修改。");
         }
-        notes.add("脚本只授了 `" + db + "` 这一个库"
-                + (tables.isEmpty() ? "" : "中列出的那几张表") + "的权限，不要图省事改成 *.*——"
-                + "多授的权限平台一行都用不上，真出了事却要算在这个账号头上。");
+        notes.add("只授权了 `" + db + "` 库" + (tables.isEmpty() ? "" : "中的指定表")
+                + "，不要改成 *.*，多余的权限用不上。");
         if (!tables.isEmpty()) {
             // 这条是实测踩出来的：information_schema 只返回账号有权限的对象，
             // 所以漏授一张表，平台侧的表现是「这张表不存在」而不是「没权限」，排查会绕很远。
-            notes.add("逐表授权后平台只看得见这 " + tables.size() + " 张表，"
-                    + "漏授的表在平台侧表现为「这张表不存在」而不是权限报错，所以请一次把 Agent 要用的表列全。");
+            notes.add("平台只看得到这 " + tables.size() + " 张表；漏授的表会显示为「不存在」，请一次列全。");
         }
         if (policy.allowsWrite()) {
-            notes.add("这是一个能写的账号：平台会在连接上如实标注写策略「" + policy.label()
-                    + "」，界面和审计里都看得到，不会伪装成只读。");
-            notes.add("写操作仍受平台侧两道闸约束——单次影响行数上限、UPDATE/DELETE 必须带 WHERE"
-                    + (policy == WritePolicy.REQUIRE_APPROVAL ? "，且每一条都要超管点确认后才真正执行。" : "。")
-                    + "如果只是想让平台查数，请把写策略调回只读后重新生成脚本：数据库侧的只读授权才是承重层。");
+            notes.add("这个账号能写数据，连接上会标注写策略「" + policy.label() + "」。");
+            notes.add("写操作有行数上限，UPDATE/DELETE 必须带 WHERE"
+                    + (policy == WritePolicy.REQUIRE_APPROVAL ? "，且每条都需超管批准。" : "。"));
         }
-        notes.add("MySQL 8.0 起 GRANT 不再能隐式建账号，所以必须先 CREATE USER；"
-                + "5.7 的默认 sql_mode 也带 NO_AUTO_CREATE_USER，这段脚本两个版本都能直接跑。");
-        notes.add("MySQL 8.0 的默认认证插件是 caching_sha2_password，而平台连库时刻意关掉了"
-                + "「向服务端索要 RSA 公钥」（防中间人拿到明文密码）——"
-                + "所以请在连接里勾选 SSL，或把建号语句改成 IDENTIFIED WITH mysql_native_password BY '...'，否则会认证失败。");
-        notes.add("如果这个账号已存在，CREATE USER 会报 ERROR 1396；"
-                + "此时改用 ALTER USER " + account + " IDENTIFIED BY '...' 重设密码，或换一个账号名，不要直接跳过这一行。");
+        notes.add("MySQL 8 认证失败时，请勾选 SSL，或建号改用 mysql_native_password。");
+        notes.add("账号已存在时，请改用 ALTER USER 重设密码，或换个账号名。");
         return notes;
     }
 

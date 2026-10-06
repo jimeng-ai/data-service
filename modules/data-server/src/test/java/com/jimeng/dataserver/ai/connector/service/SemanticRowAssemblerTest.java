@@ -116,9 +116,11 @@ class SemanticRowAssemblerTest {
      * {@link #RICH_PAYLOAD} 跑 {@code derive()} 录下的：第一行是 {@code DeriveResult}，其余每行一条 replaceInferred 的入参，
      * 列依次为 scope | object | field | term | gloss | detail_json | evidence | confidence | anchor_kind | anchor_hash | verified | status。
      * <b>不要照着新代码的输出更新它</b>——它存在的意义就是「和抽取前一样」。
+     * （唯一例外：第一行末尾的 {@code note=} 是管理台文案，2026-10 按产品要求改短后手工改写了这一段，
+     * 数字与当时一致；各行语义行的内容一个字没动。）
      */
     private static final String GOLDEN_BEFORE_EXTRACTION = """
-            ConnectorSemanticDeriveService.DeriveResult(ok=true, objectCount=1, fieldCount=2, joinCount=2, caveatCount=1, droppedGuess=3, droppedUnknown=5, droppedTooLong=1, skippedAnswered=1, truncated=false, note=覆盖 3/3 个对象：表用途 1、字段含义 2、关系 2（均未经数据验证）、待确认口径 1 条。已丢弃：无外部依据 3、名字对不上结构 5、重复 4、超长 1 条。另有 1 条口径人已经答过，不再重复提问。)
+            ConnectorSemanticDeriveService.DeriveResult(ok=true, objectCount=1, fieldCount=2, joinCount=2, caveatCount=1, droppedGuess=3, droppedUnknown=5, droppedTooLong=1, skippedAnswered=1, truncated=false, note=覆盖 3/3 张表：表说明 1、字段 2、关系 2（未经数据核对）。)
             OBJECT | orders |  |  | 订单主表，一行一个订单头 | {"table_shape":"DETAIL","table_shape_source":"MODEL","typical_questions":["上月下单量","本周退款数"]} | COMMENT | 90 | NONE | null | NONE | DRAFT
             FIELD | orders | amt |  | 金额（高置信） | null | COMMENT | 99 | FIELD | ee08605b94b37da3e78193ae78eb73379b93c185cc71d01e945458b3d7c3f317 | NONE | DRAFT
             FIELD | users | name |  | 用户名 | null | NAME | null | FIELD | 974df0c5b32fdf3c67e437da942906de48aa5454c6538e724703fab55c537e47 | NONE | DRAFT

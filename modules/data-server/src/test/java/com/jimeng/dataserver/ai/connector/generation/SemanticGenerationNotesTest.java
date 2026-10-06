@@ -16,8 +16,8 @@ class SemanticGenerationNotesTest {
     private final SemanticGenerationNotes notes = new SemanticGenerationNotes();
 
     @Test
-    @DisplayName("进度说明使用真正 startedAt，并包含 k/N 与 i/M")
-    void progressUsesRealStartedAt() {
+    @DisplayName("进度说明只说已完成几张、几张没成功，不带内部分片信息")
+    void progressShowsDoneAndFailedOnly() {
         ConnectorSemanticGeneration generation = generation("DIRECT");
         generation.setStartedAt(Date.from(Instant.parse("2026-09-17T01:02:00Z")));
         generation.setTotalTables(18);
@@ -26,17 +26,27 @@ class SemanticGenerationNotesTest {
 
         String note = notes.progress(generation, new SemanticGenerationNotes.ProgressCounts(7, 2));
 
-        assertTrue(note.contains("已完成 7/18 张表（第 3/9 片）"), note);
-        assertTrue(note.contains("开始于 09-17"), note);
-        assertTrue(note.contains("放弃 2 张"), note);
+        assertEquals("正在生成：已完成 7/18 张表，2 张未成功", note);
         assertFalse(note.contains("｜"), note);
+        assertFalse(note.contains("片"), "分片是内部机制，不给超管看：" + note);
+        assertFalse(note.contains("agent"), note);
+    }
+
+    @Test
+    @DisplayName("没有放弃的表时进度里不出现「未成功」")
+    void progressWithoutGaveUp() {
+        ConnectorSemanticGeneration generation = generation("DIRECT");
+        generation.setTotalTables(18);
+
+        assertEquals("正在生成：已完成 7/18 张表",
+                notes.progress(generation, new SemanticGenerationNotes.ProgressCounts(7, 0)));
     }
 
     @Test
     @DisplayName("排队说明只在前面有本租户批次时带数量")
     void queued() {
-        assertEquals("语义层生成已排队（agent，全平台串行执行）", notes.queued(0));
-        assertEquals("语义层生成已排队（agent，全平台串行执行），本租户前面还有 2 个", notes.queued(2));
+        assertEquals("已排队，等待生成", notes.queued(0));
+        assertEquals("已排队，前面还有 2 个", notes.queued(2));
     }
 
     @Test
@@ -45,42 +55,75 @@ class SemanticGenerationNotesTest {
         ConnectorSemanticGeneration direct = generation("DIRECT");
         ConnectorSemanticGeneration staged = generation("STAGED");
 
-        assertTrue(notes.interrupted(direct, "服务关停").contains("已生成的部分照常可用"));
-        assertTrue(notes.interrupted(staged, "服务关停").contains("暂存中，未替换"));
+        assertTrue(notes.interrupted(direct, "服务重启").contains("点「重新生成」补其余"));
+        assertTrue(notes.interrupted(staged, "服务重启").contains("仍用上一版"));
         assertTrue(notes.failed(direct, "没有任何表生成成功").contains("已完成 4/10 张表"));
-        assertTrue(notes.failed(staged, "没有任何表生成成功").contains("上一版原样保留"));
+        assertTrue(notes.failed(staged, "没有任何表生成成功").contains("仍用上一版"));
     }
 
     @Test
-    @DisplayName("DIRECT READY 说明严格汇总覆盖表和四类语义行")
+    @DisplayName("还没列出任何表就中断/失败时，不说「已完成 0/0 张表」")
+    void noProgressWhenNoTableListed() {
+        ConnectorSemanticGeneration direct = generation("DIRECT");
+        direct.setTotalTables(0);
+        direct.setDoneTables(0);
+
+        assertEquals("生成失败：读取表结构失败。", notes.failed(direct, "读取表结构失败"));
+        assertEquals("生成中断（连接已停用）：点「重新生成」补其余。", notes.interrupted(direct, "连接已停用"));
+    }
+
+    @Test
+    @DisplayName("中断与失败说明是一两句短话：整条不超过 45 字符")
+    void terminalNotesAreShort() {
+        for (String mode : new String[]{"DIRECT", "STAGED"}) {
+            ConnectorSemanticGeneration generation = generation(mode);
+            for (String note : new String[]{
+                    notes.interrupted(generation, "服务繁忙或不可用"),
+                    notes.failed(generation, "读取表结构失败")}) {
+                assertTrue(note.length() <= 45, mode + " 说明太长：" + note);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("DIRECT READY 说明汇总覆盖表和三类语义行，放弃的表单独交代")
     void readyDirect() {
         ConnectorSemanticGeneration direct = generation("DIRECT");
         direct.setGaveUpTables(2);
 
         String note = notes.ready(direct, new SemanticGenerationNotes.ReadyStats(3, 12, 4, 2, false));
 
-        assertEquals("覆盖 4/10 张表：表用途 3、字段含义 12、关系 4（均未经数据验证）、待确认口径 2 条；放弃 2 张。"
-                + "由 agent 分 5 片生成，未做采样验证。", note);
+        assertEquals("覆盖 4/10 张表：表说明 3、字段 12、关系 4（未经数据核对）。另有 2 张未能生成。", note);
     }
 
     @Test
-    @DisplayName("STAGED READY 说明明确旧机器版已替换、人工口径未动")
+    @DisplayName("没有放弃的表时 READY 说明就是一句覆盖统计")
+    void readyWithoutGaveUp() {
+        ConnectorSemanticGeneration direct = generation("DIRECT");
+
+        String note = notes.ready(direct, new SemanticGenerationNotes.ReadyStats(3, 12, 4, 2, false));
+
+        assertEquals("覆盖 4/10 张表：表说明 3、字段 12、关系 4（未经数据核对）。", note);
+    }
+
+    @Test
+    @DisplayName("STAGED READY 说明与 DIRECT 一样：替换上一版是内部过程，不复述")
     void readyStaged() {
         ConnectorSemanticGeneration staged = generation("STAGED");
 
         String note = notes.ready(staged, new SemanticGenerationNotes.ReadyStats(1, 2, 3, 4, false));
 
-        assertTrue(note.endsWith("上一版机器生成的说明已替换，人工口径未动。"), note);
+        assertEquals("覆盖 4/10 张表：表说明 1、字段 2、关系 3（未经数据核对）。", note);
     }
 
     @Test
-    @DisplayName("快照截断时 READY 说明追加 200 对象限制与影响")
+    @DisplayName("快照截断时 READY 说明追加「只覆盖了最重要的 200 张」")
     void readySnapshotTruncated() {
         ConnectorSemanticGeneration direct = generation("DIRECT");
 
         String note = notes.ready(direct, new SemanticGenerationNotes.ReadyStats(1, 2, 3, 4, true));
 
-        assertTrue(note.endsWith("结构快照在 200 个对象处按重要性截断，其余表没有进过快照，也不会有语义。"), note);
+        assertTrue(note.endsWith("表太多，只覆盖了最重要的 200 张。"), note);
     }
 
     @Test
@@ -92,17 +135,27 @@ class SemanticGenerationNotesTest {
 
         String directInterrupted = head(notes.interrupted(direct, reason));
         assertTrue(directInterrupted.contains("已完成 4/10 张表"), directInterrupted);
-        assertTrue(directInterrupted.contains("已生成的部分照常可用"), directInterrupted);
-        assertTrue(directInterrupted.contains("点「重新生成」只补其余表"), directInterrupted);
+        assertTrue(directInterrupted.contains("点「重新生成」补其余"), directInterrupted);
 
         String stagedInterrupted = head(notes.interrupted(staged, reason));
-        assertTrue(stagedInterrupted.contains("新一轮已完成 4/10 张表"), stagedInterrupted);
-        assertTrue(stagedInterrupted.contains("当前仍是上一版说明书"), stagedInterrupted);
+        assertTrue(stagedInterrupted.contains("已完成 4/10 张"), stagedInterrupted);
+        assertTrue(stagedInterrupted.contains("仍用上一版"), stagedInterrupted);
         assertTrue(stagedInterrupted.contains("点「重新生成」继续"), stagedInterrupted);
 
         assertTrue(head(notes.failed(direct, reason)).contains("已完成 4/10 张表"));
-        assertTrue(head(notes.failed(staged, reason)).contains("上一版原样保留"));
-        assertTrue(head(notes.fellBack(reason)).contains("已改走单次推导"));
+        assertTrue(head(notes.failed(staged, reason)).contains("仍用上一版"));
+        assertEquals("已改用备用方式生成。", notes.fellBack(reason));
+    }
+
+    @Test
+    @DisplayName("回落说明不复述内部原因：没有 agent、sandbox、单次推导这类字眼")
+    void fellBackHidesInternalReason() {
+        String note = notes.fellBack("降级原因：sandbox 持续繁忙或不可用。");
+
+        assertFalse(note.contains("sandbox"), note);
+        assertFalse(note.contains("agent"), note);
+        assertFalse(note.contains("单次推导"), note);
+        assertFalse(note.contains("降级"), note);
     }
 
     private static String head(String note) {

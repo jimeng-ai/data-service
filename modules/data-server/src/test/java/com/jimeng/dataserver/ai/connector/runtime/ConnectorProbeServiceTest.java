@@ -123,7 +123,7 @@ class ConnectorProbeServiceTest {
             assertTrue(r.failureReason().contains("无法确认"),
                     "实际文案: " + r.failureReason());
             // 两种不通过的话术必须分开，否则客户按「换只读账号」去做，而问题其实在别处。
-            assertFalse(r.failureReason().contains("这个账号具备写权限"));
+            assertFalse(r.failureReason().contains("有写权限"));
         }
     }
 

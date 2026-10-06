@@ -436,7 +436,7 @@ class ConnectorSemanticPipelineSilentFailureTest {
         }
 
         @Test
-        @DisplayName("★ 目标表唯一键还不知道：判成普通关系也不写 join_kind（否则组合键永远被冻成 SIMPLE），note 说暂缓")
+        @DisplayName("★ 目标表唯一键还不知道：判成普通关系也不写 join_kind（否则组合键永远被冻成 SIMPLE）")
         void simpleIsNotWrittenWhileTargetKeysUnknown() {
             snapshot(orders(), table("sku", col("shop_id", "bigint"), col("code", "varchar(32)")));
             when(semanticService.all(CONNECTOR_ID)).thenReturn(List.of(joinRow(1L, "orders", "sku_code", "sku", "code",
@@ -447,7 +447,8 @@ class ConnectorSemanticPipelineSilentFailureTest {
 
             verify(joinValidator).structureOnly(any(), any(), any());
             verify(semanticMapper, never()).updateById(any());
-            assertTrue(r.getNote().contains("暂缓"), r.getNote());
+            // 「暂缓」是内部处置，不写进管理台那行字（超管无从处理，下次刷新结构会自动重判）。
+            assertFalse(r.getNote().contains("暂缓"), r.getNote());
         }
 
         @Test
@@ -847,7 +848,8 @@ class ConnectorSemanticPipelineSilentFailureTest {
             ConnectorSemanticDeriveService.ValidationResult r = service.validate(CONNECTOR_ID);
 
             verify(shapeDetector, times(1)).detect(anyLong(), any(), any());
-            assertTrue(r.getNote().contains("冷却"), r.getNote());
+            // 冷却是省客户库配额的内部机制，管理台那行字只说表关系核对的结果。
+            assertFalse(r.getNote().contains("冷却"), r.getNote());
         }
 
         @Test

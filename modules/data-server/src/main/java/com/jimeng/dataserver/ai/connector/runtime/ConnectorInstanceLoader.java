@@ -90,7 +90,7 @@ public class ConnectorInstanceLoader {
             // 归到 AUTH_FAILED 而不是 CONFIG_ERROR：从使用者的角度，这就是「这把凭据用不了」。
             log.warn("连接器凭据解密失败 connectorId={} encryptionVersion={}", row.getId(), version);
             throw ConnectorException.of(ConnectorErrorCode.AUTH_FAILED,
-                    "连接凭据无法解密（多半是加密密钥已轮换），请在管理台重新填写凭据");
+                    "保存的密码无法读取，请重新填写");
         }
     }
 
@@ -105,7 +105,7 @@ public class ConnectorInstanceLoader {
             // 原始异常里带着 config_json 的片段，只准进日志。
             log.warn("连接器 config_json 解析失败 connectorId={}", row.getId(), e);
             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                    "这条连接的参数已损坏，无法解析。请在管理台重新保存一次配置");
+                    "连接参数已损坏，请重新保存");
         }
     }
 

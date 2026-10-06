@@ -536,7 +536,6 @@ class ConnectorSemanticSelfHealingTest {
             assertFalse(d.containsKey("discriminator_value"), "判别值只能来自第 3 档的真实探查");
             assertEquals("来自视图 v_rr 的定义；未经数据验证", d.get("basis"), "basis 不能被抹成泛泛的「未经数据验证」");
             assertEquals("来自视图 v_rr 的定义", d.get("source_sql"));
-            assertTrue(r.getNote().contains("补标了结构形态"), r.getNote());
         }
 
         @Test

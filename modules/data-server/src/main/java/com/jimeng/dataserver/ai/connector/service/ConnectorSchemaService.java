@@ -446,7 +446,7 @@ public class ConnectorSchemaService {
         Connector connector = registry.require(ConnectorInstanceLoader.normalizeKind(row.getKind()));
         if (!connector.declaredCapabilities().contains(Capability.DESCRIBE)) {
             throw new ServiceException(ExceptionCode.OPERATION_UNSUPPORTED,
-                    "这种连接器类型不支持自描述，无法拉取结构");
+                    "这种连接不支持读取表结构");
         }
 
         // 拉取开始的时刻：既是这份快照每行的 synced_at，也是落库前「有没有更新的快照先落了库」的比较基准。
@@ -468,7 +468,7 @@ public class ConnectorSchemaService {
                             // 网关的兜底 catch 会把一切非 ConnectorException 归成 UPSTREAM_ERROR
                             // （「目标系统返回了错误」），那会把排查方向带到客户的库上。
                             throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                                    "这条连接的自描述能力不可用，请先点「测试连接」重新探测");
+                                    "暂时读不了表结构，请先点「测试连接」");
                         }
                         return pullDetails(describe, describe.catalog(), row, pullStart,
                                 () -> knownObjectNames(connectorId, pendingRemoved), probeRowPresence);
@@ -814,7 +814,7 @@ public class ConnectorSchemaService {
                 // 排序依据要进日志。只说「只覆盖前 200 个」，看日志的人会按自己的直觉补上
                 // 「前」是什么意思——而这正是上一版静默丢掉半个库时没人发现的原因。
                 log.warn("连接器结构快照达到对象上限 {}，connectorId={}：{}",
-                        MAX_OBJECTS, row.getId(), truncationNote(catalog, MAX_OBJECTS));
+                        MAX_OBJECTS, row.getId(), truncationDetail(catalog, MAX_OBJECTS));
                 break;
             }
             // 截断判断通过之后 n 恰好是这张表在目录里从 1 开始的位置，即重要性排名；
@@ -1089,12 +1089,23 @@ public class ConnectorSchemaService {
      * 而截断说明存在的全部意义就是别让人误读「只覆盖了 200 个」。
      * 连接器没声明顺序时如实说不知道——「不知道」和「按行数」必须分得开。
      */
-    static String truncationNote(CatalogView catalog, int kept) {
+    static String truncationDetail(CatalogView catalog, int kept) {
         String ordering = catalog.ordering() == null || catalog.ordering().isBlank()
                 ? "连接器返回的原始顺序（该连接器未声明排序依据）"
                 : catalog.ordering();
         return "共 " + catalog.total() + " 个对象，本次只覆盖了" + ordering + "的前 " + kept
                 + " 个；其余对象没有结构快照，也不在结构漂移检测范围内。";
+    }
+
+    /**
+     * 给管理台看的截断说明：一句话，不展开排序细节（细节在 {@link #truncationDetail} 和日志里）。
+     * 声明了排序依据 = 按重要性留的；没声明就如实说是「数据库返回的前 N 张」，不替连接器编一个顺序。
+     */
+    static String truncationNote(CatalogView catalog, int kept) {
+        String scope = catalog.ordering() == null || catalog.ordering().isBlank()
+                ? "数据库返回的前 " + kept + " 张"
+                : "最重要的 " + kept + " 张";
+        return "共 " + catalog.total() + " 张表，只覆盖了" + scope + "；其余的不在变化检测范围内。";
     }
 
     /**

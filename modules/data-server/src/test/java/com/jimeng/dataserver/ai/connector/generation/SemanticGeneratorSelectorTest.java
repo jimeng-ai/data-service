@@ -198,8 +198,8 @@ class SemanticGeneratorSelectorTest {
 
         SemanticGeneratorSelector.Selection selection = new SemanticGeneratorSelector(proxiedChain).select(connector);
 
-        assertSingleCall(selection, false,
-                "agent 生成未开启，走单次推导", InterruptedBatchPolicy.SUPERSEDE);
+        assertSingleCall(selection, true,
+                "agent 生成未开启", InterruptedBatchPolicy.SUPERSEDE);
         verifyNoInteractions(sidecar);
     }
 
@@ -247,11 +247,13 @@ class SemanticGeneratorSelectorTest {
     }
 
     @Test
-    void agent开关关闭写稳定原因() {
+    void agent开关关闭走单次推导且不写原因() {
         properties.getSemantic().getAgent().setEnabled(false);
 
-        assertSingleCall(selector().select(connector), false,
-                "agent 生成未开启，走单次推导", InterruptedBatchPolicy.SUPERSEDE);
+        // 开关关着时单次推导是配置出来的常态，不是降级：silent，管理台的说明里不写这句内部话；
+        // 但原因留着，trigger 会把它打进日志——「分批生成一直没开」只能从日志里看出来。
+        assertSingleCall(selector().select(connector), true,
+                "agent 生成未开启", InterruptedBatchPolicy.SUPERSEDE);
         verifyNoInteractions(sidecar);
     }
 

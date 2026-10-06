@@ -53,7 +53,7 @@ public record ParamSpec(List<ParamField> fields) {
                     || (raw instanceof List<?> l && l.isEmpty());
             if (blank) {
                 if (f.required() && f.defaultValue() == null) {
-                    errs.add(f.label() + "（" + f.name() + "）不能为空");
+                    errs.add(f.label() + "不能为空");
                 }
                 continue;
             }
@@ -61,33 +61,33 @@ public record ParamSpec(List<ParamField> fields) {
                 case INT -> {
                     Integer n = asInt(raw);
                     if (n == null) {
-                        errs.add(f.label() + "（" + f.name() + "）必须是整数");
+                        errs.add(f.label() + "必须是整数");
                     } else {
-                        if (f.min() != null && n < f.min()) errs.add(f.label() + " 不能小于 " + f.min());
-                        if (f.max() != null && n > f.max()) errs.add(f.label() + " 不能大于 " + f.max());
+                        if (f.min() != null && n < f.min()) errs.add(f.label() + "不能小于 " + f.min());
+                        if (f.max() != null && n > f.max()) errs.add(f.label() + "不能大于 " + f.max());
                     }
                 }
                 case BOOL -> {
                     if (!(raw instanceof Boolean) && !"true".equalsIgnoreCase(String.valueOf(raw))
                             && !"false".equalsIgnoreCase(String.valueOf(raw))) {
-                        errs.add(f.label() + "（" + f.name() + "）必须是 true / false");
+                        errs.add(f.label() + "只能是开或关");
                     }
                 }
                 case ENUM -> {
                     List<String> opts = f.options() == null ? List.of() : f.options();
                     if (!opts.contains(String.valueOf(raw))) {
-                        errs.add(f.label() + "（" + f.name() + "）只能是 " + String.join(" / ", opts));
+                        errs.add(f.label() + "只能是 " + String.join(" / ", opts));
                     }
                 }
                 case STRING_LIST -> {
                     if (!(raw instanceof List<?>)) {
-                        errs.add(f.label() + "（" + f.name() + "）必须是数组");
+                        errs.add(f.label() + "格式不对");
                     }
                 }
                 default -> {
                     String s = String.valueOf(raw);
                     if (f.pattern() != null && !s.matches(f.pattern())) {
-                        errs.add(f.label() + "（" + f.name() + "）格式不合法，需匹配 " + f.pattern());
+                        errs.add(f.label() + "格式不对");
                     }
                 }
             }
@@ -95,7 +95,7 @@ public record ParamSpec(List<ParamField> fields) {
         // 未声明的参数一律拒绝：悄悄忽略一个拼错的字段名，等于让客户以为自己配上了。
         for (String k : v.keySet()) {
             if (field(k) == null) {
-                errs.add("未知参数 " + k + "（该连接器类型不接受这个参数）");
+                errs.add("不支持的参数：" + k);
             }
         }
         return errs;

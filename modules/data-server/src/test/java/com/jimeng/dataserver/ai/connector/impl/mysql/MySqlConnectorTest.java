@@ -302,6 +302,55 @@ class MySqlConnectorTest {
         }
     }
 
+    // ================================================================ 给人看的文案
+
+    /**
+     * 这些字符串原样显示在「数据连接」的新建/编辑表单上，读的是企业超管。
+     * 产品要求：一眼知道这一栏是干什么的，不要一大段——所以这里钉住长度，并且不许出现开发术语。
+     */
+    @Nested
+    @DisplayName("表单文案：一句话、没有开发术语")
+    class UserFacingText {
+
+        private final List<String> devTerms = List.of("TCP", "GRANT", "config_json", "JDBC", "★");
+
+        @Test
+        void 类型显示名() {
+            assertEquals("MySQL（兼容 Doris、StarRocks）", connector.displayName());
+        }
+
+        @Test
+        void 字段名与提示都很短且不含开发术语() {
+            for (var f : connector.paramSpec().fields()) {
+                assertTrue(f.label().length() <= 12, f.name() + " 的字段名太长：" + f.label());
+                if (f.help() != null) {
+                    assertTrue(f.help().length() <= 30, f.name() + " 的提示太长：" + f.help());
+                    for (String term : devTerms) {
+                        assertFalse(f.help().contains(term), f.name() + " 的提示里有开发术语 " + term + "：" + f.help());
+                    }
+                }
+            }
+        }
+
+        @Test
+        void 参数校验报错不带字段英文名与正则() {
+            Map<String, Object> p = new LinkedHashMap<>(baseParams());
+            p.put("password", "x");
+            p.put("host", "bad host!");
+            p.put("port", 70000);
+            p.put("hostt", "typo");
+
+            List<String> errs = connector.paramSpec().validate(p);
+
+            assertTrue(errs.size() >= 3, errs.toString());
+            for (String e : errs) {
+                assertFalse(e.contains("^"), "不把正则甩给超管：" + e);
+                assertFalse(e.contains("（host）") || e.contains("（port）"), "不带字段英文名：" + e);
+            }
+            assertTrue(errs.contains("主机地址格式不对"), errs.toString());
+        }
+    }
+
     // ================================================================ 参数定义
 
     @Nested

@@ -620,14 +620,14 @@ public class SemanticJoinValidator {
                         && c.getToObject() != null && c.getToColumn() != null)
                 .toList();
         if (input.isEmpty()) {
-            return done(OUT_NOTHING_TO_DO, "没有待验证的表关系。", List.of(), new RunState());
+            return done(OUT_NOTHING_TO_DO, "没有需要核对的表关系", List.of(), new RunState());
         }
         Map<String, Map<String, FieldDetail>> snap = snapshot == null ? Map.of() : snapshot;
 
         if (!enabled) {
             // 开关只管「去不去碰客户的库」。结构判定不碰库，照样给。
             return blocked(input, OUT_DISABLED,
-                    "采样验证已被配置关闭（connector.semantic.join-probe-enabled=false），本次没有做任何验证。",
+                    "表关系核对功能已关闭，请联系平台管理员",
                     "采样验证未启用，本条未经数据验证", snap, uniqueKeysByObject);
         }
 
@@ -636,7 +636,7 @@ public class SemanticJoinValidator {
             log.error("采样验证跑在没有租户上下文的线程上 connectorId={}（后台任务漏了 TenantContext.set？）",
                     connectorId);
             return blocked(input, OUT_ABORTED,
-                    "当前线程没有租户上下文，无法访问客户系统，本次没有做任何验证。",
+                    "暂时无法核对表关系，请稍后重试",
                     "缺少租户上下文，本条未经数据验证", null, null);
         }
 
@@ -645,7 +645,7 @@ public class SemanticJoinValidator {
             // 与网关同一条取舍：「不存在」与「不属于你」对外同形。连这条连接是谁的都没确认，结构判定也不给。
             log.warn("采样验证找不到连接，或它不属于当前租户 connectorId={}", connectorId);
             return blocked(input, OUT_ABORTED,
-                    "连接不存在，或它不属于当前租户，本次没有做任何验证。",
+                    "连接不存在，表关系暂未核对",
                     "连接不可用，本条未经数据验证", null, null);
         }
 
@@ -654,10 +654,7 @@ public class SemanticJoinValidator {
         if (!tier.allowsDerivedStats()) {
             // 第 1 档允许的正是「表名、列名、索引」——结构判定恰好只用这些，所以照样给。
             return blocked(input, OUT_TIER_BLOCKED,
-                    "这条连接的数据出库档位是「" + tier.label() + "」，未启用派生统计。"
-                            + "包含率、基数、distinct 数都属于派生统计，所以本次【没有】做任何采样验证——"
-                            + "这不代表这些表关系有问题，只代表没人验过它们。"
-                            + "需要验证请由企业超管把档位调到「" + SemanticDataTier.DERIVED_STATS.label() + "」。",
+                    "表关系暂未核对，需把数据出库档位调到「" + SemanticDataTier.DERIVED_STATS.label() + "」",
                     "未启用派生统计（" + tier.label() + "），本条未做采样验证", snap, uniqueKeysByObject);
         }
 
@@ -731,7 +728,7 @@ public class SemanticJoinValidator {
         }
 
         if (abortNote != null) {
-            return done(OUT_ABORTED, "采样验证中途停止：" + abortNote + "。已经得出的结论仍然有效。", out, run);
+            return done(OUT_ABORTED, "表关系核对中途停止，已得出的结论仍有效", out, run);
         }
         return done(OUT_RAN, "已对 " + decidedByKey.size() + " 条表关系做采样验证，共 "
                 + run.probeCount + " 次探查。", out, run);

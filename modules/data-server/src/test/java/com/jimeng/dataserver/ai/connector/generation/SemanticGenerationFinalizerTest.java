@@ -167,7 +167,7 @@ class SemanticGenerationFinalizerTest {
         ArgumentCaptor<SemanticCoverage.Verdict> coverage =
                 ArgumentCaptor.forClass(SemanticCoverage.Verdict.class);
         verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
-                org.mockito.ArgumentMatchers.contains("放弃 1 张"), org.mockito.ArgumentMatchers.eq(true),
+                org.mockito.ArgumentMatchers.contains("另有 1 张未能生成"), org.mockito.ArgumentMatchers.eq(true),
                 coverage.capture());
         assertTrue(coverage.getValue().partial());
         assertEquals("TABLES_MISSING,TABLES_GAVE_UP", coverage.getValue().gapCodes());
@@ -266,7 +266,7 @@ class SemanticGenerationFinalizerTest {
         order.verify(stagedMapper).physicalDeleteByGeneration("tenant-a", 10L);
         order.verify(generationMapper).update(any(), any()); // READY
         verify(claim).release(any(), org.mockito.ArgumentMatchers.eq("READY"),
-                org.mockito.ArgumentMatchers.contains("上一版机器生成的说明已替换"),
+                org.mockito.ArgumentMatchers.contains("张表：表说明"),
                 org.mockito.ArgumentMatchers.eq(true),
                 org.mockito.ArgumentMatchers.argThat(v -> v != null && !v.partial()));
         verify(semanticService, org.mockito.Mockito.times(2)).requireOwned(20L);

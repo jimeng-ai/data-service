@@ -520,7 +520,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         ConnectorProperties.Semantic cfg = properties.getSemantic();
         if (!cfg.isEnabled()) {
             // 不标 FAILED：开关关着不是失败。但也不能什么都不写——「点了没反应」是最难查的一类。
-            String note = withNotePrefix(notePrefix, "语义层推导已关闭（connector.semantic.enabled=false）");
+            String note = withNotePrefix(notePrefix, "语义层功能已关闭，请联系平台管理员");
             log.info("跳过语义层推导，开关已关 connectorId={}", connectorId);
             writeStatus(connectorId, null, note, false, null);
             return DeriveResult.builder().ok(false).note(note).build();
@@ -537,7 +537,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         if (claimAt == null) {
             // 建连自动推 + 有人同时点「重新生成」是真会发生的。两次并发推导会让 semantic_status
             // 和库里的行各走各的：后完成的那次覆盖状态，先完成的那次的行留在库里，从此对不上。
-            String note = withNotePrefix(notePrefix, "同一条连接上已有一次推导在进行中，本次跳过");
+            String note = withNotePrefix(notePrefix, "已有生成在进行，请稍后再试");
             log.info("语义层推导被跳过：认领不到 connectorId={}", connectorId);
             return DeriveResult.builder().ok(false).note(note).build();
         }
@@ -555,14 +555,15 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             if (rows.isEmpty() && mayBootstrapSnapshot) {
                 boot = bootstrapSnapshot(connectorId);
                 if (!boot.applicable()) {
-                    String note = withNotePrefix(notePrefix, "该连接器不提供结构自描述，语义层不适用"
+                    String note = withNotePrefix(notePrefix, "这种连接不适用语义层"
                             + (boot.failure() == null ? "" : "（" + boot.failure() + "）"));
                     writeStatus(connectorId, SEM_NOT_APPLICABLE, note, true, claimAt);
                     return DeriveResult.builder().ok(false).note(note).build();
                 }
-                notes.add(boot.failure() == null
-                        ? "结构快照原本是空的，已自动拉取一次结构后再推导"
-                        : "结构快照原本是空的，自动拉取结构没成功：" + boot.failure());
+                // 补拉成功是内部过程，不往说明里写；没成功才让超管知道。
+                if (boot.failure() != null) {
+                    notes.add("自动读取表结构没成功：" + boot.failure());
+                }
                 sourceTotal = boot.totalObjects();
                 // 补拉只做一次。补完还是空的，才是真的失败。
                 rows = schemaService.currentRows(connectorId);
@@ -572,13 +573,11 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                 // 混成一句话，人就只能挨个去猜下一步该做什么。
                 String note;
                 if (boot == null) {
-                    note = "结构快照为空，请先在管理台「刷新结构」，再生成语义层";
+                    note = "还没有表结构，请先点「刷新结构」";
                 } else if (boot.failure() != null) {
-                    note = "结构快照为空，自动拉取结构也没成功：" + boot.failure()
-                            + "。请在管理台点「刷新结构」重试";
+                    note = "读取表结构失败：" + boot.failure() + "。请点「刷新结构」重试";
                 } else {
-                    note = "已自动拉取一次结构，但这个只读账号看不到任何对象，没有结构就没法生成语义层。"
-                            + "请确认账号的授权范围后，在管理台点「刷新结构」重试";
+                    note = "账号看不到任何表，请检查授权后点「刷新结构」";
                 }
                 note = withNotePrefix(notePrefix, note);
                 writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
@@ -608,7 +607,13 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             Map<String, Map<String, FieldDetail>> fieldsByObject = parseFields(rows);
             Digest digest = buildDigest(rows, fieldsByObject, cfg.getMaxDigestChars(), beyond, beyondIsLowerBound);
             gaps.addAll(digest.notes());
-            notes.addAll(gaps);
+            // gaps 是写给模型的「这份材料缺了什么」；管理台上只用一句话说有几张表没写到，
+            // 覆盖了几张由 summarize 里「覆盖 N/M 张表」那组数字说清。
+            if (digest.includedObjects() < digest.totalObjects()) {
+                notes.add(digest.totalIsLowerBound()
+                        ? "库里还有更多表没有说明"
+                        : "其余 " + (digest.totalObjects() - digest.includedObjects()) + " 张表没有说明");
+            }
 
             // ★ S1 在模型之前、且在同一个方法里同步跑，理由见 readCorpusJoins 的 javadoc。
             List<ConnectorSemantic> corpusJoins = readCorpusJoins(connectorId, fieldsByObject, notes);
@@ -641,7 +646,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             String nowStamp = snapshotStamp(schemaService.currentRows(connectorId));
             if (!stamp.equals(nowStamp)) {
                 String note = withNotePrefix(notePrefix,
-                        "结构在推导期间已刷新，本批产出锚的是旧结构，已整批作废，请重新生成");
+                        "生成期间表结构变了，本次结果作废，请点「重新生成」");
                 log.warn("语义层推导期间结构被刷新，本批作废 connectorId={} 开始={} 现在={}",
                         connectorId, stamp, nowStamp);
                 writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
@@ -688,7 +693,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             // 这里必须吞掉一切。推导是建连之后顺手做的事，让它把建连整个搞失败是本末倒置。
             String reason = describe(e);
             log.error("语义层推导失败 connectorId={}: {}", connectorId, reason, e);
-            String note = withNotePrefix(notePrefix, "推导失败：" + reason);
+            String note = withNotePrefix(notePrefix, "生成失败：" + reason);
             writeStatus(connectorId, SEM_FAILED, note, true, claimAt);
             return DeriveResult.builder().ok(false).note(note).build();
         }
@@ -813,7 +818,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             try {
                 Connection c = connectionMapper.selectById(connectorId);
                 writeStageNote(connectorId, notePrefix(c == null ? null : c.getSemanticNote()),
-                        "新增表的说明书没有派发出去（后台队列已满），下一次刷新结构时会自动补写");
+                        "新增表的说明暂未补写，下次刷新结构时会自动补上");
             } catch (Exception ignore) {
                 // note 写不进去只剩日志，不能让它反过来把一次成功的刷新变成失败。
             }
@@ -1186,7 +1191,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
     AddedOutcome deriveAdded(Long connectorId, Set<String> requested, Set<String> rewritable) {
         ConnectorProperties.Semantic cfg = properties.getSemantic();
         if (!cfg.isEnabled()) {
-            return AddedOutcome.skipped("语义层推导已关闭（connector.semantic.enabled=false）");
+            return AddedOutcome.skipped("语义层功能已关闭，请联系平台管理员");
         }
         Connection conn;
         try {
@@ -1210,7 +1215,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         // 「正在……」盖掉了，接在后面只会误导，换成一句说清发生了什么的话。
         boolean takeover = SEM_RUNNING.equals(conn.getSemanticStatus());
         String prevPrefix = takeover
-                ? "上一次推导停在「进行中」超过 " + CLAIM_STALE_MINUTES + " 分钟没有结束（多半是被发版打断），本次已接管"
+                ? "上次生成中断，本次已接管"
                 : notePrefix(conn.getSemanticNote());
         Date claimAt = claimAdded(connectorId, requested.size());
         if (claimAt == null) {
@@ -1247,7 +1252,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                     .toList();
             if (targets.isEmpty()) {
                 String note = restoreReady(connectorId, prevPrefix,
-                        "待补写的 " + requested.size() + " 张表在推导前已不在结构快照里，没有需要补写的", false, claimAt);
+                        "待补写的 " + requested.size() + " 张表已不存在，无需补写", false, claimAt);
                 restored = true;
                 return AddedOutcome.skipped(note);
             }
@@ -1275,7 +1280,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             AddedContext ctx = buildAddedContext(rows, fieldsByObject, allTargets,
                     Math.max(0, cfg.getMaxDigestChars() - digest.text().length()));
 
-            List<String> notes = new ArrayList<>(digest.notes());
+            List<String> notes = new ArrayList<>();
             String content = SemanticPrompts.deriveAddedUser(conn.getName(), conn.getKind(),
                     digest.includedObjects(), targets.size(), digest.notes(), digest.text(),
                     ctx.text(), ctx.complete());
@@ -1303,7 +1308,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
 
             if (!structure.equals(ConnectorSemanticService.structureStamp(parseFields(schemaService.currentRows(connectorId))))) {
                 String note = restoreReady(connectorId, prevPrefix,
-                        "补写说明书期间结构又变了，本批作废并用新结构重推", false, claimAt);
+                        "补写期间表结构又变了，将重新补写", false, claimAt);
                 restored = true;
                 log.warn("语义层增量推导期间结构变化，本批重新入队 connectorId={}", connectorId);
                 return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), true, sent);
@@ -1338,13 +1343,13 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             String reason = describe(e);
             log.error("语义层增量推导失败 connectorId={}: {}", connectorId, reason, e);
             // 说明书本身没坏（一行没删），状态回到 READY；失败写在 note 里，synced_at 不盖。
-            String note = restoreReady(connectorId, prevPrefix, "补写说明书失败：" + reason, false, claimAt);
+            String note = restoreReady(connectorId, prevPrefix, "补写失败：" + reason, false, claimAt);
             restored = true;
             return new AddedOutcome(DeriveResult.builder().ok(false).note(note).build(), false, sent);
         } finally {
             if (!restored) {
                 // 只有 catch 接不住的 Error 会走到这里。说明书一行没删（upsert 是一个事务），回到 READY 是实话。
-                restoreReady(connectorId, prevPrefix, "补写说明书被意外中断，状态已恢复", false, claimAt);
+                restoreReady(connectorId, prevPrefix, "补写被意外中断，已恢复", false, claimAt);
             }
         }
     }
@@ -1505,29 +1510,15 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         if (uncovered == 0) {
             b.append("新增 ").append(total).append(" 张表");
         } else if (added <= 0) {
-            b.append("此前没有说明书的 ").append(total).append(" 张表");
+            b.append("此前没有说明的 ").append(total).append(" 张表");
         } else {
-            b.append("新增 ").append(added).append(" 张、此前没有说明书的 ").append(uncovered).append(" 张表");
+            b.append("新增 ").append(added).append(" 张、此前没有说明的 ").append(uncovered).append(" 张表");
         }
         if (included < total) {
-            b.append("（本次覆盖 ").append(included).append(" 张，其余超出摘要上限，接着补）");
+            b.append("（本次覆盖 ").append(included).append(" 张，其余稍后补）");
         }
-        b.append("已补写说明书：表用途 ").append(c[0]).append("、字段含义 ").append(c[1])
-                .append("、关系 ").append(c[2]).append("（均未经数据验证）、待确认口径 ").append(c[3])
-                .append("；插入 ").append(w.inserted()).append(" 行、原地更新 ").append(w.updated()).append(" 行");
-        if (w.skippedNotInferred() > 0) {
-            b.append("、人工确认的 ").append(w.skippedNotInferred()).append(" 条未改动");
-        }
-        if (w.keptExisting() > 0) {
-            b.append("、已有表上的 ").append(w.keptExisting()).append(" 条保持原样");
-        }
-        if (w.conflicts() > 0) {
-            b.append("、撞键跳过 ").append(w.conflicts()).append(" 条");
-        }
-        if (st.getDroppedGuess() > 0 || st.getDroppedUnknown() > 0 || outOfScope > 0) {
-            b.append("；已丢弃：无外部依据 ").append(st.getDroppedGuess()).append("、名字对不上结构 ")
-                    .append(st.getDroppedUnknown()).append("、超出本次范围 ").append(outOfScope);
-        }
+        b.append("，已补写：表说明 ").append(c[0]).append("、字段 ").append(c[1])
+                .append("、关系 ").append(c[2]).append("（未经数据核对）");
         for (String n : notes) {
             b.append("；").append(n);
         }
@@ -1658,8 +1649,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         if (joins.isEmpty()) {
             // 「看了 N 个视图、一条关系都没挖到」和「压根没去看」是两件事，note 要分得开。
             if (r.getViewsSeen() > 0 || r.getRoutinesSeen() > 0) {
-                notes.add("客户自己写的视图/存储过程共 " + (r.getViewsSeen() + r.getRoutinesSeen())
-                        + " 个，没有解析出可用的等值关系");
+                notes.add("视图和存储过程里没有读出表关系");
             }
             return List.of();
         }
@@ -1703,10 +1693,10 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
 
         // 「挖到 N 条」这一个数字会把三种完全不同的情况混在一起，所以把对不上的那一档单独说出来：
         // unmatched 偏高通常不是解析坏了，而是这些表压根没进过快照（快照自己按字母序截到 200）。
-        StringBuilder note = new StringBuilder("从客户自己写的视图/存储过程里挖到 ")
-                .append(out.size()).append(" 条表关系（均未经数据验证）");
+        StringBuilder note = new StringBuilder("从视图和存储过程读到 ")
+                .append(out.size()).append(" 条表关系（未经数据核对）");
         if (unmatched > 0) {
-            note.append("，另有 ").append(unmatched).append(" 条引用的表或列不在结构快照里，已丢弃");
+            note.append("，另有 ").append(unmatched).append(" 条对不上已丢弃");
         }
         notes.add(note.toString());
         log.info("既有 SQL 语料挖掘完成 connectorId={} 视图 {}/{} 存储过程 {}/{} 关系 {} 对不上快照 {} "
@@ -1930,10 +1920,9 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                 throw first;
             }
             Map<String, Object> m = readMap(repaired);
-            // 这句话一个字都别改：前端和运维都在读它。截断的【结构化】信号另走
-            // Parsed.modelOutputTruncated → SemanticCoverage，不是从这段散文里反解出来的。
-            notes.add("模型输出疑似被 max_tokens 截断，已截到最后一个完整条目，"
-                    + "说明书不完整（可调大 connector.semantic.max-tokens）");
+            // 这句话是给超管看的一句人话（产品要求短、不带配置项名），没有任何代码按它的字面匹配。
+            // 截断的【结构化】信号另走 Parsed.modelOutputTruncated → SemanticCoverage，不是从这段散文里反解出来的。
+            notes.add("内容太长被截断，有些表没写到，请联系平台管理员");
             log.warn("语义层推导的模型输出被截断，已修复后解析：原长 {} 字符，修复后 {} 字符",
                     s.length(), repaired.length());
             return new Parsed(m, true);
@@ -2174,8 +2163,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                                       List<ConnectorSemantic> corpusJoins,
                                       List<ConnectorSemantic> existing, AssemblyReport st) {
         if (!hasAnyExpectedKey(parsed)) {
-            return "模型返回里 objects / fields / joins / ambiguities 一个键都没有，"
-                    + "本次不替换，上一版说明书原样保留";
+            return "生成结果为空，已保留上一版";
         }
         // ★ 这道闸看的必须是【模型】有没有产出，不是 fresh 空不空。
         //   S1 接进来之后，一次「模型返回了正确形状但四个数组全空」的失败也会带着几十条语料关系走到这里，
@@ -2200,10 +2188,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         if (!hadInferred) {
             return null;
         }
-        return "本次模型一条语义都没能留下（无外部依据 " + st.getDroppedGuess() + "、名字对不上结构 "
-                + st.getDroppedUnknown() + "、超长 " + st.getDroppedTooLong() + "）"
-                + (corpusJoins.isEmpty() ? "" : "，客户 SQL 语料里的 " + corpusJoins.size() + " 条关系也一并作废")
-                + "，为免抹掉上一版说明书，本次不替换";
+        return "没有生成出可用内容，已保留上一版";
     }
 
     private static boolean hasAnyExpectedKey(Map<String, Object> parsed) {
@@ -2224,20 +2209,10 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         // 总数是估出来的下界时写成 ">200"，不写成一个假的确数：这一行是给人读的，
         // 「覆盖 200/200」会被读成全覆盖，而事实是「至少还有一批表根本没进过快照」。
         String total = d.totalIsLowerBound() ? ">" + (d.totalObjects() - 1) : String.valueOf(d.totalObjects());
-        b.append("覆盖 ").append(d.includedObjects()).append('/').append(total).append(" 个对象：")
-                .append("表用途 ").append(st.getObjects())
-                .append("、字段含义 ").append(st.getFields())
-                .append("、关系 ").append(st.getJoins()).append("（均未经数据验证）")
-                .append("、待确认口径 ").append(st.getCaveats()).append(" 条。");
-        if (st.getDroppedGuess() > 0 || st.getDroppedUnknown() > 0 || st.getDroppedDup() > 0 || st.getDroppedTooLong() > 0) {
-            b.append("已丢弃：无外部依据 ").append(st.getDroppedGuess())
-                    .append("、名字对不上结构 ").append(st.getDroppedUnknown())
-                    .append("、重复 ").append(st.getDroppedDup())
-                    .append("、超长 ").append(st.getDroppedTooLong()).append(" 条。");
-        }
-        if (st.getDroppedAnswered() > 0) {
-            b.append("另有 ").append(st.getDroppedAnswered()).append(" 条口径人已经答过，不再重复提问。");
-        }
+        b.append("覆盖 ").append(d.includedObjects()).append('/').append(total).append(" 张表：")
+                .append("表说明 ").append(st.getObjects())
+                .append("、字段 ").append(st.getFields())
+                .append("、关系 ").append(st.getJoins()).append("（未经数据核对）。");
         for (String n : notes) {
             b.append(n).append("。");
         }
@@ -2306,8 +2281,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             // 「说明书生成了但没人去验」和「验过了，全都成立」在库里长得一模一样。
             log.warn("语义层采样验证阶段派发失败 connectorId={}: {}", connectorId, describe(e));
             writeStageNote(connectorId, notePrefix(deriveNote),
-                    "采样验证没有派发出去（后台队列已满），表关系仍全部是未经数据验证；"
-                            + "可在管理台点「验证表关系」重试");
+                    "表关系暂未核对，请稍后点「重新生成」重试");
         }
     }
 
@@ -2417,7 +2391,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             if (rows == null || rows.isEmpty()) {
                 // 这一步<b>不补拉</b>：补拉是推导的事（它要拿结构去喂模型）。
                 // 在一个「顺手做的增强」里偷偷加 200 次打客户库的 describe，是把成本藏起来。
-                String note = "结构快照为空，没有可验证的表关系。请先在管理台「刷新结构」并重新生成语义层";
+                String note = "还没有表结构，请先点「刷新结构」";
                 writeStageNote(connectorId, prefix, note);
                 return ValidationResult.builder().ok(false).note(note).build();
             }
@@ -2428,7 +2402,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
 
             List<ConnectorSemantic> all = existingRows(connectorId);
             if (all == null) {
-                String note = "读取语义层失败，本轮采样验证没有开始";
+                String note = "读取说明失败，表关系暂未核对";
                 writeStageNote(connectorId, prefix, note);
                 return ValidationResult.builder().ok(false).note(note).build();
             }
@@ -2446,7 +2420,8 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                     ? new ValueStage(0, 0, 0, 0, "本批表已不在结构快照里，未采集列取值")
                     : runValueStage(connectorId, conn, scopedRows, all, fieldsByObject);
 
-            String note = js.note() + "；" + ss.note() + "；" + vs.note();
+            // 管理台只说表关系核对的结果：表形态测量、列取值采集是平台内部的补充步骤，数字留在日志与审计里。
+            String note = js.note();
             writeStageNote(connectorId, prefix, note);
             log.info("语义层采样验证完成 connectorId={} 用时 {}ms 范围={}；关系：候选 {} 成立 {} 部分成立 {} "
                             + "不成立 {} 判不出 {} 未探查 {} 已落库 {} 探查次数 {} 结构补标 {}；"
@@ -2481,8 +2456,8 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         } catch (Exception e) {
             String reason = describe(e);
             log.error("语义层采样验证阶段失败 connectorId={}: {}", connectorId, reason, e);
-            writeStageNote(connectorId, null, "采样验证失败：" + reason);
-            return ValidationResult.builder().ok(false).note("采样验证失败：" + reason).build();
+            writeStageNote(connectorId, null, "表关系核对失败：" + reason);
+            return ValidationResult.builder().ok(false).note("表关系核对失败：" + reason).build();
         } finally {
             // 顺序要紧：先放闸再取补跑名单。反过来的话，两步之间进来的那次派发既没被记下、又被闸挡回。
             validating.remove(connectorId);
@@ -2537,15 +2512,11 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
         List<SemanticJoinValidator.JoinCandidate> candidates = new ArrayList<>();
         JoinCounters c = new JoinCounters();
         int alreadyDecided = 0;
-        int human = 0;
-        int unusable = 0;
-        int reprobe = 0;
         for (ConnectorSemantic r : all) {
             if (!ConnectorSemanticService.SCOPE_JOIN.equals(r.getScope())) {
                 continue;
             }
             if (ConnectorSemanticService.SOURCE_HUMAN.equals(r.getSource())) {
-                human++;
                 continue;
             }
             String[] to = joinTarget(r);
@@ -2574,24 +2545,18 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
                 continue;
             }
             if (!usable) {
-                unusable++;
                 continue;
             }
             String key = joinKey(r.getObjectName(), r.getFieldName(), to[0], to[1]);
             if (pending.putIfAbsent(key, r) != null) {
                 continue;
             }
-            if (reprobeRow) {
-                reprobe++;
-            }
             candidates.add(SemanticJoinValidator.JoinCandidate.of(
                     r.getObjectName(), r.getFieldName(), to[0], to[1]));
         }
 
         if (candidates.isEmpty()) {
-            String note = (alreadyDecided > 0
-                    ? "表关系此前已全部验证过（" + alreadyDecided + " 条），本轮没有新候选"
-                    : "没有待验证的表关系") + structureNote(c);
+            String note = alreadyDecided > 0 ? "表关系都已核对过" : "没有需要核对的表关系";
             return new JoinStage(SemanticJoinValidator.OUT_NOTHING_TO_DO, 0, 0, 0, 0, 0, 0, 0, 0,
                     c.structureMarked, note);
         }
@@ -2610,12 +2575,12 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             log.warn("表关系采样验证抛了异常（契约上不该） connectorId={}: {}", connectorId, reason);
             return new JoinStage(SemanticJoinValidator.OUT_ABORTED, candidates.size(),
                     c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0, c.structureMarked,
-                    "表关系采样验证失败：" + reason + structureNote(c));
+                    "表关系核对失败：" + reason);
         }
         if (res == null) {
             return new JoinStage(SemanticJoinValidator.OUT_ABORTED, candidates.size(),
                     c.confirmed, c.weak, c.rejected, c.undecidable, c.notProbed, c.written, 0, c.structureMarked,
-                    "表关系采样验证没有返回结果" + structureNote(c));
+                    "表关系核对没有结果");
         }
 
         // ★ 没探查的结论只落结构形态，而且要扫返回的全集：TIER_BLOCKED / DISABLED 整批一次都不回调，
@@ -2630,34 +2595,19 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
 
         StringBuilder note = new StringBuilder();
         if (res.ran()) {
-            note.append("表关系验证 ").append(candidates.size()).append(" 条：成立 ").append(c.confirmed)
+            note.append("表关系核对 ").append(candidates.size()).append(" 条：成立 ").append(c.confirmed)
                     .append("、部分成立 ").append(c.weak)
                     .append("、不成立 ").append(c.rejected)
                     .append("、判不出 ").append(c.undecidable);
             if (c.notProbed > 0) {
-                // ★ 「没探查」和「探查了判不出来」是两句不同的话，绝不能并成一个数字。
-                note.append("、未探查 ").append(c.notProbed);
+                // ★ 「没核对」和「核对了判不出来」是两句不同的话，绝不能并成一个数字。
+                note.append("、未核对 ").append(c.notProbed);
             }
-            note.append("（探查 ").append(res.getProbeCount()).append(" 次）");
         } else {
             // 没跑起来时，验证器自己那句话比我们能拼出来的任何一句都准确
             //（档位不够 / 开关关了 / 被中止 / 没有候选各是一句不同的话）。
-            note.append(blank(res.getNote()) ? "表关系没有做采样验证" : res.getNote());
+            note.append(blank(res.getNote()) ? "表关系暂未核对" : res.getNote());
         }
-        if (reprobe > 0) {
-            note.append("；其中 ").append(reprobe)
-                    .append(" 条多态外键此前是在读不到取值的档位下验的，现在档位允许读取值，本轮重新探查判别值");
-        }
-        if (alreadyDecided > 0) {
-            note.append("；另有 ").append(alreadyDecided).append(" 条此前已验证过，本轮跳过");
-        }
-        if (human > 0) {
-            note.append("；").append(human).append(" 条人工确认的关系不参与验证");
-        }
-        if (unusable > 0) {
-            note.append("；").append(unusable).append(" 条关系缺少目标表列，无法验证");
-        }
-        note.append(structureNote(c));
         return new JoinStage(res.getOutcome(), candidates.size(), c.confirmed, c.weak, c.rejected,
                 c.undecidable, c.notProbed, c.written, res.getProbeCount(), c.structureMarked, note.toString());
     }
@@ -3187,27 +3137,6 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             c.sampleValues = allowed;
         }
         return c.sampleValues;
-    }
-
-    /**
-     * 结构补标那半句。「暂缓」必须说出来：目标表唯一键一直读不到时，这些关系会一直按普通关系进 joins，
-     * 不说的话它和「补过了、都是普通关系」长得一模一样。
-     */
-    private static String structureNote(JoinCounters c) {
-        StringBuilder b = new StringBuilder();
-        if (c.structureMarked > 0) {
-            b.append("；为 ").append(c.structureMarked)
-                    .append(" 条关系补标了结构形态（多态外键 / 组合键 / 普通关联，只读结构快照，没有访问客户库）");
-            if (c.structureReset > 0) {
-                b.append("，其中 ").append(c.structureReset)
-                        .append(" 条原有的采样结论与结构矛盾，已打回未验证、按结构重验");
-            }
-        }
-        if (c.structurePending > 0) {
-            b.append("；").append(c.structurePending)
-                    .append(" 条关系的目标表还没有唯一键信息，结构形态暂缓到下一次「刷新结构」之后再判");
-        }
-        return b.toString();
     }
 
     /**
@@ -3847,7 +3776,7 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
             return;
         }
         c.lastNoteAt = now;
-        writeStageNote(connectorId, prefix, "正在验证表关系 " + decided + "/" + total + "……");
+        writeStageNote(connectorId, prefix, "正在核对表关系 " + decided + "/" + total + "……");
     }
 
     private static void appendIfPresent(StringBuilder b, Object v) {

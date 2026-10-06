@@ -273,26 +273,45 @@ class SemanticDataTierTest {
          * 这条用例把「不照搬那种叙事」变成一个会红的断言：谁把这句话改软了，测试立刻拦下。
          */
         @Test
-        void 第3档必须明说索引的是真实取值() {
+        void 第3档必须明说带走的是真实取值() {
             String s = SemanticDataTier.SAMPLE_VALUES.egressStatement();
             assertTrue(s.contains("真实取值"),
                     "第 3 档的出库说明必须出现「真实取值」四个字，不许回避：" + s);
-            assertTrue(s.contains("默认关闭"), "必须说清这一档默认是关的");
+            assertTrue(s.contains("不能保证"), "过滤只是减损手段，不是保证，这一点要说出来：" + s);
         }
 
-        /** 第 2 档也不许说成「完全不碰数据」：min/max 本身就是两个真实数字。 */
+        /** 第 2 档也不许说成「完全不碰数据」：它带走的是统计结果，要把这个范围写在明面上。 */
         @Test
-        void 第2档要如实说明聚合结果也带信息() {
+        void 第2档要说明带走的是统计结果() {
             String s = SemanticDataTier.DERIVED_STATS.egressStatement();
-            assertTrue(s.contains("min/max"), "第 2 档要点名 min/max 这类会漏出真实数字的统计量：" + s);
-            assertTrue(s.contains("哈希"), "minhash sketch 是哈希值不是原始值，这一点要说清：" + s);
+            assertTrue(s.contains("统计结果"), "第 2 档带走的是统计结果，不是「什么都不带」：" + s);
+            assertTrue(s.contains("不带走逐行数据"), "逐行数据不出库这条承诺要说出来：" + s);
         }
 
-        /** 第 1 档不是免费的：仅凭名字推关系精确率约 0.49，这个代价要写在明面上。 */
+        /** 第 1 档：只有结构出库，不读任何数据。 */
         @Test
-        void 第1档要写清代价() {
-            assertTrue(SemanticDataTier.METADATA_ONLY.egressStatement().contains("0.49"),
-                    "选最严档的客户应当同时知道自己付的是什么");
+        void 第1档只有结构出库() {
+            String s = SemanticDataTier.METADATA_ONLY.egressStatement();
+            assertTrue(s.contains("不读任何数据"), s);
+        }
+
+        /**
+         * ★ 三句话与前端 presentation.tsx 里的 egress 逐字一致（前端对拍时以这里为准）。
+         * 界面优先显示后端给的这份，前端的兜底文案分叉了，客户在不同入口会读到两种承诺。
+         * 同时钉住「一句话」的长度：这几句要一眼读完，再往里塞限定语就是回到一大段。
+         */
+        @Test
+        void 三档出库说明逐字固定且是一句话() {
+            assertEquals("只有表名、列名、类型和注释会离开数据库，不读任何数据。",
+                    SemanticDataTier.METADATA_ONLY.egressStatement());
+            assertEquals("只带走统计结果（如去重数、空值率、最大最小值），不带走逐行数据。",
+                    SemanticDataTier.DERIVED_STATS.egressStatement());
+            assertEquals("会带走部分真实取值（如高频值）；个人信息会先过滤，但不能保证全部滤掉。",
+                    SemanticDataTier.SAMPLE_VALUES.egressStatement());
+            for (SemanticDataTier t : SemanticDataTier.values()) {
+                assertTrue(t.egressStatement().length() <= 40,
+                        t + " 的出库说明超过 40 字：" + t.egressStatement());
+            }
         }
     }
 }

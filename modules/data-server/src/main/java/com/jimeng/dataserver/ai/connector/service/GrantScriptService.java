@@ -42,7 +42,7 @@ public class GrantScriptService {
         // 而它没有被 GlobalExceptionHandler 认领，出网会变成一句「服务器内部错误」——
         // 类型选错是用户能自己修的事，必须如实告诉他。
         Connector connector = registry.find(kind).orElseThrow(() -> new ServiceException(
-                ExceptionCode.OPERATION_UNSUPPORTED, "不支持的连接器类型 " + kind + "，无法生成授权脚本"));
+                ExceptionCode.OPERATION_UNSUPPORTED, "不支持的连接类型：" + kind));
 
         GrantScript script;
         try {
@@ -59,7 +59,7 @@ public class GrantScriptService {
         // 顺手把「返回了空脚本」也归到这一档：给界面一个空代码框，比明说不提供更让人摸不着头脑。
         if (script == null || script.getSql() == null || script.getSql().isBlank()) {
             throw new ServiceException(ExceptionCode.OPERATION_UNSUPPORTED,
-                    connector.displayName() + " 暂不提供授权脚本，请按界面上的权限说明在对方系统里手工授权");
+                    connector.displayName() + " 暂不提供授权脚本，请手工授权");
         }
         return script;
     }

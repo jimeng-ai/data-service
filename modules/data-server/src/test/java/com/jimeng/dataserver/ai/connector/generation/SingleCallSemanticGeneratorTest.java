@@ -110,7 +110,8 @@ class SingleCallSemanticGeneratorTest {
         assertEquals("tenant-http", tenant.get());
         assertEquals("trace-http", traceId.get());
         assertEquals("semantic-fallback-7", connectionId.get());
-        assertEquals("降级原因：sandbox 未配置", prefix.get());
+        // 内部原因（sandbox 未配置）只留在请求里，说明前缀是一句固定的短话，不带原因、不带「降级」「sandbox」。
+        assertEquals("已用备用方式生成", prefix.get());
         assertEquals(GeneratorKind.SINGLE_CALL, ack.get().kind());
         assertTrue(ack.get().accepted());
         assertNull(ack.get().generationId());
@@ -222,7 +223,7 @@ class SingleCallSemanticGeneratorTest {
         assertEquals(GeneratorKind.SINGLE_CALL, ack.kind());
         assertFalse(ack.accepted());
         assertNull(ack.generationId());
-        assertTrue(ack.note().startsWith("单次推导提交失败："), ack.note());
+        assertEquals("提交失败，请稍后重试", ack.note());
         verify(deriveService, never()).deriveAsync(any(), any());
     }
 

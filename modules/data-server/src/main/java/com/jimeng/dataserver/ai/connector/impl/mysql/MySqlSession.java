@@ -496,13 +496,13 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
             } catch (SQLException e) {
                 // 关不掉就没法探。归 unknown 而不是 confirmed——「验不了」不是「验过了」。
                 log.warn("只读探针无法关闭连接的 readOnly 标志 connectorId={}", instance.id(), e);
-                return ReadOnlyVerdict.unknown("平台无法在这条连接上执行只读校验");
+                return ReadOnlyVerdict.unknown("无法执行只读校验");
             }
             try (Statement st = c.createStatement()) {
                 st.setQueryTimeout(10);
                 st.executeUpdate(probe);
                 // 竟然成功了：说明客户真有这张表，而且这个账号能写它。
-                return ReadOnlyVerdict.writable("账号可以执行 UPDATE 语句");
+                return ReadOnlyVerdict.writable("账号能修改数据");
             } finally {
                 // 连接要还回池里，必须恢复原状，否则后续查询拿到的是一条可写连接。
                 try {
@@ -516,17 +516,17 @@ public class MySqlSession implements ConnectorSession, QueryCapable, DescribeCap
             return switch (code) {
                 // 1142 ER_TABLEACCESS_DENIED_ERROR / 1044 ER_DBACCESS_DENIED_ERROR
                 case 1142, 1044 -> ReadOnlyVerdict.confirmed(
-                        "数据库在表/库级别拒绝了写操作（错误码 " + code + "）");
+                        "数据库已拒绝写操作（错误码 " + code + "）");
                 // 1290 ER_OPTION_PREVENTS_STATEMENT：整个服务端是 read_only 的（只读从库）
-                case 1290 -> ReadOnlyVerdict.confirmed("数据库实例处于只读模式（错误码 1290）");
+                case 1290 -> ReadOnlyVerdict.confirmed("数据库本身是只读的（错误码 1290）");
                 // 1146 ER_NO_SUCH_TABLE：权限检查过了，说明这个账号在该库上有写权限
                 case 1146 -> ReadOnlyVerdict.writable(
-                        "账号具备该库的写权限（写操作没有被权限拦下，只是探针表不存在）");
+                        "账号对该库有写权限");
                 default -> {
                     // 任何判不出来的情况都归 unknown，绝不归 confirmed。
                     log.warn("只读探针返回了未预期的错误码 connectorId={} errorCode={} sqlState={}",
                             instance.id(), code, e.getSQLState(), e);
-                    yield ReadOnlyVerdict.unknown("探测返回了无法判定的错误（错误码 " + code + "）");
+                    yield ReadOnlyVerdict.unknown("无法判定（错误码 " + code + "）");
                 }
             };
         }

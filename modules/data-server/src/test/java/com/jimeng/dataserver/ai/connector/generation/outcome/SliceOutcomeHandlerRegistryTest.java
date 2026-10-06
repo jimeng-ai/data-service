@@ -52,7 +52,7 @@ class SliceOutcomeHandlerRegistryTest {
                 first.sliceFailStreak(), first.noCallbackStreak(), 3);
         assertEquals(SliceOutcomeAction.FALLBACK, second.action());
         assertEquals(GenerationReasonCode.NO_CALLBACK, second.reasonCode());
-        assertEquals("降级原因：回调没有到达 data-service，请检查 callback-base-url 或 sandbox 版本。", second.note());
+        assertEquals("降级原因：生成服务没有回应，请联系平台管理员。", second.note());
     }
 
     @Test
@@ -89,7 +89,7 @@ class SliceOutcomeHandlerRegistryTest {
         SliceOutcomeDecision decision = decide(SliceOutcomeKind.SANDBOX_UNAVAILABLE, 0, 0, 0, 3);
         assertEquals(SliceOutcomeAction.FALLBACK, decision.action());
         assertEquals(GenerationReasonCode.SANDBOX_UNAVAILABLE, decision.reasonCode());
-        assertEquals("降级原因：sandbox 拒绝服务（未配置服务 token）。", decision.note());
+        assertEquals("降级原因：生成服务配置有误，请联系平台管理员。", decision.note());
     }
 
     @Test
@@ -103,7 +103,7 @@ class SliceOutcomeHandlerRegistryTest {
 
         SliceOutcomeDecision fallback = decide(SliceOutcomeKind.NO_PROGRESS, 0, 2, 0, 3);
         assertEquals(SliceOutcomeAction.FALLBACK, fallback.action());
-        assertTrue(fallback.note().contains("timeout"), fallback.note());
+        assertTrue(fallback.note().contains("多次尝试都没有进展"), fallback.note());
         assertEquals(GenerationReasonCode.NO_PROGRESS, fallback.reasonCode());
 
         SliceOutcomeDecision interrupt = decide(SliceOutcomeKind.NO_PROGRESS, 4, 2, 0, 3);
@@ -125,8 +125,8 @@ class SliceOutcomeHandlerRegistryTest {
     }
 
     @Test
-    @DisplayName("NO_PROGRESS 不把任意上游异常文本写进管理台说明")
-    void noProgress原因只接受技术码() {
+    @DisplayName("NO_PROGRESS 不把任何上游异常文本（含技术码）写进管理台说明")
+    void noProgress原因不带上游文本() {
         SliceRunResult unsafe = new SliceRunResult(SliceRunKind.ERROR, true, false, null, null,
                 "failed", "connection failed with sk-secret-value", null, 1, Set.of());
         SliceOutcomeDecision decision = registry.decide(new SliceOutcomeContext(
@@ -134,7 +134,8 @@ class SliceOutcomeHandlerRegistryTest {
 
         assertEquals(SliceOutcomeAction.FALLBACK, decision.action());
         assertFalse(decision.note().contains("sk-secret-value"), decision.note());
-        assertTrue(decision.note().contains("unknown"), decision.note());
+        assertFalse(decision.note().contains("unknown"), "技术码对超管没有意义：" + decision.note());
+        assertTrue(decision.note().contains("多次尝试都没有进展"), decision.note());
     }
 
     private SliceOutcomeDecision decide(SliceOutcomeKind kind, int doneTables,

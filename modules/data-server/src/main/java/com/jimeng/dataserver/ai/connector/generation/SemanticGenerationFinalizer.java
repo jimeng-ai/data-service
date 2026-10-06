@@ -178,7 +178,7 @@ public class SemanticGenerationFinalizer implements ApplicationEventPublisherAwa
 
     private void interruptForGaveUp(ConnectorSemanticGeneration generation, int gaveUp) {
         interruptOwned(generation, GenerationReasonCode.GAVE_UP_RATIO,
-                "新一轮有 " + gaveUp + " 张表没能生成，未替换，上一版原样保留；点「重新生成」只重试这些表");
+                "有 " + gaveUp + " 张表没生成成功");
     }
 
     private boolean enterFinalizing(ConnectorSemanticGeneration generation) {
@@ -253,12 +253,12 @@ public class SemanticGenerationFinalizer implements ApplicationEventPublisherAwa
             }
             if (outcome == PromoteOutcome.EMPTY_REPLACE) {
                 failOwned(generation, GenerationReasonCode.EMPTY_REPLACE,
-                        "新一轮没有产出任何可写入的行，未替换，上一版原样保留", true,
+                        "没有产出可用内容", true,
                         restoredStatus(generation));
                 return FinishResult.DONE;
             }
         }
-        interruptOwned(generation, GenerationReasonCode.SNAPSHOT_CHURN, "收尾时结构反复刷新，未替换");
+        interruptOwned(generation, GenerationReasonCode.SNAPSHOT_CHURN, "表结构反复变化");
         return FinishResult.DONE;
     }
 

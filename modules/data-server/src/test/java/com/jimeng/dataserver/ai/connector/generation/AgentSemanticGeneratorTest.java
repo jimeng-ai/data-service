@@ -167,7 +167,7 @@ class AgentSemanticGeneratorTest {
         GenerationAck ack = generator.submit(request(9L));
 
         assertFalse(ack.accepted());
-        assertEquals("agent 生成受理失败", ack.note());
+        assertEquals("提交失败，请稍后重试", ack.note());
         verify(transactionManager).rollback(transactionStatus);
         verify(kick, never()).kick();
         verify(connectionMapper, never()).update(any(), any());
@@ -207,7 +207,7 @@ class AgentSemanticGeneratorTest {
 
         assertFalse(ack.accepted());
         assertNull(ack.generationId());
-        assertEquals("同一条连接上已有一次推导在进行中，本次跳过", ack.note());
+        assertEquals("已有生成在进行，请稍后再试", ack.note());
         verify(generationMapper, never()).insert(any());
         verify(kick, never()).kick();
     }
@@ -286,7 +286,7 @@ class AgentSemanticGeneratorTest {
 
         GenerationAck ack = generator.submit(request(9L));
 
-        assertEquals("语义层生成已排队（agent，全平台串行执行），本租户前面还有 2 个", ack.note());
+        assertEquals("已排队，前面还有 2 个", ack.note());
         ArgumentCaptor<Connection> update = ArgumentCaptor.forClass(Connection.class);
         verify(connectionMapper).update(update.capture(), any());
         assertEquals(ack.note(), update.getValue().getSemanticNote());

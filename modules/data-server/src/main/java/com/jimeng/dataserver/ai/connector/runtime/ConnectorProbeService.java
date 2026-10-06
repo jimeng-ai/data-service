@@ -111,7 +111,7 @@ public class ConnectorProbeService {
                 verdict = ReadOnlyVerdict.unknown("只读校验未能完成：" + safe(e));
             }
             if (verdict == null) {
-                verdict = ReadOnlyVerdict.unknown("连接器没有返回只读校验结果");
+                verdict = ReadOnlyVerdict.unknown("没有拿到只读校验结果");
             }
 
             WritePolicy policy = inst.writePolicy();
@@ -119,11 +119,8 @@ public class ConnectorProbeService {
                 // 只读策略下，账号必须确认是只读的。两种不通过要分开说：
                 // 话术完全不同，客户要做的事也不同。
                 String reason = verdict.undetermined()
-                        ? "无法确认这个账号是只读的：" + verdict.detail()
-                          + "。为安全起见不予保存——请确认账号权限后重试，或换一个明确只授予查询权限的账号。"
-                        : "这个账号具备写权限：" + verdict.detail()
-                          + "。当前连接的写策略是「只读」，请改用只读账号（数据库侧只 GRANT SELECT），"
-                          + "或者在写策略里显式开放写操作。";
+                        ? "无法确认这个账号是只读的：" + verdict.detail() + "。请检查账号权限后重试。"
+                        : "这个账号有写权限，但写策略是「只读」。请换只读账号，或调整写策略。";
                 return new ProbeReport(false, reason, verdict, Set.of());
             }
             if (policy.allowsWrite() && verdict.acceptable()) {

@@ -266,7 +266,7 @@ public class SemanticSqlCorpusReader {
         if (!enabled) {
             CorpusResult off = new CorpusResult();
             off.ok = false;
-            off.note = "既有 SQL 语料挖掘已被配置关闭（connector.semantic.corpus.enabled=false）。";
+            off.note = "读取视图和存储过程的功能已关闭";
             return off;
         }
         Corpus corpus;
@@ -277,7 +277,7 @@ public class SemanticSqlCorpusReader {
                 // 别因为「读的只是元数据」就去申一个更软的——那会让能力位失去它的意思。
                 if (!(session instanceof QueryCapable q)) {
                     throw ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                            "这条连接不支持执行查询，无法读取既有 SQL 语料");
+                            "这条连接不支持查询，无法读取视图");
                 }
                 return readCorpus(q);
             });
@@ -285,7 +285,7 @@ public class SemanticSqlCorpusReader {
             CorpusResult bad = new CorpusResult();
             bad.ok = false;
             // getSafeDetail() 是 ConnectorException 的契约：写死的常量句子，不含 SQL / 主机名。
-            bad.note = clip("读取既有 SQL 语料失败："
+            bad.note = clip("读取视图失败："
                     + (e.getSafeDetail() == null ? e.getCode().modelHint() : e.getSafeDetail()));
             return bad;
         } catch (RuntimeException e) {
@@ -294,7 +294,7 @@ public class SemanticSqlCorpusReader {
             log.error("读取既有 SQL 语料时出现未归类异常 connectorId={}", connectorId, e);
             CorpusResult bad = new CorpusResult();
             bad.ok = false;
-            bad.note = "读取既有 SQL 语料时发生内部错误，已跳过这一步（详见服务端日志）。";
+            bad.note = "读取视图时出错，已跳过这一步";
             return bad;
         }
         CorpusResult r = extract(corpus.entries());

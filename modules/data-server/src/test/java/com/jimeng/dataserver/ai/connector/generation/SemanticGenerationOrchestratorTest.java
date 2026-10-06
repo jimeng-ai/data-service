@@ -275,7 +275,7 @@ class SemanticGenerationOrchestratorTest {
         order.verify(lease).release("lease-1");
         ArgumentCaptor<GenerationRequest> request = ArgumentCaptor.forClass(GenerationRequest.class);
         order.verify(singleCall).submit(request.capture());
-        assertEquals("连续多片没有进展：upstream_5xx", request.getValue().degradeReason());
+        assertEquals("多次尝试都没有进展", request.getValue().degradeReason());
         assertNull(TenantContext.get());
     }
 
@@ -491,8 +491,7 @@ class SemanticGenerationOrchestratorTest {
 
         assertEquals(2, org.mockito.Mockito.mockingDetails(dispatcher).getInvocations().stream()
                 .filter(i -> i.getMethod().getName().equals("runSlice")).count());
-        assertEquals("回调没有到达 data-service，请检查 callback-base-url 或 sandbox 版本",
-                fallback.degradeReason());
+        assertEquals("生成服务没有回应，请联系平台管理员", fallback.degradeReason());
     }
 
     @Test

@@ -365,7 +365,7 @@ public class ConnectorHealthJob {
         } catch (Exception e) {
             // 没归类的异常：原始信息只进日志，写回库的文案用固定句子。
             log.warn("连接器健康探测出现未归类异常 connectorId={} kind={}", row.getId(), row.getKind(), e);
-            writeBack(row, "UNHEALTHY", "探测失败，请在管理台点「测试连接」查看详情");
+            writeBack(row, "UNHEALTHY", "探测失败，请点「测试连接」查看详情");
             return false;
         }
     }

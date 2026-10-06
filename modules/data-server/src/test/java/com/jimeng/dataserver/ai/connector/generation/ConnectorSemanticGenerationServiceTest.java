@@ -83,7 +83,7 @@ class ConnectorSemanticGenerationServiceTest {
     @Test
     @DisplayName("INTERRUPTED批次在配置性不通过时SUPERSEDED")
     void INTERRUPTED批次在配置性不通过时SUPERSEDED() {
-        selectSingle(InterruptedBatchPolicy.SUPERSEDE, "agent 生成未开启，走单次推导", false);
+        selectSingle(InterruptedBatchPolicy.SUPERSEDE, "", false);
         ConnectorSemanticGeneration interrupted = interrupted("STAGED");
         when(generationMapper.selectOne(any())).thenReturn(interrupted);
         when(generationMapper.update(any(), any())).thenReturn(1);
@@ -116,7 +116,7 @@ class ConnectorSemanticGenerationServiceTest {
         assertFalse(ack.accepted());
         assertEquals(GeneratorKind.AGENT, ack.kind());
         assertEquals(GENERATION_ID, ack.generationId());
-        assertEquals("sandbox 暂不可用，保留上次未完成的生成，稍后再点重新生成继续", ack.note());
+        assertEquals("生成服务暂不可用，请稍后点「重新生成」继续", ack.note());
         verify(generationMapper, never()).update(any(), any());
         verify(stagedMapper, never()).physicalDeleteByGeneration(any(), any());
         verify(singleGenerator, never()).submit(any());

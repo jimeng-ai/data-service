@@ -420,12 +420,26 @@ class ConnectorSchemaServiceTest {
         }
 
         @Test
-        @DisplayName("说清共几个、留了几个、按什么留的")
+        @DisplayName("日志用的完整说明：说清共几个、留了几个、按什么留的")
         void 说明包含排序依据() {
-            String note = ConnectorSchemaService.truncationNote(catalog(500, "按估算行数的数量级降序"), 200);
+            String note = ConnectorSchemaService.truncationDetail(catalog(500, "按估算行数的数量级降序"), 200);
             assertTrue(note.contains("500"), "总数要出现，否则看不出漏了多少");
             assertTrue(note.contains("200"), "覆盖数要出现");
             assertTrue(note.contains("按估算行数的数量级降序"), "排序依据是这条消息存在的理由");
+        }
+
+        /**
+         * 管理台上那句：一句话，说清共几张、留了几张、没留的怎么办。
+         * 排序依据的完整描述留在日志里（{@code truncationDetail}），界面上只说「最重要的」。
+         */
+        @Test
+        @DisplayName("管理台说明：共几张、留了几张，一句话")
+        void 管理台说明一句话说清() {
+            String note = ConnectorSchemaService.truncationNote(catalog(500, "按估算行数的数量级降序"), 200);
+            assertEquals("共 500 张表，只覆盖了最重要的 200 张；其余的不在变化检测范围内。", note);
+            assertFalse(note.contains("按估算行数的数量级降序"), "排序细节不上界面：" + note);
+            assertFalse(note.contains("漂移"), "「漂移」是开发术语：" + note);
+            assertTrue(note.length() <= 40, note);
         }
 
         /**
@@ -436,20 +450,28 @@ class ConnectorSchemaServiceTest {
         @Test
         @DisplayName("连接器没声明顺序时如实说不知道")
         void 顺序未知时不编造() {
-            String note = ConnectorSchemaService.truncationNote(catalog(500, null), 200);
-            assertTrue(note.contains("未声明排序依据"));
-            assertFalse(note.contains("行数"), "不能替连接器编一个它并没有承诺的顺序");
+            String detail = ConnectorSchemaService.truncationDetail(catalog(500, null), 200);
+            assertTrue(detail.contains("未声明排序依据"));
+            assertFalse(detail.contains("行数"), "不能替连接器编一个它并没有承诺的顺序");
 
             // 空串和 null 是同一回事，别让一个空字符串拼出「本次只覆盖了的前 200 个」。
+            assertEquals(detail, ConnectorSchemaService.truncationDetail(catalog(500, "  "), 200));
+
+            // 管理台上那句同理：没声明顺序就只说「数据库返回的前 N 张」，不说「最重要的」。
+            String note = ConnectorSchemaService.truncationNote(catalog(500, null), 200);
+            assertTrue(note.contains("数据库返回的前 200 张"), note);
+            assertFalse(note.contains("最重要"), "没声明排序依据就不能说成按重要性留的：" + note);
             assertEquals(note, ConnectorSchemaService.truncationNote(catalog(500, "  "), 200));
         }
 
         /** 没覆盖到的那批会怎样，也要说——沉默会被读成「都检查过了，没有变化」。 */
         @Test
-        @DisplayName("说清没覆盖的那批不在漂移检测范围内")
+        @DisplayName("说清没覆盖的那批不在变化检测范围内")
         void 说明未覆盖对象的后果() {
+            String detail = ConnectorSchemaService.truncationDetail(catalog(500, "按估算行数的数量级降序"), 200);
+            assertTrue(detail.contains("漂移"));
             String note = ConnectorSchemaService.truncationNote(catalog(500, "按估算行数的数量级降序"), 200);
-            assertTrue(note.contains("漂移"));
+            assertTrue(note.contains("不在变化检测范围内"), note);
         }
     }
 }

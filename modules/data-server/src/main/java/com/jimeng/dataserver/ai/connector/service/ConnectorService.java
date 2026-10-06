@@ -169,7 +169,7 @@ public class ConnectorService {
         Connection row = requireRow(id);
         if (!registry.supports(ConnectorInstanceLoader.normalizeKind(row.getKind()))) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "这条连接的类型（" + row.getKind() + "）已经下线，不能授权给 Agent");
+                    "这条连接的类型（" + row.getKind() + "）已下线，不能授权");
         }
     }
 
@@ -293,10 +293,7 @@ public class ConnectorService {
             if (dupes.isEmpty()) {
                 return null;
             }
-            return "这个库已经接过了（连接 " + String.join("、", dupes) + "）。"
-                    + "语义层会按连接各推导一份，两边的业务口径不互通——"
-                    + "在一条连接上确认过的口径，Agent 用另一条查时看不到，会按默认算法算。"
-                    + "如果只是想换一套凭据或权限，这是预期行为；如果只是想再接一次同一个库，建议直接用已有的那条。";
+            return "已有连接：" + String.join("、", dupes) + "。口径在各连接间不互通，建议直接用已有的那条。";
         } catch (RuntimeException e) {
             log.debug("生成「同一目标」提示失败 connectionId={}", row.getId(), e);
             return null;
@@ -315,7 +312,7 @@ public class ConnectorService {
      */
     public ProbeOutcome dryRun(ConnectorUpsert req, Long existingId) {
         if (req == null || req.getKind() == null || !registry.supports(req.getKind())) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "不支持的连接器类型：" + (req == null ? null : req.getKind()));
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "不支持的连接类型：" + (req == null ? null : req.getKind()));
         }
         Connector connector = registry.require(req.getKind());
 
@@ -394,7 +391,7 @@ public class ConnectorService {
             if (req.getKind() != null && !req.getKind().isBlank()
                     && !ConnectorRegistry.normalize(req.getKind()).equals(ConnectorRegistry.normalize(row.getKind()))) {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                        "不能修改连接器类型。请删除后重新创建");
+                        "不能修改连接类型，请删除后重建");
             }
             validateBasics(req, false);
             Connector connector = registry.require(row.getKind());
@@ -552,17 +549,17 @@ public class ConnectorService {
         if (creating) {
             if (req.getKind() == null || !registry.supports(req.getKind())) {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                        "不支持的连接器类型：" + req.getKind());
+                        "不支持的连接类型：" + req.getKind());
             }
             if (req.getName() == null || !NAME_RE.matcher(req.getName().trim()).matches()) {
                 throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                        "name 必须匹配 ^[A-Za-z0-9_-]{1,64}$（它会直接出现在 URL 路径里，也是模型寻址用的键）");
+                        "名称只能是字母、数字、下划线、短横线，最长 64 位");
             }
         }
         if (req.getTransport() != null && !req.getTransport().isBlank()
                 && !"direct".equalsIgnoreCase(req.getTransport())) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "内网隧道（tunnel）尚未实现，当前只支持 direct");
+                    "暂不支持内网隧道");
         }
         // 数据出库档位：留空是合法的（= 默认档），但【填了个认不出来的值必须当场报错】。
         // 这里刻意不复用 SemanticDataTier.parse 的宽松兜底：那条兜底是给库里的脏值准备的
@@ -571,8 +568,7 @@ public class ConnectorService {
         if (req.getSemanticDataTier() != null && !req.getSemanticDataTier().isBlank()
                 && SemanticDataTier.tryParse(req.getSemanticDataTier()).isEmpty()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "semanticDataTier 只能是 METADATA_ONLY / DERIVED_STATS / SAMPLE_VALUES，收到："
-                            + req.getSemanticDataTier());
+                    "数据出库档位不正确，请重新选择");
         }
     }
 
@@ -665,7 +661,7 @@ public class ConnectorService {
             if (plaintext != null) {
                 if (!cipher.isAvailable()) {
                     throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                            "未配置 CONNECTION_CREDENTIAL_KEY，无法保存凭据（不会退化为明文存储）");
+                            "平台未配置密码加密，暂时无法保存，请联系平台管理员");
                 }
                 row.setCredentialCipher(cipher.encrypt(plaintext));
                 row.setEncryptionVersion(CredentialCipher.CURRENT_VERSION);
@@ -720,7 +716,7 @@ public class ConnectorService {
         // 直接让它穿出去，不要包一层把可操作的信息盖掉。
         String plaintext = cipher.decrypt(row.getCredentialCipher(), version);
         if (plaintext == null) {
-            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有存凭据");
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有保存密码");
         }
 
         Map<String, String> out = new LinkedHashMap<>();
@@ -734,7 +730,7 @@ public class ConnectorService {
             parsed = CommonUtil.getObjectMapper().readValue(plaintext, Map.class);
         } catch (Exception e) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "凭据格式异常，无法解析。请重新录入凭据");
+                    "密码数据异常，请重新填写");
         }
         for (String s : names) {
             Object v = parsed.get(s);
@@ -780,7 +776,7 @@ public class ConnectorService {
             return Map.of();
         }
         if (row.getCredentialCipher() == null || row.getCredentialCipher().isBlank()) {
-            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有存凭据");
+            throw new ServiceException(ExceptionCode.NOT_FOUND, "这条连接没有保存密码");
         }
 
         Map<String, String> out;
@@ -843,7 +839,7 @@ public class ConnectorService {
         } catch (ConnectorException e) {
             // 参数坏了也要能看到这条连接（否则用户连删都删不掉），但要显式告诉他坏了。
             params.clear();
-            params.put("__error__", "参数已损坏，无法解析。请重新保存配置");
+            params.put("__error__", "连接参数已损坏，请重新保存");
         }
         String kind = ConnectorInstanceLoader.normalizeKind(row.getKind());
         WritePolicy policy = WritePolicy.parse(row.getWritePolicy());

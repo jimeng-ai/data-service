@@ -213,7 +213,7 @@ class GrantScriptServiceTest {
 
             assertEquals(ExceptionCode.INVALID_REQUEST.getResultCode(), e.getRespCode());
             assertTrue(e.getRespMsg().contains("库名"), e.getRespMsg());
-            assertTrue(e.getRespMsg().contains("非法字符"), e.getRespMsg());
+            assertTrue(e.getRespMsg().contains("不支持的字符"), e.getRespMsg());
         }
 
         @ParameterizedTest(name = "表名 [{0}] 必须被拒")
@@ -289,7 +289,7 @@ class GrantScriptServiceTest {
         }
 
         @Test
-        @DisplayName("库名为空是「不能为空」，不是「非法字符」")
+        @DisplayName("库名为空是「不能为空」，不是「不支持的字符」")
         void blankDatabaseRejected() {
             ServiceException e = assertThrows(ServiceException.class,
                     () -> service.generate("MYSQL", req("  ", "jm_readonly", "%", List.of(), WritePolicy.FORBIDDEN)));
@@ -315,12 +315,12 @@ class GrantScriptServiceTest {
         }
 
         @Test
-        @DisplayName("提醒里明说要自己换、且不要复用")
+        @DisplayName("提醒里明说要自己换、且只填进平台密码框")
         void noteTellsToReplace() {
             List<String> notes = service.generate("MYSQL", readonlyWholeDb()).getNotes();
 
             assertTrue(notes.stream().anyMatch(n -> n.contains("请替换成一个强密码")), notes.toString());
-            assertTrue(notes.stream().anyMatch(n -> n.contains("不要与其它系统复用")), notes.toString());
+            assertTrue(notes.stream().anyMatch(n -> n.contains("只填进平台密码框")), notes.toString());
         }
     }
 
@@ -331,24 +331,26 @@ class GrantScriptServiceTest {
     class Notes {
 
         @Test
-        @DisplayName("只读整库：至少给出 % 的含义、别授 *.* 、版本差异")
+        @DisplayName("只读整库：至少给出 % 的含义、别授 *.* 、MySQL 8 的认证提醒；每条都是一句短话")
         void readonlyNotes() {
             List<String> notes = service.generate("MYSQL", readonlyWholeDb()).getNotes();
 
             assertTrue(notes.size() >= 4, notes.toString());
-            assertTrue(notes.stream().anyMatch(n -> n.contains("@'%'")), notes.toString());
+            assertTrue(notes.stream().anyMatch(n -> n.contains("任意地址")), notes.toString());
             assertTrue(notes.stream().anyMatch(n -> n.contains("*.*")), notes.toString());
-            assertTrue(notes.stream().anyMatch(n -> n.contains("8.0")), notes.toString());
+            assertTrue(notes.stream().anyMatch(n -> n.contains("MySQL 8")), notes.toString());
             assertTrue(notes.stream().noneMatch(String::isBlank), notes.toString());
+            // 一条提醒就是一句话：超过 50 个字符（含英文术语与动态内容的余量）说明又在写小作文了。
+            assertTrue(notes.stream().allMatch(n -> n.length() <= 50), notes.toString());
         }
 
         @Test
-        @DisplayName("收紧了 host 就不再提示 %，改成提示出口 IP 变更会连不上")
+        @DisplayName("收紧了 host 就不再提示「任意地址」，改成提示出口 IP 变了要同步修改")
         void tightenedHostNotes() {
             List<String> notes = service.generate("MYSQL",
                     req("shop", "jm_readonly", "203.0.113.10", List.of(), WritePolicy.FORBIDDEN)).getNotes();
 
-            assertTrue(notes.stream().noneMatch(n -> n.contains("@'%'")), notes.toString());
+            assertTrue(notes.stream().noneMatch(n -> n.contains("任意地址")), notes.toString());
             assertTrue(notes.stream().anyMatch(n -> n.contains("203.0.113.10")), notes.toString());
         }
 
@@ -368,16 +370,16 @@ class GrantScriptServiceTest {
                     req("shop", "jm_rw", "%", List.of(), WritePolicy.REQUIRE_APPROVAL)).getNotes();
 
             assertTrue(notes.stream().anyMatch(n -> n.contains(WritePolicy.REQUIRE_APPROVAL.label())), notes.toString());
-            assertTrue(notes.stream().anyMatch(n -> n.contains("影响行数")), notes.toString());
-            assertTrue(notes.stream().anyMatch(n -> n.contains("确认")), notes.toString());
+            assertTrue(notes.stream().anyMatch(n -> n.contains("行数上限")), notes.toString());
+            assertTrue(notes.stream().anyMatch(n -> n.contains("批准")), notes.toString());
         }
 
         @Test
-        @DisplayName("只读时不出现「这是一个能写的账号」这类会误导人的提醒")
+        @DisplayName("只读时不出现「这个账号能写数据」这类会误导人的提醒")
         void readonlyHasNoWriteNote() {
             List<String> notes = service.generate("MYSQL", readonlyWholeDb()).getNotes();
 
-            assertTrue(notes.stream().noneMatch(n -> n.contains("能写的账号")), notes.toString());
+            assertTrue(notes.stream().noneMatch(n -> n.contains("能写数据")), notes.toString());
         }
     }
 

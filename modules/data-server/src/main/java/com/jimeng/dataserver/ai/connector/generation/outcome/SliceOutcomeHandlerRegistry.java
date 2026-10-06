@@ -18,9 +18,9 @@ import java.util.function.Function;
 public final class SliceOutcomeHandlerRegistry {
 
     private static final String MODEL_MISMATCH_NOTE =
-            "上游实际模型与配置不符，已停止，请检查 connector.semantic.agent.llm.model 与 sandbox 的 env 钉死";
+            "模型配置有误，请联系平台管理员";
     private static final String NO_CALLBACK_NOTE =
-            "回调没有到达 data-service，请检查 callback-base-url 或 sandbox 版本";
+            "生成服务没有回应，请联系平台管理员";
 
     private final Map<SliceOutcomeKind, SliceOutcomeHandler> handlers;
 
@@ -75,16 +75,16 @@ public final class SliceOutcomeHandlerRegistry {
                 handler(SliceOutcomeKind.MODEL_MISMATCH, SliceOutcomeHandlerRegistry::modelMismatch),
                 handler(SliceOutcomeKind.SANDBOX_REJECTED,
                         c -> degradeOrInterrupt(c, GenerationReasonCode.SANDBOX_REJECTED,
-                                "sandbox 拒绝语义层运行")),
+                                "生成服务配置有误，请联系平台管理员")),
                 handler(SliceOutcomeKind.SANDBOX_AUTH,
                         c -> degradeOrInterrupt(c, GenerationReasonCode.SANDBOX_AUTH,
-                                "sandbox 拒绝了 service token")),
+                                "生成服务配置有误，请联系平台管理员")),
                 handler(SliceOutcomeKind.SANDBOX_UNAVAILABLE,
                         c -> degradeOrInterrupt(c, GenerationReasonCode.SANDBOX_UNAVAILABLE,
-                                "sandbox 拒绝服务（未配置服务 token）")),
+                                "生成服务配置有误，请联系平台管理员")),
                 handler(SliceOutcomeKind.BUSY_EXHAUSTED,
                         c -> degradeOrInterrupt(c, GenerationReasonCode.SANDBOX_BUSY,
-                                "sandbox 持续繁忙或不可用")),
+                                "服务繁忙或不可用")),
                 handler(SliceOutcomeKind.CLI_BUDGET, SliceOutcomeHandlerRegistry::cliBudget),
                 handler(SliceOutcomeKind.PROGRESS, SliceOutcomeHandlerRegistry::progress),
                 handler(SliceOutcomeKind.NO_CALLBACK, SliceOutcomeHandlerRegistry::noCallback),
@@ -112,7 +112,7 @@ public final class SliceOutcomeHandlerRegistry {
 
     private static SliceOutcomeDecision shutdown(SliceOutcomeContext context) {
         return decision(SliceOutcomeAction.INTERRUPT, GenerationReasonCode.SHUTDOWN,
-                "服务关停，语义层生成已中断", context, 0);
+                "服务重启", context, 0);
     }
 
     private static SliceOutcomeDecision modelMismatch(SliceOutcomeContext context) {
@@ -122,7 +122,7 @@ public final class SliceOutcomeHandlerRegistry {
 
     private static SliceOutcomeDecision cliBudget(SliceOutcomeContext context) {
         return decision(SliceOutcomeAction.INTERRUPT, GenerationReasonCode.CLI_BUDGET,
-                "CLI 预算闸触发，请调大 slice-max-budget-usd 后点重新生成继续", context, 0);
+                "单次用量已达上限，请联系平台管理员", context, 0);
     }
 
     private static SliceOutcomeDecision progress(SliceOutcomeContext context) {
@@ -146,9 +146,8 @@ public final class SliceOutcomeHandlerRegistry {
     private static SliceOutcomeDecision noProgress(SliceOutcomeContext context, int callbackStreak) {
         int failStreak = context.sliceFailStreak() + 1;
         if (failStreak >= context.maxRetries()) {
-            String code = safeErrorCode(context);
             return degradeOrInterrupt(context, GenerationReasonCode.NO_PROGRESS,
-                    "连续多片没有进展：" + code, failStreak, callbackStreak);
+                    "多次尝试都没有进展", failStreak, callbackStreak);
         }
         return new SliceOutcomeDecision(SliceOutcomeAction.RETRY, null, null, failStreak,
                 callbackStreak, backoff(context.retryBackoffSeconds(), failStreak));
@@ -187,14 +186,6 @@ public final class SliceOutcomeHandlerRegistry {
     private static int backoff(int base, int streak) {
         long multiplier = 1L << Math.min(30, Math.max(0, streak - 1));
         return (int) Math.min(300L, (long) base * multiplier);
-    }
-
-    private static String safeErrorCode(SliceOutcomeContext context) {
-        String code = context.result().summaryError();
-        if (code == null || code.isBlank()) {
-            return context.result().timedOut() ? "timeout" : "unknown";
-        }
-        return code.matches("[A-Za-z0-9:_-]{1,120}") ? code : "unknown";
     }
 
     private static String stripTrailingPunctuation(String reason) {

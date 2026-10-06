@@ -165,7 +165,8 @@ class SemanticJoinValidatorTest {
             assertEquals(SemanticJoinValidator.OUT_TIER_BLOCKED, r.getOutcome());
             assertFalse(r.getVerdicts().isEmpty(), "不能返回空结果——空等于「验过了没问题」");
             assertEquals(1, r.getVerdicts().size());
-            assertTrue(r.getNote().contains("未启用派生统计"), r.getNote());
+            assertTrue(r.getNote().contains("暂未核对"), r.getNote());
+            assertTrue(r.getNote().contains("第 2 档"), "要告诉超管把档位调到哪一档：" + r.getNote());
 
             SemanticJoinValidator.JoinVerdict v = r.getVerdicts().get(0);
             assertEquals(ConnectorSemanticService.V_NONE, v.getVerified(), "没查就该是 NONE，不是 UNDECIDABLE");

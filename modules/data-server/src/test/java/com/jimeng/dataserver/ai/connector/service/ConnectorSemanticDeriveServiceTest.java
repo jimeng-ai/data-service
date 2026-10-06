@@ -496,7 +496,9 @@ class ConnectorSemanticDeriveServiceTest {
             ConnectorSemantic join = only(rows, ConnectorSemanticService.SCOPE_JOIN);
             // 留的是置信度高的那条，而不是先到的那条。
             assertEquals("shops", detailOf(join).get("to_object"));
-            assertTrue(r.getNote().contains("重复 1"), "丢了什么必须出现在管理台那行字里：" + r.getNote());
+            // 去重丢掉了多少条是内部质量指标，超管没法处理，不再写进管理台那行字；管理台只说覆盖了多少。
+            assertTrue(r.getNote().startsWith("覆盖 3/3 张表："), r.getNote());
+            assertFalse(r.getNote().contains("重复"), r.getNote());
         }
 
         @Test
@@ -665,6 +667,10 @@ class ConnectorSemanticDeriveServiceTest {
             assertTrue(r.isOk());
             assertEquals(1, persisted().size());
             assertTrue(r.getNote().contains("截断"), "修复过就必须说出来：" + r.getNote());
+            // 给超管看的是一句人话：说清后果和该找谁，不出现 max_tokens、配置项名这类开发术语。
+            assertTrue(r.getNote().contains("内容太长被截断，有些表没写到，请联系平台管理员"), r.getNote());
+            assertFalse(r.getNote().contains("max_tokens"), r.getNote());
+            assertFalse(r.getNote().contains("connector.semantic"), r.getNote());
         }
 
         /**
@@ -680,7 +686,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
 
             assertFalse(r.isOk());
-            assertTrue(r.getNote().contains("推导失败"), r.getNote());
+            assertTrue(r.getNote().contains("生成失败"), r.getNote());
             verify(semanticService, never()).replaceInferred(any(), any());
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
@@ -762,9 +768,10 @@ class ConnectorSemanticDeriveServiceTest {
             String prompt = promptSent();
             assertTrue(prompt.contains("这份材料不完整"));
             assertTrue(prompt.contains("zz_second") && prompt.contains("zz_third"));
-            // 给人看的那份。
-            assertTrue(r.getNote().contains("2 个对象未送进模型"), r.getNote());
-            assertTrue(r.getNote().contains("zz_second"), r.getNote());
+            // 给人看的那份：只说覆盖了几张、还有几张没写到，不点名、不讲「摘要上限」这类内部机制。
+            assertTrue(r.getNote().contains("覆盖 1/3 张表"), r.getNote());
+            assertTrue(r.getNote().contains("其余 2 张表没有说明"), r.getNote());
+            assertFalse(r.getNote().contains("摘要"), r.getNote());
         }
 
         /** 第一张表无论多大都要进去，否则遇到一张超宽的表会得到一份空摘要——而它同样不会报错。 */
@@ -776,7 +783,8 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
 
             assertTrue(digestBlock().contains("c49|"));
-            assertTrue(r.getNote().contains("第一个对象单独就超过了摘要上限"), r.getNote());
+            assertTrue(r.getNote().contains("覆盖 1/2 张表"), r.getNote());
+            assertTrue(r.getNote().contains("其余 1 张表没有说明"), r.getNote());
         }
 
         @Test
@@ -790,7 +798,7 @@ class ConnectorSemanticDeriveServiceTest {
             String digest = digestBlock();
             assertTrue(digest.contains("## t_a") && digest.contains("## t_b") && digest.contains("## t_c"));
             assertFalse(r.isTruncated());
-            assertFalse(r.getNote().contains("未送进模型"), r.getNote());
+            assertFalse(r.getNote().contains("没有说明"), r.getNote());
         }
 
         /**
@@ -807,9 +815,9 @@ class ConnectorSemanticDeriveServiceTest {
             modelOutputs(EMPTY_BUT_WELL_FORMED);
             var r = run();
 
-            assertTrue(r.getNote().contains(String.valueOf(ConnectorSemanticDeriveService.SCHEMA_SNAPSHOT_CAP)),
-                    r.getNote());
-            assertTrue(r.getNote().contains("字母序"), r.getNote());
+            assertTrue(r.getNote().contains("覆盖 " + ConnectorSemanticDeriveService.SCHEMA_SNAPSHOT_CAP + "/>"
+                    + ConnectorSemanticDeriveService.SCHEMA_SNAPSHOT_CAP + " 张表"), r.getNote());
+            assertTrue(r.getNote().contains("库里还有更多表没有说明"), r.getNote());
         }
 
         /** 权限只到部分表时快照里会有「只有名字」的行，要如实说，不能让模型读成「这是张空表」。 */
@@ -1051,7 +1059,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             var r = run();
             assertFalse(r.isOk());
-            assertTrue(r.getNote().contains("推导失败") && r.getNote().contains("502"), r.getNote());
+            assertTrue(r.getNote().contains("生成失败") && r.getNote().contains("502"), r.getNote());
             verify(semanticService, never()).replaceInferred(any(), any());
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
@@ -1065,7 +1073,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             var r = run();
             assertFalse(r.isOk());
-            assertTrue(r.getNote().contains("推导失败：模型服务余额不足（HTTP 402）"), r.getNote());
+            assertTrue(r.getNote().contains("生成失败：模型服务余额不足（HTTP 402）"), r.getNote());
             assertFalse(r.getNote().contains("Exception"), "界面上不该出现异常类名：" + r.getNote());
         }
 
@@ -1202,7 +1210,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             assertFalse(r.isOk());
             verify(semanticService, never()).replaceInferred(any(), any());
-            assertTrue(r.getNote().contains("不替换"), r.getNote());
+            assertTrue(r.getNote().contains("已保留上一版"), r.getNote());
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
 
@@ -1255,7 +1263,8 @@ class ConnectorSemanticDeriveServiceTest {
             // 留置信度高的那条；而且留下来的行里存的仍然是模型原样的大小写（要和快照对得上）。
             assertEquals("shops", detailOf(join).get("to_object"));
             assertEquals("T_Ord", join.getObjectName());
-            assertTrue(r.getNote().contains("重复 1"), r.getNote());
+            assertTrue(r.getNote().startsWith("覆盖 4/4 张表："), r.getNote());
+            assertFalse(r.getNote().contains("重复"), r.getNote());
         }
 
         @Test
@@ -1397,7 +1406,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
 
             assertFalse(r.isOk());
-            assertTrue(r.getNote().contains("已有一次推导在进行中"), r.getNote());
+            assertTrue(r.getNote().contains("已有生成在进行"), r.getNote());
             verify(claudeService, never()).messagesInternal(any(), any());
             verify(semanticService, never()).replaceInferred(any(), any());
         }
@@ -1422,7 +1431,7 @@ class ConnectorSemanticDeriveServiceTest {
             var r = run();
 
             assertFalse(r.isOk());
-            assertTrue(r.getNote().contains("结构在推导期间已刷新"), r.getNote());
+            assertTrue(r.getNote().contains("生成期间表结构变了"), r.getNote());
             verify(semanticService, never()).replaceInferred(any(), any());
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
@@ -1573,7 +1582,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             runAsync("手工前缀");
 
-            assertEquals("手工前缀。语义层推导已关闭（connector.semantic.enabled=false）",
+            assertEquals("手工前缀。语义层功能已关闭，请联系平台管理员",
                     lastStatusWrite().getSemanticNote());
         }
 
@@ -1584,7 +1593,7 @@ class ConnectorSemanticDeriveServiceTest {
 
             runAsync("降级原因：健康检查失败");
 
-            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：健康检查失败。推导失败："),
+            assertTrue(lastStatusWrite().getSemanticNote().startsWith("降级原因：健康检查失败。生成失败："),
                     lastStatusWrite().getSemanticNote());
         }
 

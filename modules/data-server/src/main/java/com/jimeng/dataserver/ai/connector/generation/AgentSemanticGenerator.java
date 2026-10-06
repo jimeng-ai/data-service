@@ -119,7 +119,7 @@ public class AgentSemanticGenerator implements SemanticGenerator {
                 return rejected("连接不存在");
             }
             if (freshJavaClaim(connection)) {
-                return new GenerationAck(kind(), false, null, "同一条连接上已有一次推导在进行中，本次跳过");
+                return new GenerationAck(kind(), false, null, "已有生成在进行，请稍后再试");
             }
 
             ConnectorSemanticGeneration created = newBatch(request, connection);
@@ -136,7 +136,7 @@ public class AgentSemanticGenerator implements SemanticGenerator {
         } catch (RuntimeException e) {
             log.warn("agent 语义层生成受理失败 connectorId={}: {}",
                     request == null ? null : request.connectorId(), safeMessage(e), e);
-            return rejected("agent 生成受理失败");
+            return rejected("提交失败，请稍后重试");
         }
     }
 

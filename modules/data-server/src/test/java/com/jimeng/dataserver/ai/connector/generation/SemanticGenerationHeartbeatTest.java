@@ -158,7 +158,7 @@ class SemanticGenerationHeartbeatTest {
         ArgumentCaptor<String> note = ArgumentCaptor.forClass(String.class);
         verify(claim).writeNote(eq(generation.getConnectorId()), note.capture());
         assertTrue(note.getValue().contains("已完成 3/10 张表"), note.getValue());
-        assertTrue(note.getValue().contains("放弃 1 张"), note.getValue());
+        assertTrue(note.getValue().contains("1 张未成功"), note.getValue());
         assertFalse(note.getValue().contains("99/10"), note.getValue());
 
         ArgumentCaptor<LambdaQueryWrapper<ConnectorSemanticGenerationTable>> wrapper =
@@ -183,8 +183,8 @@ class SemanticGenerationHeartbeatTest {
 
         ArgumentCaptor<String> notes = ArgumentCaptor.forClass(String.class);
         verify(claim, times(2)).writeNote(eq(generation.getConnectorId()), notes.capture());
-        assertTrue(notes.getAllValues().get(0).contains("已完成 2/10 张表（第 1/5 片）"));
-        assertTrue(notes.getAllValues().get(1).contains("已完成 3/10 张表（第 1/5 片）"));
+        assertTrue(notes.getAllValues().get(0).contains("已完成 2/10 张表"));
+        assertTrue(notes.getAllValues().get(1).contains("已完成 3/10 张表"));
         verify(tableMapper, times(4)).selectList(any());
     }
 
@@ -289,7 +289,7 @@ class SemanticGenerationHeartbeatTest {
         ArgumentCaptor<String> notes = ArgumentCaptor.forClass(String.class);
         verify(claim, times(2)).writeNote(eq(generation.getConnectorId()), notes.capture());
         assertTrue(notes.getAllValues().get(1).contains("已完成 4/10 张表"), notes.getAllValues().get(1));
-        assertTrue(notes.getAllValues().get(1).contains("放弃 1 张"), notes.getAllValues().get(1));
+        assertTrue(notes.getAllValues().get(1).contains("1 张未成功"), notes.getAllValues().get(1));
         verify(tableMapper, times(2)).selectList(any());
     }
 

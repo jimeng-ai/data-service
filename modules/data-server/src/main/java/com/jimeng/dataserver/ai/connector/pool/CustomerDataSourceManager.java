@@ -242,11 +242,10 @@ public class CustomerDataSourceManager {
                 case 1049:  // ER_BAD_DB_ERROR
                 case 1044:  // ER_DBACCESS_DENIED_ERROR
                     return ConnectorException.of(ConnectorErrorCode.FORBIDDEN,
-                            "这个账号访问不了该库：库名可能填错了，或者这个账号还没有被授予该库的只读权限"
-                                    + "（数据库侧 GRANT SELECT ON 库名.* TO 账号）");
+                            "访问不了这个库：库名可能填错，或账号没有该库的只读权限");
                 case 1045:  // ER_ACCESS_DENIED_ERROR
                     return ConnectorException.of(ConnectorErrorCode.AUTH_FAILED,
-                            "数据库拒绝了这把凭据：用户名或密码不正确");
+                            "用户名或密码不对");
                 default:
                     break;
             }
@@ -257,12 +256,12 @@ public class CustomerDataSourceManager {
             // 28xxx = invalid authorization specification（MySQL 密码错 / 该账号不允许从本机登录）
             if (sqlState.startsWith("28")) {
                 return ConnectorException.of(ConnectorErrorCode.AUTH_FAILED,
-                        "数据库拒绝了这把凭据：用户名或密码不正确，或该账号不允许从平台所在网络登录");
+                        "用户名或密码不对，或账号不允许从平台所在网络登录");
             }
             // 08xxx = connection exception（含 MySQL 的 08S01 Communications link failure）
             if (sqlState.startsWith("08")) {
                 return ConnectorException.of(ConnectorErrorCode.UNREACHABLE,
-                        "无法建立到数据库的网络连接：主机不可达、端口未开放或被防火墙拦截");
+                        "连不上数据库：请检查主机、端口和防火墙");
             }
         }
         if (hasCause(e, UnknownHostException.class)
@@ -271,12 +270,12 @@ public class CustomerDataSourceManager {
                 || hasCause(e, SocketTimeoutException.class)
                 || messageHints(e)) {
             return ConnectorException.of(ConnectorErrorCode.UNREACHABLE,
-                    "无法建立到数据库的网络连接：域名解析失败、主机不可达或连接超时");
+                    "连不上数据库：请检查主机地址和网络");
         }
         // 兜底走 CONFIG_ERROR 而不是 UPSTREAM_ERROR：建池阶段还没执行任何业务语句，
         // 此时失败几乎都是参数问题（库名不存在、端口指向了别的服务、驱动参数非法）。
         return ConnectorException.of(ConnectorErrorCode.CONFIG_ERROR,
-                "建立数据库连接池失败，请检查主机、端口、库名与驱动参数是否正确");
+                "连接失败：请检查主机、端口和库名");
     }
 
     /** 同 {@link #findSqlState}：错误码也可能被 Hikari 包了好几层。0 不算有效码（驱动自造的异常常是 0）。 */
