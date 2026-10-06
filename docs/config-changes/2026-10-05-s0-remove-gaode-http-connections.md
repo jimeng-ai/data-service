@@ -1,7 +1,8 @@
 # S0：删除高德和 HTTP 类连接（一切皆可 skills）
 
 - 依据：工作区 `docs/superpowers/specs/2026-10-05-everything-is-skills-design.md` §7.1。
-- 涉及仓库：data-service、jm-agent-sandbox、jm-agent-front。合入 main 后，各自会自动打 tag，到时把版本号补在这里。
+- 涉及仓库与版本：data-service v1.2.1、jm-agent-sandbox v1.1.2、jm-agent-front v1.1.2（2026-10-06 合入 main）。
+  之后的 data-service v1.2.2、jm-agent-sandbox v1.1.3、jm-agent-front v1.1.3 在此基础上另有改动，见各自的提交说明。
 - 前提：用户 2026-10-05 确认，没有人在用高德，也没有人在用 HTTP 类连接。
 
 ## 一、上线前：生产库（ds-mysql）

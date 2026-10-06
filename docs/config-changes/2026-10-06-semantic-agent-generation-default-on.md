@@ -1,7 +1,7 @@
 # 语义层默认走 agent 生成
 
 - 依据：用户 2026-10-06 定，语义层说明书默认用 agent 生成。
-- 代码改动：`connector.semantic.agent.enabled` 的默认值从 `false` 改成 `true`（data-service `connector-ux` 分支）。
+- 代码改动：`connector.semantic.agent.enabled` 的默认值从 `false` 改成 `true`（data-service v1.2.2）。
 - 为什么要改：这个开关从前默认关，也没有任何变更文档让人打开，所以各环境一直在走单次推导。单次推导是一次调用写完整个库，表一多就被截断（本地 46 张表就截了）。agent 生成在沙箱里每批最多处理 20 张表，不会被截断。
 
 ## 一、上线前：生产 Nacos `data-server.yml`
