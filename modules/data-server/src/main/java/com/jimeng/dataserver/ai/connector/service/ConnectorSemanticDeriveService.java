@@ -12,6 +12,7 @@ import com.jimeng.dataserver.ai.connector.model.FieldDetail;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorAuditService;
 import com.jimeng.dataserver.ai.connector.runtime.ConnectorProperties;
 import com.jimeng.dataserver.ai.connector.spi.Capability;
+import com.jimeng.dataserver.ai.conversation.ModelServiceException;
 import com.jimeng.dataserver.web.MdcAsyncSupport;
 import com.jimeng.persistence.entity.Connection;
 import com.jimeng.persistence.entity.ConnectorSchema;
@@ -3879,6 +3880,10 @@ public class ConnectorSemanticDeriveService implements ApplicationEventPublisher
     private static String describe(Throwable e) {
         if (e == null) {
             return "unknown";
+        }
+        if (e instanceof ModelServiceException) {
+            // 它的 message 就是写给人看的一句话（余额不足 / 限流 / 暂时不可用……），再带类名反而碍事。
+            return e.getMessage();
         }
         String m = e.getMessage();
         return e.getClass().getSimpleName() + (m == null || m.isBlank() ? "" : ": " + m);

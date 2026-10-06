@@ -217,18 +217,50 @@ class AiConversationLoopInternalTest {
         verify(recordService).recordException(eq(1L), same(boom), anyInt());
     }
 
+    /**
+     * ★ 上游非 2xx 直接抛，说清是什么问题。调用方（语义层推导等）只要文本：从前错误体被当成回复交回去，
+     * 取正文只拿到空串，「余额不足」在界面上就成了一句 JSON 解析错误。
+     */
     @Test
-    @DisplayName("上游 5xx 不抛：记熔断失败、trace 记失败，错误体原样返回（与 runBlocking 一致）")
-    void 上游5xx() {
-        String err = "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}";
-        upstreamReturns(503, err);
+    @DisplayName("★ 上游 402：抛出「模型服务余额不足」，响应只记一次，不再补记异常")
+    void 上游402余额不足() {
+        String err = "{\"error\":{\"message\":\"Insufficient Balance (request_id: r1)\","
+                + "\"type\":\"unknown_error\",\"param\":null,\"code\":\"invalid_request_error\"}}";
+        upstreamReturns(402, err);
 
-        Object out = loop.runInternal(body(), claude, Map.of(), "http://llm", "trace-1", rc(), TIMEOUT);
+        ModelServiceException ex = assertThrows(ModelServiceException.class,
+                () -> loop.runInternal(body(), claude, Map.of(), "http://llm", "trace-1", rc(), TIMEOUT));
 
-        verify(llmCallGuard).recordFailure();
+        assertEquals(402, ex.getHttpStatus());
+        assertEquals("模型服务余额不足（HTTP 402）", ex.getMessage());
+        assertEquals("Insufficient Balance (request_id: r1)", ex.getUpstreamMessage());
+        verify(recordService).recordResponse(eq(1L), eq(402), eq(err), anyInt());
+        verify(recordService, never()).recordException(any(), any(), anyInt());
         verify(traceRecorder).recordLlm(eq(1L), anyString(), any(), isNull(), isNull(), isNull(),
                 anyLong(), eq(false), eq(err));
-        assertTrue(out instanceof Map<?, ?> m && m.containsKey("error"), "错误体被吞了：" + out);
+    }
+
+    @Test
+    @DisplayName("上游 5xx：照常记熔断失败，抛出「暂时不可用」；错误体不是 JSON（网关的 HTML 页）也一样")
+    void 上游5xx() {
+        upstreamReturns(502, "<html>Bad Gateway</html>");
+
+        ModelServiceException ex = assertThrows(ModelServiceException.class,
+                () -> loop.runInternal(body(), claude, Map.of(), "http://llm", "trace-1", rc(), TIMEOUT));
+
+        assertEquals("模型服务暂时不可用（HTTP 502）", ex.getMessage());
+        verify(llmCallGuard).recordFailure();
+    }
+
+    @Test
+    @DisplayName("没有专门说法的状态码：带上上游原话，否则看不出是哪里不对")
+    void 上游其它4xx带原话() {
+        upstreamReturns(400, "{\"error\":{\"message\":\"Invalid max_tokens value\"}}");
+
+        ModelServiceException ex = assertThrows(ModelServiceException.class,
+                () -> loop.runInternal(body(), claude, Map.of(), "http://llm", "trace-1", rc(), TIMEOUT));
+
+        assertEquals("模型服务拒绝了请求（HTTP 400）：Invalid max_tokens value", ex.getMessage());
     }
 
     @Test

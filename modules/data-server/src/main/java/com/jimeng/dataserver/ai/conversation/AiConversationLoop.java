@@ -278,7 +278,11 @@ public class AiConversationLoop {
      * 熔断（acquirePermission / recordFailure / recordGuardOutcome）、调用记录（safeRecordRequest / Response /
      * Exception —— 调用日志与计费都靠它们）、trace 埋点（recordUserMessage / recordLlm，与无工具短路径同样的标题与入参）、
      * adapter 的 toUpstreamBody / fromUpstreamResponse 转换。返回值与 runBlocking 无工具短路径同形：
-     * <b>入口协议</b>形状的响应；上游非 2xx 时同样不抛，原样返回（转换后的）错误体。
+     * <b>入口协议</b>形状的响应。
+     *
+     * <h3>和 runBlocking 不同的一点：上游非 2xx 时抛 {@link ModelServiceException}</h3>
+     * 内部调用方只要文本。从前这里把（转换后的）错误体当回复原样交回去，调用方取正文只拿到空串，
+     * 「余额不足」在管理台上就成了一句 JSON 解析错误。响应照常先记进调用日志、熔断与 trace，再抛。
      *
      * <h3>为什么超时单独给</h3>
      * 非流式调用要等上游把整条生成完才回响应头。全局 {@code okhttp.read-timeout} 是按交互式对话调的（dev 180 秒），
@@ -296,8 +300,9 @@ public class AiConversationLoop {
         llmCallGuard.acquirePermission();
         long start = System.currentTimeMillis();
         Long logId = safeRecordRequest(body, headers, rc);
+        RequestService.HttpResp resp;
+        Map<String, Object> rawMap;
         try {
-            RequestService.HttpResp resp;
             try {
                 // 跨协议 adapter 在这里把 body 转成上游形状；同协议的 adapter 恒等返回。
                 resp = requestService.post(url, headers, Collections.emptyMap(),
@@ -313,16 +318,35 @@ public class AiConversationLoop {
 
             // 与 runBlocking 同一个转换点：调用方按【入口协议】解析返回值。
             Object rawParsed = tryParseJson(resp.getBody());
-            Map<String, Object> rawMap = asMapOrNull(rawParsed);
+            rawMap = asMapOrNull(rawParsed);
             Object parsed = rawMap == null ? rawParsed : adapter.fromUpstreamResponse(rawMap);
             boolean ok = isSuccess(resp.getStatusCode());
             traceRecorder.recordLlm(logId, "推理·生成回答", modelOf(body, rc),
                     null, null, null, latency, ok, ok ? null : resp.getBody());
-            return parsed;
+            if (ok) {
+                return parsed;
+            }
         } catch (Exception e) {
             safeRecordException(logId, e, elapsed(start));
             throw e;
         }
+        // 在 try 外面抛：这次响应上面已经如实记过，再走 catch 会给同一条调用补记一次异常。
+        int status = resp.getStatusCode() == null ? 0 : resp.getStatusCode();
+        throw new ModelServiceException(status, upstreamErrorMessage(rawMap, resp.getBody()));
+    }
+
+    /** 上游错误体里的原话：OpenAI 与 Anthropic 都是 error.message；取不到就用响应体本身。 */
+    private static String upstreamErrorMessage(Map<String, Object> rawMap, String body) {
+        if (rawMap != null) {
+            Object err = rawMap.get("error");
+            if (err instanceof Map<?, ?> m && m.get("message") != null) {
+                return String.valueOf(m.get("message"));
+            }
+            if (err instanceof String s && !s.isBlank()) {
+                return s;
+            }
+        }
+        return body;
     }
 
     // ------------------------------------------------------------------ stream

@@ -1056,6 +1056,19 @@ class ConnectorSemanticDeriveServiceTest {
             assertEquals(ConnectorSemanticDeriveService.SEM_FAILED, lastStatusWrite().getSemanticStatus());
         }
 
+        /** 模型服务自己报错（余额不足、限流……）：说明里直接写原因，不带异常类名，也不会变成一句 JSON 解析错误。 */
+        @Test
+        void 模型服务报错时说明里直接写原因() {
+            defaultSnapshot();
+            when(claudeService.messagesInternal(any(), any()))
+                    .thenThrow(new com.jimeng.dataserver.ai.conversation.ModelServiceException(402, "Insufficient Balance"));
+
+            var r = run();
+            assertFalse(r.isOk());
+            assertTrue(r.getNote().contains("推导失败：模型服务余额不足（HTTP 402）"), r.getNote());
+            assertFalse(r.getNote().contains("Exception"), "界面上不该出现异常类名：" + r.getNote());
+        }
+
         /** 异常摘要要带类名：NPE 这类 message 为 null 的异常，否则界面上只剩一个孤零零的 "null"。 */
         @Test
         void message为null的异常也要留下线索() {
