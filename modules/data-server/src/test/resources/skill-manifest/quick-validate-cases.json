@@ -17,6 +17,8 @@
   {"id": "name-yaml11-bool", "md": "---\nname: yes\ndescription: d\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "name-empty", "md": "---\nname: \"\"\ndescription: d\n---\nb\n", "quickValidate": "valid", "jm": "invalid", "platformRule": "name 不能为空"},
   {"id": "description-empty", "md": "---\nname: a\ndescription: \"\"\n---\nb\n", "quickValidate": "valid", "jm": "invalid", "platformRule": "description 不能为空"},
+  {"id": "name-blank", "md": "---\nname: \"   \"\ndescription: d\n---\nb\n", "quickValidate": "valid", "jm": "invalid", "platformRule": "name 不能为空"},
+  {"id": "description-blank", "md": "---\nname: a\ndescription: \"   \"\n---\nb\n", "quickValidate": "valid", "jm": "invalid", "platformRule": "description 不能为空"},
   {"id": "description-angle-brackets", "md": "---\nname: a\ndescription: 用 <b> 加粗\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "description-1024-cjk", "template": "---\nname: a\ndescription: @@FILL@@\n---\nb\n", "fill": {"char": "测", "count": 1024}, "quickValidate": "valid", "jm": "valid"},
   {"id": "description-1025-cjk", "template": "---\nname: a\ndescription: @@FILL@@\n---\nb\n", "fill": {"char": "测", "count": 1025}, "quickValidate": "invalid", "jm": "invalid"},

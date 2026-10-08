@@ -14,12 +14,22 @@ import java.util.regex.Pattern;
  * 通配<b>只匹配一层</b>：{@code *.example.com} 匹配 {@code a.example.com}，不匹配 {@code a.b.example.com}，也不匹配
  * {@code example.com} 本身——与证书通配、与 paths 里 {@code *} 只匹配一层是同一个口径。
  *
- * <p>★ 解析只做字面检查，<b>绝不做 DNS</b>：IPv4 自己逐段解析；含冒号的才交给 {@link InetAddress#getByName}
- * （JDK 对含冒号的串只按 v6 字面量解析，不合法直接抛，不会去查 DNS）。
+ * <p>标签允许下划线（{@code a_b.corp.local}）：AD、Docker Compose 的服务名这类内网主机名里确有，OkHttp 的
+ * {@code HttpUrl}（网关取 host 用它）和 {@code IDN.toASCII} 都接受；是不是内网地址在解析成地址之后才判，
+ * 所以放开它没有安全上的代价。注意 {@code java.net.URI#getHost} 对带下划线的主机名返回 null，别拿它取 host。
+ *
+ * <p>★ 解析只做字面检查，<b>绝不做 DNS</b>：IPv4 自己逐段解析；含冒号的才交给 {@link InetAddress#getByName}，
+ * 而且<b>只有首字符是十六进制数字或冒号时</b>——JDK 只在这时才把它当 IP 字面量处理（不合法直接抛），
+ * 首字符是别的（比如 {@code .:1}）它会去查名称服务，所以调用前必须先检查首字符。
+ *
+ * <p>{@link #parse} 抛出的 {@link IllegalArgumentException} 的消息是<b>一句完整的原因</b>（调用方会把它直接接在
+ * 「写的那一项」后面给作者看），改文案时保持这一点。
  */
 public final class HostPattern {
 
-    private static final Pattern LABEL = Pattern.compile("[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?");
+    private static final Pattern LABEL = Pattern.compile("[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?");
+    /** 通配匹配时，被 {@code *} 顶替的那一层允许出现的字符：比 LABEL 宽松，但绝不含空白、{@code #}、NUL 这类 URL 里不会出现的字符。 */
+    private static final Pattern WILDCARD_HEAD = Pattern.compile("[a-z0-9_-]+");
     private static final Pattern IPV4 = Pattern.compile("\\d{1,3}(\\.\\d{1,3}){3}");
     private static final Pattern IPV6_CHARS = Pattern.compile("[0-9a-f:.]+");
 
@@ -85,7 +95,8 @@ public final class HostPattern {
         if (wildcardSuffix == null) return h.equals(text);
         if (!h.endsWith(wildcardSuffix)) return false;
         String head = h.substring(0, h.length() - wildcardSuffix.length());
-        return !head.isEmpty() && !head.contains(".");
+        // 非空、没有点（只一层）、只含 [a-z0-9_-]：host 取自 HttpUrl.host() 时本来就如此，这里不依赖调用方守规矩
+        return WILDCARD_HEAD.matcher(head).matches();
     }
 
     public boolean isIpLiteral() {
@@ -115,6 +126,9 @@ public final class HostPattern {
             return b;
         }
         if (s.contains(":") && IPV6_CHARS.matcher(s).matches()) {
+            // ★ JDK 只在首字符是十六进制数字或冒号时才把它当字面量；别的（如 ".:1"）会去查名称服务，必须挡在外面
+            char first = s.charAt(0);
+            if (Character.digit(first, 16) < 0 && first != ':') return null;
             try {
                 return InetAddress.getByName(s).getAddress();
             } catch (UnknownHostException e) {

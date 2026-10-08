@@ -20,6 +20,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 严格模式与 skill-creator 的 quick_validate.py 对拍（设计文档 §8.1 第 5 条）。
  * 用例里的 quickValidate 由 scripts/check-quick-validate-parity.py 用真的 quick_validate.py 核对过；
  * 这里保证我们的严格模式和那份结论一致，只有标了平台规则的用例允许不同。
+ *
+ * <p>「一致」是<b>逐条一致，以下已知差异除外</b>（完整说明见 {@link SkillManifestParser} 的类注释）：
+ * 闭合行 {@code ---junk} / {@code ----}、{@code name: 1e3}、name 末尾的 U+00A0、开头的 BOM（设计如此）。
+ * 它们没法作为用例收进来，因为这里只允许「平台规则」这一种差异。纯空白的 name / description 属于平台规则，
+ * 由用例 name-blank、description-blank 钉着。
  */
 class SkillManifestParserQuickValidateParityTest {
 
@@ -75,8 +80,10 @@ class SkillManifestParserQuickValidateParityTest {
     @DisplayName("用例文件读得到、覆盖了两种结论和两条平台规则（工作目录不对时读到空集会白白通过）")
     void 用例覆盖面() throws IOException {
         List<Case> cs = cases();
-        assertThat(cs).hasSizeGreaterThanOrEqualTo(38);
+        assertThat(cs).hasSizeGreaterThanOrEqualTo(40);
         assertThat(cs).extracting(Case::platformRule).contains("name 不能为空", "description 不能为空");
+        // 纯空白的 name / description：quick_validate.py 的 strip() 之后为空会整段跳过检查，平台规则必须单独钉住
+        assertThat(cs).extracting(Case::id).contains("name-blank", "description-blank");
         assertThat(cs).anyMatch(c -> "invalid".equals(c.quickValidate()));
         assertThat(cs).anyMatch(c -> "valid".equals(c.quickValidate()));
     }

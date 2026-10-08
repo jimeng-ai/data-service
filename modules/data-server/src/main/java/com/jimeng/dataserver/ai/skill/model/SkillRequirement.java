@@ -47,6 +47,27 @@ public enum SkillRequirement {
     }
 
     /**
+     * {@link #parse} 的不抛异常版本，认的字面量和规则（去首尾空白、忽略大小写）与它是同一份：
+     * 认得出来返回枚举；null、空白、认不出来<b>一律返回 null</b>。
+     *
+     * <p>★ 返回 null 分不清「没写」和「写错了」。要区分这两种情况的调用方（比如不能为一次拼写错误构造 {@link ServiceException}
+     * 的解析器——那个异常一构造就 {@code log.error}），必须先自己判空，再把 null 当成「写错了」；
+     * 不要把 null 直接当成「没有前置资源」，那正是类注释里说的静默回退。
+     */
+    public static SkillRequirement tryParse(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String v = raw.trim();
+        for (SkillRequirement r : values()) {
+            if (r.token.equalsIgnoreCase(v)) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /**
      * 解析 frontmatter 的 {@code requires} 值。
      *
      * @param raw 原始字面量；null / 空白表示<b>没有前置资源</b>（走发现，即改动前的行为）
@@ -57,12 +78,11 @@ public enum SkillRequirement {
         if (raw == null || raw.isBlank()) {
             return null;
         }
-        String v = raw.trim();
-        for (SkillRequirement r : values()) {
-            if (r.token.equalsIgnoreCase(v)) {
-                return r;
-            }
+        SkillRequirement known = tryParse(raw);
+        if (known != null) {
+            return known;
         }
+        String v = raw.trim();
         StringBuilder allowed = new StringBuilder();
         for (SkillRequirement r : values()) {
             if (allowed.length() > 0) allowed.append(" / ");

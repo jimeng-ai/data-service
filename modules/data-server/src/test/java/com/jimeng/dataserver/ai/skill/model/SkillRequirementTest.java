@@ -48,6 +48,18 @@ class SkillRequirementTest {
     }
 
     @Test
+    @DisplayName("tryParse 不抛异常：认得的返回枚举（规则与 parse 同一份）；null、空白、认不出来的都返回 null，要区分「没写」和「写错了」的调用方先自己判空")
+    void tryParseNeverThrows() {
+        assertEquals(SkillRequirement.CONNECTIONS, SkillRequirement.tryParse("connections"));
+        assertEquals(SkillRequirement.KNOWLEDGE_BASES, SkillRequirement.tryParse("knowledge_bases"));
+        assertEquals(SkillRequirement.CONNECTIONS, SkillRequirement.tryParse("  CONNECTIONS  "));
+        assertNull(SkillRequirement.tryParse("connection"));
+        assertNull(SkillRequirement.tryParse("true"));
+        assertNull(SkillRequirement.tryParse(null));
+        assertNull(SkillRequirement.tryParse("   "));
+    }
+
+    @Test
     @DisplayName("token 与枚举名不是一回事：写进 SKILL.md 的是 token，别拿 name() 去比")
     void tokenIsTheWireFormat() {
         assertEquals("knowledge_bases", SkillRequirement.KNOWLEDGE_BASES.token());
