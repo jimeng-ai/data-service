@@ -3,6 +3,7 @@
   {"id": "ok-six-allowed-keys", "md": "---\nname: a-b\ndescription: d\nlicense: MIT\nallowed-tools: Read Bash\nmetadata:\n  author: x\ncompatibility: claude-code\n---\nbody\n", "quickValidate": "valid", "jm": "valid"},
   {"id": "top-level-requires", "md": "---\nname: connector\ndescription: d\nrequires: connections\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "top-level-argument-hint", "md": "---\nname: design-system\ndescription: d\nargument-hint: \"[x]\"\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
+  {"id": "top-level-jm", "md": "---\nname: a\ndescription: d\njm:\n  hosts: [api.example.com]\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "missing-name", "md": "---\ndescription: d\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "missing-description", "md": "---\nname: a\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},
   {"id": "name-null", "md": "---\nname:\ndescription: d\n---\nb\n", "quickValidate": "invalid", "jm": "invalid"},

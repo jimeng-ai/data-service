@@ -440,6 +440,65 @@ class SkillManifestParserTest {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------
+    // 顶层的 jm（R12）：平台自己的命名空间，最可能的写错方式是抄 jm: 那一段时漏了外面的 metadata:
+    // ---------------------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("宽松：顶层出现 jm 键（不管值是什么）就报错，说清要写到 metadata 下面；它被拒绝，不算「被忽略的键」")
+    void lenientRejectsTopLevelJm() {
+        String[] variants = {
+                "jm:\n  hosts: [api.example.com]",                 // 抄 jm: 那一段时漏了外面的 metadata:
+                "metadata:\njm:\n  hosts: [api.example.com]",      // metadata: 空着、jm 顶格
+                "jm: {hosts: [api.example.com]}",
+                "jm: x", "jm: 5", "jm: [a]", "jm:",
+        };
+        for (String variant : variants) {
+            ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + variant), LENIENT);
+            assertThat(p.errors()).as(variant).singleElement().asString()
+                    .startsWith("jm 要写在 metadata 下面").contains("写在顶层不会生效");
+            assertThat(p.ignoredKeys()).as(variant + "：被拒绝的键不算被忽略").isEmpty();
+        }
+        // 走补引号重试的路径同样拦得住
+        ParsedSkill retried = SkillManifestParser.parse(
+                skill("name: a\ndescription: Use when: x\njm:\n  hosts: [api.example.com]"), LENIENT);
+        assertThat(retried.errors()).singleElement().asString().startsWith("jm 要写在 metadata 下面");
+        // 同时有别的不认识的键：别的照旧被忽略并记下来，jm 单独报错
+        ParsedSkill mixed = SkillManifestParser.parse(skill("name: a\ndescription: d\nauthor: x\njm:\n  web: true"), LENIENT);
+        assertThat(mixed.errors()).singleElement().asString().startsWith("jm 要写在 metadata 下面");
+        assertThat(mixed.ignoredKeys()).containsExactly("author");
+    }
+
+    @Test
+    @DisplayName("宽松：只拦顶层的 jm——顶层的 hosts / web / timeout-seconds / requires / binding 照旧是被忽略的键（通用词会撞上第三方 skill 的同名键），metadata.hosts 也不拦")
+    void lenientDoesNotBlockTheOtherJmKeyNames() {
+        for (String line : new String[]{"hosts: [api.example.com]", "web: true", "timeout-seconds: 90",
+                "requires: connections", "binding: always"}) {
+            String key = line.substring(0, line.indexOf(':'));
+            ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + line), LENIENT);
+            assertThat(p.errors()).as(line).isEmpty();
+            assertThat(p.ignoredKeys()).as(line).containsExactly(key);
+            assertThat(p.jm()).as(line).isEqualTo(JmMetadata.EMPTY);
+        }
+        // metadata.hosts（漏写 jm）：metadata 里本来允许任意键，两种模式都合规，只是声明不生效
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\nmetadata:\n  hosts: [api.example.com]"), mode);
+            assertThat(p.errors()).as(mode.name()).isEmpty();
+            assertThat(p.jm()).as(mode.name()).isEqualTo(JmMetadata.EMPTY);
+        }
+    }
+
+    @Test
+    @DisplayName("严格：顶层的 jm 本来就以「不允许的键」被拒（quick_validate 也拒，对拍用例 top-level-jm），现在顺带告诉作者要写到 metadata 下面；别的不允许的键不带这句")
+    void strictTopLevelJmGetsTheSpecificHint() {
+        ParsedSkill jm = SkillManifestParser.parse(skill("name: a\ndescription: d\njm:\n  hosts: [api.example.com]"), STRICT);
+        assertThat(jm.errors()).singleElement().asString()
+                .startsWith("frontmatter 里有不允许的键：jm").contains("jm 要写在 metadata 下面");
+        ParsedSkill hosts = SkillManifestParser.parse(skill("name: a\ndescription: d\nhosts: [api.example.com]"), STRICT);
+        assertThat(hosts.errors()).singleElement().asString()
+                .startsWith("frontmatter 里有不允许的键：hosts").doesNotContain("jm 要写在");
+    }
+
     @Test
     @DisplayName("hosts 太多或写成字符串都报错")
     void hostsShape() {

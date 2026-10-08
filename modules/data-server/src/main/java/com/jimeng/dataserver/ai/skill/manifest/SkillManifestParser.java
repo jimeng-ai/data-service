@@ -44,11 +44,16 @@ import java.util.stream.Collectors;
  *       <b>frontmatter 不是合法 YAML 时，按 Claude Code 加载器的规则给「值里有特殊字符」的行补上引号，再解析一次</b>
  *       （见 {@link #quoteSpecialValues}，其中 {@code metadata} 行是唯一不补引号的）：LENIENT 接收的是别处写出来的
  *       skill，它拒绝的集合原则上不该比 Claude Code 自己能加载的更大（比如 {@code description: Use when: x}）。
- *       <b>有两个有意的例外</b>，理由相同：metadata 是平台唯一按结构读的顶层键，它坏了或者不是字典，写在
- *       {@code metadata.jm} 下的声明就会静默丢失，而 Claude Code 不读 metadata，照样能加载这样的文件。
+ *       <b>有三个有意的例外</b>，理由相同：平台只从 {@code metadata.jm} 读声明，写错了位置，声明就会静默丢失，
+ *       而 Claude Code 不读 metadata、会忽略不认识的顶层键，照样能加载这样的文件。
  *       <ol>
  *         <li>metadata 那一行自己不是合法 YAML（比如单行 flow 没闭合）：这里拒绝，不会替作者补引号把它吞成字符串。</li>
  *         <li>metadata 不是字典：这里拒绝（上面第三条平台规则）。</li>
+ *         <li>顶层出现 {@code jm} 键（不管值是什么）：这里拒绝，提示要写到 metadata 下面（R12）。<b>只拦 jm</b>：
+ *             它是平台自己的命名空间，不会撞上第三方 skill 的键，几乎没有误伤，也是最可能的写错方式——抄 {@code jm:}
+ *             那一段时漏了外面的 {@code metadata:}。顶层的 hosts / web / timeout-seconds / requires / binding，
+ *             以及 {@code metadata.hosts}（漏写 jm）<b>不拦</b>：这几个通用词会撞上第三方 skill 里同名的键，
+ *             宽松模式照旧把顶层的当作被忽略的键（记进 {@code ignoredKeys}）；严格模式本来就拒绝顶层的这些键。</li>
  *       </ol>
  *       STRICT 不重试，继续和 quick_validate.py 对拍。</li>
  * </ul>
@@ -93,6 +98,14 @@ public final class SkillManifestParser {
     private static final Pattern NEEDS_QUOTES = Pattern.compile("[{}\\[\\]*&#!|>%@`]|: ");
 
     private static final String QUOTE_HINT = "（值里有冒号等符号时，用引号把整个值括起来）";
+
+    /** 平台自己的命名空间：声明只从 metadata.jm 读。 */
+    private static final String JM = "jm";
+    /**
+     * 顶层写了 jm 时的改法。最可能的写错方式是抄 jm: 那一段时漏了外面的 metadata:。
+     * 严格模式附在「不允许的键」后面，宽松模式单独作为一条错误。
+     */
+    private static final String TOP_LEVEL_JM_HINT = "jm 要写在 metadata 下面（metadata: 的下一行缩进写 jm: …），写在顶层不会生效";
 
     private SkillManifestParser() {}
 
@@ -145,12 +158,20 @@ public final class SkillManifestParser {
         }
 
         List<String> unexpected = fields.keySet().stream().filter(k -> !ALLOWED_KEYS.contains(k)).sorted().toList();
+        boolean topLevelJm = unexpected.contains(JM);
+        List<String> ignored = unexpected;
         if (!unexpected.isEmpty()) {
             if (mode == Mode.STRICT) {
                 errors.add("frontmatter 里有不允许的键：" + String.join(", ", unexpected)
-                        + "（只允许 " + String.join(", ", ALLOWED_KEYS.stream().sorted().toList()) + "）");
+                        + "（只允许 " + String.join(", ", ALLOWED_KEYS.stream().sorted().toList()) + "）"
+                        + (topLevelJm ? "；" + TOP_LEVEL_JM_HINT : ""));
             } else {
-                log.info("SKILL.md 宽松解析：忽略不认识的顶层键 {}", unexpected);
+                // 顶层的 jm 是宽松模式「忽略不认识的顶层键」的例外（R12）：被拒绝，不算被忽略。只拦它：理由见类注释。
+                if (topLevelJm) {
+                    errors.add(TOP_LEVEL_JM_HINT);
+                    ignored = unexpected.stream().filter(k -> !JM.equals(k)).toList();
+                }
+                if (!ignored.isEmpty()) log.info("SKILL.md 宽松解析：忽略不认识的顶层键 {}", ignored);
             }
         }
 
@@ -161,7 +182,7 @@ public final class SkillManifestParser {
         if (mode == Mode.LENIENT && body.isBlank()) {
             errors.add("SKILL.md 正文不能为空");
         }
-        return new ParsedSkill(name, description, body, jm, mode == Mode.LENIENT ? unexpected : List.of(), errors);
+        return new ParsedSkill(name, description, body, jm, mode == Mode.LENIENT ? ignored : List.of(), errors);
     }
 
     /** 主解析和重试、以及「值是不是合法序列」的判断都走这一个，所以 LoaderOptions 的各项上限始终一致。 */
@@ -299,9 +320,9 @@ public final class SkillManifestParser {
                     + "；写在 metadata.jm 下的声明不会生效，请改成多行缩进写法");
             return JmMetadata.EMPTY;
         }
-        if (!md.containsKey("jm")) return JmMetadata.EMPTY;
+        if (!md.containsKey(JM)) return JmMetadata.EMPTY;
         // jm 存在就必须是字典，包括 jm: 后面空着——那多半是 hosts 等子项忘了缩进（写成了 jm 的兄弟），空着放过会丢声明。
-        if (!(md.get("jm") instanceof Map<?, ?> jm)) {
+        if (!(md.get(JM) instanceof Map<?, ?> jm)) {
             errors.add("metadata.jm 必须是字典");
             return JmMetadata.EMPTY;
         }

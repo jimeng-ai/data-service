@@ -82,10 +82,12 @@ class SkillManifestParserQuickValidateParityTest {
     @DisplayName("用例文件读得到、覆盖了两种结论和两条平台规则（工作目录不对时读到空集会白白通过）")
     void 用例覆盖面() throws IOException {
         List<Case> cs = cases();
-        assertThat(cs).hasSizeGreaterThanOrEqualTo(46);
+        assertThat(cs).hasSizeGreaterThanOrEqualTo(47);
         assertThat(cs).extracting(Case::platformRule).contains("name 不能为空", "description 不能为空", "metadata 必须是字典");
         // 纯空白的 name / description：quick_validate.py 的 strip() 之后为空会整段跳过检查，平台规则必须单独钉住
         assertThat(cs).extracting(Case::id).contains("name-blank", "description-blank");
+        // 顶层的 jm：quick_validate 和严格模式都拒，只是严格模式的报错多一句具体的改法（解析器测试里钉着文案）
+        assertThat(cs).extracting(Case::id).contains("top-level-jm");
         // metadata 的形状：非字典要报错，null 和空字典不能误伤（它们没写任何声明，没有什么会丢）
         assertThat(cs).extracting(Case::id).contains("metadata-not-a-map", "metadata-quoted-flow-map", "metadata-block-scalar",
                 "metadata-null", "metadata-empty-map", "metadata-flow-map", "metadata-jm-null");
