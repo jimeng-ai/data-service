@@ -10,6 +10,7 @@ import org.yaml.snakeyaml.constructor.SafeConstructor;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -25,7 +26,7 @@ import java.util.stream.Collectors;
  *   <li>{@link Mode#STRICT}：构建器发布、平台 skill 的出厂版本、平台上传。规则与 skill-creator 的
  *       {@code scripts/quick_validate.py} <b>逐条一致，以下已知差异除外</b>（对拍用例：test resources 的
  *       {@code skill-manifest/quick-validate-cases.json}；对拍用例里只允许「平台规则」这一种差异，下面前四条不在其中），
- *       另加平台自己的两条：name、description 不能为空。已知差异：
+ *       另加平台自己的三条：name、description 不能为空，metadata 必须是字典。已知差异：
  *       <ul>
  *         <li>闭合行 {@code ---junk}、{@code ----}：quick_validate.py 放过，这里要求 {@code ---} 后面只能是空白再换行
  *             （与原来的 {@code SkillFrontmatter} 是同一个正则）。</li>
@@ -34,17 +35,27 @@ import java.util.stream.Collectors;
  *         <li>开头的 BOM：quick_validate.py 拒绝，这里接受（Windows 上编辑过的文件，设计如此，两种模式都接受）。</li>
  *         <li>纯空白的 name / description：quick_validate.py 的 {@code strip()} 之后为空就整段跳过检查，这里是平台规则
  *             「不能为空」（对拍用例 name-blank、description-blank 钉着）。</li>
+ *         <li>metadata 不是字典（字符串、块标量、列表……）：quick_validate.py 不检查 metadata 的形状，这里是平台规则，
+ *             <b>两种模式都报错</b>（对拍用例 metadata-not-a-map、metadata-quoted-flow-map、metadata-block-scalar 钉着）；
+ *             {@code metadata:} 后面什么都没写（null）和 {@code metadata: {}} 不算错。</li>
  *       </ul></li>
  *   <li>{@link Mode#LENIENT}：GitHub 导入、对话里的 skill_install、单个 SKILL.md 上传。不认识的顶层键忽略并记日志；
  *       名字沿用上传 / 导入一直以来接受的形状，收紧会让以前能导入的 skill 导不进来。
  *       <b>frontmatter 不是合法 YAML 时，按 Claude Code 加载器的规则给「值里有特殊字符」的行补上引号，再解析一次</b>
  *       （见 {@link #quoteSpecialValues}，其中 {@code metadata} 行是唯一不补引号的）：LENIENT 接收的是别处写出来的
- *       skill，它拒绝的集合不该比 Claude Code 自己能加载的更大（比如 {@code description: Use when: x}）。
+ *       skill，它拒绝的集合原则上不该比 Claude Code 自己能加载的更大（比如 {@code description: Use when: x}）。
+ *       <b>有两个有意的例外</b>，理由相同：metadata 是平台唯一按结构读的顶层键，它坏了或者不是字典，写在
+ *       {@code metadata.jm} 下的声明就会静默丢失，而 Claude Code 不读 metadata，照样能加载这样的文件。
+ *       <ol>
+ *         <li>metadata 那一行自己不是合法 YAML（比如单行 flow 没闭合）：这里拒绝，不会替作者补引号把它吞成字符串。</li>
+ *         <li>metadata 不是字典：这里拒绝（上面第三条平台规则）。</li>
+ *       </ol>
  *       STRICT 不重试，继续和 quick_validate.py 对拍。</li>
  * </ul>
  *
- * <p>{@code metadata.jm} 在两种模式下都严格校验：那是平台自己的命名空间，写错一个键名
- * （比如把 timeout-seconds 写成 timeout）若被静默忽略，表现就是「声明了却不生效」，没有任何信号。
+ * <p>{@code metadata} 本身必须是字典（null 和空字典除外），{@code metadata.jm} 存在就必须是字典，里面在两种模式下都
+ * 严格校验：那是平台自己的命名空间，写错一个键名（比如把 timeout-seconds 写成 timeout）、或者 metadata 写成了字符串，
+ * 若被静默忽略，表现就是「声明了却不生效」，没有任何信号。
  *
  * <p>YAML 用 SnakeYAML 的 SafeConstructor（YAML 1.1，与 quick_validate.py 用的 PyYAML safe_load 同一个口径：
  * {@code yes} 是布尔、{@code 2024-01-01} 是日期，都不是字符串）。
@@ -176,7 +187,8 @@ public final class SkillManifestParser {
      *       {@link #parse} 随后把它当作没有 jm，声明的 hosts / web / timeout-seconds 悄悄退回默认，没有任何信号
      *       （违反「metadata.jm 写错不能静默」）；metadata 自己写坏时也会被吞成字符串而通过。块风格的
      *       {@code metadata:  # 注释} 同理：行尾的 {@code #} 会让它被改写，下面缩进的 jm 整段随之解析失败。
-     *       跳过之后，metadata 自己写坏时第二次解析照样失败，照常拒绝。</li>
+     *       跳过之后，metadata 自己写坏时第二次解析照样失败，照常拒绝。<b>这是有意的例外</b>：Claude Code 能加载这样的文件
+     *       （它给这行补引号，又不读 metadata），这里拒绝——别按类注释里「不比 Claude Code 更严」的原则把它改回去。</li>
      * </ol>
      * 行数不变，所以第二次解析失败时报的行号仍然对得上作者的文件。CRLF 先当 LF 处理。
      *
@@ -277,8 +289,18 @@ public final class SkillManifestParser {
     }
 
     private static JmMetadata parseJm(Object metadata, List<String> errors) {
-        // quick_validate.py 不检查 metadata 的形状：不是字典就当作没有 jm，不报错。
-        if (!(metadata instanceof Map<?, ?> md) || !md.containsKey("jm")) return JmMetadata.EMPTY;
+        // metadata: 后面什么都没写（YAML null）= 没写任何声明，没有什么会丢，不算错。
+        if (metadata == null) return JmMetadata.EMPTY;
+        // 平台规则（两种模式都查）：metadata 是平台唯一按结构读的顶层键。quick_validate.py 不检查它的形状，
+        // 但它不是字典（作者把单行写法整个加了引号、写成块标量……）时，写在 metadata.jm 下的声明会被静默当作「没有」，
+        // 网关运行时才拒绝，作者查不出原因。Agent Skills 规范本来就要求 metadata 是字典。
+        if (!(metadata instanceof Map<?, ?> md)) {
+            errors.add("metadata 必须是字典（键: 值），现在是" + typeName(metadata)
+                    + "；写在 metadata.jm 下的声明不会生效，请改成多行缩进写法");
+            return JmMetadata.EMPTY;
+        }
+        if (!md.containsKey("jm")) return JmMetadata.EMPTY;
+        // jm 存在就必须是字典，包括 jm: 后面空着——那多半是 hosts 等子项忘了缩进（写成了 jm 的兄弟），空着放过会丢声明。
         if (!(md.get("jm") instanceof Map<?, ?> jm)) {
             errors.add("metadata.jm 必须是字典");
             return JmMetadata.EMPTY;
@@ -293,6 +315,16 @@ public final class SkillManifestParser {
                 parseTimeout(jm.get("timeout-seconds"), errors),
                 parseRequires(jm.get("requires"), errors),
                 parseBinding(jm.get("binding"), errors));
+    }
+
+    /** 报错里说「现在是什么」：只区分作者看得懂的几类，其余（!!binary、!!set 之类）统称其他类型。 */
+    private static String typeName(Object v) {
+        if (v instanceof String) return "字符串";
+        if (v instanceof Boolean) return "布尔值";
+        if (v instanceof Number) return "数字";
+        if (v instanceof List<?>) return "列表";
+        if (v instanceof Date) return "日期";
+        return "其他类型";
     }
 
     private static List<String> parseHosts(Object v, List<String> errors) {

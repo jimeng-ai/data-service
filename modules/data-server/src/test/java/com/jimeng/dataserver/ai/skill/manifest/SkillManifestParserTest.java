@@ -359,6 +359,87 @@ class SkillManifestParserTest {
         assertThat(p.errors()).anyMatch(e -> e.startsWith("metadata.jm.binding"));
     }
 
+    // ---------------------------------------------------------------------------------------------------------
+    // metadata 的形状：平台唯一按结构读的顶层键。它不是字典时，写在 metadata.jm 下的声明会静默丢失，所以两种模式都报错
+    // ---------------------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("metadata 存在但不是字典：两种模式都报错，说清现在是什么、后果和改法——不能当作「没有 jm」静默放过")
+    void nonMapMetadataIsRejectedInBothModes() {
+        // {frontmatter 里 metadata 的写法, 报错里「现在是…」说的类型}
+        String[][] shapes = {
+                {"metadata: \"{jm: {hosts: [api.example.com]}}\"", "字符串"},   // 作者自己把单行写法整个加了引号
+                {"metadata: |\n  jm: {hosts: [api.example.com]}", "字符串"},      // 块标量
+                {"metadata: x", "字符串"},
+                {"metadata: [a, b]", "列表"},
+                {"metadata: 5", "数字"},
+                {"metadata: true", "布尔值"},
+                {"metadata: 2024-01-01", "日期"},
+        };
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            for (String[] shape : shapes) {
+                ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + shape[0]), mode);
+                assertThat(p.errors()).as(mode + "  " + shape[0]).singleElement().asString()
+                        .startsWith("metadata 必须是字典")
+                        .contains("现在是" + shape[1])
+                        .contains("metadata.jm 下的声明不会生效")
+                        .contains("多行缩进");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("metadata: 后面什么都没写（YAML null）、metadata: ~、metadata: {} 都合规：没写任何声明，没有什么会丢")
+    void emptyMetadataIsFine() {
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            for (String line : new String[]{"metadata:", "metadata: ~", "metadata: {}"}) {
+                ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + line), mode);
+                assertThat(p.errors()).as(mode + "  " + line).isEmpty();
+                assertThat(p.jm()).as(mode + "  " + line).isEqualTo(JmMetadata.EMPTY);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("metadata.jm 存在但不是字典（字符串、列表、true、空）：两种模式都报错；jm: 后面空着也报错——多半是子项忘了缩进")
+    void nonMapJmIsRejectedInBothModes() {
+        String[] shapes = {
+                "metadata:\n  jm: \"x\"",
+                "metadata:\n  jm: [a]",
+                "metadata:\n  jm: true",
+                "metadata:\n  jm:",
+                // 最常见的手滑：hosts 写成了 jm 的兄弟而不是子项，jm 本身是空的
+                "metadata:\n  jm:\n  hosts: [api.example.com]",
+        };
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            for (String shape : shapes) {
+                ParsedSkill p = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + shape), mode);
+                assertThat(p.errors()).as(mode + "  " + shape).containsExactly("metadata.jm 必须是字典");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("正常写法照旧合规：块风格、单行 flow 字典（带 jm 或不带），两种模式都一样")
+    void wellFormedMetadataStaysValid() {
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            ParsedSkill block = SkillManifestParser.parse(
+                    skill("name: a\ndescription: d\nmetadata:\n  author: x\n  jm:\n    hosts: [api.example.com]"), mode);
+            assertThat(block.errors()).as(mode + " 块风格").isEmpty();
+            assertThat(block.jm().hosts()).as(mode + " 块风格").containsExactly("api.example.com");
+
+            ParsedSkill flow = SkillManifestParser.parse(
+                    skill("name: a\ndescription: d\nmetadata: {jm: {hosts: [api.example.com], web: true}}"), mode);
+            assertThat(flow.errors()).as(mode + " 单行 flow").isEmpty();
+            assertThat(flow.jm().hosts()).as(mode + " 单行 flow").containsExactly("api.example.com");
+            assertThat(flow.jm().web()).as(mode + " 单行 flow").isTrue();
+
+            ParsedSkill noJm = SkillManifestParser.parse(skill("name: a\ndescription: d\nmetadata: {author: x}"), mode);
+            assertThat(noJm.errors()).as(mode + " 没有 jm").isEmpty();
+            assertThat(noJm.jm()).as(mode + " 没有 jm").isEqualTo(JmMetadata.EMPTY);
+        }
+    }
+
     @Test
     @DisplayName("hosts 太多或写成字符串都报错")
     void hostsShape() {

@@ -24,7 +24,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>「一致」是<b>逐条一致，以下已知差异除外</b>（完整说明见 {@link SkillManifestParser} 的类注释）：
  * 闭合行 {@code ---junk} / {@code ----}、{@code name: 1e3}、name 末尾的 U+00A0、开头的 BOM（设计如此）。
  * 它们没法作为用例收进来，因为这里只允许「平台规则」这一种差异。纯空白的 name / description 属于平台规则，
- * 由用例 name-blank、description-blank 钉着。
+ * 由用例 name-blank、description-blank 钉着；metadata 不是字典（字符串、块标量、列表……）同样是平台规则：
+ * quick_validate.py 不检查 metadata 的形状，这里两种模式都报错，由用例 metadata-not-a-map、metadata-quoted-flow-map、
+ * metadata-block-scalar 钉着（null 和空字典不算错，由 metadata-null、metadata-empty-map 钉着）。
  */
 class SkillManifestParserQuickValidateParityTest {
 
@@ -33,7 +35,7 @@ class SkillManifestParserQuickValidateParityTest {
 
     /** 允许与 quick_validate.py 结论不同的只有平台自己的硬约束。新加一类之前，先想清楚它为什么不能照 quick_validate 来。 */
     private static final List<String> PLATFORM_RULE_PREFIXES =
-            List.of("name 不能为空", "description 不能为空", "metadata.jm");
+            List.of("name 不能为空", "description 不能为空", "metadata 必须是字典", "metadata.jm");
 
     /*
      * data-server 解析到的 jackson-databind 是 2.11.1（父 pom 里先 import 的 redisson 3.13.4 BOM 把 Spring Boot 的 2.14.1 压住了），
@@ -80,10 +82,13 @@ class SkillManifestParserQuickValidateParityTest {
     @DisplayName("用例文件读得到、覆盖了两种结论和两条平台规则（工作目录不对时读到空集会白白通过）")
     void 用例覆盖面() throws IOException {
         List<Case> cs = cases();
-        assertThat(cs).hasSizeGreaterThanOrEqualTo(40);
-        assertThat(cs).extracting(Case::platformRule).contains("name 不能为空", "description 不能为空");
+        assertThat(cs).hasSizeGreaterThanOrEqualTo(46);
+        assertThat(cs).extracting(Case::platformRule).contains("name 不能为空", "description 不能为空", "metadata 必须是字典");
         // 纯空白的 name / description：quick_validate.py 的 strip() 之后为空会整段跳过检查，平台规则必须单独钉住
         assertThat(cs).extracting(Case::id).contains("name-blank", "description-blank");
+        // metadata 的形状：非字典要报错，null 和空字典不能误伤（它们没写任何声明，没有什么会丢）
+        assertThat(cs).extracting(Case::id).contains("metadata-not-a-map", "metadata-quoted-flow-map", "metadata-block-scalar",
+                "metadata-null", "metadata-empty-map", "metadata-flow-map", "metadata-jm-null");
         assertThat(cs).anyMatch(c -> "invalid".equals(c.quickValidate()));
         assertThat(cs).anyMatch(c -> "valid".equals(c.quickValidate()));
     }
