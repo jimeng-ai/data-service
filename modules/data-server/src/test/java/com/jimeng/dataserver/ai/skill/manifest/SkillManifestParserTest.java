@@ -157,6 +157,41 @@ class SkillManifestParserTest {
     }
 
     @Test
+    @DisplayName("宽松：别处有一行要补引号时，单行 flow 风格的 metadata 原样保留——hosts、web 不能被悄悄丢掉")
+    void lenientKeepsFlowStyleMetadataIntact() {
+        String md = skill("name: a\ndescription: Use when: x\nmetadata: {jm: {hosts: [api.example.com], web: true}}");
+        ParsedSkill p = SkillManifestParser.parse(md, LENIENT);
+        assertThat(p.errors()).isEmpty();
+        assertThat(p.description()).isEqualTo("Use when: x");
+        assertThat(p.jm().hosts()).containsExactly("api.example.com");
+        assertThat(p.jm().web()).isTrue();
+    }
+
+    @Test
+    @DisplayName("宽松：块风格的 metadata 行尾带注释，别处要补引号时也不能被当成「带 # 的值」改写（改写后下面缩进的 jm 整段会解析失败）")
+    void lenientKeepsBlockMetadataWithTrailingComment() {
+        String md = skill("name: a\ndescription: Use when: x\nmetadata:  # 平台扩展\n  jm:\n    hosts: [api.example.com]");
+        ParsedSkill p = SkillManifestParser.parse(md, LENIENT);
+        assertThat(p.errors()).isEmpty();
+        assertThat(p.jm().hosts()).containsExactly("api.example.com");
+    }
+
+    @Test
+    @DisplayName("宽松：metadata 自己写坏了照样拒绝，不能被补引号吞成一个字符串而静默通过（不管别处有没有要补引号的行）")
+    void lenientStillRejectsBrokenMetadata() {
+        String brokenMetadata = "metadata: {jm: {hosts: [api.example.com}}";
+        // 别处也有一行要补引号：第二次解析仍然失败 → 拒绝，报作者原文第一次的错误
+        ParsedSkill withBadDescription = SkillManifestParser.parse(skill("name: a\ndescription: Use when: x\n" + brokenMetadata), LENIENT);
+        assertThat(withBadDescription.valid()).isFalse();
+        assertThat(withBadDescription.errors()).singleElement().asString().startsWith("frontmatter 不是合法的 YAML");
+        // 只有 metadata 自己写坏：补引号规则什么也不改，所以不重试、也不附「用引号」的提示
+        ParsedSkill onlyMetadata = SkillManifestParser.parse(skill("name: a\ndescription: d\n" + brokenMetadata), LENIENT);
+        assertThat(onlyMetadata.valid()).isFalse();
+        assertThat(onlyMetadata.errors()).singleElement().asString()
+                .startsWith("frontmatter 不是合法的 YAML").doesNotContain("引号");
+    }
+
+    @Test
     @DisplayName("宽松：CRLF 的文件同样能补引号（Windows 上编辑的 SKILL.md）")
     void lenientQuotesCrlfFiles() {
         String md = skill("name: a\ndescription: Use when: x").replace("\n", "\r\n");
@@ -214,6 +249,18 @@ class SkillManifestParserTest {
     }
 
     @Test
+    @DisplayName("metadata 行不参与「会不会改动文本」的判断：只有它带特殊字符、错误出在别处（缩进）时，不重试，也不附「用引号」的提示")
+    void hintIgnoresTheMetadataLine() {
+        String frontmatter = "name: a\n  description: x\nmetadata: {jm: {web: true}}";
+        assertThat(SkillManifestParser.quoteSpecialValues(frontmatter)).isEqualTo(frontmatter);
+        for (SkillManifestParser.Mode mode : SkillManifestParser.Mode.values()) {
+            ParsedSkill p = SkillManifestParser.parse(skill(frontmatter), mode);
+            assertThat(p.errors()).as(mode.name()).singleElement().asString()
+                    .startsWith("frontmatter 不是合法的 YAML").doesNotContain("引号");
+        }
+    }
+
+    @Test
     @DisplayName("重试成功记一条 INFO（带 skill 名）；本来就合法的 YAML 不记")
     void retryIsLoggedOnce() {
         SkillManifestParser.parse(skill("name: needs-quotes\ndescription: Use when: x"), LENIENT);
@@ -256,6 +303,17 @@ class SkillManifestParserTest {
         // 行数不变；CRLF 当作 LF 处理
         assertThat(SkillManifestParser.quoteSpecialValues("a: x: y\r\nb: 1\r\n")).isEqualTo("a: \"x: y\"\nb: 1\n");
         assertThat(SkillManifestParser.quoteSpecialValues("a: x: y\nb: 1\nc: z: w").split("\n", -1)).hasSize(3);
+    }
+
+    @Test
+    @DisplayName("补引号规则跳过的只有键恰好是 metadata 的行（相对 Claude Code 的唯一偏离）：别的键、大小写不同的键照常补引号")
+    void quoteSkipsOnlyTheMetadataKey() {
+        assertUnchanged("metadata: {jm: {hosts: [api.example.com], web: true}}");
+        assertUnchanged("metadata:   {jm: {web: true}}");
+        assertUnchanged("metadata:  # 平台扩展");
+        assertQuoted("Metadata: {a: b}", "Metadata: \"{a: b}\"");
+        assertQuoted("metadata-x: {a: b}", "metadata-x: \"{a: b}\"");
+        assertQuoted("meta: {a: b}", "meta: \"{a: b}\"");
     }
 
     private static void assertQuoted(String line, String expected) {

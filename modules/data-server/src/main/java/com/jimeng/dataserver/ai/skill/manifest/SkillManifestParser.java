@@ -38,8 +38,9 @@ import java.util.stream.Collectors;
  *   <li>{@link Mode#LENIENT}：GitHub 导入、对话里的 skill_install、单个 SKILL.md 上传。不认识的顶层键忽略并记日志；
  *       名字沿用上传 / 导入一直以来接受的形状，收紧会让以前能导入的 skill 导不进来。
  *       <b>frontmatter 不是合法 YAML 时，按 Claude Code 加载器的规则给「值里有特殊字符」的行补上引号，再解析一次</b>
- *       （见 {@link #quoteSpecialValues}）：LENIENT 接收的是别处写出来的 skill，它拒绝的集合不该比 Claude Code 自己
- *       能加载的更大（比如 {@code description: Use when: x}）。STRICT 不重试，继续和 quick_validate.py 对拍。</li>
+ *       （见 {@link #quoteSpecialValues}，其中 {@code metadata} 行是唯一不补引号的）：LENIENT 接收的是别处写出来的
+ *       skill，它拒绝的集合不该比 Claude Code 自己能加载的更大（比如 {@code description: Use when: x}）。
+ *       STRICT 不重试，继续和 quick_validate.py 对拍。</li>
  * </ul>
  *
  * <p>{@code metadata.jm} 在两种模式下都严格校验：那是平台自己的命名空间，写错一个键名
@@ -161,7 +162,7 @@ public final class SkillManifestParser {
      * 把 frontmatter 里「键: 值」行中带 YAML 特殊字符的值整个加上双引号。宽松模式在 YAML 解析失败后用它重试一次；
      * 严格模式不重试，只用它判断提示要不要附（补引号会不会改动文本）。
      *
-     * <p>逐条照搬 Claude Code 2.1.158 加载 SKILL.md 时的同名处理，不增不减：
+     * <p>逐条照搬 Claude Code 2.1.158 加载 SKILL.md 时的同名处理，只有第 5 条是我们加的：
      * <ol>
      *   <li>只看形如 {@code key: value} 的行：整行匹配 {@code ([a-zA-Z_-]+):\s+(.+)}。缩进的行、没有值的行、
      *       键里带数字的行、注释行都原样放过。</li>
@@ -169,6 +170,13 @@ public final class SkillManifestParser {
      *   <li>值以 {@code [} 开头、{@code ]} 结尾，且本身能被同一个 YAML 加载成序列，原样放过。</li>
      *   <li>值里有「冒号 + 空格」，或有 {@code {}[]*&#!|>%@} 和反引号之一：先把反斜杠换成两个反斜杠、双引号换成反斜杠加双引号，
      *       整行改写成 {@code key: "转义后的值"}（冒号后的多个空白归一成一个空格）；否则原样放过。</li>
+     *   <li><b>相对 Claude Code 的唯一偏离</b>（在上面各条之前判断）：键恰好是 {@code metadata} 的行原样放过，不补引号。
+     *       Claude Code 不读 metadata，所以这不影响它能加载什么；我们要读 {@code metadata.jm}。单行写法
+     *       {@code metadata: {jm: {hosts: [api.example.com]}}} 的值含 {@code {}}，补引号会把整个 metadata 变成一个字符串，
+     *       {@link #parse} 随后把它当作没有 jm，声明的 hosts / web / timeout-seconds 悄悄退回默认，没有任何信号
+     *       （违反「metadata.jm 写错不能静默」）；metadata 自己写坏时也会被吞成字符串而通过。块风格的
+     *       {@code metadata:  # 注释} 同理：行尾的 {@code #} 会让它被改写，下面缩进的 jm 整段随之解析失败。
+     *       跳过之后，metadata 自己写坏时第二次解析照样失败，照常拒绝。</li>
      * </ol>
      * 行数不变，所以第二次解析失败时报的行号仍然对得上作者的文件。CRLF 先当 LF 处理。
      *
@@ -190,6 +198,8 @@ public final class SkillManifestParser {
         if (!kv.matches()) return line;
         String key = kv.group(1);
         String value = kv.group(2);
+        // 相对 Claude Code 的唯一偏离，理由见 quoteSpecialValues 的注释第 5 条
+        if ("metadata".equals(key)) return line;
         boolean alreadyQuoted = (value.startsWith("\"") && value.endsWith("\""))
                 || (value.startsWith("'") && value.endsWith("'"));
         if (alreadyQuoted) return line;
