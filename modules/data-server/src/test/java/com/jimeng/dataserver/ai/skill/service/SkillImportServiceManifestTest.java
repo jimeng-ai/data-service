@@ -4,6 +4,7 @@ import com.jimeng.dataserver.ai.skill.imports.GithubTarballFetcher;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundle;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundleExtractor;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import org.junit.jupiter.api.DisplayName;
@@ -31,7 +32,8 @@ class SkillImportServiceManifestTest {
         when(fetcher.fetch(any(), any(), any())).thenReturn(new byte[]{1});
         SkillBundleExtractor extractor = mock(SkillBundleExtractor.class);
         when(extractor.extract(any(), any())).thenReturn(new SkillBundle(skillMd, Map.of()));
-        return new SkillImportService(fetcher, extractor, mapper, mock(AiSkillRegistryService.class), null);
+        return new SkillImportService(fetcher, extractor, mapper, mock(AiSkillRegistryService.class), null,
+                mock(SkillSecretService.class));
     }
 
     @Test

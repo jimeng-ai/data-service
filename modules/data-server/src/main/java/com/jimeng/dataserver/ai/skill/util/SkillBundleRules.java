@@ -25,6 +25,16 @@ public final class SkillBundleRules {
     private static final Set<String> JUNK_FILES = Set.of(".DS_Store");
     private static final String EVALS_DIR = "evals";
     public static final String SKILL_MD = "SKILL.md";
+    /**
+     * 根目录的 key 文件（设计文档 §3.3–3.4）。发布时被提取、加密存库、从包里删掉，所以它不是 skill 的附带文件：
+     * 不参与运行方式的判定，不下发给任何运行。S1 之前发布的老 bundle 里可能还留着它，同样一律不下发、不给读。
+     * 与沙箱 {@code vendor/skill-creator/scripts/run_eval.py} 的 {@code _has_bundled_files} 一致，改一边要改另一边。
+     */
+    public static final String SECRETS_JSON = "secrets.json";
+
+    public static boolean isSecretsFile(String relPath) {
+        return SECRETS_JSON.equals(relPath);
+    }
 
     /** 相对 skill 根目录的 posix 路径是否是 skill 的一部分（不是缓存 / 依赖 / 系统垃圾，也没有越界段）。 */
     public static boolean isPartOfSkill(String relPath) {
@@ -39,9 +49,9 @@ public final class SkillBundleRules {
         return !JUNK_FILES.contains(name) && !name.endsWith(".pyc");
     }
 
-    /** 这个文件要不要下发给运行时（沙箱 DOER 运行、评测运行）：是 skill 的一部分，且不在根目录 evals/ 下。 */
+    /** 这个文件要不要下发给运行时（沙箱 DOER 运行、评测运行）：是 skill 的一部分，且不在根目录 evals/ 下，也不是根目录的 secrets.json。 */
     public static boolean isRuntimeFile(String relPath) {
-        return isPartOfSkill(relPath) && !isRootEvalsPath(relPath);
+        return isPartOfSkill(relPath) && !isRootEvalsPath(relPath) && !isSecretsFile(relPath);
     }
 
     public static boolean isRootEvalsPath(String relPath) {
@@ -49,7 +59,7 @@ public final class SkillBundleRules {
     }
 
     /**
-     * 按附带文件推断运行方式：除 SKILL.md 与根目录 evals/ 之外还有任何文件 → DOER（只能在沙箱执行：
+     * 按附带文件推断运行方式：除 SKILL.md、根目录 evals/ 与根目录 secrets.json 之外还有任何文件 → DOER（只能在沙箱执行：
      * 对话平面只注入 SKILL.md 正文，读不到任何附带文件）；否则 PROMPT。
      *
      * @param relPaths skill 目录下全部文件的相对路径

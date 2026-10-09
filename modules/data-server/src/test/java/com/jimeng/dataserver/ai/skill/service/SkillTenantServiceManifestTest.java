@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.skill.service;
 
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
@@ -22,7 +23,8 @@ import static org.mockito.Mockito.when;
 class SkillTenantServiceManifestTest {
 
     private final SkillTenantService svc = new SkillTenantService(
-            mock(AiSkillMapper.class), mock(AiSkillRegistryService.class), mock(SkillBuilderSessionMapper.class));
+            mock(AiSkillMapper.class), mock(AiSkillRegistryService.class), mock(SkillBuilderSessionMapper.class),
+            mock(SkillSecretService.class));
 
     @Test
     @DisplayName("单文件上传走宽松解析：名字可以大写下划线、不认识的键忽略；metadata.jm 存进 manifest")
@@ -58,7 +60,7 @@ class SkillTenantServiceManifestTest {
             return 1;
         });
         SkillTenantService local = new SkillTenantService(
-                mapper, mock(AiSkillRegistryService.class), mock(SkillBuilderSessionMapper.class));
+                mapper, mock(AiSkillRegistryService.class), mock(SkillBuilderSessionMapper.class), mock(SkillSecretService.class));
 
         AiSkill returned = local.createFromMarkdown("---\nname: a\ndescription: d\nmetadata:\n  jm:\n"
                 + "    hosts: [api.example.com]\n    timeout-seconds: 90\n---\n正文\n", "t1", 7L);

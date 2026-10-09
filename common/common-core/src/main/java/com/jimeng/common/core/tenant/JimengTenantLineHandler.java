@@ -63,7 +63,9 @@ public class JimengTenantLineHandler implements TenantLineHandler {
             "ai_skill",
             // Skill 构建器（沙箱里原样跑 skill-creator）：会话 → 工作区前缀的映射、每个发布版本的 bundle
             "skill_builder_session",
-            "ai_skill_version"
+            "ai_skill_version",
+            // 一切皆可 skills：企业 skill 的 key（加密保存）
+            "skill_secret"
     )));
 
     /** 防御性兜底租户 ID：当 TenantContext 缺失但表又是租户隔离表时，用这个值让查询命不中任何真实数据。 */

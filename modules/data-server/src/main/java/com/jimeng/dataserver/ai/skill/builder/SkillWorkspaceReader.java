@@ -10,6 +10,7 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
+import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -117,6 +118,11 @@ public class SkillWorkspaceReader {
         if (!nested.isEmpty()) {
             errors.add("skill 里只能有一个 SKILL.md，多出来的：" + String.join(", ", nested)
                     + "（参考资料请改名为 references/<主题>.md）");
+        }
+        // secrets.json 写错要在发布前就显示出来（报错文案里不会带出值）。
+        if (files.containsKey(SkillBundleRules.SECRETS_JSON)) {
+            errors.addAll(SkillSecretsFile.parse(
+                    readBytes(l, SkillWorkspaceLayout.skillDirPrefix(loc.dir()) + SkillBundleRules.SECRETS_JSON)).errors());
         }
         if (fm.name() != null && !fm.name().equals(loc.dir())) {
             errors.add("目录名「" + loc.dir() + "」与 frontmatter 的 name「" + fm.name() + "」不一致");

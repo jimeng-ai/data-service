@@ -11,11 +11,15 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
+import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
+import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.dataserver.ai.skill.service.AiSkillRegistryService;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.AiSkillVersion;
 import com.jimeng.persistence.entity.SkillBuilderSession;
+import com.jimeng.persistence.entity.SkillSecret;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import com.jimeng.persistence.mapper.AiSkillVersionMapper;
 import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
@@ -24,7 +28,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -32,10 +35,13 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 
 /**
- * 发布构建器会话里的 skill：按 skill-creator quick_validate 的规则校验 → 把工作区里的 skill 目录复制成
- * {@code skills/{id}/{version}/}（SKILL.md 原样、不重新渲染 frontmatter）→ 写 ai_skill 与 ai_skill_version → 刷新注册表。
+ * 发布构建器会话里的 skill：按 skill-creator quick_validate 的规则校验 → 读出工作区里的 skill 目录，交给
+ * {@link SkillPackageProcessor} 提取 secrets.json、把文本文件里的 key 原文换成占位符（设计文档 §3.4）→ 写成
+ * {@code skills/{id}/{version}/}（SKILL.md 除了 key 原文变占位符，不重新渲染 frontmatter）→ 写 ai_skill 与
+ * ai_skill_version，key 加密写进 skill_secret → 刷新注册表。
  *
  * <p>没有评测闸门：skill-creator 的方法是人来看对照结果、人来决定，发布关口只拦「格式不合规」这种客观错误，
  * 其余（没跑过测试、最近一轮评审没交反馈）作为 warnings 回给界面。
@@ -53,6 +59,7 @@ public class SkillBuilderPublishService {
     private final AiSkillVersionMapper versionMapper;
     private final AiSkillRegistryService registry;
     private final ChatConversationService conversationService;
+    private final SkillSecretService secretService;
 
     @Transactional
     public PublishResult publish(Long sessionId) {
@@ -70,10 +77,18 @@ public class SkillBuilderPublishService {
                     "SKILL.md 不符合发布规则：" + String.join("；", draft.getValidationErrors()));
         }
         String dir = draft.getDirName();
-        List<String> files = reader.skillFiles(l, dir).keySet().stream().filter(SkillBundleRules::isPartOfSkill).toList();
+        // 读出属于 skill 的全部文件交给发布处理器：提取 secrets.json、把 key 原文换成占位符、解析 SKILL.md（设计文档 §3.4）。
+        Map<String, byte[]> raw = new TreeMap<>();
+        for (String rel : reader.skillFiles(l, dir).keySet()) {
+            if (SkillBundleRules.isPartOfSkill(rel)) {
+                raw.put(rel, reader.readBytes(l, SkillWorkspaceLayout.skillDirPrefix(dir) + rel));
+            }
+        }
+        SkillPackageProcessor.Output out = SkillPackageProcessor.process(raw, SkillManifestParser.Mode.STRICT, true);
 
         AiSkill row;
         int version;
+        Integer previousVersion = null;
         if (session.getBaseSkillId() != null) {
             row = aiSkillMapper.selectById(session.getBaseSkillId());
             if (row == null) throw new ServiceException(ExceptionCode.NOT_FOUND, "要改进的 skill 已不存在");
@@ -86,6 +101,7 @@ public class SkillBuilderPublishService {
                         + "」，现在是「" + draft.getName() + "」）");
             }
             recordVersionIfMissing(row);
+            previousVersion = row.getVersion();
             version = row.getVersion() + 1;
         } else {
             assertNameFree(draft.getName(), session);
@@ -105,15 +121,17 @@ public class SkillBuilderPublishService {
             version = 1;
         }
 
-        String bundlePrefix = "skills/" + row.getId() + "/" + version + "/";
-        String hash = copyBundle(session.getWorkspacePrefix() + SkillWorkspaceLayout.skillDirPrefix(dir), bundlePrefix, files);
-        // 解析结果存库，运行时只读它（设计文档 §3.6）。Task 3 会改成用发布处理器的结果（那时还要带上 key 的声明）。
-        String manifestJson = SkillManifest.of(
-                SkillManifestParser.parse(draft.getSkillMd(), SkillManifestParser.Mode.STRICT).jm(), List.of()).toJson();
+        // key 先算好再动存储：没给值、范围改了、没配密钥都在这里失败，bundle 和库都还没写（事务回滚掉刚插的 DRAFT 行）。
+        List<SkillSecret> secretRows = secretService.prepare(row.getTenantId(), row.getId(), previousVersion, out.secrets());
 
-        row.setName(draft.getName());
-        row.setDescription(draft.getDescription());
-        row.setBody(draft.getBody());
+        String bundlePrefix = "skills/" + row.getId() + "/" + version + "/";
+        String hash = writeBundle(bundlePrefix, out.files());
+        // 解析结果存库，运行时只读它（设计文档 §3.6）；key 只记名字和发送范围，不含值。
+        String manifestJson = SkillManifest.of(out.skill().jm(), SkillSecretsFile.decls(out.secrets())).toJson();
+
+        row.setName(out.skill().name());
+        row.setDescription(out.skill().description());
+        row.setBody(out.skill().body());
         row.setManifest(manifestJson);
         row.setSkillType(draft.getEffectiveType());
         row.setBundleKey(bundlePrefix);
@@ -143,6 +161,7 @@ public class SkillBuilderPublishService {
         v.setBuilderSessionId(session.getId());
         v.setManifest(manifestJson);
         versionMapper.insert(v);
+        secretService.save(row.getId(), version, secretRows);
 
         SkillBuilderSession u = new SkillBuilderSession();
         u.setId(session.getId());
@@ -201,21 +220,19 @@ public class SkillBuilderPublishService {
     }
 
     /**
-     * 服务端复制工作区里的 skill 目录到版本化 bundle，返回全部文件的 sha256（路径与内容都参与：
-     * 旧实现只哈希正文，改了脚本 hash 不变）。目标前缀若已有残留（上一次复制到一半失败）先清掉。
+     * 把处理过的文件写成版本化 bundle，返回全部文件的 sha256（路径与内容都参与）。目标前缀若已有残留先清掉。
+     * 以前是存储端整份复制；现在文本文件里的 key 原文要换成占位符、secrets.json 要拿掉，只能读出来处理完再写。
      */
-    private String copyBundle(String sourcePrefix, String bundlePrefix, List<String> files) {
+    private String writeBundle(String bundlePrefix, Map<String, byte[]> files) {
         try {
             storage.deletePrefix(bundlePrefix);
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            for (String rel : files.stream().sorted().toList()) {
-                storage.copyObject(sourcePrefix + rel, bundlePrefix + rel);
-                md.update(rel.getBytes(StandardCharsets.UTF_8));
+            for (Map.Entry<String, byte[]> f : new TreeMap<>(files).entrySet()) {
+                storage.putObject(bundlePrefix + f.getKey(), f.getValue(),
+                        f.getKey().endsWith(".md") ? "text/markdown" : "application/octet-stream");
+                md.update(f.getKey().getBytes(StandardCharsets.UTF_8));
                 md.update((byte) 0);
-                try (InputStream in = storage.download(bundlePrefix + rel)) {
-                    byte[] buf = new byte[64 * 1024];
-                    for (int n; (n = in.read(buf)) > 0; ) md.update(buf, 0, n);
-                }
+                md.update(f.getValue());
                 md.update((byte) 0);
             }
             return HexFormat.of().formatHex(md.digest());
@@ -243,8 +260,9 @@ public class SkillBuilderPublishService {
         return w;
     }
 
-    /** 给测试用：bundle 里会有哪些文件（与 copyBundle 的取舍一致）。 */
+    /** 给测试用：bundle 里会有哪些文件（与 writeBundle 的取舍一致）。 */
     static List<String> bundleFiles(Map<String, ?> skillFiles) {
-        return skillFiles.keySet().stream().filter(SkillBundleRules::isPartOfSkill).sorted().toList();
+        return skillFiles.keySet().stream().filter(SkillBundleRules::isPartOfSkill)
+                .filter(p -> !SkillBundleRules.isSecretsFile(p)).sorted().toList();
     }
 }

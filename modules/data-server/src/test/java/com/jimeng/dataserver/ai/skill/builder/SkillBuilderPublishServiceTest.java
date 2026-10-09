@@ -4,6 +4,7 @@ import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.skill.manifest.JmMetadata;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.dataserver.ai.skill.service.AiSkillRegistryService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.AiSkillVersion;
@@ -24,8 +25,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 发布构建器 skill 时补老版本记录（{@code recordVersionIfMissing}）。publish 主路径的 manifest 写入由 Task 3 换成发布处理器的结果，
- * 并带 ArgumentCaptor 测试，这里不重复。
+ * 发布构建器 skill 时补老版本记录（{@code recordVersionIfMissing}）。publish 主路径的 manifest 写入已换成发布处理器的结果，
+ * 由 {@link SkillBuilderPublishSecretsTest} 在 mapper 被调用的那一刻记快照来断言，这里不重复。
  */
 class SkillBuilderPublishServiceTest {
 
@@ -33,7 +34,7 @@ class SkillBuilderPublishServiceTest {
     private final SkillBuilderPublishService svc = new SkillBuilderPublishService(
             mock(SkillBuilderSessionService.class), mock(SkillBuilderSessionMapper.class), mock(SkillWorkspaceReader.class),
             mock(RagMinioStorageService.class), mock(AiSkillMapper.class), versionMapper,
-            mock(AiSkillRegistryService.class), mock(ChatConversationService.class));
+            mock(AiSkillRegistryService.class), mock(ChatConversationService.class), mock(SkillSecretService.class));
 
     /** 本功能之前发布的 v2，库里没有对应的版本记录。 */
     private static AiSkill publishedRow() {

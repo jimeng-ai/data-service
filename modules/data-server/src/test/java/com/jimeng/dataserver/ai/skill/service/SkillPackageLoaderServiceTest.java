@@ -45,6 +45,15 @@ class SkillPackageLoaderServiceTest {
     }
 
     @Test
+    @DisplayName("出厂版本带了 secrets.json：拒绝加载这个 skill 并报错，其余照常")
+    void diskSkillWithSecretsIsRejected() throws IOException {
+        write(root.resolve("good/SKILL.md"), "---\nname: good\ndescription: d\n---\n正文\n");
+        write(root.resolve("leaky/SKILL.md"), "---\nname: leaky\ndescription: d\n---\n正文\n");
+        write(root.resolve("leaky/secrets.json"), "{\"K_1\":{\"value\":\"abcdefgh\",\"hosts\":[\"a.example.com\"]}}");
+        assertThat(loaderAt(root).loadSkillPackages()).containsOnlyKeys("good");
+    }
+
+    @Test
     @DisplayName("平台上传走严格校验：顶层多一个键就拒绝，目录里什么都不写")
     void uploadIsStrict() {
         MockMultipartFile f = new MockMultipartFile("file", "SKILL.md", "text/markdown",

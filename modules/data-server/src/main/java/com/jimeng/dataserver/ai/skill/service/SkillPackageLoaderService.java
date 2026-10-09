@@ -8,6 +8,7 @@ import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
+import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -161,6 +162,11 @@ public class SkillPackageLoaderService {
     private SkillPackage loadSingleSkill(Path skillDir) {
         Path skillFile = skillDir.resolve(SKILL_FILE);
         if (!Files.isRegularFile(skillFile)) {
+            return null;
+        }
+        if (Files.exists(skillDir.resolve(SkillBundleRules.SECRETS_JSON))) {
+            // 设计文档 §3.4 第 5 条：出厂版本来自 git，key 不能进 git。拒绝并报错，PlatformSkillsManifestTest 在 CI 里先拦一道。
+            log.error("平台技能 {} 带了 secrets.json，已拒绝加载：key 不能放进代码仓库", skillDir.getFileName());
             return null;
         }
 

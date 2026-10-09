@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.skill.service;
 
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.skill.controller.dto.SkillFileView;
+import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -39,6 +40,8 @@ public class SkillBundleReadService {
         for (String obj : objects) {
             String rel = obj.startsWith(bundleKey) ? obj.substring(bundleKey.length()) : obj;
             if (ROOT_SKILL_MD.equals(rel)) continue;
+            // S1 之前发布的老 bundle 里可能留着 secrets.json（key 原文），详情页一律不读。
+            if (SkillBundleRules.isSecretsFile(rel)) continue;
             try {
                 files.add(readOne(obj, rel));
             } catch (Exception e) {

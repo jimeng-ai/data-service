@@ -3,6 +3,7 @@ package com.jimeng.dataserver.ai.skill.service;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.imports.*;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import org.junit.jupiter.api.Test;
@@ -21,7 +22,7 @@ class SkillImportServiceTest {
                         Map.of("references/x.md", new byte[]{1})));
         AiSkillMapper mapper = mock(AiSkillMapper.class);
         AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
-        SkillImportService svc = new SkillImportService(fetcher, extractor, mapper, registry, null);
+        SkillImportService svc = new SkillImportService(fetcher, extractor, mapper, registry, null, mock(SkillSecretService.class));
         AiSkill s = svc.importFromGithub("anthropics", "skills", "main", "brand", "t1", 7L);
         assertEquals("brand", s.getName());
         assertEquals(SkillConst.SOURCE_MARKET, s.getSource());
@@ -42,7 +43,7 @@ class SkillImportServiceTest {
         doAnswer(inv -> { ((AiSkill) inv.getArgument(0)).setId(99L); return 1; }).when(mapper).insert(any());
         AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
         RagMinioStorageService minio = mock(RagMinioStorageService.class);
-        SkillImportService svc = new SkillImportService(fetcher, extractor, mapper, registry, minio);
+        SkillImportService svc = new SkillImportService(fetcher, extractor, mapper, registry, minio, mock(SkillSecretService.class));
         AiSkill s = svc.importFromGithub("o", "r", "main", "pdf", "t1", 7L);
         assertEquals(SkillConst.TYPE_DOER, s.getSkillType());
         assertEquals("skills/99/1/", s.getBundleKey());

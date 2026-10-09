@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.skill.service;
 
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.skill.SkillConst;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
@@ -16,8 +17,12 @@ class SkillTenantServiceTest {
     }
 
     private SkillTenantService newService(AiSkillMapper mapper, SkillBuilderSessionMapper sessions) {
+        return newService(mapper, sessions, mock(SkillSecretService.class));
+    }
+
+    private SkillTenantService newService(AiSkillMapper mapper, SkillBuilderSessionMapper sessions, SkillSecretService secrets) {
         AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
-        return new SkillTenantService(mapper, registry, sessions);
+        return new SkillTenantService(mapper, registry, sessions, secrets);
     }
 
     private static AiSkill owned(String status) {
@@ -46,6 +51,27 @@ class SkillTenantServiceTest {
         newService(mapper, sessions).delete(11L, 7L);
         verify(mapper).deleteById(11L);
         verify(sessions).update(any(), any());
+    }
+
+    @Test
+    void deletingSkillDeletesItsKeysToo() {
+        // 删 skill 时它所有版本的 key 一并删掉，不然密文会留在 skill_secret 里没人管
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        SkillSecretService secrets = mock(SkillSecretService.class);
+        when(mapper.selectById(11L)).thenReturn(owned(SkillConst.STATUS_ACTIVE));
+        newService(mapper, mock(SkillBuilderSessionMapper.class), secrets).delete(11L, 7L);
+        verify(secrets).deleteAll(11L);
+    }
+
+    @Test
+    void notOwnerCannotDeleteItsKeys() {
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        SkillSecretService secrets = mock(SkillSecretService.class);
+        when(mapper.selectById(11L)).thenReturn(owned(SkillConst.STATUS_ACTIVE));
+        SkillTenantService svc = newService(mapper, mock(SkillBuilderSessionMapper.class), secrets);
+        assertThrows(ServiceException.class, () -> svc.delete(11L, 999L));
+        verify(mapper, never()).deleteById(any(java.io.Serializable.class));
+        verify(secrets, never()).deleteAll(any());
     }
 
     @Test

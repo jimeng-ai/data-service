@@ -60,6 +60,9 @@ class JimengTenantLineHandlerTest {
         assertFalse(handler.ignoreTable("connector_semantic_generation_table"));
         assertFalse(handler.ignoreTable("connector_semantic_staged"));
         assertFalse(handler.ignoreTable("knowledge_base"));
+        // 技能里的 key（加密保存）：漏登记不报错，后果是按 skill_id 查的 key 行不带租户条件，
+        // 传错一个 id 就读到别的租户的 key 密文、范围声明，连带着能沿用 / 解出别家的 key。
+        assertFalse(handler.ignoreTable("skill_secret"));
         assertFalse(handler.ignoreTable("ai_trace"));
         assertFalse(handler.ignoreTable("ai_trace_step"));
         // 大小写不敏感

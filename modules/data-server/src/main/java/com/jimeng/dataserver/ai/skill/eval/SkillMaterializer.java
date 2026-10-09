@@ -5,6 +5,7 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.agent.exec.dto.SidecarRunPayload;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.skill.service.SkillBundleResolver;
+import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -77,6 +78,8 @@ public class SkillMaterializer {
                 String rel = (obj.startsWith(bundleKey) ? obj.substring(bundleKey.length()) : obj)
                         .replaceAll("^/+", "");
                 if (rel.isBlank()) continue;
+                // 老 bundle 里的 secrets.json 绝不读进评测运行（那里的文件会物化进沙箱）。
+                if (SkillBundleRules.isSecretsFile(rel)) continue;
                 try (InputStream is = storage.download(obj)) {
                     out.put(rel, new String(is.readAllBytes(), StandardCharsets.UTF_8));
                 }

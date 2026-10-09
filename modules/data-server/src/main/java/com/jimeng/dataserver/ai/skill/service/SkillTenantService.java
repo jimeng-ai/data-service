@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.SkillBuilderSession;
 import com.jimeng.persistence.mapper.AiSkillMapper;
@@ -25,6 +26,7 @@ public class SkillTenantService {
     private final AiSkillRegistryService registry;
     /** 只用 mapper、不依赖构建器服务：本类在对话链路上（ChatRunService → 这里），不能把构建器那一串拖进来。 */
     private final SkillBuilderSessionMapper builderSessionMapper;
+    private final SkillSecretService secretService;
 
     @Transactional
     public AiSkill createFromMarkdown(String rawMarkdown, String tenantId, Long ownerUserId) {
@@ -98,6 +100,7 @@ public class SkillTenantService {
     public void delete(Long id, Long currentUserId) {
         AiSkill s = requireOwned(id, currentUserId);
         aiSkillMapper.deleteById(id);
+        secretService.deleteAll(id);   // 它所有版本的 key 一并删掉
         // 删掉构建器草稿卡片 = 放弃那个会话；工作区由 SkillBuilderJanitor 按保留期回收。
         if (SkillConst.STATUS_DRAFT.equals(s.getStatus())) {
             SkillBuilderSession u = new SkillBuilderSession();

@@ -55,6 +55,13 @@ class PlatformSkillsManifestTest {
     }
 
     @TestFactory
+    @DisplayName("出厂版本不带 secrets.json：key 不能进代码仓库（设计文档 §3.4 第 5 条）")
+    Stream<DynamicTest> 出厂版本不带secrets() throws IOException {
+        return skillDirs().stream().map(d -> DynamicTest.dynamicTest(d.getFileName().toString(),
+                () -> assertThat(d.resolve("secrets.json")).as(d + "/secrets.json").doesNotExist()));
+    }
+
+    @TestFactory
     @DisplayName("S1 的平台 skill 不声明 hosts / web：平台 skill 的 key 要等 S2b，现在写了不会生效")
     Stream<DynamicTest> 平台skill暂不声明HTTP() throws IOException {
         return skillDirs().stream().map(d -> DynamicTest.dynamicTest(d.getFileName().toString(), () -> {
