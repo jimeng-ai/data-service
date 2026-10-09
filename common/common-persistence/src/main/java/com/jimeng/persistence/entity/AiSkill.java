@@ -71,4 +71,8 @@ public class AiSkill extends BaseEntity {
     @Schema(description = "版本号")
     @TableField("version")
     private Integer version;
+
+    @Schema(description = "SKILL.md 解析结果 JSON：metadata.jm 与 key 的声明（不含值）。NULL = 老数据，按没有扩展字段处理")
+    @TableField("manifest")
+    private String manifest;
 }

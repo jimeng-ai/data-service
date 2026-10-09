@@ -69,6 +69,26 @@ class SkillManifestParserTest {
         assertThat(p.jm()).isEqualTo(JmMetadata.EMPTY);
     }
 
+    // 下面两条是被删掉的旧 SkillFrontmatterTest 里、对拍用例（只有 CJK 的 1024 / 1025 和 compatibility 的 501）没有覆盖到的边界。
+    @Test
+    @DisplayName("description 的 1024 上限按码点计：1024 个 emoji 是 1024 个字符，不是 2048（与 quick_validate.py 的 len() 同口径）")
+    void descriptionLimitCountsCodePoints() {
+        // 补充平面字符，UTF-16 里占两个 char；用 toChars 构造，不把 emoji 写成字面字符，免得被工具链改掉
+        String emoji = new String(Character.toChars(0x1F600));
+        assertThat(SkillManifestParser.parse(skill("name: a\ndescription: " + emoji.repeat(1024)), STRICT).errors()).isEmpty();
+        assertThat(SkillManifestParser.parse(skill("name: a\ndescription: " + emoji.repeat(1025)), STRICT).errors())
+                .anyMatch(e -> e.contains("最多 1024"));
+    }
+
+    @Test
+    @DisplayName("compatibility 的 500 上限：500 个字符合规，501 个报错")
+    void compatibilityLimitBoundary() {
+        assertThat(SkillManifestParser.parse(skill("name: a\ndescription: d\ncompatibility: " + "x".repeat(500)), STRICT).errors())
+                .isEmpty();
+        assertThat(SkillManifestParser.parse(skill("name: a\ndescription: d\ncompatibility: " + "x".repeat(501)), STRICT).errors())
+                .anyMatch(e -> e.contains("最多 500"));
+    }
+
     @Test
     @DisplayName("CRLF和BOM都能解析（Windows 上编辑过的文件），两种模式都一样")
     void CRLF和BOM都能解析() {

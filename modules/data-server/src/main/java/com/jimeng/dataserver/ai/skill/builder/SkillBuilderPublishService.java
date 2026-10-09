@@ -9,6 +9,8 @@ import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.service.AiSkillRegistryService;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import com.jimeng.persistence.entity.AiSkill;
@@ -105,10 +107,14 @@ public class SkillBuilderPublishService {
 
         String bundlePrefix = "skills/" + row.getId() + "/" + version + "/";
         String hash = copyBundle(session.getWorkspacePrefix() + SkillWorkspaceLayout.skillDirPrefix(dir), bundlePrefix, files);
+        // 解析结果存库，运行时只读它（设计文档 §3.6）。Task 3 会改成用发布处理器的结果（那时还要带上 key 的声明）。
+        String manifestJson = SkillManifest.of(
+                SkillManifestParser.parse(draft.getSkillMd(), SkillManifestParser.Mode.STRICT).jm(), List.of()).toJson();
 
         row.setName(draft.getName());
         row.setDescription(draft.getDescription());
         row.setBody(draft.getBody());
+        row.setManifest(manifestJson);
         row.setSkillType(draft.getEffectiveType());
         row.setBundleKey(bundlePrefix);
         row.setBundleHash(hash);
@@ -135,6 +141,7 @@ public class SkillBuilderPublishService {
         v.setBundleKey(bundlePrefix);
         v.setBundleHash(hash);
         v.setBuilderSessionId(session.getId());
+        v.setManifest(manifestJson);
         versionMapper.insert(v);
 
         SkillBuilderSession u = new SkillBuilderSession();
@@ -186,6 +193,7 @@ public class SkillBuilderPublishService {
         v.setSkillType(row.getSkillType());
         v.setBundleKey(row.getBundleKey());
         v.setBundleHash(row.getBundleHash());
+        v.setManifest(row.getManifest());
         versionMapper.insert(v);
     }
 

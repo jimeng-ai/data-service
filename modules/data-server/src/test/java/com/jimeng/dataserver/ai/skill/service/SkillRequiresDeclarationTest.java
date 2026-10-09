@@ -1,5 +1,7 @@
 package com.jimeng.dataserver.ai.skill.service;
 
+import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.model.SkillRequirement;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -8,16 +10,13 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * 磁盘上那几份 SKILL.md 的 {@code requires:} 声明。
+ * 磁盘上那几份 SKILL.md 的 {@code metadata.jm.requires} 声明。
  *
  * <h3>为什么这件事需要一个测试盯着</h3>
  * 「这个 Skill 什么时候该出现」现在是<b>一行 markdown</b> 说了算。漏写这一行<b>不会报错</b>：
@@ -35,17 +34,17 @@ class SkillRequiresDeclarationTest {
     private static final Path SKILLS_DIR = Path.of("skills");
 
     @Test
-    @DisplayName("connector 必须声明 requires: connections —— 漏了就退回走发现，且不报错")
+    @DisplayName("connector 必须声明 metadata.jm.requires: connections —— 漏了就退回走发现，且不报错")
     void connectorDeclaresConnections() throws IOException {
         assertEquals(SkillRequirement.CONNECTIONS, requiresOf("connector"),
-                "skills/connector/SKILL.md 的 frontmatter 必须是 requires: connections");
+                "skills/connector/SKILL.md 的 frontmatter 必须是 metadata.jm.requires: connections");
     }
 
     @Test
-    @DisplayName("rag-knowledge 必须声明 requires: knowledge_bases —— 它原来靠运行时硬编码，现在靠这一行")
+    @DisplayName("rag-knowledge 必须声明 metadata.jm.requires: knowledge_bases —— 它原来靠运行时硬编码，现在靠这一行")
     void ragKnowledgeDeclaresKnowledgeBases() throws IOException {
         assertEquals(SkillRequirement.KNOWLEDGE_BASES, requiresOf("rag-knowledge"),
-                "skills/rag-knowledge/SKILL.md 的 frontmatter 必须是 requires: knowledge_bases。"
+                "skills/rag-knowledge/SKILL.md 的 frontmatter 必须是 metadata.jm.requires: knowledge_bases。"
                         + "这段判断原本硬编码在 SkillRuntimeService 里，删掉硬编码之后它唯一的落点就是这一行");
     }
 
@@ -78,7 +77,7 @@ class SkillRequiresDeclarationTest {
     // ---------------------------------------------------------------- helpers
 
     /**
-     * 直接读磁盘文件解析 frontmatter，<b>不经过 SkillPackageLoaderService</b>。
+     * 直接读磁盘文件、用统一解析器解析，<b>不经过 SkillPackageLoaderService</b>。
      *
      * <p>刻意绕开加载器：本用例要断言的是「磁盘上那一行写没写对」，
      * 走加载器的话，加载器自己的一个 bug（比如把 requires 读丢了）会让这个测试跟着一起绿。
@@ -86,18 +85,8 @@ class SkillRequiresDeclarationTest {
     private static SkillRequirement requiresOf(String skillName) throws IOException {
         Path md = SKILLS_DIR.resolve(skillName).resolve("SKILL.md");
         assertTrue(Files.isRegularFile(md), "找不到 " + md.toAbsolutePath());
-        String text = Files.readString(md, StandardCharsets.UTF_8).replace("\r\n", "\n");
-        assertTrue(text.startsWith("---\n"), skillName + " 的 SKILL.md 缺 frontmatter");
-        int end = text.indexOf("\n---\n", 4);
-        assertTrue(end > 0, skillName + " 的 frontmatter 没有闭合");
-
-        Map<String, String> fm = new LinkedHashMap<>();
-        for (String line : text.substring(4, end).split("\n")) {
-            int i = line.indexOf(':');
-            if (i <= 0) continue;
-            fm.put(line.substring(0, i).trim().toLowerCase(), line.substring(i + 1).trim());
-        }
-        assertNotNull(fm.get("name"), skillName + " 的 frontmatter 缺 name");
-        return SkillRequirement.parse(fm.get("requires"));
+        ParsedSkill p = SkillManifestParser.parse(Files.readString(md, StandardCharsets.UTF_8), SkillManifestParser.Mode.STRICT);
+        assertTrue(p.valid(), skillName + " 的 SKILL.md 不合规：" + p.errors());
+        return p.jm().requires();
     }
 }

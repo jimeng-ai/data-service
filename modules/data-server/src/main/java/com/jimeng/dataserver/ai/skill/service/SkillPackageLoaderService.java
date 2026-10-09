@@ -4,8 +4,9 @@ import cn.hutool.core.util.StrUtil;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
+import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
-import com.jimeng.dataserver.ai.skill.model.SkillRequirement;
 import com.jimeng.dataserver.ai.skill.model.SkillToolDefinition;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -27,7 +28,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 @Service
@@ -36,7 +36,6 @@ public class SkillPackageLoaderService {
 
     private static final String SKILL_FILE = "SKILL.md";
     private static final String TOOLS_FILE = "tools.json";
-    private static final Pattern SKILL_NAME_PATTERN = Pattern.compile("[A-Za-z][A-Za-z0-9_-]{0,63}");
 
     @Value("${skill.root-dir:skills}")
     private String skillRootDir;
@@ -99,19 +98,22 @@ public class SkillPackageLoaderService {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md内容不能为空");
         }
 
-        ParsedSkillMarkdown parsed = parseSkillMarkdown(raw, "");
-        validateUploadedSkill(parsed);
+        // 平台上传 = 运营端上传，走严格校验（设计文档 §3.6）。
+        ParsedSkill parsed = SkillManifestParser.parse(raw, SkillManifestParser.Mode.STRICT).orThrow();
+        if (StrUtil.isBlank(parsed.body())) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md正文不能为空");
+        }
 
         Path root = resolveRootPathForWrite();
-        Path skillDir = root.resolve(parsed.name).normalize();
+        Path skillDir = root.resolve(parsed.name()).normalize();
         if (!skillDir.startsWith(root)) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "非法skill名称: " + parsed.name);
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "非法skill名称: " + parsed.name());
         }
 
         Path skillFile = skillDir.resolve(SKILL_FILE);
         boolean existed = Files.exists(skillFile);
         if (existed && !overwrite) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill已存在，如需覆盖请传overwrite=true: " + parsed.name);
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill已存在，如需覆盖请传overwrite=true: " + parsed.name());
         }
 
         try {
@@ -123,7 +125,7 @@ public class SkillPackageLoaderService {
 
         SkillPackage skillPackage = loadSingleSkill(skillDir);
         if (skillPackage == null) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存后加载skill失败: " + parsed.name);
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存后加载skill失败: " + parsed.name());
         }
 
         skillCache.set(null);  // invalidate cache so next call reloads from disk
@@ -170,13 +172,15 @@ public class SkillPackageLoaderService {
             return null;
         }
 
-        ParsedSkillMarkdown parsed = parseSkillMarkdown(raw, skillDir.getFileName().toString());
-        if (StrUtil.isBlank(parsed.name)) {
+        ParsedSkill parsed = SkillManifestParser.parse(raw, SkillManifestParser.Mode.STRICT);
+        if (!parsed.valid()) {
+            // ★ 出厂版本不合规只跳过它自己并报错，不让整个 data-server 起不来（以前 requires 写错就是启动失败）。
+            //   PlatformSkillsManifestTest 在 CI 里先拦一道，正常走不到这里。
+            log.error("平台技能 {} 的 SKILL.md 不符合规则，已跳过：{}", skillDir.getFileName(), String.join("；", parsed.errors()));
             return null;
         }
-
         List<SkillToolDefinition> tools = loadToolDefinitions(skillDir.resolve(TOOLS_FILE));
-        return new SkillPackage(parsed.name, parsed.description, parsed.body, skillDir, tools, parsed.requires);
+        return new SkillPackage(parsed.name(), parsed.description(), parsed.body(), skillDir, tools, parsed.jm());
     }
 
     private List<SkillToolDefinition> loadToolDefinitions(Path toolsFile) {
@@ -212,75 +216,6 @@ public class SkillPackageLoaderService {
         } catch (Exception e) {
             log.warn("解析tools.json失败, file={}, error={}", toolsFile, e.getMessage());
             return Collections.emptyList();
-        }
-    }
-
-    private ParsedSkillMarkdown parseSkillMarkdown(String raw, String fallbackName) {
-        if (raw == null) {
-            raw = "";
-        }
-        String normalized = normalizeLineEndings(raw);
-
-        String name = fallbackName;
-        String description = "";
-        String body = normalized.trim();
-        SkillRequirement requires = null;
-
-        if (!normalized.startsWith("---\n")) {
-            return new ParsedSkillMarkdown(name, description, body, requires);
-        }
-
-        int frontmatterEnd = normalized.indexOf("\n---\n", 4);
-        if (frontmatterEnd < 0) {
-            return new ParsedSkillMarkdown(name, description, body, requires);
-        }
-
-        String frontmatter = normalized.substring(4, frontmatterEnd);
-        String[] lines = frontmatter.split("\n");
-        for (String line : lines) {
-            if (line == null) {
-                continue;
-            }
-            int idx = line.indexOf(':');
-            if (idx <= 0) {
-                continue;
-            }
-            String key = line.substring(0, idx).trim();
-            String value = line.substring(idx + 1).trim();
-            if (value.startsWith("\"") && value.endsWith("\"") && value.length() >= 2) {
-                value = value.substring(1, value.length() - 1);
-            }
-            if ("name".equalsIgnoreCase(key) && StrUtil.isNotBlank(value)) {
-                name = value;
-            }
-            if ("description".equalsIgnoreCase(key)) {
-                description = value;
-            }
-            // ★ 认不出来的值直接抛，不回落成 null——理由见 SkillRequirement 的类注释：
-            //   静默忽略一个拼错的 requires，后果正是「该直注的 Skill 安静地退回走发现」，
-            //   而那恰好是这个字段被引入来修掉的那个 bug 的形状。
-            if ("requires".equalsIgnoreCase(key)) {
-                requires = SkillRequirement.parse(value);
-            }
-        }
-
-        body = normalized.substring(frontmatterEnd + 5).trim();
-        return new ParsedSkillMarkdown(name, description, body, requires);
-    }
-
-    private void validateUploadedSkill(ParsedSkillMarkdown parsed) {
-        if (parsed == null || StrUtil.isBlank(parsed.name)) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md frontmatter必须包含name");
-        }
-        if (!SKILL_NAME_PATTERN.matcher(parsed.name).matches()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "skill名称只能包含字母、数字、下划线、中划线，且必须以字母开头，长度不超过64");
-        }
-        if (StrUtil.isBlank(parsed.description)) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md frontmatter必须包含description");
-        }
-        if (StrUtil.isBlank(parsed.body)) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "SKILL.md正文不能为空");
         }
     }
 
@@ -348,21 +283,6 @@ public class SkillPackageLoaderService {
             return root.toAbsolutePath().normalize();
         } catch (IOException e) {
             throw new ServiceException(e, ExceptionCode.INTERNAL_SERVER_ERROR.getResultCode(), "创建skill根目录失败");
-        }
-    }
-
-    private static class ParsedSkillMarkdown {
-        private final String name;
-        private final String description;
-        private final String body;
-        /** frontmatter 的 requires；null = 没有前置资源，走发现。 */
-        private final SkillRequirement requires;
-
-        private ParsedSkillMarkdown(String name, String description, String body, SkillRequirement requires) {
-            this.name = name;
-            this.description = description;
-            this.body = body;
-            this.requires = requires;
         }
     }
 }

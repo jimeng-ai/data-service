@@ -1,5 +1,7 @@
 package com.jimeng.dataserver.ai.skill.model;
 
+import com.jimeng.dataserver.ai.skill.manifest.JmMetadata;
+
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
@@ -11,16 +13,16 @@ public class SkillPackage implements ToolPackage {
     private final String body;
     private final Path rootPath;
     private final List<SkillToolDefinition> tools;
-    private final SkillRequirement requires;
+    private final JmMetadata jm;
 
     public SkillPackage(String name, String description, String body, Path rootPath,
-                        List<SkillToolDefinition> tools, SkillRequirement requires) {
+                        List<SkillToolDefinition> tools, JmMetadata jm) {
         this.name = name;
         this.description = description;
         this.body = body;
         this.rootPath = rootPath;
         this.tools = tools == null ? Collections.emptyList() : List.copyOf(tools);
-        this.requires = requires;
+        this.jm = jm == null ? JmMetadata.EMPTY : jm;
     }
 
     public String getName() {
@@ -43,8 +45,13 @@ public class SkillPackage implements ToolPackage {
         return tools;
     }
 
+    /** SKILL.md 的 metadata.jm。 */
+    public JmMetadata getJm() {
+        return jm;
+    }
+
     @Override
     public SkillRequirement getRequires() {
-        return requires;
+        return jm.requires();
     }
 }

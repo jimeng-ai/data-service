@@ -8,7 +8,9 @@ import com.jimeng.dataserver.ai.skill.imports.GithubTarballFetcher;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundle;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundleExtractor;
 import com.jimeng.dataserver.ai.skill.imports.SkillClassifier;
-import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
+import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.mapper.AiSkillMapper;
 import lombok.RequiredArgsConstructor;
@@ -18,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.List;
 import java.util.Map;
 
 @Service
@@ -34,8 +37,7 @@ public class SkillImportService {
                                     String tenantId, Long ownerUserId) {
         byte[] tarGz = fetcher.fetch(owner, repo, ref);
         SkillBundle bundle = extractor.extract(tarGz, subPath);
-        SkillMarkdownParser.ParsedSkill p = SkillMarkdownParser.parse(bundle.skillMarkdown());
-        SkillMarkdownParser.validate(p);
+        ParsedSkill p = SkillManifestParser.parse(bundle.skillMarkdown(), SkillManifestParser.Mode.LENIENT).orThrow();
         String type = SkillClassifier.classify(bundle);
 
         AiSkill s = new AiSkill();
@@ -50,6 +52,7 @@ public class SkillImportService {
         s.setOriginRef(owner + "/" + repo + "@" + ref + ":" + (subPath == null ? "" : subPath));
         s.setStatus(SkillConst.STATUS_ACTIVE);
         s.setVersion(1);
+        s.setManifest(SkillManifest.of(p.jm(), List.of()).toJson());
         aiSkillMapper.insert(s);
 
         if (SkillConst.TYPE_DOER.equals(type)) {

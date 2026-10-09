@@ -18,8 +18,9 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReportView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.SessionView;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.manifest.SkillMarkdownRenderer;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
-import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.SkillBuilderSession;
@@ -137,7 +138,8 @@ public class SkillBuilderSessionService {
                 }
             }
             if (!hasSkillMd) {
-                String md = SkillMarkdownParser.render(base.getName(), base.getDescription(), base.getBody());
+                String md = SkillMarkdownRenderer.render(base.getName(), base.getDescription(),
+                        SkillManifest.fromJson(base.getManifest()).toJm(), base.getBody());
                 storage.putObject(dirPrefix + SkillBundleRules.SKILL_MD, md.getBytes(StandardCharsets.UTF_8), "text/markdown");
             }
         } catch (Exception e) {

@@ -6,9 +6,9 @@ import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.common.core.utils.CommonUtil;
 import com.jimeng.dataserver.admin.common.AdminRequestContext;
 import com.jimeng.dataserver.ai.skill.SkillConst;
+import com.jimeng.dataserver.ai.skill.manifest.SkillMarkdownRenderer;
 import com.jimeng.dataserver.ai.skill.model.SkillPackage;
 import com.jimeng.dataserver.ai.skill.service.SkillPackageLoaderService;
-import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.SkillEvalRun;
 import com.jimeng.persistence.mapper.AiSkillMapper;
@@ -89,7 +89,7 @@ public class SkillEvalController {
             Map<String, String> files = readPackageFiles(pkg);
             // loader 已经把 frontmatter 剥掉了，这里按规范重建一份再物化——缺 frontmatter 的 SKILL.md
             // 沙箱里的 SDK 读不到 description，技能等于没装上，而这恰恰是 RECALL 模式要测的那个信号。
-            String body = SkillMarkdownParser.render(pkg.getName(), pkg.getDescription(), pkg.getBody());
+            String body = SkillMarkdownRenderer.render(pkg.getName(), pkg.getDescription(), pkg.getJm(), pkg.getBody());
             return evalService.start(pkg.getName(), body, files,
                     parseSuite(files.get(EVALS_PATH)), mode, null, null, req.getAgentId());
         }
@@ -119,7 +119,7 @@ public class SkillEvalController {
      * 把磁盘技能包里除 {@code SKILL.md} 之外的文件读成「相对路径 → 内容」表，
      * 形状与草稿的 {@code files} / 已发布 skill 的 bundle 一致，于是三条来源之后的代码完全相同。
      *
-     * <p>{@code SKILL.md} 单独排除：它由调用方用 {@link SkillMarkdownParser#render} 重建 frontmatter
+     * <p>{@code SKILL.md} 单独排除：它由调用方用 {@link SkillMarkdownRenderer#render} 重建 frontmatter
      * 之后当作 {@code body} 传，再混进 files 会在沙箱里被覆盖成没有 frontmatter 的那一份。
      */
     private Map<String, String> readPackageFiles(SkillPackage pkg) {

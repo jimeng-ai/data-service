@@ -1,7 +1,9 @@
 ---
 name: connector
 description: 访问企业已接入的业务数据库——查客户的业务数据，在被授权时还能修改库里的数据（改状态、补字段、删记录）。当用户的问题需要真实业务数据（订单、退款、库存、工单、客户信息等），或要求变更库里的某些记录时使用。
-requires: connections
+metadata:
+  jm:
+    requires: connections
 ---
 
 # connector

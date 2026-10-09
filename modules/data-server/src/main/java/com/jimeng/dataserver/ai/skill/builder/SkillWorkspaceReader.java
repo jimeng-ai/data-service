@@ -8,8 +8,9 @@ import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftFile;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
+import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
-import com.jimeng.dataserver.ai.skill.util.SkillFrontmatter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -105,7 +106,7 @@ public class SkillWorkspaceReader {
         Map<String, ObjectInfo> files = skillFiles(l, loc.dir());
         String skillMd = new String(readBytes(l, SkillWorkspaceLayout.skillDirPrefix(loc.dir()) + SkillBundleRules.SKILL_MD),
                 StandardCharsets.UTF_8);
-        SkillFrontmatter.Parsed fm = SkillFrontmatter.parse(skillMd);
+        ParsedSkill fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
 
         List<String> errors = new ArrayList<>(fm.errors());
         // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。

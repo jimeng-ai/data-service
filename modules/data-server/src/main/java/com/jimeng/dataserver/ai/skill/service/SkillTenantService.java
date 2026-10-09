@@ -4,7 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.skill.SkillConst;
-import com.jimeng.dataserver.ai.skill.util.SkillMarkdownParser;
+import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.persistence.entity.AiSkill;
 import com.jimeng.persistence.entity.SkillBuilderSession;
 import com.jimeng.persistence.mapper.AiSkillMapper;
@@ -26,8 +28,7 @@ public class SkillTenantService {
 
     @Transactional
     public AiSkill createFromMarkdown(String rawMarkdown, String tenantId, Long ownerUserId) {
-        SkillMarkdownParser.ParsedSkill p = SkillMarkdownParser.parse(rawMarkdown);
-        SkillMarkdownParser.validate(p);
+        ParsedSkill p = SkillManifestParser.parse(rawMarkdown, SkillManifestParser.Mode.LENIENT).orThrow();
         AiSkill s = new AiSkill();
         s.setTenantId(tenantId);
         s.setOwnerUserId(ownerUserId);
@@ -39,6 +40,7 @@ public class SkillTenantService {
         s.setSource(SkillConst.SOURCE_UPLOAD);
         s.setStatus(SkillConst.STATUS_ACTIVE);
         s.setVersion(1);
+        s.setManifest(SkillManifest.of(p.jm(), List.of()).toJson());
         aiSkillMapper.insert(s);
         registry.reloadAndBroadcast();
         return s;

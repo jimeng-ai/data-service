@@ -45,4 +45,8 @@ public class AiSkillVersion extends BaseEntity {
     @Schema(description = "产出这一版的构建器会话；上传 / 导入的版本为 null")
     @TableField("builder_session_id")
     private Long builderSessionId;
+
+    @Schema(description = "这一版 SKILL.md 的解析结果 JSON")
+    @TableField("manifest")
+    private String manifest;
 }
