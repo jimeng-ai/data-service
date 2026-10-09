@@ -1,0 +1,171 @@
+package com.jimeng.dataserver.ai.skill.builder;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
+import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
+import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService.ObjectInfo;
+import com.jimeng.dataserver.ai.skill.SkillConst;
+import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftUpdateEvent;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
+import com.jimeng.persistence.entity.AiSkill;
+import com.jimeng.persistence.entity.SkillBuilderSession;
+import com.jimeng.persistence.mapper.AgentMapper;
+import com.jimeng.persistence.mapper.AiSkillMapper;
+import com.jimeng.persistence.mapper.SkillBuilderSessionMapper;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * 每轮结束同步 DRAFT 行（{@code syncAfterRun}）：DRAFT 行在列表里就是一张卡片，还能被设成全团队可见，
+ * 库里不能有 key 原文。真的草稿读取（SkillWorkspaceReader）加真的 SkillBuilderSessionService，存储和 mapper 是桩。
+ */
+class SkillBuilderSessionServiceDraftSyncTest {
+
+    private static final String TOKEN = "sk-live-CRM-0123456789";
+    private static final String WITH_VALUE = "{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}";
+
+    /** 插入 / 更新 DRAFT 行那一刻行上的内容（ArgumentCaptor 留的是引用，分不出是写之前还是之后设的）。 */
+    private record Row(String name, String description, String body) {
+        static Row of(AiSkill s) {
+            return new Row(s.getName(), s.getDescription(), s.getBody());
+        }
+    }
+
+    private final RagMinioStorageService storage = mock(RagMinioStorageService.class);
+    private final AiSkillMapper aiSkillMapper = mock(AiSkillMapper.class);
+    private final SkillBuilderSessionMapper sessionMapper = mock(SkillBuilderSessionMapper.class);
+    private final SkillBuilderSessionService svc = new SkillBuilderSessionService(sessionMapper, aiSkillMapper,
+            mock(AgentMapper.class), mock(ChatConversationService.class), storage,
+            new SkillWorkspaceReader(storage, new SkillBuilderProperties()), new SkillBuilderProperties(), new ObjectMapper(),
+            mock(SkillSecretService.class));
+    private final List<Row> inserted = new ArrayList<>();
+    private final List<Row> updated = new ArrayList<>();
+
+    private void workspace(Map<String, String> files, AiSkill existingDraft) throws Exception {
+        SkillBuilderSession session = new SkillBuilderSession();
+        session.setId(1L);
+        session.setTenantId("t1");
+        session.setOwnerUserId(7L);
+        session.setWorkspacePrefix("ws/1/");
+        session.setDraftSkillId(existingDraft == null ? null : existingDraft.getId());
+        when(sessionMapper.selectById(1L)).thenReturn(session);
+        List<ObjectInfo> infos = new ArrayList<>();
+        for (Map.Entry<String, String> e : files.entrySet()) {
+            String name = "ws/1/skill/refund-flow/" + e.getKey();
+            byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
+            infos.add(new ObjectInfo(name, bytes.length, new Date()));
+            when(storage.readBytes(name)).thenReturn(bytes);
+        }
+        when(storage.listObjectInfos("ws/1/")).thenReturn(infos);
+        if (existingDraft != null) when(aiSkillMapper.selectById(existingDraft.getId())).thenReturn(existingDraft);
+        doAnswer(inv -> { inserted.add(Row.of(inv.getArgument(0))); return 1; }).when(aiSkillMapper).insert(any(AiSkill.class));
+        doAnswer(inv -> { updated.add(Row.of(inv.getArgument(0))); return 1; }).when(aiSkillMapper).updateById(any(AiSkill.class));
+    }
+
+    private static AiSkill draftRow() {
+        AiSkill row = new AiSkill();
+        row.setId(77L);
+        row.setStatus(SkillConst.STATUS_DRAFT);
+        row.setName("上一次同步的名字");
+        row.setBody("上一次同步的正文");
+        return row;
+    }
+
+    @Test
+    @DisplayName("★ 模型把 key 原文写进了 SKILL.md（name 以外的 description 和正文）：DRAFT 行里是 {{名字}}，一个字原文都没有")
+    void theDraftRowNeverReceivesTheValue() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: \"退款，key 是 " + TOKEN + "\"\n---\n调接口时带上 " + TOKEN + "\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo("refund-flow");
+            assertThat(row.description()).isEqualTo("退款，key 是 {{CRM_TOKEN}}");
+            assertThat(row.body()).isEqualTo("调接口时带上 {{CRM_TOKEN}}\n");
+        });
+        assertThat(inserted.toString()).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ 已有 DRAFT 行时同样：更新进去的 name / description / body 都是抹过值的")
+    void anExistingDraftRowIsUpdatedWithScrubbedText() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, draftRow());
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(updated).singleElement().satisfies(row -> assertThat(row.body()).isEqualTo("带上 {{CRM_TOKEN}}\n"));
+        assertThat(updated.toString()).doesNotContain(TOKEN);
+        verify(aiSkillMapper, never()).insert(any(AiSkill.class));
+    }
+
+    @Test
+    @DisplayName("★ secrets.json 存在却读不出来（写到一半）：不知道哪些是值，第一次同步就建一行，名字和正文都是说明，不写草稿里的任何文字")
+    void anUnreadableSecretsFileMeansNothingIsWrittenOnTheFirstSync() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[");
+        workspace(files, null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.description()).isNull();
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_BODY);
+        });
+        assertThat(inserted.toString()).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ secrets.json 读不出来、DRAFT 行已经有了：保留上一次同步的内容，不更新")
+    void anUnreadableSecretsFileLeavesTheExistingDraftRowAlone() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[");
+        AiSkill existing = draftRow();
+        workspace(files, existing);
+
+        svc.syncAfterRun(1L, true);
+
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+        verify(aiSkillMapper, never()).insert(any(AiSkill.class));
+        assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
+    }
+
+    @Test
+    @DisplayName("★ 推给前端的 draft-update 事件（序列化之后的 JSON）里没有值：不论 SKILL.md、脚本、secrets.json 的预览、校验错误")
+    void theDraftUpdateEventCarriesNoValue() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: a: " + "字".repeat(20) + TOKEN + " 调接口\n---\n带上 " + TOKEN + "\n");
+        files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, null);
+
+        DraftUpdateEvent event = svc.syncAfterRun(1L, true);
+
+        String payload = new ObjectMapper().writeValueAsString(event);
+        assertThat(payload).doesNotContain(TOKEN).doesNotContain("sk-live");
+        assertThat(payload).contains("{{CRM_TOKEN}}").contains("******");
+    }
+}

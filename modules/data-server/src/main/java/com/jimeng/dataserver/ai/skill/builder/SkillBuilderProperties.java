@@ -45,4 +45,10 @@ public class SkillBuilderProperties {
     private long reviewMaxBytes = 30L * 1024 * 1024;
     /** 草稿预览里单个文本文件内容的上限（字节），超过只给元数据。 */
     private long previewFileMaxBytes = 512L * 1024;
+    /**
+     * 发布时 skill 目录的总字节数上限。发布要把整个目录读进内存（提取 key、把文本里的 key 原文换成占位符），
+     * 峰值是它的几倍；沙箱工作区本身的上限是单文件 25 MB、总计 300 MB，不设这一道，一次发布就能把 data-server 挤出内存。
+     * 导入用它自己的上限（skill.import.max-total-bytes，默认 5 MB）。
+     */
+    private long publishMaxBytes = 50L * 1024 * 1024;
 }

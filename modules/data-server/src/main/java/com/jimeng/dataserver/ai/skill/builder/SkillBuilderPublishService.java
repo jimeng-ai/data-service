@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
+import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
@@ -27,6 +28,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -60,6 +63,7 @@ public class SkillBuilderPublishService {
     private final AiSkillRegistryService registry;
     private final ChatConversationService conversationService;
     private final SkillSecretService secretService;
+    private final SkillBuilderProperties props;
 
     @Transactional
     public PublishResult publish(Long sessionId) {
@@ -68,23 +72,36 @@ public class SkillBuilderPublishService {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "构建器还在工作，等这一轮结束再发布");
         }
         SkillWorkspaceReader.Listing l = reader.list(session.getWorkspacePrefix());
-        DraftView draft = reader.draft(l, session.getSkillTypeOverride());
+        // 改进已有 skill 时，secrets.json 里不带 value 的条目是沿用上一版的值：核对文件、抹报错都要用它们的值
+        // （解不出来——没配密钥、密文坏了——整次发布拒绝，不会跳过核对）
+        PreviousKeys previous = session.getBaseSkillId() == null ? PreviousKeys.NONE
+                : secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion());
+        DraftView draft = reader.draft(l, session.getSkillTypeOverride(), previous);
         if (draft == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");
         }
         if (!draft.getValidationErrors().isEmpty()) {
+            // 这些文案 reader.draft 里已经抹过 key 的值（ServiceException 构造时就会把它记进 ERROR 日志）
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "SKILL.md 不符合发布规则：" + String.join("；", draft.getValidationErrors()));
         }
         String dir = draft.getDirName();
+        // 发布要把整个目录读进内存：先看总大小，超了就拒绝，不读
+        Map<String, RagMinioStorageService.ObjectInfo> inWorkspace = reader.skillFiles(l, dir);
+        long totalBytes = inWorkspace.entrySet().stream()
+                .filter(e -> SkillBundleRules.isPartOfSkill(e.getKey())).mapToLong(e -> e.getValue().size()).sum();
+        if (totalBytes > props.getPublishMaxBytes()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill 里的文件一共 " + megabytes(totalBytes)
+                    + " MB，超过了发布的上限 " + megabytes(props.getPublishMaxBytes()) + " MB：把大文件拿掉，或者拆成几个 skill");
+        }
         // 读出属于 skill 的全部文件交给发布处理器：提取 secrets.json、把 key 原文换成占位符、解析 SKILL.md（设计文档 §3.4）。
         Map<String, byte[]> raw = new TreeMap<>();
-        for (String rel : reader.skillFiles(l, dir).keySet()) {
+        for (String rel : inWorkspace.keySet()) {
             if (SkillBundleRules.isPartOfSkill(rel)) {
                 raw.put(rel, reader.readBytes(l, SkillWorkspaceLayout.skillDirPrefix(dir) + rel));
             }
         }
-        SkillPackageProcessor.Output out = SkillPackageProcessor.process(raw, SkillManifestParser.Mode.STRICT, true);
+        SkillPackageProcessor.Output out = SkillPackageProcessor.process(raw, SkillManifestParser.Mode.STRICT, true, previous);
 
         AiSkill row;
         int version;
@@ -162,6 +179,7 @@ public class SkillBuilderPublishService {
         v.setManifest(manifestJson);
         versionMapper.insert(v);
         secretService.save(row.getId(), version, secretRows);
+        scheduleWorkspaceSecretsRewrite(session, dir, out.secrets());
 
         SkillBuilderSession u = new SkillBuilderSession();
         u.setId(session.getId());
@@ -182,6 +200,42 @@ public class SkillBuilderPublishService {
         r.setSkillType(row.getSkillType());
         r.setWarnings(warnings(l, draft));
         return r;
+    }
+
+    /**
+     * 发布提交之后，把工作区里的 secrets.json 改写成不带值的声明（格式同「用 AI 改进」时放进工作区的那份）：
+     * 值已经加密存进 skill_secret，工作区里那份明文没有理由再留着（会话读接口和 MinIO 里最多还能看 7 天）。
+     * <b>必须在提交之后做</b>：在事务里做的话，后面提交失败，工作区的值就已经丢了，用户得重新给。
+     * 失败只记 WARN（只带 key 名），发布照样成功，清理任务按保留期回收。
+     */
+    private void scheduleWorkspaceSecretsRewrite(SkillBuilderSession session, String dir, List<SkillSecretsFile.Entry> secrets) {
+        if (secrets.isEmpty()) return;   // 工作区里本来就没有 secrets.json
+        String path = session.getWorkspacePrefix() + SkillWorkspaceLayout.skillDirPrefix(dir) + SkillBundleRules.SECRETS_JSON;
+        byte[] valueLess = SkillSecretsFile.valueLessJson(SkillSecretsFile.decls(secrets)).getBytes(StandardCharsets.UTF_8);   // 闭包里不留值
+        List<String> names = secrets.stream().map(SkillSecretsFile.Entry::name).toList();
+        Long sessionId = session.getId();
+        Runnable rewrite = () -> {
+            try {
+                storage.putObject(path, valueLess, "application/json");
+            } catch (Exception e) {
+                log.warn("发布之后把工作区里的 secrets.json 改写成不带值失败，由清理任务回收 session={} keys={} cause={}",
+                        sessionId, names, e.getClass().getSimpleName());
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    rewrite.run();
+                }
+            });
+        } else {
+            rewrite.run();   // 没有事务可等（不会发生在 @Transactional 的 publish 里）
+        }
+    }
+
+    private static String megabytes(long bytes) {
+        return String.format("%.1f", bytes / 1024.0 / 1024.0);
     }
 
     /** 同租户里别的已发布 skill（自己的，或共享给全团队的）不能重名：发现阶段按名字激活，重名就分不清是哪一个。 */

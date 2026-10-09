@@ -2,6 +2,7 @@ package com.jimeng.persistence.entity;
 
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.jimeng.persistence.BaseEntity;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Data;
@@ -42,8 +43,9 @@ public class SkillSecret extends BaseEntity {
     @TableField("paths")
     private String paths;
 
-    /** 密文也不进 toString：@Data 生成的 toString 会被顺手打进日志。 */
+    /** 密文也不进 toString（@Data 生成的 toString 会被顺手打进日志），也不进 JSON（哪天谁直接把实体当响应返回，密文就出去了）。 */
     @ToString.Exclude
+    @JsonIgnore
     @TableField("ciphertext")
     private String ciphertext;
 

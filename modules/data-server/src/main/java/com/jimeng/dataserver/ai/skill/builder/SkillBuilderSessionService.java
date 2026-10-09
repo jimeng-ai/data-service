@@ -20,6 +20,8 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.SessionView;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillMarkdownRenderer;
+import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
+import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import com.jimeng.persistence.entity.Agent;
 import com.jimeng.persistence.entity.AiSkill;
@@ -55,6 +57,9 @@ public class SkillBuilderSessionService {
     /** 新建 skill 时 DRAFT 行的 origin_ref 前缀；列表页据此把草稿卡片接回会话。 */
     public static final String ORIGIN_REF_PREFIX = "builder-session:";
     private static final long FEEDBACK_MAX_BYTES = 1024 * 1024;
+    /** 第一次同步时 secrets.json 就读不出来：DRAFT 行先用这个名字和说明占位，修好之后的下一轮同步会换成真的。 */
+    static final String UNREADABLE_DRAFT_NAME = "草稿";
+    static final String UNREADABLE_DRAFT_BODY = "（草稿里的 secrets.json 格式有误，修好后再同步）";
 
     private final SkillBuilderSessionMapper sessionMapper;
     private final AiSkillMapper aiSkillMapper;
@@ -64,6 +69,7 @@ public class SkillBuilderSessionService {
     private final SkillWorkspaceReader reader;
     private final SkillBuilderProperties props;
     private final ObjectMapper objectMapper;
+    private final SkillSecretService secretService;
 
     // ------------------------------------------------------------------ 创建 / 恢复
 
@@ -126,6 +132,11 @@ public class SkillBuilderSessionService {
      * 没有 bundle 的老 skill（上传 / 导入的纯 PROMPT）按库里的列重建一份带 frontmatter 的 SKILL.md，
      * 并带上 {@code ai_skill.manifest} 里的 {@code metadata.jm}：不带的话，用构建器改一次再发布，声明过的域名和超时就静默丢了。
      *
+     * <p>key 也是一样：这个版本在 {@code skill_secret} 里有的 key，写一份<b>不带值</b>的 secrets.json 放进工作区（名字和发送范围
+     * 取自 skill_secret 行，不取 manifest——key 能发到哪里只看那张表）。不写的话，改进之后的新版本里没有 secrets.json，
+     * 新版本就没有 key，而 SKILL.md 里还是 {@code {{名字}}}，运行时静默解析不到。发布时没写 value 的条目沿用上一版的值。
+     * 老 bundle 里残留的 secrets.json（S1 之前的 bundle 里可能有，里面是 key 原文）不带进来。
+     *
      * <p>包内可见只为了让测试直接调它：走 {@link #create} 要搭一整条会话链路（请求上下文、对话、工作区读取）。
      */
     void seedFromPublished(String prefix, AiSkill base) {
@@ -136,6 +147,7 @@ public class SkillBuilderSessionService {
                 for (String obj : storage.listObjects(base.getBundleKey())) {
                     String rel = obj.substring(base.getBundleKey().length());
                     if (!SkillBundleRules.isPartOfSkill(rel)) continue;
+                    if (SkillBundleRules.isSecretsFile(rel)) continue;
                     storage.copyObject(obj, dirPrefix + rel);
                     if (SkillBundleRules.SKILL_MD.equals(rel)) hasSkillMd = true;
                 }
@@ -144,6 +156,11 @@ public class SkillBuilderSessionService {
                 String md = SkillMarkdownRenderer.render(base.getName(), base.getDescription(),
                         SkillManifest.fromJson(base.getManifest()).toJm(), base.getBody());
                 storage.putObject(dirPrefix + SkillBundleRules.SKILL_MD, md.getBytes(StandardCharsets.UTF_8), "text/markdown");
+            }
+            List<SkillManifest.KeyDecl> keys = secretService.declarationsOf(base.getId(), base.getVersion());
+            if (!keys.isEmpty()) {
+                storage.putObject(dirPrefix + SkillBundleRules.SECRETS_JSON,
+                        SkillSecretsFile.valueLessJson(keys).getBytes(StandardCharsets.UTF_8), "application/json");
             }
         } catch (Exception e) {
             throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "把 skill 放进构建器工作区失败: " + e.getMessage());
@@ -340,9 +357,19 @@ public class SkillBuilderSessionService {
         return ev;
     }
 
+    /**
+     * 写进 DRAFT 行的 name / description / body 取自 {@code draft}，而 {@code draft} 里的文字是 SkillWorkspaceReader 用工作区
+     * secrets.json 的值抹过的：模型把 key 原文写进 SKILL.md 时，库里只有 {@code {{名字}}}。DRAFT 行在列表里就是一张卡片，
+     * 还能被设成全团队可见，库里不能有 key 原文。
+     *
+     * <p>secrets.json 存在、却读不出来时不知道哪些是值，草稿里的文字没法抹：一个字都不写进库。已有的 DRAFT 行保留上一次
+     * 同步的内容；第一次同步就建一行，正文写一句说明。
+     */
     private void upsertDraftRow(SkillBuilderSession s, DraftView draft) {
-        String name = StrUtil.maxLength(StrUtil.blankToDefault(draft.getName(), draft.getDirName()), 61);
-        String desc = draft.getDescription() == null ? null : StrUtil.maxLength(draft.getDescription(), 1021);
+        boolean unreadable = draft.isSecretsUnreadable();
+        String name = unreadable || StrUtil.isBlank(draft.getName()) ? UNREADABLE_DRAFT_NAME : StrUtil.maxLength(draft.getName(), 61);
+        String desc = unreadable || draft.getDescription() == null ? null : StrUtil.maxLength(draft.getDescription(), 1021);
+        String body = unreadable ? UNREADABLE_DRAFT_BODY : draft.getBody();
         AiSkill row = s.getDraftSkillId() == null ? null : aiSkillMapper.selectById(s.getDraftSkillId());
         if (row == null) {
             row = new AiSkill();
@@ -353,22 +380,22 @@ public class SkillBuilderSessionService {
             row.setStatus(SkillConst.STATUS_DRAFT);
             row.setVersion(1);
             row.setOriginRef(ORIGIN_REF_PREFIX + s.getId());
-            fill(row, name, desc, draft);
+            fill(row, name, desc, body, draft);
             aiSkillMapper.insert(row);
             SkillBuilderSession u = new SkillBuilderSession();
             u.setId(s.getId());
             u.setDraftSkillId(row.getId());
             sessionMapper.updateById(u);
-        } else if (SkillConst.STATUS_DRAFT.equals(row.getStatus())) {
-            fill(row, name, desc, draft);
+        } else if (SkillConst.STATUS_DRAFT.equals(row.getStatus()) && !unreadable) {
+            fill(row, name, desc, body, draft);
             aiSkillMapper.updateById(row);
         }
     }
 
-    private static void fill(AiSkill row, String name, String desc, DraftView draft) {
+    private static void fill(AiSkill row, String name, String desc, String body, DraftView draft) {
         row.setName(name);
         row.setDescription(desc);
-        row.setBody(draft.getBody());
+        row.setBody(body);
         row.setSkillType(draft.getEffectiveType());
         // 有意不同步 manifest：DRAFT 行没有运行时消费者，manifest 在发布时才写（SkillBuilderPublishService.publish），
         // 草稿期间保持 NULL。读到 DRAFT 卡片的 manifest 为空是预期，不是漏了。

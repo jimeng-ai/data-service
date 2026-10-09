@@ -9,6 +9,8 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftFile;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
+import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
+import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
@@ -100,32 +102,67 @@ public class SkillWorkspaceReader {
         }
     }
 
-    /** 草稿预览；工作区里还没有 skill 时返回 null。 */
+    /** 草稿预览；工作区里还没有 skill 时返回 null。预览和同步 DRAFT 行用这个：不解密沿用的 key。 */
     public DraftView draft(Listing l, String skillTypeOverride) {
+        return draft(l, skillTypeOverride, PreviousKeys.NONE);
+    }
+
+    /**
+     * 草稿预览；工作区里还没有 skill 时返回 null。
+     *
+     * <p>★ key 的值不出现在这里的任何输出里（预览会随 draft-update 事件推给前端、写进 Redis Stream，DRAFT 行同步也用它；
+     * 报错文案会进异常和 ERROR 日志）：先用工作区 secrets.json 里的值把 SKILL.md 抹一遍，<b>再</b>解析——
+     * 校验的文本就是将要发布的文本，报错片段里也只有 {@code {{名字}}}；secrets.json 的预览把每个 value 打码。
+     * secrets.json 存在却读不出来时不知道哪些是值：只报它自己的错误，不校验 SKILL.md（见 {@link DraftView#isSecretsUnreadable}）。
+     *
+     * @param previous 发布时传进来：不带 value 的条目是沿用上一版的值，它们的原文只有解密之后才抹得掉。预览不传。
+     */
+    public DraftView draft(Listing l, String skillTypeOverride, PreviousKeys previous) {
         SkillLocation loc = locateSkill(l);
         if (loc.dir() == null) return null;
+        String dirPrefix = SkillWorkspaceLayout.skillDirPrefix(loc.dir());
         Map<String, ObjectInfo> files = skillFiles(l, loc.dir());
-        String skillMd = new String(readBytes(l, SkillWorkspaceLayout.skillDirPrefix(loc.dir()) + SkillBundleRules.SKILL_MD),
-                StandardCharsets.UTF_8);
-        ParsedSkill fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
+        String rawSkillMd = new String(readBytes(l, dirPrefix + SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8);
 
-        List<String> errors = new ArrayList<>(fm.errors());
-        // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
-        List<String> nested = files.keySet().stream()
-                .filter(p -> !p.equals(SkillBundleRules.SKILL_MD) && p.endsWith("/" + SkillBundleRules.SKILL_MD))
-                .filter(p -> SkillBundleRules.isPartOfSkill(p) && !SkillBundleRules.isRootEvalsPath(p))
-                .toList();
-        if (!nested.isEmpty()) {
-            errors.add("skill 里只能有一个 SKILL.md，多出来的：" + String.join(", ", nested)
-                    + "（参考资料请改名为 references/<主题>.md）");
-        }
-        // secrets.json 写错要在发布前就显示出来（报错文案里不会带出值）。
+        List<String> errors = new ArrayList<>();
+        SecretValues values = SecretValues.NONE;
+        boolean unreadable = false;
+        byte[] secretsJson = null;
         if (files.containsKey(SkillBundleRules.SECRETS_JSON)) {
-            errors.addAll(SkillSecretsFile.parse(
-                    readBytes(l, SkillWorkspaceLayout.skillDirPrefix(loc.dir()) + SkillBundleRules.SECRETS_JSON)).errors());
+            secretsJson = readBytes(l, dirPrefix + SkillBundleRules.SECRETS_JSON);
+            SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson);
+            errors.addAll(parsed.errors());   // 文案在 parse 里已经抹过值
+            if (parsed.readable()) {
+                values = parsed.values();
+                List<String> reuse = parsed.valid()
+                        ? parsed.entries().stream().filter(e -> e.value() == null).map(SkillSecretsFile.Entry::name).toList()
+                        : List.of();
+                if (!reuse.isEmpty()) values = values.plus(SecretValues.of(previous.values(reuse)));
+            } else {
+                unreadable = true;
+            }
         }
-        if (fm.name() != null && !fm.name().equals(loc.dir())) {
-            errors.add("目录名「" + loc.dir() + "」与 frontmatter 的 name「" + fm.name() + "」不一致");
+        final SecretValues known = values;
+
+        String skillMd = known.replace(rawSkillMd);
+        ParsedSkill fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
+        if (unreadable) {
+            // 不知道哪些是 key 的值：只报 secrets.json 自己的错误，SKILL.md 的校验报错、目录名 / name 不一致这类会回显文件名和 name 的话都不给
+            errors.add("SKILL.md 等 secrets.json 修好之后再校验：现在不知道哪些是 key 的值，校验的报错里可能带出原文");
+        } else {
+            fm.errors().forEach(e -> errors.add(known.replace(e)));
+            // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
+            List<String> nested = files.keySet().stream()
+                    .filter(p -> !p.equals(SkillBundleRules.SKILL_MD) && p.endsWith("/" + SkillBundleRules.SKILL_MD))
+                    .filter(p -> SkillBundleRules.isPartOfSkill(p) && !SkillBundleRules.isRootEvalsPath(p))
+                    .toList();
+            if (!nested.isEmpty()) {
+                errors.add(known.replace("skill 里只能有一个 SKILL.md，多出来的：" + String.join(", ", nested)
+                        + "（参考资料请改名为 references/<主题>.md）"));
+            }
+            if (fm.name() != null && !fm.name().equals(loc.dir())) {
+                errors.add(known.replace("目录名「" + loc.dir() + "」与 frontmatter 的 name「" + fm.name() + "」不一致"));
+            }
         }
 
         DraftView v = new DraftView();
@@ -140,23 +177,31 @@ public class SkillWorkspaceReader {
         v.setValidationErrors(errors);
         v.setIterations(iterationCount(l, loc.dir()));
         v.setOtherSkillDirs(loc.others());
+        v.setSecretsUnreadable(unreadable);
 
         List<DraftFile> out = new ArrayList<>();
-        files.forEach((path, o) -> {
-            if (!SkillBundleRules.isPartOfSkill(path)) return;   // 缓存 / 依赖不进预览
+        for (Map.Entry<String, ObjectInfo> entry : files.entrySet()) {
+            String path = entry.getKey();
+            ObjectInfo o = entry.getValue();
+            if (!SkillBundleRules.isPartOfSkill(path)) continue;   // 缓存 / 依赖不进预览
             DraftFile f = new DraftFile();
             f.setPath(path);
             f.setSize(o.size());
             f.setRuntime(SkillBundleRules.isRuntimeFile(path));
             if (o.size() <= props.getPreviewFileMaxBytes()) {
-                String text = decodeText(readBytes(l, SkillWorkspaceLayout.skillDirPrefix(loc.dir()) + path));
-                f.setText(text);
-                f.setBinary(text == null);
+                if (SkillBundleRules.isSecretsFile(path)) {
+                    f.setText(SkillSecretsFile.maskedPreview(secretsJson));   // 读不出来是 null：一个字都不给
+                    f.setBinary(false);
+                } else {
+                    String text = decodeText(readBytes(l, dirPrefix + path));
+                    f.setText(text == null ? null : known.replace(text));
+                    f.setBinary(text == null);
+                }
             } else {
                 f.setBinary(false);
             }
             out.add(f);
-        });
+        }
         v.setFiles(out);
         return v;
     }

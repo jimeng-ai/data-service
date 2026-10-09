@@ -56,6 +56,11 @@ public final class SkillBuilderDtos {
         private int iterations;
         /** 工作区里不止一个 skill 目录时列出全部（发布取最近修改的那个）。 */
         private List<String> otherSkillDirs;
+        /**
+         * 工作区里有 secrets.json、却读不出来（不是合法 JSON 等）：不知道哪些是 key 的值，草稿里的文字没法抹值。
+         * 此时不校验 SKILL.md（报错片段会带出源码）、不给 secrets.json 的预览，也不能把草稿里的文字同步进 DRAFT 行。
+         */
+        private boolean secretsUnreadable;
     }
 
     @Data

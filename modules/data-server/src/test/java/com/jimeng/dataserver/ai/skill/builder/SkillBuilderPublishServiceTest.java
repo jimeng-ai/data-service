@@ -34,7 +34,8 @@ class SkillBuilderPublishServiceTest {
     private final SkillBuilderPublishService svc = new SkillBuilderPublishService(
             mock(SkillBuilderSessionService.class), mock(SkillBuilderSessionMapper.class), mock(SkillWorkspaceReader.class),
             mock(RagMinioStorageService.class), mock(AiSkillMapper.class), versionMapper,
-            mock(AiSkillRegistryService.class), mock(ChatConversationService.class), mock(SkillSecretService.class));
+            mock(AiSkillRegistryService.class), mock(ChatConversationService.class), mock(SkillSecretService.class),
+            new SkillBuilderProperties());
 
     /** 本功能之前发布的 v2，库里没有对应的版本记录。 */
     private static AiSkill publishedRow() {

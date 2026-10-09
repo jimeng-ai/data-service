@@ -30,6 +30,20 @@ class PathPatternTest {
     }
 
     @Test
+    @DisplayName("★ * 只匹配一个非空的段：OkHttp 的 encodedPath() 保留 // 和结尾的 /，nginx 一类的上游会把它们合并，空段不能拿来绕过路径限制")
+    void starNeedsAtLeastOneCharacter() {
+        PathPattern middle = PathPattern.parse("/v1/orders/*/items");
+        assertThat(middle.matches("/v1/orders/9/items")).isTrue();
+        assertThat(middle.matches("/v1/orders//items")).isFalse();
+        PathPattern tail = PathPattern.parse("/v1/orders/*");
+        assertThat(tail.matches("/v1/orders/123")).isTrue();
+        assertThat(tail.matches("/v1/orders/")).isFalse();
+        assertThat(tail.matches("/v1/orders/1/2")).isFalse();
+        assertThat(PathPattern.parse("/a*b").matches("/ab")).isFalse();
+        assertThat(PathPattern.parse("/a*b").matches("/aXb")).isTrue();
+    }
+
+    @Test
     @DisplayName("必须以 / 开头，不带查询串、#、空白、反斜杠")
     void rejects() {
         for (String bad : new String[]{"", "v1/x", "/v1?x=1", "/v1#a", "/v 1", "/v1\\x"}) {
@@ -42,7 +56,7 @@ class PathPatternTest {
     void wildcardEdges() {
         assertThat(PathPattern.parse("/**").matches("/")).isTrue();
         assertThat(PathPattern.parse("/**").matches("/a/b/c")).isTrue();
-        assertThat(PathPattern.parse("/*").matches("/")).isTrue();
+        assertThat(PathPattern.parse("/*").matches("/")).isFalse();
         assertThat(PathPattern.parse("/*").matches("/a")).isTrue();
         assertThat(PathPattern.parse("/*").matches("/a/b")).isFalse();
         assertThat(PathPattern.parse("/a/**/b").matches("/a/x/y/b")).isTrue();
@@ -55,7 +69,7 @@ class PathPatternTest {
     }
 
     @Test
-    @DisplayName("与「翻成正则」的写法对拍：随机的模式和路径，结论逐条一致（只用 / a b * 四个字符，覆盖相邻通配、空段、重叠字面）")
+    @DisplayName("与「翻成正则」的写法对拍（** → .*，* → [^/]+）：随机的模式和路径，结论逐条一致（只用 / a b * 四个字符，覆盖相邻通配、空段、重叠字面）")
     void agreesWithTheRegexTranslation() {
         Random rnd = new Random(20261009L);
         String patternAlphabet = "/ab**";
@@ -71,7 +85,7 @@ class PathPatternTest {
         }
     }
 
-    /** 参照写法：** → .*，* → [^/]*，其余按字面。 */
+    /** 参照写法：** → .*，* → [^/]+（一个或多个非 / 的字符），其余按字面。 */
     private static Pattern regexOf(String raw) {
         StringBuilder re = new StringBuilder();
         StringBuilder literal = new StringBuilder();
@@ -82,7 +96,7 @@ class PathPatternTest {
                     literal.setLength(0);
                 }
                 boolean doubleStar = raw.startsWith("**", i);
-                re.append(doubleStar ? ".*" : "[^/]*");
+                re.append(doubleStar ? ".*" : "[^/]+");
                 i += doubleStar ? 2 : 1;
             } else {
                 literal.append(raw.charAt(i++));
@@ -102,5 +116,21 @@ class PathPatternTest {
         assertTimeoutPreemptively(Duration.ofSeconds(2), () -> assertThat(p.matches(nearMiss)).isFalse());
         String hit = "/".repeat(400) + "x";
         assertTimeoutPreemptively(Duration.ofSeconds(2), () -> assertThat(p.matches(hit)).isTrue());
+    }
+    @Test
+    @DisplayName("★ 拒绝永远匹配不上的写法并说明原因：%2F %5C %2E（网关先拒）、非 ASCII（OkHttp 会编码）、. 和 .. 段（OkHttp 会解析掉）")
+    void rejectsPatternsThatCanNeverMatch() {
+        assertThatThrownBy(() -> PathPattern.parse("/files/a%2Fb")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("%2F");
+        assertThatThrownBy(() -> PathPattern.parse("/files/a%2fb")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("网关");
+        assertThatThrownBy(() -> PathPattern.parse("/files/a%5Cb")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("%5C");
+        assertThatThrownBy(() -> PathPattern.parse("/files/%2e%2e/x")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("%2E");
+        assertThatThrownBy(() -> PathPattern.parse("/订单/列表")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("非 ASCII");
+        assertThatThrownBy(() -> PathPattern.parse("/a/./b")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("「.」");
+        assertThatThrownBy(() -> PathPattern.parse("/a/..")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("「..」");
+        assertThatThrownBy(() -> PathPattern.parse("/a\u0001b")).isInstanceOf(IllegalArgumentException.class);
+        // 正常写法不受影响：带点的文件名、编码过的空格、通配
+        for (String ok : new String[]{"/v1/a.b", "/v1/a..b", "/v1/.well-known/x", "/v1/a%20b", "/v1/*.json", "/v1/**"}) {
+            assertThat(PathPattern.parse(ok).text()).isEqualTo(ok);
+        }
     }
 }
