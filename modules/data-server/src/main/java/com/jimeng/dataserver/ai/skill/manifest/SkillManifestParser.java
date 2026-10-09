@@ -205,8 +205,8 @@ public final class SkillManifestParser {
      *   <li><b>相对 Claude Code 的唯一偏离</b>（在上面各条之前判断）：键恰好是 {@code metadata} 的行原样放过，不补引号。
      *       Claude Code 不读 metadata，所以这不影响它能加载什么；我们要读 {@code metadata.jm}。单行写法
      *       {@code metadata: {jm: {hosts: [api.example.com]}}} 的值含 {@code {}}，补引号会把整个 metadata 变成一个字符串，
-     *       {@link #parse} 随后把它当作没有 jm，声明的 hosts / web / timeout-seconds 悄悄退回默认，没有任何信号
-     *       （违反「metadata.jm 写错不能静默」）；metadata 自己写坏时也会被吞成字符串而通过。块风格的
+     *       而 metadata 不是字典会被 {@link #parse} 直接拒绝（R11）——一份本来合法的文件，只因为别处有一行要补引号就被误拒。
+     *       （R11 之前后果更糟：字符串 metadata 被当作没有 jm，声明的 hosts / web / timeout-seconds 悄悄退回默认。）块风格的
      *       {@code metadata:  # 注释} 同理：行尾的 {@code #} 会让它被改写，下面缩进的 jm 整段随之解析失败。
      *       跳过之后，metadata 自己写坏时第二次解析照样失败，照常拒绝。<b>这是有意的例外</b>：Claude Code 能加载这样的文件
      *       （它给这行补引号，又不读 metadata），这里拒绝——别按类注释里「不比 Claude Code 更严」的原则把它改回去。</li>

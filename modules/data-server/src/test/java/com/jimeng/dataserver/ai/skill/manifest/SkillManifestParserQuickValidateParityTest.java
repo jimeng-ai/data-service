@@ -79,7 +79,7 @@ class SkillManifestParserQuickValidateParityTest {
     }
 
     @Test
-    @DisplayName("用例文件读得到、覆盖了两种结论和两条平台规则（工作目录不对时读到空集会白白通过）")
+    @DisplayName("用例文件读得到、覆盖了两种结论和三条平台规则（工作目录不对时读到空集会白白通过）")
     void 用例覆盖面() throws IOException {
         List<Case> cs = cases();
         assertThat(cs).hasSizeGreaterThanOrEqualTo(47);
