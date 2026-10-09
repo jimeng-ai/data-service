@@ -28,9 +28,11 @@ import java.util.List;
  * JSON 语法错误；<b>出现了未知字段</b>（Jackson 默认 {@code FAIL_ON_UNKNOWN_PROPERTIES}，有意不放开）；
  * requires 认不出来；binding 不是 always / optional。每一种都记一条 ERROR，带原文的前 200 个字符。
  *
- * <p>★ 以后给 manifest 加字段要想到这一点：部署回滚到旧版本时，新代码写进去的行在旧代码里会因为未知字段读成 EMPTY，
- * 也就是这些 skill 的外部接口声明会暂时<b>全部失效</b>。要么先发一个认得新字段（只读不写）的版本，再发开始写它的版本；
- * 要么接受回滚期间声明失效。
+ * <p>★ 以后给 manifest 加字段、或给 requires / binding 加新取值，都要想到这一点：部署回滚到旧版本时，新代码写进去的行
+ * 在旧代码里会读成 EMPTY，这些 skill 的外部接口声明（hosts、keys 一起）在回滚期间<b>全部失效</b>。
+ * 而且不一定只是「暂时」：回滚期间有人对没有附件包的 skill（单文件上传、导入）点「用 AI 改进」再发布，
+ * {@code seedFromPublished} 会按 EMPTY 重建 SKILL.md，发布时把 EMPTY 写回库，声明就永久丢了（有附件包的原样复制 SKILL.md，不受影响）。
+ * 所以要分两步发：先发一个认得新字段 / 新取值（只读不写）的版本，再发开始写它的版本。
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record SkillManifest(@JsonProperty("hosts") List<String> hosts,
