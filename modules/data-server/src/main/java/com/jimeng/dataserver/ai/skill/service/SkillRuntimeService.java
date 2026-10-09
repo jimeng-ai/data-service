@@ -98,7 +98,7 @@ public class SkillRuntimeService {
                 skillOnly.put(e.getKey(), e.getValue());
             }
         }
-        // 有前置资源声明（SKILL.md 的 requires:）的平台 Skill：绑了→提升为直接注入工具；
+        // 有前置资源声明（SKILL.md 的 metadata.jm.requires）的平台 Skill：绑了→提升为直接注入工具；
         // 没绑→直接摘除（没有资源可用，暴露它只会诱导模型盲调一次必然失败的工具）。
         // 今天 rag-knowledge 声明 knowledge_bases、connector 声明 connections。
         resolveResourceBoundSkills(skillOnly, boundPlugins);
@@ -192,7 +192,7 @@ public class SkillRuntimeService {
     // ------------------------------------------------------------------ internals
 
     /**
-     * 按 Skill 自己声明的前置资源（SKILL.md 的 {@code requires:}）决定它的可见性：
+     * 按 Skill 自己声明的前置资源（SKILL.md 的 {@code metadata.jm.requires}）决定它的可见性：
      * <ul>
      *   <li><b>资源已绑</b>：从「待发现」移到「直接注入」，工具立刻在手上，省掉 discovery→activate 往返。</li>
      *   <li><b>资源未绑</b>：直接从候选里摘除——没有资源可用，暴露它只会诱导模型盲调一次必然失败的工具。</li>
@@ -211,7 +211,7 @@ public class SkillRuntimeService {
      * 并且「这个 Agent 能不能查库」从一次管理员配置退化成模型每轮重赌一次。
      *
      * <p>同一个形状出现第二次就该抽象。现在新增一个有前置资源的平台 Skill，
-     * <b>只需在它自己的 SKILL.md 里写一行</b>，本方法和运行时一个字都不用改。
+     * <b>只需在它自己的 SKILL.md 里声明 {@code metadata.jm.requires}</b>，本方法和运行时一个字都不用改。
      */
     private void resolveResourceBoundSkills(Map<String, ToolPackage> skillOnly, List<ToolPackage> boundPlugins) {
         AgentRuntimeView agent = AgentContext.get();
@@ -283,7 +283,7 @@ public class SkillRuntimeService {
      * 这个条件<b>恒为真</b>，所以它一次也没防住——实测过：概览照常注入 system，
      * 而同一次请求的 tools 数组里只有 {@code activate_skills / skill_search / skill_install}。
      *
-     * <p>现在真正兑现这条守卫的是 SKILL.md 里的 {@code requires: connections}：
+     * <p>现在真正兑现这条守卫的是 SKILL.md 里的 {@code metadata.jm.requires: connections}：
      * 授权了 → connector 被提升为直接注入，工具和概览<b>同时出现</b>；
      * 没授权 → 它被整个隐藏，而 {@code buildRequestContext} 同样返回空。两侧同源，不会再分叉。
      * 下面这条判空<b>保留</b>，作为「有人把 connector 从磁盘上删了」时的兜底。

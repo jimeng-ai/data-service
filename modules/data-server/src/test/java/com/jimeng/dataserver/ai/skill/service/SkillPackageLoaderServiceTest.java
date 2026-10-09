@@ -53,4 +53,14 @@ class SkillPackageLoaderServiceTest {
                 .isInstanceOf(ServiceException.class).hasMessageContaining("不允许的键");
         assertThat(root.resolve("x-y")).doesNotExist();
     }
+
+    @Test
+    @DisplayName("平台上传：只有 frontmatter、正文为空的 SKILL.md 被拒绝（严格模式本身不查正文，这是唯一的守卫），目录里什么都不写")
+    void uploadRejectsEmptyBody() {
+        MockMultipartFile f = new MockMultipartFile("file", "SKILL.md", "text/markdown",
+                "---\nname: x-y\ndescription: d\n---\n\n".getBytes(StandardCharsets.UTF_8));
+        assertThatThrownBy(() -> loaderAt(root).uploadSkillMarkdown(f, false))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("正文不能为空");
+        assertThat(root.resolve("x-y")).doesNotExist();
+    }
 }

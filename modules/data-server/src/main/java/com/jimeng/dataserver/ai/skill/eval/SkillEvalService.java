@@ -380,7 +380,7 @@ public class SkillEvalService {
     /**
      * 这个 skill 是不是「没有 {@code conn_*} 工具就根本测不了」的那一类。
      *
-     * <p>按<b>名字</b>判而不是按 frontmatter 的 {@code requires}：评测的输入可能是构建器里的草稿，
+     * <p>按<b>名字</b>判而不是按 {@code metadata.jm.requires}：评测的输入可能是构建器里的草稿，
      * 已入库 skill 的 body 已经被剥掉 frontmatter（库里只存正文），
      * 这里拿不到 requires。名字是两条来源（磁盘平台技能、草稿）都一定有的东西。
      */

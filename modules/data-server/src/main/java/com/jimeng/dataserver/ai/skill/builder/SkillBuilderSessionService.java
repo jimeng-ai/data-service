@@ -123,9 +123,12 @@ public class SkillBuilderSessionService {
 
     /**
      * 把已发布 skill 当前版本的 bundle 复制进工作区 skill/&lt;name&gt;/，作为改进的起点（skill-creator 会先快照它当基线）。
-     * 没有 bundle 的老 skill（上传 / 导入的纯 PROMPT）按库里的列重建一份带 frontmatter 的 SKILL.md。
+     * 没有 bundle 的老 skill（上传 / 导入的纯 PROMPT）按库里的列重建一份带 frontmatter 的 SKILL.md，
+     * 并带上 {@code ai_skill.manifest} 里的 {@code metadata.jm}：不带的话，用构建器改一次再发布，声明过的域名和超时就静默丢了。
+     *
+     * <p>包内可见只为了让测试直接调它：走 {@link #create} 要搭一整条会话链路（请求上下文、对话、工作区读取）。
      */
-    private void seedFromPublished(String prefix, AiSkill base) {
+    void seedFromPublished(String prefix, AiSkill base) {
         String dirPrefix = prefix + SkillWorkspaceLayout.skillDirPrefix(base.getName());
         try {
             boolean hasSkillMd = false;
@@ -367,6 +370,8 @@ public class SkillBuilderSessionService {
         row.setDescription(desc);
         row.setBody(draft.getBody());
         row.setSkillType(draft.getEffectiveType());
+        // 有意不同步 manifest：DRAFT 行没有运行时消费者，manifest 在发布时才写（SkillBuilderPublishService.publish），
+        // 草稿期间保持 NULL。读到 DRAFT 卡片的 manifest 为空是预期，不是漏了。
     }
 
     /** DRAFT 卡片被删 = 放弃这个会话（工作区由清理任务回收）。 */

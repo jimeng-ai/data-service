@@ -4,7 +4,7 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 
 /**
- * 一个 Skill 声明的<b>前置资源</b>（SKILL.md frontmatter 的 {@code requires:}）。
+ * 一个 Skill 声明的<b>前置资源</b>（SKILL.md 的 {@code metadata.jm.requires}）。
  *
  * <h3>它解决的问题</h3>
  * 在此之前，Skill 只能声明「我是谁、我能干什么」（{@code name} / {@code description}），
@@ -22,10 +22,11 @@ import com.jimeng.common.core.exception.ServiceException;
  * 同一个形状出现第二次就该抽象。本枚举把「什么时候出现」交还给 Skill 自己声明。
  *
  * <h3>★ 未知值必须当场报错，不能静默忽略</h3>
- * frontmatter 的解析对未知键一向是静默跳过的（{@code argument-hint:} 今天就被默默丢着）。
+ * 宽松模式的解析（导入、单文件上传）对别人写的、不认识的顶层键是静默忽略的。
  * 但 {@code requires} 不能照办：写成 {@code requires: connection}（少个 s）而被忽略，
  * 后果正是<b>今天这个 bug 的形状</b>——该直注的 Skill 安静地回退成走发现，没有任何报错，
- * 表现只是「模型有时候会用、有时候不会」。所以 {@link #parse} 对认不出来的值直接抛。
+ * 表现只是「模型有时候会用、有时候不会」。所以统一解析器（{@code SkillManifestParser}）和 {@link #parse}
+ * 对认不出来的值都当场报错，{@code SkillManifest.fromJson} 读库时也一样（当坏数据处理）。
  */
 public enum SkillRequirement {
 
@@ -68,7 +69,7 @@ public enum SkillRequirement {
     }
 
     /**
-     * 解析 frontmatter 的 {@code requires} 值。
+     * 解析 {@code metadata.jm.requires} 的值。
      *
      * @param raw 原始字面量；null / 空白表示<b>没有前置资源</b>（走发现，即改动前的行为）
      * @return 对应枚举；{@code raw} 为空时返回 null
@@ -89,6 +90,6 @@ public enum SkillRequirement {
             allowed.append(r.token);
         }
         throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                "SKILL.md frontmatter 的 requires 只能是 " + allowed + "，收到：" + v);
+                "metadata.jm.requires 只能是 " + allowed + "，收到：" + v);
     }
 }

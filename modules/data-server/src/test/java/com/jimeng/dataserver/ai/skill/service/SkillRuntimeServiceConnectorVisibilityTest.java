@@ -26,7 +26,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * 平台级 Skill「connector」的可见性随 Agent 有没有被授权连接而变——{@code requires: connections}。
+ * 平台级 Skill「connector」的可见性随 Agent 有没有被授权连接而变——{@code metadata.jm.requires: connections}。
  *
  * <h3>这个用例钉的是一个上线后实测出来的静默失效</h3>
  * 在 {@code requires} 之前，connector 是磁盘平台技能、对所有 Agent 恒可见，于是它一直走

@@ -29,7 +29,7 @@ import java.util.stream.Collectors;
  *       另加平台自己的三条：name、description 不能为空，metadata 必须是字典。已知差异：
  *       <ul>
  *         <li>闭合行 {@code ---junk}、{@code ----}：quick_validate.py 放过，这里要求 {@code ---} 后面只能是空白再换行
- *             （与原来的 {@code SkillFrontmatter} 是同一个正则）。</li>
+ *             （与原来的旧解析器是同一个正则）。</li>
  *         <li>{@code name: 1e3} 这类「数字 e 数字」：PyYAML 当字符串，SnakeYAML 当浮点数，这里报「name 必须是字符串」。</li>
  *         <li>name 末尾的 U+00A0（不间断空格）：Python 的 {@code strip()} 会去掉，Java 的不会，这里报 kebab-case。</li>
  *         <li>开头的 BOM：quick_validate.py 拒绝，这里接受（Windows 上编辑过的文件，设计如此，两种模式都接受）。</li>

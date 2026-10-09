@@ -42,7 +42,7 @@ public interface ToolPackage {
     }
 
     /**
-     * 这个工具包需要 Agent 先绑定哪一类资源才生效（SKILL.md frontmatter 的 {@code requires:}）。
+     * 这个工具包需要 Agent 先绑定哪一类资源才生效（SKILL.md 的 {@code metadata.jm.requires}）。
      *
      * <p>返回 null = 没有前置资源，走正常的 discovery→activate 流程。
      * 返回非 null 时由 {@code SkillRuntimeService} 判定：

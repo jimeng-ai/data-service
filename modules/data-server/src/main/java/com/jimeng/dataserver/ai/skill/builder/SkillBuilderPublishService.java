@@ -178,8 +178,11 @@ public class SkillBuilderPublishService {
         }
     }
 
-    /** 老 skill（本功能之前发布的 v1）没有版本记录：改进前补一条，版本历史才完整。 */
-    private void recordVersionIfMissing(AiSkill row) {
+    /**
+     * 老 skill（本功能之前发布的 v1）没有版本记录：改进前补一条，版本历史才完整。manifest 带上 ai_skill 行上的那份，
+     * 与同一行的 bundle 字段是同一时刻的东西。包内可见只为了让测试直接调它（走 {@link #publish} 要搭十几处 mock）。
+     */
+    void recordVersionIfMissing(AiSkill row) {
         Long n = versionMapper.selectCount(new LambdaQueryWrapper<AiSkillVersion>()
                 .eq(AiSkillVersion::getSkillId, row.getId())
                 .eq(AiSkillVersion::getVersion, row.getVersion()));

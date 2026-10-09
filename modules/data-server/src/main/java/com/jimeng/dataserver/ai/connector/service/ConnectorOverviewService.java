@@ -204,7 +204,7 @@ public class ConnectorOverviewService {
     /**
      * 这个 Agent 有没有被授权任何外部连接。
      *
-     * <p>给 {@code SkillRuntimeService} 判定 {@code requires: connections} 用：决定 connector 这个
+     * <p>给 {@code SkillRuntimeService} 判定 {@code metadata.jm.requires: connections} 用：决定 connector 这个
      * 平台 Skill 是<b>提升为直接注入</b>还是<b>整个隐藏</b>。
      *
      * <h4>为什么单开一个方法，而不是让调用方去看 {@link #buildRequestContext} 返回空</h4>

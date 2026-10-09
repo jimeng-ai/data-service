@@ -10,10 +10,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@code requires:} 的解析。
+ * {@code metadata.jm.requires} 的解析。
  *
  * <p>全部四条都是「错了不会报错」的那种，所以逐条钉住——尤其第三条：
- * frontmatter 对未知键一向静默忽略（{@code argument-hint:} 今天就被默默丢着），
+ * 宽松模式对不认识的顶层键是静默忽略的，
  * 如果 {@code requires} 也照办，一个拼错的值会让该直注的 Skill <b>安静地退回走发现</b>，
  * 而那正是这个字段被引入来修掉的那个 bug 的形状。
  */
@@ -42,6 +42,8 @@ class SkillRequirementTest {
         ServiceException e = assertThrows(ServiceException.class, () -> SkillRequirement.parse("connection"));
         assertTrue(e.getMessage().contains("connections"), "报错要把合法取值列出来：" + e.getMessage());
         assertTrue(e.getMessage().contains("connection"), "报错要回显收到的值：" + e.getMessage());
+        // requires 现在写在 metadata.jm 下；顶层的 requires 在两种模式的解析器里都不生效，文案不能再把人指回顶层
+        assertTrue(e.getMessage().contains("metadata.jm.requires"), "报错要指向 metadata.jm.requires：" + e.getMessage());
 
         assertThrows(ServiceException.class, () -> SkillRequirement.parse("knowledgebases"));
         assertThrows(ServiceException.class, () -> SkillRequirement.parse("true"));

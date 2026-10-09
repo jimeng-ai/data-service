@@ -69,7 +69,7 @@ class SkillManifestParserTest {
         assertThat(p.jm()).isEqualTo(JmMetadata.EMPTY);
     }
 
-    // 下面两条是被删掉的旧 SkillFrontmatterTest 里、对拍用例（只有 CJK 的 1024 / 1025 和 compatibility 的 501）没有覆盖到的边界。
+    // 下面两条是旧解析器的测试里有、对拍用例（只有 CJK 的 1024 / 1025 和 compatibility 的 501）没有覆盖到的边界。
     @Test
     @DisplayName("description 的 1024 上限按码点计：1024 个 emoji 是 1024 个字符，不是 2048（与 quick_validate.py 的 len() 同口径）")
     void descriptionLimitCountsCodePoints() {

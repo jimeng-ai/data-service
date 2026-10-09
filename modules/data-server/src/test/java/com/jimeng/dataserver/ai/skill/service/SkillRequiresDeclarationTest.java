@@ -56,20 +56,14 @@ class SkillRequiresDeclarationTest {
     }
 
     @Test
-    @DisplayName("每一份 SKILL.md 的 requires 都必须是认得出来的值（拼错会被 parse 当场抛）")
+    @DisplayName("每一份 SKILL.md 都过严格校验，其中 metadata.jm.requires 必须是认得出来的值（拼错会被解析器报成错误）")
     void everySkillOnDiskParses() throws IOException {
         assumeTrue(Files.isDirectory(SKILLS_DIR), "skills 目录不在，跳过");
         try (var dirs = Files.list(SKILLS_DIR)) {
             for (Path dir : dirs.filter(Files::isDirectory).toList()) {
-                Path md = dir.resolve("SKILL.md");
-                if (!Files.isRegularFile(md)) continue;
-                // parse 对认不出来的值会抛 ServiceException；这里不 catch，让它把文件名带出来。
-                try {
-                    requiresOf(dir.getFileName().toString());
-                } catch (RuntimeException e) {
-                    throw new AssertionError("skills/" + dir.getFileName() + "/SKILL.md 的 requires 非法: "
-                            + e.getMessage(), e);
-                }
+                if (!Files.isRegularFile(dir.resolve("SKILL.md"))) continue;
+                // 不合规时 requiresOf 的断言失败，失败信息里带着文件名和解析器给的原因
+                requiresOf(dir.getFileName().toString());
             }
         }
     }
