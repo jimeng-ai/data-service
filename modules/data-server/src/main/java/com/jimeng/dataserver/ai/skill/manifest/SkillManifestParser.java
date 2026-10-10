@@ -7,10 +7,13 @@ import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -152,9 +155,10 @@ public final class SkillManifestParser {
         }
         Map<String, Object> fields = new LinkedHashMap<>();
         raw.forEach((k, v) -> fields.put(String.valueOf(k), v));
+        List<ParsedSkill.Decoded> decoded = decodedStrings(raw);
         if (requoted) {
-            log.info("SKILL.md 宽松解析：skill「{}」的 frontmatter 不是合法 YAML，已按 Claude Code 的规则给特殊值补引号后解析",
-                    printable(fields.get("name")));
+            // 不带 skill 名：名字是 YAML 解码出来的，这时还没有核对过它——可能是用转义拼出来的 key 值（R34）
+            log.info("SKILL.md 宽松解析：frontmatter 不是合法 YAML，已按 Claude Code 的规则给特殊值补引号后解析");
         }
 
         List<String> unexpected = fields.keySet().stream().filter(k -> !ALLOWED_KEYS.contains(k)).sorted().toList();
@@ -171,7 +175,8 @@ public final class SkillManifestParser {
                     errors.add(TOP_LEVEL_JM_HINT);
                     ignored = unexpected.stream().filter(k -> !JM.equals(k)).toList();
                 }
-                if (!ignored.isEmpty()) log.info("SKILL.md 宽松解析：忽略不认识的顶层键 {}", ignored);
+                // 只记个数：键名也是 YAML 解码出来的，这时还没有核对过（R34）
+                if (!ignored.isEmpty()) log.info("SKILL.md 宽松解析：忽略了 {} 个不认识的顶层键", ignored.size());
             }
         }
 
@@ -182,7 +187,47 @@ public final class SkillManifestParser {
         if (mode == Mode.LENIENT && body.isBlank()) {
             errors.add("SKILL.md 正文不能为空");
         }
-        return new ParsedSkill(name, description, body, jm, mode == Mode.LENIENT ? ignored : List.of(), errors);
+        return new ParsedSkill(name, description, body, jm, mode == Mode.LENIENT ? ignored : List.of(), errors, decoded);
+    }
+
+    /**
+     * frontmatter 里由 YAML 解码出来的每一个字符串：键名和标量值都算——字符串原样，数字、布尔、日期取 {@code String.valueOf}，
+     * {@code !!binary} 按 UTF-8 解成字符串——连同它在哪儿：顶层的键名、某个顶层键下面的值（就记那个顶层键）、某个顶层键里面的键名。
+     * 发布处理器解析之后拿它核对（R34）：转义、续行、{@code !!binary}、十六进制数字……拼出来的 key 值原文里没有、替换不掉，
+     * 只有解码之后才看得见。
+     *
+     * <p>锚点和别名会让同一个字典、列表被引用很多次：按对象身份只走一遍，成本跟 frontmatter 的长度成正比；嵌套层数由 LoaderOptions 限住。
+     */
+    static List<ParsedSkill.Decoded> decodedStrings(Map<?, ?> root) {
+        List<ParsedSkill.Decoded> out = new ArrayList<>();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Map.Entry<?, ?> e : root.entrySet()) {
+            String top = String.valueOf(e.getKey());
+            collectDecoded(e.getKey(), "顶层的键名", "顶层的键名", out, seen);
+            collectDecoded(e.getValue(), top, top + " 里的键名", out, seen);
+        }
+        return out;
+    }
+
+    private static void collectDecoded(Object node, String where, String keysWhere, List<ParsedSkill.Decoded> out, Set<Object> seen) {
+        if (node == null) return;
+        if (node instanceof Map<?, ?> map) {
+            if (!seen.add(map)) return;
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                collectDecoded(e.getKey(), keysWhere, keysWhere, out, seen);
+                collectDecoded(e.getValue(), where, keysWhere, out, seen);
+            }
+        } else if (node instanceof Collection<?> items) {
+            if (!seen.add(items)) return;
+            for (Object x : items) collectDecoded(x, where, keysWhere, out, seen);
+        } else if (node instanceof Object[] items) {
+            if (!seen.add(items)) return;
+            for (Object x : items) collectDecoded(x, where, keysWhere, out, seen);
+        } else if (node instanceof byte[] bytes) {
+            out.add(new ParsedSkill.Decoded(where, new String(bytes, StandardCharsets.UTF_8)));
+        } else {
+            out.add(new ParsedSkill.Decoded(where, String.valueOf(node)));
+        }
     }
 
     /** 主解析和重试、以及「值是不是合法序列」的判断都走这一个，所以 LoaderOptions 的各项上限始终一致。 */
@@ -425,11 +470,5 @@ public final class SkillManifestParser {
     private static String oneLine(String message) {
         String s = message == null ? "" : message.replaceAll("\\s+", " ").strip();
         return s.length() > 160 ? s.substring(0, 160) + "…" : s;
-    }
-
-    /** 写进日志的用户输入：控制字符、换行符换成空格（防止伪造日志行），最多 64 个字符。 */
-    private static String printable(Object value) {
-        String s = String.valueOf(value).replaceAll("[\\p{Cc}\\p{Zl}\\p{Zp}]", " ");
-        return s.length() > 64 ? s.substring(0, 64) + "…" : s;
     }
 }

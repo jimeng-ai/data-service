@@ -78,17 +78,22 @@ public class SkillBuilderJanitor {
                 deleteWorkspace(s);
                 log.info("[janitor] 放弃长期未动的构建器会话 session={} tenant={}", s.getId(), s.getTenantId());
             } catch (Exception e) {
-                log.warn("[janitor] 清理闲置会话失败 session={}: {}", s.getId(), e.getMessage());
+                log.warn("[janitor] 清理闲置会话失败 session={} cause={}", s.getId(), e.getClass().getSimpleName());
             }
         }
     }
 
+    /**
+     * 删一个会话的工作区。★ 日志里不出现对象名、也不出现异常的 message（存储异常的 message 常带着对象名）：工作区里的文件名
+     * 可能带着 key 的值，日志经 Filebeat 进 ES。所以用不记对象名的删除，只记删掉几个、删不掉几个，异常只记类名。
+     */
     private void deleteWorkspace(SkillBuilderSession s) {
         try {
-            int n = storage.deletePrefix(s.getWorkspacePrefix());
-            if (n > 0) log.info("[janitor] 清理构建器工作区 session={} objects={}", s.getId(), n);
+            RagMinioStorageService.Deleted d = storage.deletePrefixWithoutObjectNames(s.getWorkspacePrefix());
+            if (d.deleted() > 0) log.info("[janitor] 清理构建器工作区 session={} objects={}", s.getId(), d.deleted());
+            if (d.failed() > 0) log.warn("[janitor] 清理构建器工作区时有 {} 个对象没删掉（不记对象名）session={}", d.failed(), s.getId());
         } catch (Exception e) {
-            log.warn("[janitor] 清理工作区失败 session={}: {}", s.getId(), e.getMessage());
+            log.warn("[janitor] 清理工作区失败 session={} cause={}", s.getId(), e.getClass().getSimpleName());
         }
     }
 
@@ -106,12 +111,18 @@ public class SkillBuilderJanitor {
                 newest.merge(group, t, Math::max);
             }
             int removed = 0;
+            int failed = 0;
             for (Map.Entry<String, Long> e : newest.entrySet()) {
-                if (e.getValue() < cutoff) removed += storage.deletePrefix(e.getKey());
+                if (e.getValue() < cutoff) {
+                    RagMinioStorageService.Deleted d = storage.deletePrefixWithoutObjectNames(e.getKey());   // 同 deleteWorkspace：不记对象名
+                    removed += d.deleted();
+                    failed += d.failed();
+                }
             }
             if (removed > 0) log.info("[janitor] 清理 {} 下过期临时对象 {} 个", root, removed);
+            if (failed > 0) log.warn("[janitor] 清理 {} 时有 {} 个过期临时对象没删掉（不记对象名）", root, failed);
         } catch (Exception e) {
-            log.warn("[janitor] 清理 {} 失败: {}", root, e.getMessage());
+            log.warn("[janitor] 清理 {} 失败 cause={}", root, e.getClass().getSimpleName());
         }
     }
 }

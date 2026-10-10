@@ -189,6 +189,21 @@ public class RagMinioStorageService {
      * 而且不报错。这里必须把结果逐个取一遍（出错的对象会以 DeleteError 出现在里面）。
      */
     public int deletePrefix(String prefix) throws Exception {
+        return deleteUnder(prefix, true).deleted();
+    }
+
+    /** {@link #deletePrefixWithoutObjectNames} 的结果：删掉了几个、删不掉几个。 */
+    public record Deleted(int deleted, int failed) {}
+
+    /**
+     * 同 {@link #deletePrefix}，但删不掉的对象<b>不记对象名</b>，只数个数、交给调用方去记：对象名里可能有不能进日志的东西——
+     * 构建器工作区里的文件名可能带着 key 的值（日志经 Filebeat 进 ES）。{@link #deletePrefix} 的日志照旧带对象名，RAG 那边排障要用。
+     */
+    public Deleted deletePrefixWithoutObjectNames(String prefix) throws Exception {
+        return deleteUnder(prefix, false);
+    }
+
+    private Deleted deleteUnder(String prefix, boolean logObjectNames) throws Exception {
         ensureReady();
         if (prefix == null || prefix.isBlank() || !prefix.endsWith("/")) {
             // 空前缀 = 整个 bucket；不以 / 结尾会误删同名前缀的兄弟（skills/1 会匹配 skills/10/…）。
@@ -196,15 +211,15 @@ public class RagMinioStorageService {
         }
         List<DeleteObject> objects = new ArrayList<>();
         for (String key : listObjects(prefix)) objects.add(new DeleteObject(key));
-        if (objects.isEmpty()) return 0;
+        if (objects.isEmpty()) return new Deleted(0, 0);
         int failed = 0;
         for (Result<DeleteError> r : client.removeObjects(
                 RemoveObjectsArgs.builder().bucket(bucket).objects(objects).build())) {
             DeleteError err = r.get();
             failed++;
-            log.warn("MinIO 删除失败 object={} msg={}", err.objectName(), err.message());
+            if (logObjectNames) log.warn("MinIO 删除失败 object={} msg={}", err.objectName(), err.message());
         }
-        return objects.size() - failed;
+        return new Deleted(objects.size() - failed, failed);
     }
 
     public String getBucket() {

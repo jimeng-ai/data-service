@@ -666,6 +666,11 @@ class SkillPackageProcessorTest {
         String md = "---\nname: refund-flow\ndescription: 退款\nmetadata:\n  jm:\n    hosts: [\"sk-live-\\x43RM-0123456789.example.com\"]\n---\n正文\n";
         ServiceException e = publishing(skillMdWith(md, CRM_SECRETS), PreviousKeys.NONE);
         assertThat(e.getMessage()).contains("metadata.jm").contains("CRM_TOKEN").doesNotContain("sk-live").doesNotContain("0123456789");
+
+        // 原文就写成小写（不经过解码）：替换按原文、区分大小写，换不掉；解码出来的也是小写，按原样比也查不出——只有「域名按小写比」这一道拦得住
+        String lower = "---\nname: refund-flow\ndescription: 退款\nmetadata:\n  jm:\n    hosts: [sk-live-crm-0123456789.example.com]\n---\n正文\n";
+        assertThat(publishing(skillMdWith(lower, CRM_SECRETS), PreviousKeys.NONE).getMessage())
+                .contains("metadata.jm").contains("CRM_TOKEN").doesNotContain("sk-live").doesNotContain("0123456789");
     }
 
     @Test
@@ -682,6 +687,51 @@ class SkillPackageProcessorTest {
         previousOnly.put("SKILL.md", b(previousMd));
         assertThat(publishing(previousOnly, PreviousKeys.decrypted(Map.of("WECOM_HOOK", OLD))).getMessage())
                 .contains("description").contains("WECOM_HOOK").doesNotContain(OLD).doesNotContain("0123456789ab");
+    }
+
+    // ---------------------------------------------------------------- 第 4 轮（再续）R34：解析之后的核对扩到 frontmatter 解码出来的所有字符串
+
+    @Test
+    @DisplayName("★ 第 4 轮（再续）R34：license 用 \\x43 拼出 key 的值——它不入库，可转义原样留在 bundle 的 SKILL.md 里，运行时模型读得到、也解得开："
+            + "拒绝，文案点名 license 和 key，不带值")
+    void aValueRebuiltInLicenseIsRejected() {
+        String md = "---\nname: refund-flow\ndescription: 退款\nlicense: \"MIT sk-live-\\x43RM-0123456789\"\n---\n正文\n";
+        assertThat(md).doesNotContain(TOKEN);
+        ServiceException e = publishing(skillMdWith(md, CRM_SECRETS), PreviousKeys.NONE);
+        assertThat(e.getMessage()).contains("license").contains("CRM_TOKEN").contains("{{CRM_TOKEN}}")
+                .doesNotContain("sk-live").doesNotContain("0123456789");
+    }
+
+    private static ServiceException lenientPublishing(Map<String, byte[]> files) {
+        try {
+            SkillPackageProcessor.process(files, SkillManifestParser.Mode.LENIENT, true);
+        } catch (ServiceException e) {
+            return e;
+        }
+        throw new AssertionError("本该拒绝发布，却发布成功了");
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（再续）R34：别的解码写法和位置同样拒绝——宽松模式下被忽略的键的值和键名本身、metadata 里别的字段和键名、!!binary（YAML 自带的 base64）、"
+            + "十六进制数字（拼出一个全是数字的 key 值）；文案点名位置，不带值")
+    void everyOtherDecodedStringIsCheckedToo() {
+        String escaped = "\"sk-live-\\x43RM-0123456789\"";
+        assertThat(lenientPublishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\nauthor: " + escaped + "\n---\n正文\n", CRM_SECRETS))
+                .getMessage()).contains("author").contains("CRM_TOKEN").doesNotContain("sk-live");
+        assertThat(lenientPublishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\n" + escaped + ": x\n---\n正文\n", CRM_SECRETS))
+                .getMessage()).contains("顶层的键名").contains("CRM_TOKEN").doesNotContain("sk-live");
+        assertThat(publishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\nmetadata:\n  owner: " + escaped + "\n---\n正文\n", CRM_SECRETS),
+                PreviousKeys.NONE).getMessage()).contains("metadata").contains("CRM_TOKEN").doesNotContain("sk-live");
+        assertThat(publishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\nmetadata:\n  " + escaped + ": x\n---\n正文\n", CRM_SECRETS),
+                PreviousKeys.NONE).getMessage()).contains("metadata 里的键名").contains("CRM_TOKEN").doesNotContain("sk-live");
+
+        String base64 = java.util.Base64.getEncoder().encodeToString(b(TOKEN));
+        assertThat(publishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\nmetadata:\n  blob: !!binary " + base64 + "\n---\n正文\n", CRM_SECRETS),
+                PreviousKeys.NONE).getMessage()).contains("metadata").contains("CRM_TOKEN").doesNotContain("sk-live");
+
+        String numeric = "{\"NUM_KEY\":{\"value\":\"1234567890\",\"hosts\":[\"api.customer.com\"]}}";   // 0x499602D2 = 1234567890
+        assertThat(publishing(skillMdWith("---\nname: refund-flow\ndescription: 退款\nmetadata:\n  build: 0x499602D2\n---\n正文\n", numeric),
+                PreviousKeys.NONE).getMessage()).contains("metadata").contains("NUM_KEY").doesNotContain("1234567890");
     }
 
     @Test

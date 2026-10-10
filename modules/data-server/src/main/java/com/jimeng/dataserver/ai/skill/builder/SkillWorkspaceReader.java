@@ -134,8 +134,9 @@ public class SkillWorkspaceReader {
      * @param skillMdPartlyReplaced SKILL.md 里有已知的值没被整段换成占位符（几个值在文本里首尾相接、互相包含了一部分，被抢掉的那个会剩下一截原文）。
      *                           和发布处理器同一道核对（{@link SecretValues.Replacement#notFullyReplaced}，在原文上判）；为 true 时 DRAFT 行不同步——
      *                           DRAFT 行在库里，还能被设成全团队可见。没读、没解析 SKILL.md 时为 false
-     * @param parsedFieldsCarryValues 解析出来的 name / description / 正文 / metadata.jm 里有已知的值（R33：转义、续行拼出来的，原文里没有、
-     *                           替换不掉）。和发布处理器同一道核对（{@link SkillPackageProcessor#valuesInParsedFields}）；为 true 时 DRAFT 行不同步。
+     * @param parsedFieldsCarryValues frontmatter 里 YAML 解码出来的任何字符串（键名、标量值，入不入库都算）、正文、metadata.jm 里有已知的值
+     *                           （R33、R34：转义、续行拼出来的，原文里没有、替换不掉）。和发布处理器同一道核对
+     *                           （{@link SkillPackageProcessor#valuesInParsedFields}）；为 true 时 DRAFT 行不同步。
      *                           没读、没解析 SKILL.md 时为 false
      */
     public record Draft(DraftView view, SecretValues known, boolean skillMdPartlyReplaced, boolean parsedFieldsCarryValues) {
@@ -265,9 +266,11 @@ public class SkillWorkspaceReader {
 
         DraftView v = new DraftView();
         v.setDirName(loc.dir());
-        // 没解析的时候 name / description 是 null、skillMd / body 是空串（前端要用 skillMd 和 body 的长度切 frontmatter）
-        v.setName(fm == null ? null : fm.name());
-        v.setDescription(fm == null ? null : fm.description());
+        // 没解析的时候 name / description 是 null、skillMd / body 是空串（前端要用 skillMd 和 body 的长度切 frontmatter）。
+        // R34：name、description 是 YAML 解码出来的，转义、续行拼出来的值原文里没有、替换不掉——用这一轮确定的值集合再抹一遍，
+        // 不然会随 draft-update 事件进 Redis Stream（R22：文本出去都抹过）。值集合确定不了时上面根本没有解析（fm 为 null）
+        v.setName(fm == null ? null : known.replace(fm.name()));
+        v.setDescription(fm == null ? null : known.replace(fm.description()));
         v.setSkillMd(skillMd);
         v.setBody(fm == null ? "" : fm.body());
         String inferred = SkillBundleRules.inferSkillType(files.keySet());

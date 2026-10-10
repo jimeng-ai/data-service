@@ -36,8 +36,9 @@ import java.util.stream.Collectors;
  *       文件路径、任何 key 的 hosts / methods / paths、二进制文件里还出现上一版的值，照旧按子串检查；</li>
  *   <li>文件里还在用 {@code {{X}}}、上一版有 X、这一版的 secrets.json 却没有 X 了：拒绝（否则新版本静默丢 key）；</li>
  *   <li>★ <b>用替换后的</b> SKILL.md 解析 frontmatter：正文进库时已经是占位符，解析报错的片段里也只有占位符；</li>
- *   <li>★ <b>解析之后再核对一遍</b>（R33，{@link #valuesInParsedFields}）：要入库的 name、description、正文、manifest 的 JSON 里不能有任何已知的值——
- *       YAML 的转义、续行拼出来的值原文里没有、替换不掉，只能在这里兜住。manifest 的 JSON 由这里算好放进 {@link Output}，调用方原样存。</li>
+ *   <li>★ <b>解析之后再核对一遍</b>（R33、R34，{@link #valuesInParsedFields}）：frontmatter 里 YAML 解码出来的每一个字符串（入不入库都算）、
+ *       正文、manifest 的 JSON 里不能有任何已知的值——转义、续行拼出来的值原文里没有、替换不掉，只能在这里兜住。
+ *       manifest 的 JSON 由这里算好放进 {@link Output}，调用方原样存。</li>
  * </ol>
  * 解析或校验产生的任何消息放进异常之前都先抹值（当前的值 + 上一版的全部值）：{@code ServiceException} 构造时就把文案记进 ERROR 日志。
  * 加密和「沿用旧值」的范围核对不在这里，见 {@code SkillSecretService.prepare}。
@@ -169,29 +170,34 @@ public final class SkillPackageProcessor {
     }
 
     /**
-     * 解析之后再核对一遍（R33）：要入库的每个字符串里有没有已知的值。返回「字段 → 出现在里面的 key」（按字段的先后），没有就是空。
+     * 解析之后再核对一遍（R33、R34）：解析得到的字符串里有没有已知的值。返回「位置 → 出现在里面的 key」（按位置的先后），没有就是空。
      *
-     * <p>「先替换、再解析」只管得住原文。YAML 双引号里的转义（比如 {@code \x43}）、反斜杠续行、折叠标量……任何解码手法拼出来的值，
-     * 原文里都没有、替换不掉，解码之后才出现在字段里——发布后就进了 {@code ai_skill} 的列。所以统一在解析之后用这一道兜住，
-     * 不逐个封堵编码写法。核对的是要入库的东西，用原文子串比：name、description、正文（它不经过解码，核对一下不费事）、
-     * manifest 的 JSON（metadata.jm 加 key 的声明，就是存进库的那一份）；manifest 里的域名入库前被归一成了小写（HostPattern），
-     * 另外按小写比——和 secrets.json 的 hosts 同一个口径。
+     * <p>「先替换、再解析」只管得住原文。YAML 双引号里的转义（比如 {@code \x43}）、反斜杠续行、折叠标量、{@code !!binary}、十六进制数字……
+     * 任何解码手法拼出来的值，原文里都没有、替换不掉，解码之后才出现。所以统一在解析之后用这一道兜住，不逐个封堵编码写法。用原文子串比：
+     * <ul>
+     *   <li>frontmatter 里 YAML 解码出来的每一个字符串（{@link ParsedSkill#decoded}：键名和标量值，含 license、被忽略的键、metadata 里的别的字段）——
+     *       不入库的也算：转义原样留在 bundle 的 SKILL.md 里，运行时模型读得到、也解得开（R34）；</li>
+     *   <li>要入库的：name、description、正文（它不经过解码，核对一下不费事）、manifest 的 JSON（metadata.jm 加 key 的声明，就是存进库的那一份）；
+     *       manifest 里的域名入库前被归一成了小写（HostPattern），另外按小写比——和 secrets.json 的 hosts 同一个口径。</li>
+     * </ul>
      *
      * <p>发布处理器（构建器发布、GitHub 导入、对话里的 skill_install 都走这里）和构建器的 DRAFT 行同步（SkillWorkspaceReader）共用这一个。
      */
     public static Map<String, List<String>> valuesInParsedFields(ParsedSkill skill, String manifestJson, SecretValues known) {
-        Map<String, List<String>> hits = new LinkedHashMap<>();
-        putIfAny(hits, "name", known.namesIn(skill.name()));
-        putIfAny(hits, "description", known.namesIn(skill.description()));
-        putIfAny(hits, "正文", known.namesIn(skill.body()));
-        Set<String> inManifest = new LinkedHashSet<>(known.namesIn(manifestJson));
-        for (String host : skill.jm().hosts()) inManifest.addAll(known.namesInIgnoreCase(host));
-        putIfAny(hits, "metadata.jm", List.copyOf(inManifest));
-        return hits;
+        Map<String, Set<String>> hits = new LinkedHashMap<>();
+        addIfAny(hits, "name", known.namesIn(skill.name()));
+        addIfAny(hits, "description", known.namesIn(skill.description()));
+        addIfAny(hits, "正文", known.namesIn(skill.body()));
+        for (ParsedSkill.Decoded d : skill.decoded()) addIfAny(hits, d.where(), known.namesIn(d.text()));
+        addIfAny(hits, "metadata.jm", known.namesIn(manifestJson));
+        for (String host : skill.jm().hosts()) addIfAny(hits, "metadata.jm", known.namesInIgnoreCase(host));
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        hits.forEach((where, names) -> out.put(where, List.copyOf(names)));
+        return out;
     }
 
-    private static void putIfAny(Map<String, List<String>> hits, String field, List<String> names) {
-        if (!names.isEmpty()) hits.put(field, names);
+    private static void addIfAny(Map<String, Set<String>> hits, String where, List<String> names) {
+        if (!names.isEmpty()) hits.computeIfAbsent(where, k -> new LinkedHashSet<>()).addAll(names);
     }
 
     /** 解析之后核对出值的文案：点名字段和 key，不带值，告诉作者别用转义、续行拼 key。 */

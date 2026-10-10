@@ -281,15 +281,29 @@ class SkillManifestParserTest {
     }
 
     @Test
-    @DisplayName("重试成功记一条 INFO（带 skill 名）；本来就合法的 YAML 不记")
+    @DisplayName("重试成功记一条 INFO（第 4 轮 R34 起不带 skill 名：名字是 YAML 解码出来的，记日志的时候还没核对过它）；本来就合法的 YAML 不记")
     void retryIsLoggedOnce() {
         SkillManifestParser.parse(skill("name: needs-quotes\ndescription: Use when: x"), LENIENT);
         assertThat(parserLogs.list).filteredOn(e -> e.getLevel() == Level.INFO).singleElement().satisfies(e ->
-                assertThat(e.getFormattedMessage()).contains("needs-quotes").contains("补引号"));
+                assertThat(e.getFormattedMessage()).contains("补引号").doesNotContain("needs-quotes"));
 
         parserLogs.list.clear();
         SkillManifestParser.parse(skill("name: fine\ndescription: plain"), LENIENT);
         assertThat(parserLogs.list).isEmpty();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（再续）R34：宽松解析的两条 INFO 不打 YAML 解码出来的任何东西——补引号重试时的 name、被忽略的顶层键名都可能是用转义拼出来的 key 值，"
+            + "而这两条日志打在发布处理器「解析之后再核对」之前；被忽略的键只记个数")
+    void lenientParsingLogsNoDecodedText() {
+        ParsedSkill p = SkillManifestParser.parse(skill("name: \"sk-live-\\x43RM-0123456789\"\ndescription: a: b\n\"sk-live-\\x43RM-9876543210\": x"), LENIENT);
+
+        assertThat(p.name()).isEqualTo("sk-live-CRM-0123456789");                 // 确实走了补引号重试、确实解码了
+        assertThat(p.ignoredKeys()).containsExactly("sk-live-CRM-9876543210");
+        assertThat(parserLogs.list).extracting(ILoggingEvent::getFormattedMessage)
+                .noneMatch(m -> m.contains("sk-live-CRM"))
+                .anyMatch(m -> m.contains("补引号"))
+                .anyMatch(m -> m.contains("忽略了 1 个"));
     }
 
     @Test

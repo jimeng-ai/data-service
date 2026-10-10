@@ -348,6 +348,40 @@ class SkillBuilderSessionServiceDraftSyncTest {
         assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
     }
 
+    // ---------------------------------------------------------------- 第 4 轮（再续）R34
+
+    @Test
+    @DisplayName("★ 第 4 轮（再续）R34：预览和 draft-update 里由解析得到的 name、description 也用这一轮确定的值集合抹过——description 用 \\x43 "
+            + "解码出来的值不进事件（事件会写进 Redis Stream）；SKILL.md 的原文照旧给（里面是转义，不是值）")
+    void theDraftUpdateEventCarriesNoDecodedValue() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: \"key sk-live-\\x43RM-0123456789\"\n---\n正文\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, null);
+
+        DraftUpdateEvent event = svc.syncAfterRun(1L, true);
+
+        assertThat(event.getDraft().getDescription()).isEqualTo("key {{CRM_TOKEN}}");
+        assertThat(new ObjectMapper().writeValueAsString(event)).doesNotContain(TOKEN).doesNotContain("sk-live-CRM");
+        assertThat(cn.hutool.json.JSONUtil.toJsonStr(event)).doesNotContain(TOKEN).doesNotContain("sk-live-CRM");   // RunEventTee 用 hutool 序列化
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（再续）R34：license（不入库的字段）用 \\x43 拼出 key 的值——DRAFT 行同步和发布同一个口径：不同步，第一次同步建占位的一行")
+    void aValueRebuiltInAnyFrontmatterFieldKeepsTheDraftRowFromSyncing() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\nlicense: \"MIT sk-live-\\x43RM-0123456789\"\n---\n正文\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.DECODED_VALUE_DRAFT_BODY);
+        });
+    }
+
     @Test
     @DisplayName("★ 第 3 轮：key 的名字就是它自己的值——占位符 {{名字}} 会把值打出来，所以同样按读不出来处理：第一次同步建占位的一行，推给前端的事件里没有值、没有 skill 文件的原文")
     void aKeyNameThatIsItsOwnValueIsTreatedLikeAnUnreadableFile() throws Exception {

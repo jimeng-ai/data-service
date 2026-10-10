@@ -397,10 +397,11 @@ public class SkillBuilderSessionService {
      *   <li>SKILL.md 超过预览上限：不读、不解析、不抹值（运行时整份 SKILL.md 都进模型上下文，这个大小本来就用不了）；</li>
      *   <li>SKILL.md 里有已知的值没被整段换成占位符（几个值首尾相接、互相包含了一部分：被抢掉的那个会剩下一截原文，比如 {@code {{KEY_A}}-yyyy}）——
      *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#skillMdPartlyReplaced}）；</li>
-     *   <li>解析出来的 name / description / 正文 / metadata.jm 里有已知的值（R33：YAML 的转义、续行拼出来的，原文里没有、替换不掉）——
+     *   <li>frontmatter 里 YAML 解码出来的任何字符串（入不入库都算）、正文、metadata.jm 里有已知的值（R33、R34：转义、续行拼出来的，原文里没有、替换不掉）——
      *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#parsedFieldsCarryValues}）。</li>
      * </ul>
-     * 后两条只管 DRAFT 行：预览和 draft-update 只给属主看，不加这两道核对（R21 / R22）。
+     * 后两条只决定 DRAFT 行同不同步：预览和 draft-update 只给属主看，不因它们扣下文字（R21 / R22）；预览里解析出来的 name、description
+     * 另外用这一轮确定的值集合抹过（R34，见 SkillWorkspaceReader）。
      */
     private void upsertDraftRow(SkillBuilderSession s, SkillWorkspaceReader.Draft read) {
         DraftView draft = read.view();
