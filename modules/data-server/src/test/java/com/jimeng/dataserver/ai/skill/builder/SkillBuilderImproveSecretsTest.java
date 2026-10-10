@@ -35,6 +35,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -106,14 +107,23 @@ class SkillBuilderImproveSecretsTest {
     }
 
     private SkillBuilderPublishService serviceWith(CredentialCipher withCipher) {
+        return serviceWith(withCipher, new SkillBuilderProperties());
+    }
+
+    private SkillBuilderPublishService serviceWith(CredentialCipher withCipher, SkillBuilderProperties props) {
         return new SkillBuilderPublishService(sessions, mock(SkillBuilderSessionMapper.class),
-                new SkillWorkspaceReader(storage, new SkillBuilderProperties()), storage, aiSkillMapper, versionMapper,
+                new SkillWorkspaceReader(storage, props), storage, aiSkillMapper, versionMapper,
                 mock(AiSkillRegistryService.class), mock(ChatConversationService.class),
-                new SkillSecretService(secretMapper, withCipher), new SkillBuilderProperties());
+                new SkillSecretService(secretMapper, withCipher), props);
     }
 
     /** 改进 refund-flow（skill 5，当前 v3，上一版的 key 行是 previousRow）的会话，工作区里放这些文件。 */
     private void improvementSession(Map<String, String> workspaceFiles, SkillSecret previousRow) throws Exception {
+        improvementSession(workspaceFiles, Map.of(), previousRow);
+    }
+
+    /** 同上；declaredSizes 是列举时「报出来」的大小（可以和内容对不上：列举之后、读取之前，沙箱可以把文件换大）。 */
+    private void improvementSession(Map<String, String> workspaceFiles, Map<String, Long> declaredSizes, SkillSecret previousRow) throws Exception {
         SkillBuilderSession session = new SkillBuilderSession();
         session.setId(1L);
         session.setTenantId("t1");
@@ -128,7 +138,7 @@ class SkillBuilderImproveSecretsTest {
         List<ObjectInfo> infos = new ArrayList<>();
         for (Map.Entry<String, String> e : workspaceFiles.entrySet()) {
             String name = "ws/1/skill/refund-flow/" + e.getKey();
-            infos.add(new ObjectInfo(name, b(e.getValue()).length, new Date()));
+            infos.add(new ObjectInfo(name, declaredSizes.getOrDefault(e.getKey(), (long) b(e.getValue()).length), new Date()));
             StorageStubs.object(storage, name, b(e.getValue()));
         }
         when(storage.listObjectInfos("ws/1/")).thenReturn(infos);
@@ -403,7 +413,8 @@ class SkillBuilderImproveSecretsTest {
     }
 
     @Test
-    @DisplayName("★ R27：配了密钥、但上一版某个 key 的密文解不开（密钥换过），这一版给了新值——照常发布，新值用现在的密钥加密；WARN 只带 skill id 和 key 名")
+    @DisplayName("★ R27：配了密钥、但上一版某个 key 的密文解不开（密钥换过），这一版给了新值——照常发布，新值用现在的密钥加密；"
+            + "WARN（第 4 轮起由发布入口在处理器之后记）只带 skill id 和 key 名")
     void anUndecryptableKeyWithANewValueStillPublishes() throws Exception {
         SkillSecret row = previousRow(null, null);                     // 用 zeros 密钥加密的
         CredentialCipher rotated = cipherWithKey((byte) 1);            // 现在配的是另一把
@@ -413,7 +424,7 @@ class SkillBuilderImproveSecretsTest {
         workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
         improvementSession(workspace, row);
 
-        try (LogCapture logs = LogCapture.of(SkillSecretService.class)) {
+        try (LogCapture logs = LogCapture.of(SkillBuilderPublishService.class)) {
             serviceWith(rotated).publish(1L);
 
             assertThat(logs.warnings()).singleElement().satisfies(m -> assertThat(m).contains("CRM_TOKEN").contains("5")
@@ -445,6 +456,158 @@ class SkillBuilderImproveSecretsTest {
         assertThatThrownBy(() -> serviceWith(cipherWithKey((byte) 1)).publish(1L)).isInstanceOf(ServiceException.class)
                 .hasMessageContaining("key CRM_TOKEN 上一版的值解不开").hasMessageContaining("没法沿用")
                 .hasMessageContaining("重新写 value").hasMessageContaining("去掉 CRM_TOKEN");
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 5：解不开、给了新值是正常的发布路径——整条流程里一条 ERROR 都没有（以前 CredentialCipher.decrypt 每个解不开的 key 都构造一个 "
+            + "ServiceException、记一条 ERROR，按 ERROR 告警会误报），WARN 只有「哪些 key 解不开」那一条")
+    void anUndecryptableKeyWithANewValueLogsNoError() throws Exception {
+        SkillSecret row = previousRow(null, null);                     // 用 zeros 密钥加密的
+        CredentialCipher rotated = cipherWithKey((byte) 1);            // 现在配的是另一把
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, row);
+
+        try (LogCapture logs = LogCapture.everything()) {
+            serviceWith(rotated).publish(1L);
+
+            assertThat(logs.errors()).isEmpty();
+            assertThat(logs.warnings()).singleElement().satisfies(m -> assertThat(m).contains("CRM_TOKEN").contains("5")
+                    .doesNotContain("sk-live").doesNotContain(row.getCiphertext()));
+        }
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 2（复审探针 C）：上一版解不开的 key 叫 CRM_TOKEN_PROD，这一版某个 key 的值正好是 CRM_TOKEN_PROD——处理器的名字检查拒绝发布；"
+            + "「哪些 key 解不开」的 WARN 排在这道检查之后，所以哪一行日志里都没有这个值（以前 WARN 在解密时就打，早于名字检查）")
+    void anUndecryptableKeyNamedLikeACurrentValueNeverReachesTheLog() throws Exception {
+        SkillSecret oddName = previousRowOf("CRM_TOKEN_PROD", "an-old-secret-9999", "[\"api.customer.com\"]", null, null);   // 用 zeros 密钥加密的
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("secrets.json", "{\"NEW_KEY\":{\"value\":\"CRM_TOKEN_PROD\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, oddName);
+        SkillBuilderPublishService rotated = serviceWith(cipherWithKey((byte) 1));   // 现在配的是另一把
+
+        try (LogCapture logs = LogCapture.everything()) {
+            assertThatThrownBy(() -> rotated.publish(1L)).isInstanceOf(ServiceException.class)
+                    .hasMessageContaining("名字").hasMessageNotContaining("CRM_TOKEN_PROD");
+
+            assertThat(logs.all()).noneMatch(m -> m.contains("CRM_TOKEN_PROD"));
+        }
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 2：那条 WARN 整句先过唯一的替换 helper（当前值 ∪ 上一版的值）——两个解不开的 key 的名字连起来（AAA_KEY,BBB_KEY）正好是这一版"
+            + "某个 key 的值：处理器逐个名字查，查不出来，发布照常；WARN 里只有 {{名字}}，哪一行日志都没有这个值")
+    void theWarningIsScrubbedAsAWholeLine() throws Exception {
+        SkillSecret first = previousRowOf("AAA_KEY", "an-old-secret-1111", "[\"api.customer.com\"]", null, null);    // 都用 zeros 密钥加密
+        SkillSecret second = previousRowOf("BBB_KEY", "an-old-secret-2222", "[\"api.customer.com\"]", null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("secrets.json", "{\"NEW_KEY\":{\"value\":\"AAA_KEY,BBB_KEY\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, first);
+        when(secretMapper.selectList(any())).thenReturn(List.of(first, second));
+        SkillBuilderPublishService rotated = serviceWith(cipherWithKey((byte) 1));   // 现在配的是另一把：两个都解不开
+
+        try (LogCapture logs = LogCapture.everything()) {
+            rotated.publish(1L);
+
+            assertThat(logs.warnings()).singleElement().satisfies(m -> assertThat(m).contains("skillId=5").contains("{{NEW_KEY}}")
+                    .doesNotContain("AAA_KEY,BBB_KEY"));
+            assertThat(logs.all()).noneMatch(m -> m.contains("AAA_KEY,BBB_KEY"));
+        }
+    }
+
+    // ---------------------------------------------------------------- 第 4 轮 1：发布时读文件失败、读文件超额
+
+    /**
+     * 这个文件草稿读取时读得到，发布那一次读取失败（两次读之间对象被删了、MinIO 抖了一下）。存储报的出错信息里带着完整的对象名——
+     * 和 MinIO 真实的报错一样（{@code resource=/bucket/…}）。整个读（旧写法）也一样失败。
+     */
+    private void failsOnThePublishRead(String rel) throws Exception {
+        String name = "ws/1/skill/refund-flow/" + rel;
+        byte[] bytes = b("print(1)\n");
+        java.io.IOException gone = new java.io.IOException("The specified key does not exist. resource=/skills-bucket/" + name);
+        when(storage.readBytesUpTo(eq(name), anyLong()))
+                .thenAnswer(inv -> java.util.Arrays.copyOf(bytes, (int) Math.min(bytes.length, (long) inv.getArgument(1) + 1)))
+                .thenThrow(gone);
+        when(storage.readBytes(name)).thenThrow(gone);
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 1（复审探针 D2）：文件名里带着这一版 key 的值，草稿读取读得到、发布那一次读取失败——异常文案和 ERROR 行里只有抹过值的相对路径"
+            + "和异常类名，没有值，也没有存储报的出错信息（它带着完整的对象名 resource=/…/sk-live-…py）")
+    void aFailedPublishReadNamesTheFileWithoutItsValue() throws Exception {
+        String fresh = "sk-live-NEW-9876543210";
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("scripts/" + fresh + ".py", "print(1)\n");
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"" + fresh + "\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, previousRow(null, null));
+        failsOnThePublishRead("scripts/" + fresh + ".py");
+        SkillBuilderPublishService svc = serviceWith(cipher);
+
+        try (LogCapture logs = LogCapture.everything()) {
+            assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                    .hasMessageContaining("读取工作区文件失败 skill/refund-flow/scripts/{{CRM_TOKEN}}.py").hasMessageContaining("IOException")
+                    .hasMessageNotContaining("sk-live").hasMessageNotContaining("resource=").hasMessageNotContaining("does not exist");
+
+            assertThat(logs.errors()).singleElement().satisfies(m -> assertThat(m).contains("scripts/{{CRM_TOKEN}}.py")
+                    .doesNotContain("sk-live").doesNotContain("resource="));
+            assertThat(logs.all()).noneMatch(m -> m.contains("sk-live") || m.contains("resource="));
+        }
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 1：同上，文件名里带的是上一版的值（沿用，工作区里没有它）——发布时抹值的集合并上了上一版的值，文案里同样只有 {{名字}}")
+    void aFailedPublishReadAlsoScrubsThePreviousValues() throws Exception {
+        SkillSecret row = previousRow(null, null);
+        when(secretMapper.selectList(any())).thenReturn(List.of(row));
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("scripts/" + TOKEN + ".py", "print(1)\n");
+        workspace.put("secrets.json", seedFile());   // 不带值：沿用上一版
+        improvementSession(workspace, row);
+        failsOnThePublishRead("scripts/" + TOKEN + ".py");
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("scripts/{{CRM_TOKEN}}.py").hasMessageNotContaining("sk-live").hasMessageNotContaining("resource=");
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 1：发布时读文件同样有界——列举时报的大小在额度内、读的时候文件已经被换大：每个文件最多读「剩余额度 + 1」个字节，超了拒绝发布"
+            + "（固定文案，不带文件名）；读进内存的字节一共不超过额度 + 1，从不整个读")
+    void thePublishReadIsBoundedByWhatIsLeftOfTheBudget() throws Exception {
+        SkillBuilderProperties props = new SkillBuilderProperties();
+        props.setPreviewFileMaxBytes(1024);
+        props.setPublishMaxBytes(8192);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("references/a.md", "a".repeat(3000));
+        workspace.put("references/b.md", "b".repeat(20000));
+        improvementSession(workspace, Map.of("references/a.md", 100L, "references/b.md", 100L), previousRow(null, null));   // 列举时一共才两百多字节
+        List<long[]> publishReads = new ArrayList<>();   // 发布那一轮的每一次读：{上限, 实际给出的字节数}（草稿读取的上限都是 1024）
+        for (Map.Entry<String, String> e : workspace.entrySet()) {
+            byte[] bytes = b(e.getValue());
+            when(storage.readBytesUpTo(eq("ws/1/skill/refund-flow/" + e.getKey()), anyLong())).thenAnswer(inv -> {
+                long max = inv.getArgument(1);
+                byte[] given = java.util.Arrays.copyOf(bytes, (int) Math.min(bytes.length, max + 1));
+                if (max != props.getPreviewFileMaxBytes()) publishReads.add(new long[]{max, given.length});
+                return given;
+            });
+        }
+
+        assertThatThrownBy(() -> serviceWith(cipher, props).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("超过了发布的上限").hasMessageNotContaining("references/");
+
+        assertThat(publishReads).isNotEmpty();
+        assertThat(publishReads.stream().mapToLong(r -> r[1]).sum()).isLessThanOrEqualTo(props.getPublishMaxBytes() + 1);
+        verify(storage, never()).readBytes(anyString());
         nothingWasWritten();
     }
 

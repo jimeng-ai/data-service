@@ -57,10 +57,14 @@ public class SkillBuilderSessionService {
     /** 新建 skill 时 DRAFT 行的 origin_ref 前缀；列表页据此把草稿卡片接回会话。 */
     public static final String ORIGIN_REF_PREFIX = "builder-session:";
     private static final long FEEDBACK_MAX_BYTES = 1024 * 1024;
-    /** 第一次同步时草稿的文字就给不出来（secrets.json 读不出来，或 SKILL.md 太大）：DRAFT 行先用这个名字和说明占位，修好之后的下一轮同步会换成真的。 */
+    /**
+     * 第一次同步时草稿的文字就给不出来（secrets.json 读不出来、SKILL.md 太大，或者 SKILL.md 里有 key 的值没能整段换成占位符）：
+     * DRAFT 行先用这个名字和说明占位，修好之后的下一轮同步会换成真的。
+     */
     static final String UNREADABLE_DRAFT_NAME = "草稿";
     static final String UNREADABLE_DRAFT_BODY = "（草稿里的 secrets.json 读不出来或超出限制，修好后再同步）";
     static final String TOO_LARGE_DRAFT_BODY = "（草稿里的 SKILL.md 太大了，改小后再同步）";
+    static final String OVERLAPPING_VALUES_DRAFT_BODY = "（草稿的 SKILL.md 里有 key 的值叠在了一起、没能整段换成占位符，分开写之后再同步）";
 
     private final SkillBuilderSessionMapper sessionMapper;
     private final AiSkillMapper aiSkillMapper;
@@ -247,18 +251,24 @@ public class SkillBuilderSessionService {
         if (n == null) return null;
         ReviewView v = new ReviewView();
         v.setIteration(n);
-        String reviewRel = SkillWorkspaceLayout.reviewPath(dir, n);
-        if (l.objects().get(reviewRel).size() > props.getReviewMaxBytes()) {
+        byte[] html = readReviewFile(l, SkillWorkspaceLayout.reviewPath(dir, n));
+        if (html == null) {
             v.setTooLarge(true);
         } else {
-            v.setHtml(new String(reader.readBytes(l, reviewRel), StandardCharsets.UTF_8));
+            v.setHtml(new String(html, StandardCharsets.UTF_8));
         }
         String fbRel = SkillWorkspaceLayout.feedbackPath(dir, n);
         if (l.has(fbRel)) {
             try {
-                v.setFeedback(objectMapper.readValue(reader.readBytes(l, fbRel), Object.class));
+                byte[] feedback = readReviewFile(l, fbRel);
+                if (feedback == null) {
+                    log.warn("feedback.json 超过大小上限，不返回 session={}", sessionId);
+                } else {
+                    v.setFeedback(objectMapper.readValue(feedback, Object.class));
+                }
             } catch (Exception e) {
-                log.warn("feedback.json 解析失败 session={} path={}: {}", sessionId, fbRel, e.getMessage());
+                // 只记异常类名：Jackson 的出错信息里带着文件开头的原文（最多 500 个字节），反馈里可能就有 key 的值；路径里有 skill 目录名
+                log.warn("feedback.json 读取或解析失败 session={} cause={}", sessionId, e.getClass().getSimpleName());
             }
         }
         return v;
@@ -269,14 +279,28 @@ public class SkillBuilderSessionService {
         SkillWorkspaceReader.Listing l = reader.list(s.getWorkspacePrefix());
         String dir = reader.locateSkill(l).dir();
         if (dir == null || !reader.hasOptimizationReport(l, dir)) return null;
-        String rel = SkillWorkspaceLayout.optimizationReportPath(dir);
         ReportView v = new ReportView();
-        if (l.objects().get(rel).size() > props.getReviewMaxBytes()) {
+        byte[] html = readReviewFile(l, SkillWorkspaceLayout.optimizationReportPath(dir));
+        if (html == null) {
             v.setTooLarge(true);
         } else {
-            v.setHtml(new String(reader.readBytes(l, rel), StandardCharsets.UTF_8));
+            v.setHtml(new String(html, StandardCharsets.UTF_8));
         }
         return v;
+    }
+
+    /**
+     * 评审页、feedback.json、触发优化报告：上限 reviewMaxBytes。列举时就超了的不读；没超也只读上限 + 1 个字节（列举之后对象可能被换大，
+     * 和草稿、发布同一个有界读取）。超了返回 null。
+     *
+     * <p>读失败的文案里不写路径（{@code known} 传 null）：这里不读 secrets.json，值集合没有确定（R22）。这几个路径里唯一可变的是
+     * skill 目录名，读的是哪一个文件，接口本身已经说明了。
+     */
+    private byte[] readReviewFile(SkillWorkspaceReader.Listing l, String rel) {
+        long limit = props.getReviewMaxBytes();
+        RagMinioStorageService.ObjectInfo o = l.objects().get(rel);
+        if (o != null && o.size() > limit) return null;
+        return reader.readUpTo(l, rel, limit, null);
     }
 
     // ------------------------------------------------------------------ 写
@@ -349,12 +373,13 @@ public class SkillBuilderSessionService {
         ev.setWorkspacePersisted(workspacePersisted);
         if (s == null) return ev;
         SkillWorkspaceReader.Listing l = reader.list(s.getWorkspacePrefix());
-        DraftView draft = reader.draft(l, s.getSkillTypeOverride());
+        SkillWorkspaceReader.Draft read = reader.readDraft(l, s.getSkillTypeOverride());
+        DraftView draft = read == null ? null : read.view();
         ev.setDraft(draft);
         if (draft == null) return ev;
         ev.setReview(reader.latestReview(l, draft.getDirName()));
         ev.setHasOptimizationReport(reader.hasOptimizationReport(l, draft.getDirName()));
-        if (s.getBaseSkillId() == null) upsertDraftRow(s, draft);
+        if (s.getBaseSkillId() == null) upsertDraftRow(s, read);
         return ev;
     }
 
@@ -366,14 +391,21 @@ public class SkillBuilderSessionService {
      * <p>草稿的文字给不出来时一个字都不写进库（已有的 DRAFT 行保留上一次同步的内容；第一次同步就建一行，正文写一句说明）：
      * <ul>
      *   <li>secrets.json 存在、却读不出来或确定不了值集合（不是合法 JSON、太大、key 或候选值太多、有值太长……）：不知道哪些是值，没法抹；</li>
-     *   <li>SKILL.md 超过预览上限：不读、不解析、不抹值（运行时整份 SKILL.md 都进模型上下文，这个大小本来就用不了）。</li>
+     *   <li>SKILL.md 超过预览上限：不读、不解析、不抹值（运行时整份 SKILL.md 都进模型上下文，这个大小本来就用不了）；</li>
+     *   <li>SKILL.md 里有已知的值没被整段换成占位符（几个值首尾相接、互相包含了一部分：被抢掉的那个会剩下一截原文，比如 {@code {{KEY_A}}-yyyy}）——
+     *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#skillMdPartlyReplaced}）。预览和 draft-update 只给属主看，不加这道核对（R21 / R22）。</li>
      * </ul>
      */
-    private void upsertDraftRow(SkillBuilderSession s, DraftView draft) {
-        boolean withheld = draft.isSecretsUnreadable() || draft.isSkillMdTooLarge();
+    private void upsertDraftRow(SkillBuilderSession s, SkillWorkspaceReader.Draft read) {
+        DraftView draft = read.view();
+        String withheldBody = draft.isSecretsUnreadable() ? UNREADABLE_DRAFT_BODY
+                : draft.isSkillMdTooLarge() ? TOO_LARGE_DRAFT_BODY
+                : read.skillMdPartlyReplaced() ? OVERLAPPING_VALUES_DRAFT_BODY
+                : null;
+        boolean withheld = withheldBody != null;
         String name = withheld || StrUtil.isBlank(draft.getName()) ? UNREADABLE_DRAFT_NAME : StrUtil.maxLength(draft.getName(), 61);
         String desc = withheld || draft.getDescription() == null ? null : StrUtil.maxLength(draft.getDescription(), 1021);
-        String body = draft.isSecretsUnreadable() ? UNREADABLE_DRAFT_BODY : draft.isSkillMdTooLarge() ? TOO_LARGE_DRAFT_BODY : draft.getBody();
+        String body = withheld ? withheldBody : draft.getBody();
         AiSkill row = s.getDraftSkillId() == null ? null : aiSkillMapper.selectById(s.getDraftSkillId());
         if (row == null) {
             row = new AiSkill();

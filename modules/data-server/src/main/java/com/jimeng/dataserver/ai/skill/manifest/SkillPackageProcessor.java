@@ -21,7 +21,8 @@ import java.util.stream.Collectors;
  * 发布前把一个 skill 目录处理成可以入库的样子（设计文档 §3.4 第 1、3 步）。所有入口共用这一份，纯函数、不碰存储：
  * <ol>
  *   <li><b>最先</b>把上一版所有 key 的值解密出来（{@link PreviousKeys#allValues}），不看 secrets.json 在不在、合不合规、这一条写没写
- *       value；没配密钥或解不开就整次拒绝。它们用在后面每一步：报错抹值、沿用条目的替换、残留检查；</li>
+ *       value；没配密钥就整次拒绝。它们用在后面每一步：报错抹值、沿用条目的替换、残留检查。上一版有、却拿不到值的 key 是解不开的（R27）：
+ *       不能沿用，给了新值或者去掉了照常发布；</li>
  *   <li>读 {@code secrets.json} 并校验（平台 skill 不允许带；格式、值↔声明、重名的检查都在 {@link SkillSecretsFile#parse}）；
  *       读不出来 / 越界（太大、key 太多……）就只报它自己那句固定的话，不往下逐条校验——逐条校验会回显条目；</li>
  *   <li>不带 value 的条目是「沿用上一版的值」：只有它们用上一版的值做替换；</li>
@@ -68,7 +69,9 @@ public final class SkillPackageProcessor {
         // 0. 上一版所有 key 的值，最先解密：没配密钥这里就抛 ServiceException（整次拒绝）。配了密钥、但某个 key 的密文解不开（R27），
         // 只有这个 key 不能沿用（下面第 2 步）；它的旧值平台已经不知道是什么，不参与抹值和残留检查
         Map<String, String> previousMap = previous.allValues();
-        final Set<String> undecryptable = previous.undecryptable();
+        // ★ 解不开的 = 上一版有、这里却拿不到值的，从这一份值推出来，不信实现单独给的说法：实现对解不开的 key 返回空、又没声明它时，
+        // 处理器会把它当成「上一版没有」放行，prepare 随后把解不开的旧密文原样复制进新版本，网关永远解不开它
+        final Set<String> undecryptable = PreviousKeys.withoutValue(previous.names(), previousMap);
         SecretValues previousAll = SecretValues.of(previousMap);
 
         // 1. 读 secrets.json——要先知道有哪些值，后面每一步才抹得掉

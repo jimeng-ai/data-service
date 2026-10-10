@@ -8,6 +8,8 @@ import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.skill.LogCapture;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
+import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.persistence.entity.SkillSecret;
 import com.jimeng.persistence.mapper.SkillSecretMapper;
@@ -207,39 +209,45 @@ class SkillSecretServiceTest {
     }
 
     @Test
-    @DisplayName("previousKeys：names 不需要密钥；values 只解密被问到的，解得回原值")
-    void previousKeysDecryptsOnlyWhatIsAsked() {
+    @DisplayName("previousKeys：一次把上一版所有 key 解成一份快照（发布时最先调，R23）——names 里有全部 key，values 只给解得开的、解得回原值，"
+            + "解不开的就是 undecryptable()；之后只是查表，不再解密")
+    void previousKeysIsADecryptedSnapshot() {
         CredentialCipher cipher = realCipher();
         SkillSecretMapper mapper = mock(SkillSecretMapper.class);
         SkillSecret other = previousRow(cipher, null);
         other.setName("OTHER_KEY");
-        other.setCiphertext("not-even-base64");   // 没被问到就不能去解它
+        other.setCiphertext("not-even-base64");   // 坏的密文：解不开，不抛
         when(mapper.selectList(any())).thenReturn(List.of(previousRow(cipher, null), other));
+        CredentialCipher counting = org.mockito.Mockito.spy(cipher);
 
-        PreviousKeys prev = new SkillSecretService(mapper, cipher).previousKeys(42L, 3);
+        PreviousKeys prev = new SkillSecretService(mapper, counting).previousKeys(42L, 3);
 
         assertThat(prev.names()).containsExactlyInAnyOrder("CRM_TOKEN", "OTHER_KEY");
         assertThat(prev.values(List.of("CRM_TOKEN"))).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
         assertThat(prev.values(List.of("NEVER_HAD_IT"))).isEmpty();
         assertThat(prev.values(List.of())).isEmpty();
+        assertThat(prev.allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
+        assertThat(prev.undecryptable()).containsExactly("OTHER_KEY");
+        verify(counting, times(2)).decryptOrNull(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyInt());   // 每个 key 只解一次
         assertThat(new SkillSecretService(mapper, cipher).previousKeys(null, 3).names()).isEmpty();
     }
 
     @Test
-    @DisplayName("★ 没配密钥就解不了沿用的值：拒绝，不是跳过——跳过核对等于放行（没有要解的就不需要密钥）")
+    @DisplayName("★ 没配密钥就解不了上一版的值：previousKeys 直接拒绝，不是跳过——跳过核对等于放行；上一版没有 key 行就不需要密钥")
     void previousKeysRefuseWhenTheCipherIsMissing() {
         SkillSecretMapper mapper = mock(SkillSecretMapper.class);
         when(mapper.selectList(any())).thenReturn(List.of(previousRow(realCipher(), null)));
-        PreviousKeys prev = new SkillSecretService(mapper, new CredentialCipher()).previousKeys(42L, 3);
-        assertThat(prev.names()).containsExactly("CRM_TOKEN");
-        assertThat(prev.values(List.of())).isEmpty();
-        assertThatThrownBy(() -> prev.values(List.of("CRM_TOKEN")))
+        SkillSecretService noCipher = new SkillSecretService(mapper, new CredentialCipher());
+        assertThatThrownBy(() -> noCipher.previousKeys(42L, 3))
                 .isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
-        assertThatThrownBy(prev::open).isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置");
+
+        when(mapper.selectList(any())).thenReturn(List.of());
+        assertThat(noCipher.previousKeys(42L, 3).names()).isEmpty();
     }
 
     @Test
-    @DisplayName("★ R27 配了密钥、但某个 key 的密文解不开（密钥换过、密文坏了）：不抛，解得开的照常给，解不开的单独报出来（不参与抹值），记一条 WARN，只带 skill id 和 key 名")
+    @DisplayName("★ R27 配了密钥、但某个 key 的密文解不开（密钥换过、密文坏了）：不抛，解得开的照常给，解不开的单独报出来（不参与抹值）；"
+            + "key 服务这里一行日志都不记（第 4 轮：WARN 要等处理器的名字检查过了，由发布入口抹过值再记；也不经 decrypt 构造 ServiceException、记 ERROR）")
     void aKeyThatCannotBeDecryptedIsReportedNotThrown() {
         CredentialCipher cipher = realCipher();
         SkillSecretMapper mapper = mock(SkillSecretMapper.class);
@@ -250,31 +258,29 @@ class SkillSecretServiceTest {
         broken.setCiphertext("bm90LWEtdmFsaWQtY2lwaGVydGV4dC1hdC1hbGwtbm90LWEtdmFsaWQ=");
         when(mapper.selectList(any())).thenReturn(List.of(good, broken));
 
-        try (LogCapture logs = LogCapture.of(SkillSecretService.class)) {
+        try (LogCapture logs = LogCapture.everything()) {
             PreviousKeys prev = new SkillSecretService(mapper, cipher).previousKeys(42L, 3);
-            PreviousKeys.Opened opened = prev.open();
 
             assertThat(prev.names()).containsExactlyInAnyOrder("CRM_TOKEN", "BROKEN_KEY");   // 名字照样在：文件里还在用 {{BROKEN_KEY}} 的核对要用
-            assertThat(opened.values()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
-            assertThat(opened.undecryptable()).containsExactly("BROKEN_KEY");
+            assertThat(prev.undecryptable()).containsExactly("BROKEN_KEY");
             assertThat(prev.values(List.of("BROKEN_KEY"))).isEmpty();                          // 单独问也不抛
             assertThat(prev.allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
 
-            assertThat(logs.warnings()).isNotEmpty().allSatisfy(m -> assertThat(m).contains("BROKEN_KEY").contains("42")
-                    .doesNotContain(TOKEN).doesNotContain(broken.getCiphertext()).doesNotContain("CRM_TOKEN"));
+            assertThat(logs.warnings()).isEmpty();
+            assertThat(logs.errors()).isEmpty();
         }
     }
 
     @Test
-    @DisplayName("PreviousKeys.decrypted(值, 解不开的)：names 包含两者，values 只有解得开的，undecryptable 原样带着；不带第二个参数就是没有解不开的")
+    @DisplayName("PreviousKeys.decrypted(值, 解不开的)：names 包含两者，values 只有解得开的，undecryptable 就是解不开的那些；不带第二个参数就是没有解不开的")
     void decryptedKeepsTheUndecryptableNames() {
         PreviousKeys prev = PreviousKeys.decrypted(Map.of("GOOD_KEY", "good-value-123"), java.util.Set.of("BROKEN_KEY"));
         assertThat(prev.names()).containsExactlyInAnyOrder("GOOD_KEY", "BROKEN_KEY");
         assertThat(prev.allValues()).isEqualTo(Map.of("GOOD_KEY", "good-value-123"));
         assertThat(prev.undecryptable()).containsExactly("BROKEN_KEY");
-        assertThat(prev.open().undecryptable()).containsExactly("BROKEN_KEY");
         assertThat(PreviousKeys.decrypted(Map.of("GOOD_KEY", "good-value-123")).undecryptable()).isEmpty();
-        assertThat(PreviousKeys.NONE.open().values()).isEmpty();
+        assertThat(PreviousKeys.NONE.allValues()).isEmpty();
+        assertThat(PreviousKeys.NONE.undecryptable()).isEmpty();
     }
 
     @Test
@@ -296,6 +302,66 @@ class SkillSecretServiceTest {
         SkillSecretsFile.Entry moved = new SkillSecretsFile.Entry("MY_FIRSTSECRET1_KEY", null, List.of("evil.example.com"), null, null);
         assertThatThrownBy(() -> new SkillSecretService(mapper, cipher).prepare("t1", 42L, 3, List.of(moved, owner)))
                 .isInstanceOf(ServiceException.class).hasMessageContaining("作废").hasMessageNotContaining("FIRSTSECRET1");
+    }
+
+    // ---------------------------------------------------------------- 第 4 轮 3：PreviousKeys 的契约跟上 R27
+
+    private static CredentialCipher cipherWithKey(byte fill) {
+        CredentialCipher c = new CredentialCipher();
+        byte[] key = new byte[32];
+        java.util.Arrays.fill(key, fill);
+        ReflectionTestUtils.setField(c, "keyBase64", Base64.getEncoder().encodeToString(key));
+        ReflectionTestUtils.invokeMethod(c, "init");
+        return c;
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 3（复审探针 B）：key 服务给的 PreviousKeys 直接交给发布处理器（不经任何「先打开」的步骤），上一版解不开的 key 没写 value——拒绝。"
+            + "以前处理器放行，随后 prepare 把解不开的旧密文原样复制进新版本，网关永远解不开它")
+    void theKeyServicesPreviousKeysStraightIntoTheProcessorCannotReuseAnUndecryptableKey() {
+        SkillSecretMapper mapper = mock(SkillSecretMapper.class);
+        SkillSecret broken = previousRow(realCipher(), null);   // 用 zeros 密钥加密的 CRM_TOKEN
+        broken.setSkillId(5L);
+        when(mapper.selectList(any())).thenReturn(List.of(broken));
+        SkillSecretService svc = new SkillSecretService(mapper, cipherWithKey((byte) 1));   // 现在配的是另一把
+        Map<String, byte[]> files = new java.util.LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\n---\n带上 {{CRM_TOKEN}} 调接口\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        files.put("secrets.json", "{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, svc.previousKeys(5L, 3)))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("key CRM_TOKEN 上一版的值解不开").hasMessageNotContaining(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 3：不管从哪儿拿到 PreviousKeys，undecryptable() 都如实返回——key 服务给的、decrypted(..) 造的、NONE，"
+            + "以及只实现了 names / values 的（在 names() 里、却拿不到值的就是解不开的）")
+    void undecryptableIsTruthfulWhereverThePreviousKeysComeFrom() {
+        CredentialCipher cipher = realCipher();
+        SkillSecretMapper mapper = mock(SkillSecretMapper.class);
+        SkillSecret broken = previousRow(cipherWithKey((byte) 1), null);   // 用别的密钥加密的：现在的密钥解不开
+        broken.setName("BROKEN_KEY");
+        when(mapper.selectList(any())).thenReturn(List.of(previousRow(cipher, null), broken));
+        PreviousKeys fromTheService = new SkillSecretService(mapper, cipher).previousKeys(42L, 3);
+        assertThat(fromTheService.undecryptable()).containsExactly("BROKEN_KEY");
+        assertThat(fromTheService.names()).containsExactlyInAnyOrder("CRM_TOKEN", "BROKEN_KEY");
+        assertThat(fromTheService.allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
+
+        assertThat(PreviousKeys.decrypted(Map.of("GOOD_KEY", "good-value-123"), java.util.Set.of("BROKEN_KEY")).undecryptable())
+                .containsExactly("BROKEN_KEY");
+        assertThat(PreviousKeys.NONE.undecryptable()).isEmpty();
+
+        PreviousKeys namesAndValuesOnly = new PreviousKeys() {
+            @Override
+            public java.util.Set<String> names() {
+                return java.util.Set.of("GOOD_KEY", "SILENT_KEY");
+            }
+
+            @Override
+            public Map<String, String> values(java.util.Collection<String> wanted) {
+                return wanted.contains("GOOD_KEY") ? Map.of("GOOD_KEY", "good-value-123") : Map.of();
+            }
+        };
+        assertThat(namesAndValuesOnly.undecryptable()).containsExactly("SILENT_KEY");
     }
 
     @Test

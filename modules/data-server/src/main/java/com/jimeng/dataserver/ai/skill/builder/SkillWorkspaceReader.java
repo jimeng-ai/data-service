@@ -64,7 +64,8 @@ public class SkillWorkspaceReader {
             }
             return new Listing(prefix, m);
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "读取构建器工作区失败: " + e.getMessage());
+            // 只记异常类名，不带存储异常的 message：它可能带着对象名，而对象名（文件名）里可能有 key 的值。见 readBounded
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "读取构建器工作区失败（" + e.getClass().getSimpleName() + "）");
         }
     }
 
@@ -94,36 +95,66 @@ public class SkillWorkspaceReader {
         return out;
     }
 
-    public byte[] readBytes(Listing l, String rel) {
-        try {
-            return storage.readBytes(l.prefix() + rel);
-        } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "读取工作区文件失败 " + rel + ": " + e.getMessage());
-        }
-    }
-
     /**
-     * 有界读取：最多读 {@code limit + 1} 个字节，内容超过 {@code limit} 就返回 null（调用方按超限处理）。
-     * 列举时报的大小只是当时的快照，读之前对象可能被换大（会话 GET 发生在一轮运行中，沙箱还在写工作区）：
+     * 有界读取工作区里的一个文件——草稿、发布、评审页<b>都走这一个</b>：最多读 {@code limit + 1} 个字节，内容超过 {@code limit}
+     * 就返回 null（调用方按超限处理）。列举时报的大小只是当时的快照，读之前对象可能被换大（会话 GET 发生在一轮运行中，沙箱还在写工作区）：
      * 上限在读的时候才算数，不先把整个对象读进内存再判断。
      *
-     * <p>读失败时异常文案里的路径先用 {@code known} 抹值（存储报的出错信息里常常带着对象名，一起抹）。
-     * 读 secrets.json 本身时值集合还没确定：{@code showWhenFailed} 传固定的 {@code secrets.json}，且不带存储报的出错信息。
+     * <p>读失败抛 {@code ServiceException}（构造时就记 ERROR，经 Filebeat 进 ES，也会回给调用方）：文案只有一句固定的话、
+     * 抹过值的相对路径和存储异常的<b>类名</b>，<b>不带存储异常的 message</b>——它常带着完整的对象名（MinIO 的 {@code resource=/bucket/…}），
+     * 文件名里可能就有 key 的值。
+     *
+     * @param known 这时已知的全部值：草稿、预览是工作区 secrets.json 能确定的值，发布时再并上上一版的值；整句文案都用它抹。
+     *              <b>null = 值集合确定不了（R22），文案里不写路径</b>
      */
-    private byte[] readBounded(Listing l, String rel, long limit, SecretValues known, String showWhenFailed, boolean withDetail) {
+    public byte[] readUpTo(Listing l, String rel, long limit, SecretValues known) {
+        return readBounded(l, rel, limit, known, rel);
+    }
+
+    /** 同 {@link #readUpTo}；{@code shown} 是文案里怎么称呼这个文件（读 secrets.json 本身时值集合还没确定，传固定的名字）。 */
+    private byte[] readBounded(Listing l, String rel, long limit, SecretValues known, String shown) {
         byte[] bytes;
         try {
             bytes = storage.readBytesUpTo(l.prefix() + rel, limit);
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR,
-                    known.replace("读取工作区文件失败 " + showWhenFailed + (withDetail ? ": " + e.getMessage() : "")));
+            String message = "读取工作区文件失败" + (known == null ? "" : " " + shown) + "（" + e.getClass().getSimpleName() + "）";
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, known == null ? message : known.replace(message));
         }
         return bytes.length > limit ? null : bytes;
     }
 
-    /** 草稿预览；工作区里还没有 skill 时返回 null。预览和同步 DRAFT 行用这个：不解密沿用的 key。 */
+    /**
+     * 一次草稿读取的完整结果。{@link DraftView} 会序列化给前端、写进 draft-update 事件；另外两样只在内存里用，不进 DTO
+     * （预览和 draft-update 的内容按 R21 / R22 保持原样）。
+     *
+     * @param known              这次确定下来的全部值（工作区 secrets.json 的值 ∪ 传进来的上一版的值）；值集合确定不了（R22）为 null。
+     *                           发布时读文件失败，文案里的路径拿它抹
+     * @param skillMdPartlyReplaced SKILL.md 里有已知的值没被整段换成占位符（几个值在文本里首尾相接、互相包含了一部分，被抢掉的那个会剩下一截原文）。
+     *                           和发布处理器同一道核对（{@link SecretValues.Replacement#notFullyReplaced}，在原文上判）；为 true 时 DRAFT 行不同步——
+     *                           DRAFT 行在库里，还能被设成全团队可见。没读、没解析 SKILL.md 时为 false
+     */
+    public record Draft(DraftView view, SecretValues known, boolean skillMdPartlyReplaced) {
+        /** 不打出 view（Lombok 的 toString 会带上 SKILL.md 全文）；SecretValues.toString 只列名字。 */
+        @Override
+        public String toString() {
+            return "Draft[known=" + known + ", skillMdPartlyReplaced=" + skillMdPartlyReplaced + "]";
+        }
+    }
+
+    /** 草稿预览；工作区里还没有 skill 时返回 null。预览用这个：不解密沿用的 key。 */
     public DraftView draft(Listing l, String skillTypeOverride) {
         return draft(l, skillTypeOverride, PreviousKeys.NONE);
+    }
+
+    /** 同 {@link #readDraft(Listing, String, PreviousKeys)}，只要 DTO。 */
+    public DraftView draft(Listing l, String skillTypeOverride, PreviousKeys previous) {
+        Draft d = readDraft(l, skillTypeOverride, previous);
+        return d == null ? null : d.view();
+    }
+
+    /** 草稿读取的完整结果；同步 DRAFT 行用这个：不解密沿用的 key。工作区里还没有 skill 时返回 null。 */
+    public Draft readDraft(Listing l, String skillTypeOverride) {
+        return readDraft(l, skillTypeOverride, PreviousKeys.NONE);
     }
 
     /** SKILL.md 超过预览上限的固定文案。理由写在文案里：运行时整份 SKILL.md 都进模型上下文，这么大本来就用不了。 */
@@ -150,7 +181,7 @@ public class SkillWorkspaceReader {
      * @param previous 发布时传进来：上一版所有 key 的值，最先解密出来，所有报错文案、预览文字都用它们抹值（不论 secrets.json
      *                 在不在、合不合规）。预览不传。
      */
-    public DraftView draft(Listing l, String skillTypeOverride, PreviousKeys previous) {
+    public Draft readDraft(Listing l, String skillTypeOverride, PreviousKeys previous) {
         SkillLocation loc = locateSkill(l);
         if (loc.dir() == null) return null;
         String dirPrefix = SkillWorkspaceLayout.skillDirPrefix(loc.dir());
@@ -168,9 +199,9 @@ public class SkillWorkspaceReader {
         ObjectInfo secretsInfo = files.get(SkillBundleRules.SECRETS_JSON);
         if (secretsInfo != null) {
             // 先看列举时的大小，超了不读：读进来、解析、再数候选值，成本都是文件大小的倍数。没超也只读 limit + 1 个字节，
-            // 读回来超了同样按超限处理（列举之后、读取之前，对象可能被换大）
+            // 读回来超了同样按超限处理（列举之后、读取之前，对象可能被换大）。值集合还没确定：读失败的文案里只写固定的 secrets.json，不带目录名
             secretsJson = secretsInfo.size() > limit ? null
-                    : readBounded(l, dirPrefix + SkillBundleRules.SECRETS_JSON, limit, SecretValues.NONE, SkillBundleRules.SECRETS_JSON, false);
+                    : readBounded(l, dirPrefix + SkillBundleRules.SECRETS_JSON, limit, SecretValues.NONE, SkillBundleRules.SECRETS_JSON);
             if (secretsJson == null) {
                 unreadable = true;
                 errors.add(SkillSecretsFile.tooLargeMessage(limit));
@@ -189,18 +220,23 @@ public class SkillWorkspaceReader {
         boolean skillMdTooLarge = files.get(SkillBundleRules.SKILL_MD).size() > limit;   // 列举时就超了：不读
         byte[] skillMdBytes = null;
         if (!skillMdTooLarge && !unreadable) {
-            skillMdBytes = readBounded(l, dirPrefix + SkillBundleRules.SKILL_MD, limit, known, dirPrefix + SkillBundleRules.SKILL_MD, true);
+            skillMdBytes = readUpTo(l, dirPrefix + SkillBundleRules.SKILL_MD, limit, known);
             skillMdTooLarge = skillMdBytes == null;   // 读的时候才发现超了（列举之后被换大）
         }
         String skillMd = "";
         ParsedSkill fm = null;
+        boolean partlyReplaced = false;
         if (skillMdTooLarge) {
             errors.add(skillMdTooLargeMessage(limit));
         } else if (unreadable) {
             // 不知道哪些是 key 的值：只报 secrets.json 自己的固定文案；SKILL.md 连读都不读，也不给任何文件的原文
             errors.add("SKILL.md 等 secrets.json 修好之后再校验：现在不知道哪些是 key 的值，校验的报错里可能带出原文");
         } else {
-            skillMd = known.replace(new String(skillMdBytes, StandardCharsets.UTF_8));
+            SecretValues.Replacement replaced = known.replacement(new String(skillMdBytes, StandardCharsets.UTF_8));
+            skillMd = replaced.text();
+            // 和发布处理器同一道核对、在原文上判：有值没被整段盖住，替换之后就剩一截原文。只决定 DRAFT 行同不同步（见 Draft）；
+            // 预览、draft-update、校验结果不因它改变（只给会话属主看，R21 / R22），发布时处理器会拒绝
+            partlyReplaced = !replaced.notFullyReplaced(known).isEmpty();
             fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
             fm.errors().forEach(e -> errors.add(known.replace(e)));
             // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
@@ -251,8 +287,7 @@ public class SkillWorkspaceReader {
                 f.setBinary(false);
             } else {
                 // SKILL.md 上面已经有界读过一遍，不再读第二次；别的文件读的时候才算数，超了和「过大」一样不给文本
-                byte[] bytes = SkillBundleRules.SKILL_MD.equals(path) ? skillMdBytes
-                        : readBounded(l, dirPrefix + path, limit, known, dirPrefix + path, true);
+                byte[] bytes = SkillBundleRules.SKILL_MD.equals(path) ? skillMdBytes : readUpTo(l, dirPrefix + path, limit, known);
                 if (bytes == null) {
                     f.setBinary(false);
                 } else {
@@ -264,7 +299,7 @@ public class SkillWorkspaceReader {
             out.add(f);
         }
         v.setFiles(out);
-        return v;
+        return new Draft(v, unreadable ? null : known, partlyReplaced);
     }
 
     /** 最新一轮评审页的元数据；没有评审页返回 null。 */

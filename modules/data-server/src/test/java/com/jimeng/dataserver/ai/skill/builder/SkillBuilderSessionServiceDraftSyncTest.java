@@ -269,6 +269,57 @@ class SkillBuilderSessionServiceDraftSyncTest {
         assertThat(payload).contains("secrets.json");   // 固定文案还在
     }
 
+    // ---------------------------------------------------------------- 第 4 轮 4：DRAFT 行同步前，做发布时同一道残留核对
+
+    /** 两个当前值首尾相接地重叠：xxxx-AAAA-1111 的尾巴就是 AAAA-1111-yyyy 的头。 */
+    private static final String OVERLAPPING = "{\"KEY_A\":{\"value\":\"xxxx-AAAA-1111\",\"hosts\":[\"a.example.com\"]},"
+            + "\"KEY_B\":{\"value\":\"AAAA-1111-yyyy\",\"hosts\":[\"b.example.com\"]}}";
+    private static final String SKILL_MD_WITH_BOTH_OVERLAPPING = "---\nname: refund-flow\ndescription: \"签名 xxxx-AAAA-1111-yyyy\"\n---\n"
+            + "调接口时带上 xxxx-AAAA-1111-yyyy\n";
+
+    @Test
+    @DisplayName("★ 第 4 轮 4：两个当前值在 SKILL.md 里首尾相接地重叠——不带核对的替换只换掉先出现的那个，留下后一个值的尾巴（{{KEY_A}}-yyyy）。"
+            + "DRAFT 行同步前做发布时同一道核对：有值没被整段盖住就不同步，第一次同步建占位的一行，库里收不到尾巴")
+    void overlappingValuesNeverLeaveATailInTheDraftRow() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", SKILL_MD_WITH_BOTH_OVERLAPPING);
+        files.put("secrets.json", OVERLAPPING);
+        workspace(files, null);
+
+        DraftUpdateEvent event = svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.description()).isNull();
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.OVERLAPPING_VALUES_DRAFT_BODY);
+        });
+        assertThat(inserted.toString()).doesNotContain("yyyy").doesNotContain("xxxx").doesNotContain("AAAA");
+        // 预览和 draft-update 只给会话属主看：按 R21 / R22 保持现状，不加这道核对（文字照给、校验结果照旧，发布时处理器同一道核对会拒绝）
+        assertThat(event.getDraft().getBody()).isEqualTo("调接口时带上 {{KEY_A}}-yyyy\n");
+        assertThat(event.getDraft().getValidationErrors()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 4：同上，DRAFT 行已经有了——保留上一次同步的内容，不更新；值分开写了之后照常同步")
+    void overlappingValuesLeaveTheExistingDraftRowAlone() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", SKILL_MD_WITH_BOTH_OVERLAPPING);
+        files.put("secrets.json", OVERLAPPING);
+        AiSkill existing = draftRow();
+        workspace(files, existing);
+
+        svc.syncAfterRun(1L, true);
+
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+        verify(aiSkillMapper, never()).insert(any(AiSkill.class));
+        assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
+
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 签名\n---\n先带 xxxx-AAAA-1111，再带 AAAA-1111-yyyy\n");   // 分开写了
+        workspace(files, existing);
+        svc.syncAfterRun(1L, true);
+        assertThat(updated).singleElement().satisfies(row -> assertThat(row.body()).isEqualTo("先带 {{KEY_A}}，再带 {{KEY_B}}\n"));
+    }
+
     @Test
     @DisplayName("★ 第 3 轮：key 的名字就是它自己的值——占位符 {{名字}} 会把值打出来，所以同样按读不出来处理：第一次同步建占位的一行，推给前端的事件里没有值、没有 skill 文件的原文")
     void aKeyNameThatIsItsOwnValueIsTreatedLikeAnUnreadableFile() throws Exception {

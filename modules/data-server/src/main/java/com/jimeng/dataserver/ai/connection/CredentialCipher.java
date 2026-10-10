@@ -14,6 +14,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.function.Supplier;
 
 /**
  * 外部连接凭据的静态加密。AES-256-GCM，密钥来自环境变量。
@@ -32,6 +33,11 @@ import java.util.Base64;
  * <h3>轮换</h3>
  * {@code encryption_version} 是为轮换留的：新版本用新密钥写，读时按行上的版本选密钥。
  * 当前只有 v1；加 v2 时在这里加分支，不要复用 v1 的槽位。
+ *
+ * <h3>两种解密入口</h3>
+ * {@link #decrypt} 解不开就抛（构造 {@code ServiceException}，记 ERROR），数据连接凭据用它；
+ * {@link #decryptOrNull} 解不开返回 null、不抛、不记日志，是给「解不开属于预期情况」的调用方用的
+ * （skill 的 key：发布时密钥换过的 key 按 key 处理，Task 6 的网关把它标成不可用）。两者共用同一份解密实现。
  */
 @Slf4j
 @Component
@@ -109,6 +115,9 @@ public class CredentialCipher {
     /**
      * 解密。version 必须 >= 1 —— <b>0（明文）一律拒绝</b>，不做任何回落。
      * 这是与 PluginCredentialService 最本质的区别：那边回落明文，于是"没加密"永远不会被发现。
+     *
+     * <p>解不开就抛 {@code ServiceException}（构造时就记 ERROR）：数据连接凭据解不开是要人处理的故障。
+     * 解不开属于预期情况的调用方用 {@link #decryptOrNull}。
      */
     public String decrypt(String cipherBase64, int version) {
         if (cipherBase64 == null) return null;
@@ -117,16 +126,7 @@ public class CredentialCipher {
                     "连接凭据 encryption_version=" + version + " 不受支持（不接受明文回落），请重新录入凭据");
         }
         try {
-            byte[] all = Base64.getDecoder().decode(cipherBase64);
-            if (all.length <= IV_BYTES) {
-                throw new IllegalArgumentException("密文过短");
-            }
-            byte[] iv = new byte[IV_BYTES];
-            System.arraycopy(all, 0, iv, 0, IV_BYTES);
-            Cipher c = Cipher.getInstance(ALGO);
-            c.init(Cipher.DECRYPT_MODE, requireKey(), new GCMParameterSpec(TAG_BITS, iv));
-            byte[] pt = c.doFinal(all, IV_BYTES, all.length - IV_BYTES);
-            return new String(pt, StandardCharsets.UTF_8);
+            return open(cipherBase64, this::requireKey);
         } catch (ServiceException e) {
             throw e;
         } catch (Exception e) {
@@ -134,5 +134,39 @@ public class CredentialCipher {
             log.warn("连接凭据解密失败: {}", e.getMessage());
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "连接凭据解密失败，可能是密钥已轮换");
         }
+    }
+
+    /**
+     * 同 {@link #decrypt}，但<b>解不开就返回 null</b>：不抛、不构造 {@code ServiceException}、不记任何日志。
+     * 给「解不开属于预期情况」的调用方用：skill 的 key 发布时按 key 处理（R27，密钥换过的 key 不能沿用，给了新值照常发布），
+     * Task 6 的网关按 key 标成不可用（R31）。这些路径上每次都构造 {@code ServiceException} 会每次记一条 ERROR，按 ERROR 告警就会误报。
+     *
+     * <p>null 密文、不受支持的版本（明文回落照样不接受）、密文坏了、密钥换过都返回 null。<b>没配密钥也返回 null</b>：
+     * 要把「没配密钥」当成部署错误整体拒绝的调用方，自己先查 {@link #isAvailable()}（{@code SkillSecretService.previousKeys} 就是这样）。
+     */
+    public String decryptOrNull(String cipherBase64, int version) {
+        if (cipherBase64 == null || version < CURRENT_VERSION || key == null) return null;
+        try {
+            return open(cipherBase64, () -> key);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 真正的解密，{@link #decrypt} 和 {@link #decryptOrNull} 共用这一份：base64(iv || ciphertext+tag) → 明文。
+     * 密钥在用到的那一刻才取：decrypt 遇到「没配密钥、密文又不是 base64」时报的还是解密失败，和以前一样。
+     */
+    private static String open(String cipherBase64, Supplier<SecretKey> key) throws Exception {
+        byte[] all = Base64.getDecoder().decode(cipherBase64);
+        if (all.length <= IV_BYTES) {
+            throw new IllegalArgumentException("密文过短");
+        }
+        byte[] iv = new byte[IV_BYTES];
+        System.arraycopy(all, 0, iv, 0, IV_BYTES);
+        Cipher c = Cipher.getInstance(ALGO);
+        c.init(Cipher.DECRYPT_MODE, key.get(), new GCMParameterSpec(TAG_BITS, iv));
+        byte[] pt = c.doFinal(all, IV_BYTES, all.length - IV_BYTES);
+        return new String(pt, StandardCharsets.UTF_8);
     }
 }

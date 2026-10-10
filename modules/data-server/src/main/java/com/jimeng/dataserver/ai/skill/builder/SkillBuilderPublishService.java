@@ -10,6 +10,7 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
+import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
@@ -38,7 +39,9 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * 发布构建器会话里的 skill：按 skill-creator quick_validate 的规则校验 → 读出工作区里的 skill 目录，交给
@@ -74,6 +77,7 @@ public class SkillBuilderPublishService {
         SkillWorkspaceReader.Listing l = reader.list(session.getWorkspacePrefix());
         // 发布要把整个目录读进内存：先只看列举结果里的大小，超了就拒绝。★ 排在最前面：超限时什么都不读、不解析、不抹值，
         // 连上一版的 key 都不解密（草稿读取会读 SKILL.md 和 secrets.json、做校验和替换，成本都跟着大小走）。
+        // 列举的大小只是快照，读的时候还要按剩余额度再核一遍（readSkillFiles）。
         String dir = reader.locateSkill(l).dir();
         if (dir == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");
@@ -87,29 +91,23 @@ public class SkillBuilderPublishService {
         }
         // 改进已有 skill：上一版所有 key 的值，最先解密出来（不看 secrets.json 在不在、合不合规、这一条写没写 value）——
         // 所有报错文案的抹值、沿用条目的替换、残留检查都要用它们。没配加密密钥整次发布拒绝，不会跳过核对；配了密钥、但某个 key
-        // 的密文解不开（R27）只有这个 key 不能沿用，由处理器按 key 处理，不把整个 skill 卡死。解一次，草稿读取和发布处理器共用同一份。
-        PreviousKeys previous = PreviousKeys.NONE;
-        if (session.getBaseSkillId() != null) {
-            PreviousKeys.Opened opened = secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion()).open();
-            previous = PreviousKeys.decrypted(opened.values(), opened.undecryptable());
-        }
-        DraftView draft = reader.draft(l, session.getSkillTypeOverride(), previous);
-        if (draft == null) {
+        // 的密文解不开（R27）只有这个 key 不能沿用，由处理器按 key 处理，不把整个 skill 卡死。解一次（previousKeys 给的就是解好的快照），
+        // 草稿读取和发布处理器共用同一份。
+        PreviousKeys previous = session.getBaseSkillId() == null ? PreviousKeys.NONE
+                : secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion());
+        SkillWorkspaceReader.Draft read = reader.readDraft(l, session.getSkillTypeOverride(), previous);
+        if (read == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");
         }
+        DraftView draft = read.view();
         if (!draft.getValidationErrors().isEmpty()) {
             // 这些文案 reader.draft 里已经抹过 key 的值（ServiceException 构造时就会把它记进 ERROR 日志）
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "SKILL.md 不符合发布规则：" + String.join("；", draft.getValidationErrors()));
         }
-        // 读出属于 skill 的全部文件交给发布处理器：提取 secrets.json、把 key 原文换成占位符、解析 SKILL.md（设计文档 §3.4）。
-        Map<String, byte[]> raw = new TreeMap<>();
-        for (String rel : inWorkspace.keySet()) {
-            if (SkillBundleRules.isPartOfSkill(rel)) {
-                raw.put(rel, reader.readBytes(l, SkillWorkspaceLayout.skillDirPrefix(dir) + rel));
-            }
-        }
+        Map<String, byte[]> raw = readSkillFiles(l, dir, inWorkspace, read.known());
         SkillPackageProcessor.Output out = SkillPackageProcessor.process(raw, SkillManifestParser.Mode.STRICT, true, previous);
+        warnAboutUndecryptableKeys(session.getBaseSkillId(), previous, out);
 
         AiSkill row;
         int version;
@@ -240,6 +238,46 @@ public class SkillBuilderPublishService {
         } else {
             rewrite.run();   // 没有事务可等（不会发生在 @Transactional 的 publish 里）
         }
+    }
+
+    /**
+     * 读出属于 skill 的全部文件，交给发布处理器（提取 secrets.json、把 key 原文换成占位符、解析 SKILL.md，设计文档 §3.4）。
+     *
+     * <ul>
+     *   <li><b>有界</b>：总大小在列举时已经核过一遍，但列举之后、读取之前，文件可能被换大。每个文件最多读「剩余额度 + 1」个字节
+     *       （额度 = publishMaxBytes 减去已经读进来的），超了就拒绝发布、用固定文案——读进内存的一共不超过额度 + 1 个字节；</li>
+     *   <li>读失败的文案（会进 ERROR 日志和响应）里只有用 {@code known}（工作区 secrets.json 的值 ∪ 上一版的值）抹过的相对路径和异常类名，
+     *       不带存储异常的 message：文件名里有 key 的值时，草稿校验不拦它（路径检查在处理器里，排在读文件之后）。</li>
+     * </ul>
+     */
+    private Map<String, byte[]> readSkillFiles(SkillWorkspaceReader.Listing l, String dir,
+                                               Map<String, RagMinioStorageService.ObjectInfo> inWorkspace, SecretValues known) {
+        Map<String, byte[]> raw = new TreeMap<>();
+        long remaining = props.getPublishMaxBytes();
+        for (String rel : inWorkspace.keySet()) {
+            if (!SkillBundleRules.isPartOfSkill(rel)) continue;
+            byte[] bytes = reader.readUpTo(l, SkillWorkspaceLayout.skillDirPrefix(dir) + rel, remaining, known);
+            if (bytes == null) {
+                throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill 里的文件超过了发布的上限 " + megabytes(props.getPublishMaxBytes())
+                        + " MB：把大文件拿掉，或者拆成几个 skill");
+            }
+            remaining -= bytes.length;
+            raw.put(rel, bytes);
+        }
+        return raw;
+    }
+
+    /**
+     * R27：上一版有 key 的密文解不开（加密密钥换过、密文坏了），这一版给了新值或者去掉了，照常发布——记一条 WARN，只带 skill id 和 key 名。
+     * <b>排在发布处理器之后</b>：处理器的名字检查会拒绝「解不开的 key 的名字里含有这一版的值」，在那之前记就会把值打进日志（复审探针 C）。
+     * 整句再用当前的值 ∪ 上一版的值抹一遍（那个唯一的替换 helper）：日志经 Filebeat 进 ES。
+     */
+    private static void warnAboutUndecryptableKeys(Long skillId, PreviousKeys previous, SkillPackageProcessor.Output out) {
+        Set<String> undecryptable = previous.undecryptable();
+        if (undecryptable.isEmpty()) return;
+        SecretValues known = SecretValues.ofEntries(out.secrets()).plus(SecretValues.of(previous.allValues()));
+        log.warn("{}", known.replace("skill 上一版有 key 的密文解不开（加密密钥可能换过），这一版没有沿用它们 skillId=" + skillId
+                + " names=" + String.join(",", new TreeSet<>(undecryptable))));
     }
 
     private static String megabytes(long bytes) {

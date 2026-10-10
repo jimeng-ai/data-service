@@ -9,6 +9,7 @@ import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService.ObjectInfo;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
+import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
@@ -45,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -143,13 +145,15 @@ class SkillBuilderPublishSecretsTest {
         draft.setEffectiveType("PROMPT");
         draft.setValidationErrors(List.of());
         draft.setIterations(1);
-        when(reader.draft(eq(listing), isNull(), any(PreviousKeys.class))).thenReturn(draft);
+        when(reader.readDraft(eq(listing), isNull(), any(PreviousKeys.class))).thenReturn(new SkillWorkspaceReader.Draft(draft, SecretValues.NONE, false));
         TreeMap<String, ObjectInfo> objects = new TreeMap<>();
         files.forEach((k, v) -> objects.put(k, new ObjectInfo("ws/1/skill/refund-flow/" + k, v.length, new Date())));
         when(reader.skillFiles(listing, "refund-flow")).thenReturn(objects);
-        when(reader.readBytes(eq(listing), anyString())).thenAnswer(inv -> {
+        when(reader.readUpTo(eq(listing), anyString(), anyLong(), any())).thenAnswer(inv -> {   // 和真的 reader 一样：内容超过上限就返回 null
             String rel = inv.getArgument(1);
-            return files.entrySet().stream().filter(e -> rel.endsWith("/" + e.getKey())).findFirst().orElseThrow().getValue();
+            long limit = inv.getArgument(2);
+            byte[] bytes = files.entrySet().stream().filter(e -> rel.endsWith("/" + e.getKey())).findFirst().orElseThrow().getValue();
+            return bytes.length > limit ? null : bytes;
         });
     }
 
@@ -297,9 +301,9 @@ class SkillBuilderPublishSecretsTest {
 
         svc.publish(1L);
 
-        // 发布最先把上一版所有 key 的值解密出来，草稿读取收到的是解密好的那一份（和桩给的名字、值一一对应）
+        // 发布最先向 key 服务要上一版的 key（它给的是解好的快照），草稿读取收到的就是这一份（和桩给的名字、值一一对应）
         ArgumentCaptor<PreviousKeys> given = ArgumentCaptor.forClass(PreviousKeys.class);
-        verify(reader).draft(eq(listing), isNull(), given.capture());
+        verify(reader).readDraft(eq(listing), isNull(), given.capture());
         assertThat(given.getValue().names()).containsExactly("CRM_TOKEN");
         assertThat(given.getValue().allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
         @SuppressWarnings("unchecked")
@@ -321,13 +325,13 @@ class SkillBuilderPublishSecretsTest {
         assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
                 .hasMessageContaining("SKILL.md 不符合发布规则").hasMessageContaining("{{CRM_TOKEN}}").hasMessageNotContaining(TOKEN);
 
-        verify(reader, never()).readBytes(any(), anyString());
+        verify(reader, never()).readUpTo(any(), anyString(), anyLong(), any());
         verifyNoInteractions(storage);
         verifyNoInteractions(secretService);
     }
 
     @Test
-    @DisplayName("★ 发布要把整个目录读进内存：总字节数超过上限（默认 50 MB）就拒绝——排在草稿读取之前：什么都不读、不解析、不替换（reader.draft 没被调用）、不写")
+    @DisplayName("★ 发布要把整个目录读进内存：总字节数超过上限（默认 50 MB）就拒绝——排在草稿读取之前：什么都不读、不解析、不替换（reader.readDraft 没被调用）、不写")
     void tooBigToPublishIsRefusedBeforeAnythingIsRead() throws Exception {
         session();
         props.setPublishMaxBytes(100);
@@ -340,8 +344,8 @@ class SkillBuilderPublishSecretsTest {
                 .hasMessageContaining("超过了发布的上限");
 
         // 钉住顺序：reader 是 mock，光看「没读文件」证明不了总大小检查排在草稿读取（解析、抹值、读 secrets.json）之前
-        verify(reader, never()).draft(any(), any(), any());
-        verify(reader, never()).readBytes(any(), anyString());
+        verify(reader, never()).readDraft(any(), any(), any());
+        verify(reader, never()).readUpTo(any(), anyString(), anyLong(), any());
         verifyNoInteractions(storage);
         verifyNoInteractions(secretService);
         assertThat(new SkillBuilderProperties().getPublishMaxBytes()).isEqualTo(50L * 1024 * 1024);
@@ -362,7 +366,7 @@ class SkillBuilderPublishSecretsTest {
         assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
                 .hasMessageContaining("超过了发布的上限");
 
-        verify(reader, never()).draft(any(), any(), any());
+        verify(reader, never()).readDraft(any(), any(), any());
         verifyNoInteractions(secretService);
     }
 
@@ -377,7 +381,7 @@ class SkillBuilderPublishSecretsTest {
         assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
                 .hasMessageContaining("工作区里还没有 skill");
 
-        verify(reader, never()).draft(any(), any(), any());
+        verify(reader, never()).readDraft(any(), any(), any());
     }
 
     @Test

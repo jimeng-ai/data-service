@@ -506,7 +506,20 @@ class SkillWorkspaceReaderSecretsTest {
 
         assertThatThrownBy(ws::draft).isInstanceOf(com.jimeng.common.core.exception.ServiceException.class)
                 .hasMessageContaining("读取工作区文件失败").hasMessageContaining("scripts/{{CRM_TOKEN}}.py")
-                .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live");
+                .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live")
+                .hasMessageContaining("IOException").hasMessageNotContaining("does not exist");   // 第 4 轮：只记异常类名，不带存储异常的 message
+    }
+
+    @Test
+    @DisplayName("第 4 轮 1：列举工作区失败也一样——只有一句固定的话和异常类名，不带存储异常的 message（它可能带着对象名）")
+    void aFailedListingCarriesNoStorageMessage() throws Exception {
+        RagMinioStorageService storage = mock(RagMinioStorageService.class);
+        when(storage.listObjectInfos("ws/")).thenThrow(new java.io.IOException("listing failed near ws/skill/refund-flow/scripts/" + TOKEN + ".py"));
+
+        assertThatThrownBy(() -> new SkillWorkspaceReader(storage, new SkillBuilderProperties()).list("ws/"))
+                .isInstanceOf(com.jimeng.common.core.exception.ServiceException.class)
+                .hasMessageContaining("读取构建器工作区失败").hasMessageContaining("IOException")
+                .hasMessageNotContaining("listing failed").hasMessageNotContaining("sk-live");
     }
 
     @Test

@@ -17,7 +17,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -110,54 +109,42 @@ public class SkillSecretService {
     }
 
     /**
-     * 上一版的 key，给发布处理器核对文件用（{@link PreviousKeys}）。名字不需要密钥；解密只在被问到值的时候做。解出来的值只在这一次发布的内存里。
+     * 上一版的 key（{@link PreviousKeys}），发布时最先调（R23）：<b>一次把上一版所有 key 解密成一份快照</b>，草稿读取（报错抹值）和发布处理器
+     * 共用这一份，之后只是查表、不再解密。解出来的值只在这一次发布的内存里。上一版没有 key 行时直接是 {@link PreviousKeys#NONE}，不需要密钥。
      *
      * <p>解不开的按 key 处理（R27）：<b>没配加密密钥</b>就拒绝（部署配置错了，跳过核对等于放行，新值也没法加密）；
-     * <b>配了密钥、但某个 key 的密文解不开</b>（密钥换过、密文坏了）只有这个 key 不能沿用——它不在返回的值里，记在
-     * {@link PreviousKeys.Opened#undecryptable} 里，记一条 WARN（只带 skill id 和 key 名），由发布处理器在它没写 value 时拒绝、
-     * 给了新值或去掉了就照常发布。不然加密密钥一换，这个 skill 就再也不能用「用 AI 改进」发布了。
+     * <b>配了密钥、但某个 key 的密文解不开</b>（密钥换过、密文坏了）只有这个 key 不能沿用——它的名字在 {@code names()} 里、值不在，
+     * 于是 {@link PreviousKeys#undecryptable()} 就是它；由发布处理器在它没写 value 时拒绝、给了新值或去掉了就照常发布。
+     * 不然加密密钥一换，这个 skill 就再也不能用「用 AI 改进」发布了。
      */
     public PreviousKeys previousKeys(Long skillId, Integer version) {
         Map<String, SkillSecret> rows = previous(skillId, version);
-        return new PreviousKeys() {
-            @Override
-            public Set<String> names() {
-                return Set.copyOf(rows.keySet());
-            }
-
-            @Override
-            public Map<String, String> values(Collection<String> names) {
-                return decrypt(rows, names.stream().filter(rows::containsKey).toList()).values();
-            }
-
-            @Override
-            public Opened open() {
-                return decrypt(rows, List.copyOf(rows.keySet()));
-            }
-        };
-    }
-
-    private PreviousKeys.Opened decrypt(Map<String, SkillSecret> rows, List<String> wanted) {
-        Map<String, String> values = new LinkedHashMap<>();
-        Set<String> failed = new LinkedHashSet<>();
-        if (wanted.isEmpty()) return new PreviousKeys.Opened(values, failed);
+        if (rows.isEmpty()) return PreviousKeys.NONE;
         if (!cipher.isAvailable()) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "加密密钥没有配置（CONNECTION_CREDENTIAL_KEY），请联系管理员");
         }
-        for (String name : wanted) {
-            SkillSecret row = rows.get(name);
-            try {
-                if (row.getCipherVersion() == null) throw new IllegalStateException("没有密文版本号");
-                String value = cipher.decrypt(row.getCiphertext(), row.getCipherVersion());
-                if (value == null) throw new IllegalStateException("没有密文");
-                values.put(name, value);
-            } catch (RuntimeException e) {
-                // 不带原因：解密失败的细节对调用方没用；日志里也只留 skill id 和 key 名
-                log.warn("skill key 解密失败，这一版不能沿用它 skillId={} name={}", row.getSkillId(), name);
-                failed.add(name);
+        Map<String, String> values = new LinkedHashMap<>();
+        Set<String> failed = new LinkedHashSet<>();
+        for (SkillSecret row : rows.values()) {
+            String value = decryptOrNull(row);
+            if (value != null) {
+                values.put(row.getName(), value);
+            } else {
+                failed.add(row.getName());
             }
         }
-        return new PreviousKeys.Opened(values, failed);
+        // 这里不记日志：解不开的 key 的名字里可能正好含有这一版某个 key 的值，要等发布处理器的名字检查过了，
+        // 由发布入口抹过值再记那一条 WARN（SkillBuilderPublishService）
+        return PreviousKeys.decrypted(values, failed);
+    }
+
+    /**
+     * 解一条 key 行；解不开（没有密文或版本号、密文坏了、密钥换过）返回 null。这是预期情况（R27），不抛、不记 ERROR：
+     * 用 {@link CredentialCipher#decryptOrNull}，不用 {@code decrypt}（它每次都构造 ServiceException、记一条 ERROR）。
+     * 没配密钥要整体拒绝的，调用方先查 {@code cipher.isAvailable()}。
+     */
+    private String decryptOrNull(SkillSecret row) {
+        return row.getCipherVersion() == null ? null : cipher.decryptOrNull(row.getCiphertext(), row.getCipherVersion());
     }
 
     /** 某一版的 key 声明（名字和发送范围，不含值），来源是 skill_secret 行——key 能发到哪里只看这张表，manifest 只是给人看的副本。 */

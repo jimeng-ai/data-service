@@ -91,21 +91,14 @@ class SkillPackageProcessorTest {
     /** 只带 hosts、不带 value 的 secrets.json：沿用上一版的值。 */
     private static final String REUSE_JSON = "{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}";
 
-    /** 上一版有 CRM_TOKEN（值是 TOKEN）。 */
+    /**
+     * 上一版有这些 key：CRM_TOKEN 的值是 TOKEN，别的各有一个不会出现在文件里的旧值。每个名字都要给值——在 names() 里、却拿不到值的
+     * key 就是解不开的（第 4 轮 3），那是另一种情形，见 {@link #crmTokenCannotBeOpened}。
+     */
     private static PreviousKeys previousHas(String... names) {
-        return new PreviousKeys() {
-            @Override
-            public Set<String> names() {
-                return Set.of(names);
-            }
-
-            @Override
-            public Map<String, String> values(Collection<String> wanted) {
-                Map<String, String> out = new LinkedHashMap<>();
-                for (String n : wanted) if (n.equals("CRM_TOKEN")) out.put(n, TOKEN);
-                return out;
-            }
-        };
+        Map<String, String> all = new LinkedHashMap<>();
+        for (String n : names) all.put(n, n.equals("CRM_TOKEN") ? TOKEN : n.toLowerCase() + "-old-value-1");
+        return PreviousKeys.decrypted(all);
     }
 
     private static Map<String, byte[]> reuseSkill(String body) {
@@ -588,6 +581,50 @@ class SkillPackageProcessorTest {
 
         // 没人用它：去掉就去掉了
         SkillPackageProcessor.process(plainSkill(), SkillManifestParser.Mode.STRICT, true, crmTokenCannotBeOpened());
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮 3：处理器不靠实现自己声明「解不开」——上一版有（在 names() 里）、却拿不到值的 key 就是解不开的：没写 value 一律拒绝沿用；"
+            + "给了新值、或者去掉了，照常发布")
+    void aPreviousKeyWithoutAValueIsUndecryptableWhateverTheImplementationDeclares() {
+        PreviousKeys silent = new PreviousKeys() {   // 只实现 names / values：CRM_TOKEN 在上一版里，值却拿不到；没有声明 undecryptable()
+            @Override
+            public Set<String> names() {
+                return Set.of("CRM_TOKEN", "WECOM_HOOK");
+            }
+
+            @Override
+            public Map<String, String> values(Collection<String> wanted) {
+                return wanted.contains("WECOM_HOOK") ? Map.of("WECOM_HOOK", OLD) : Map.of();
+            }
+        };
+        ServiceException e = publishing(skillWith("print(1)\n", "{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}"), silent);
+        assertThat(e.getMessage()).contains("key CRM_TOKEN 上一版的值解不开").contains("重新写 value").doesNotContain(OLD);
+
+        PreviousKeys lying = new PreviousKeys() {   // 同上，还覆写了 undecryptable()、说「没有解不开的」：处理器照样不信
+            @Override
+            public Set<String> names() {
+                return silent.names();
+            }
+
+            @Override
+            public Map<String, String> values(Collection<String> wanted) {
+                return silent.values(wanted);
+            }
+
+            @Override
+            public Set<String> undecryptable() {
+                return Set.of();
+            }
+        };
+        assertThat(publishing(skillWith("print(1)\n", "{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}"), lying).getMessage())
+                .contains("key CRM_TOKEN 上一版的值解不开");
+
+        SkillPackageProcessor.Output withNewValue = SkillPackageProcessor.process(
+                skillWith("print(1)\n", "{\"CRM_TOKEN\":{\"value\":\"sk-live-FRESH-0123456789\",\"hosts\":[\"api.customer.com\"]}}"),
+                SkillManifestParser.Mode.STRICT, true, silent);
+        assertThat(withNewValue.secrets()).extracting(SkillSecretsFile.Entry::name).containsExactly("CRM_TOKEN");
+        SkillPackageProcessor.process(plainSkill(), SkillManifestParser.Mode.STRICT, true, silent);   // 去掉了：照常发布
     }
 
     @Test

@@ -14,14 +14,19 @@ public final class LogCapture implements AutoCloseable {
     private final Logger logger;
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
 
-    private LogCapture(Class<?> type) {
-        this.logger = (Logger) LoggerFactory.getLogger(type);
+    private LogCapture(Logger logger) {
+        this.logger = logger;
         appender.start();
         logger.addAppender(appender);
     }
 
     public static LogCapture of(Class<?> type) {
-        return new LogCapture(type);
+        return new LogCapture((Logger) LoggerFactory.getLogger(type));
+    }
+
+    /** 抓所有类的日志（挂在根 logger 上）：要断言「整条流程里哪儿都没打出某个串」「一条 ERROR 都没有」时用。 */
+    public static LogCapture everything() {
+        return new LogCapture((Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME));
     }
 
     /** 某个级别的日志（已经格式化好的整句）。 */
@@ -31,6 +36,10 @@ public final class LogCapture implements AutoCloseable {
 
     public List<String> warnings() {
         return at(Level.WARN);
+    }
+
+    public List<String> errors() {
+        return at(Level.ERROR);
     }
 
     /** 所有级别的日志整句。 */
