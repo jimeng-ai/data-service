@@ -107,49 +107,75 @@ public class SkillWorkspaceReader {
         return draft(l, skillTypeOverride, PreviousKeys.NONE);
     }
 
+    /** SKILL.md 超过预览上限的固定文案。理由写在文案里：运行时整份 SKILL.md 都进模型上下文，这么大本来就用不了。 */
+    static String skillMdTooLargeMessage(long limitBytes) {
+        return "SKILL.md 超过 " + limitBytes / 1024 + " KB：运行时整份 SKILL.md 都会放进模型的上下文，这么大用不了。"
+                + "请把细节拆到 references/ 下的文件里，SKILL.md 只留流程和索引";
+    }
+
     /**
      * 草稿预览；工作区里还没有 skill 时返回 null。
      *
      * <p>★ key 的值不出现在这里的任何输出里（预览会随 draft-update 事件推给前端、写进 Redis Stream，DRAFT 行同步也用它；
      * 报错文案会进异常和 ERROR 日志）：先用工作区 secrets.json 里的值把 SKILL.md 抹一遍，<b>再</b>解析——
      * 校验的文本就是将要发布的文本，报错片段里也只有 {@code {{名字}}}；secrets.json 的预览把每个 value 打码。
-     * secrets.json 存在却读不出来时不知道哪些是值：只报它自己的错误，不校验 SKILL.md（见 {@link DraftView#isSecretsUnreadable}）。
      *
-     * @param previous 发布时传进来：不带 value 的条目是沿用上一版的值，它们的原文只有解密之后才抹得掉。预览不传。
+     * <p>★ 抹值的成本有上限，所以值集合要「能确定」才抹：secrets.json 不超过 {@code previewFileMaxBytes}（<b>先看对象大小，超了不读</b>）、
+     * JSON 读得出来、key 不超过 32 个、候选值不超过 64 个、每个候选值不超过 8192 个字符（见 {@link SkillSecretsFile}）。
+     * 确定不了就按「读不出来」处理：<b>一律不给 skill 文件的原文</b>（SKILL.md、正文、其它文本文件都不读），校验结果只有
+     * secrets.json 自己的固定文案，不回显条目、不往下逐条校验（见 {@link DraftView#isSecretsUnreadable}）。
+     *
+     * <p>SKILL.md 超过 {@code previewFileMaxBytes} 同理：不读、不解析、不抹值，校验结果是一句固定的话（见 {@link DraftView#isSkillMdTooLarge}）。
+     * 运行时整份 SKILL.md 都会放进模型的上下文，这个大小本来就用不了，所以不是限制作者，是提前告诉他。
+     *
+     * @param previous 发布时传进来：上一版所有 key 的值，最先解密出来，所有报错文案、预览文字都用它们抹值（不论 secrets.json
+     *                 在不在、合不合规）。预览不传。
      */
     public DraftView draft(Listing l, String skillTypeOverride, PreviousKeys previous) {
         SkillLocation loc = locateSkill(l);
         if (loc.dir() == null) return null;
         String dirPrefix = SkillWorkspaceLayout.skillDirPrefix(loc.dir());
         Map<String, ObjectInfo> files = skillFiles(l, loc.dir());
-        String rawSkillMd = new String(readBytes(l, dirPrefix + SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8);
+        final long limit = props.getPreviewFileMaxBytes();
+
+        // 发布时：上一版所有 key 的值最先解密（不看 secrets.json 在不在、合不合规；解不出来、没配密钥就在这里抛，文案只带 key 名）。
+        // 报错文案、预览里的文字都要用它们抹值。预览和同步传 NONE：沿用的值只在发布时于内存里解密。
+        SecretValues previousValues = SecretValues.of(previous.allValues());
 
         List<String> errors = new ArrayList<>();
-        SecretValues values = SecretValues.NONE;
+        SecretValues current = SecretValues.NONE;
         boolean unreadable = false;
         byte[] secretsJson = null;
-        if (files.containsKey(SkillBundleRules.SECRETS_JSON)) {
-            secretsJson = readBytes(l, dirPrefix + SkillBundleRules.SECRETS_JSON);
-            SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson);
-            errors.addAll(parsed.errors());   // 文案在 parse 里已经抹过值
-            if (parsed.readable()) {
-                values = parsed.values();
-                List<String> reuse = parsed.valid()
-                        ? parsed.entries().stream().filter(e -> e.value() == null).map(SkillSecretsFile.Entry::name).toList()
-                        : List.of();
-                if (!reuse.isEmpty()) values = values.plus(SecretValues.of(previous.values(reuse)));
-            } else {
+        ObjectInfo secretsInfo = files.get(SkillBundleRules.SECRETS_JSON);
+        if (secretsInfo != null) {
+            if (secretsInfo.size() > limit) {
+                // 先看大小，超了不读：读进来、解析、再数候选值，成本都是文件大小的倍数
                 unreadable = true;
+                errors.add(SkillSecretsFile.tooLargeMessage(limit));
+            } else {
+                secretsJson = readBytes(l, dirPrefix + SkillBundleRules.SECRETS_JSON);
+                SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson, previousValues);
+                errors.addAll(parsed.errors());   // 文案在 parse 里已经抹过值（文件里的 + 上一版的）
+                if (parsed.readable()) {
+                    current = parsed.values();
+                } else {
+                    unreadable = true;
+                }
             }
         }
-        final SecretValues known = values;
+        final SecretValues known = current.plus(previousValues);   // 抹值用的全集：文件里的值 + 上一版的全部值
 
-        String skillMd = known.replace(rawSkillMd);
-        ParsedSkill fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
-        if (unreadable) {
-            // 不知道哪些是 key 的值：只报 secrets.json 自己的错误，SKILL.md 的校验报错、目录名 / name 不一致这类会回显文件名和 name 的话都不给
+        boolean skillMdTooLarge = files.get(SkillBundleRules.SKILL_MD).size() > limit;
+        String skillMd = "";
+        ParsedSkill fm = null;
+        if (skillMdTooLarge) {
+            errors.add(skillMdTooLargeMessage(limit));
+        } else if (unreadable) {
+            // 不知道哪些是 key 的值：只报 secrets.json 自己的固定文案；SKILL.md 连读都不读，也不给任何文件的原文
             errors.add("SKILL.md 等 secrets.json 修好之后再校验：现在不知道哪些是 key 的值，校验的报错里可能带出原文");
         } else {
+            skillMd = known.replace(new String(readBytes(l, dirPrefix + SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8));
+            fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
             fm.errors().forEach(e -> errors.add(known.replace(e)));
             // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
             List<String> nested = files.keySet().stream()
@@ -167,10 +193,11 @@ public class SkillWorkspaceReader {
 
         DraftView v = new DraftView();
         v.setDirName(loc.dir());
-        v.setName(fm.name());
-        v.setDescription(fm.description());
+        // 没解析的时候 name / description 是 null、skillMd / body 是空串（前端要用 skillMd 和 body 的长度切 frontmatter）
+        v.setName(fm == null ? null : fm.name());
+        v.setDescription(fm == null ? null : fm.description());
         v.setSkillMd(skillMd);
-        v.setBody(fm.body());
+        v.setBody(fm == null ? "" : fm.body());
         String inferred = SkillBundleRules.inferSkillType(files.keySet());
         v.setInferredType(inferred);
         v.setEffectiveType(skillTypeOverride != null ? skillTypeOverride : inferred);
@@ -178,6 +205,7 @@ public class SkillWorkspaceReader {
         v.setIterations(iterationCount(l, loc.dir()));
         v.setOtherSkillDirs(loc.others());
         v.setSecretsUnreadable(unreadable);
+        v.setSkillMdTooLarge(skillMdTooLarge);
 
         List<DraftFile> out = new ArrayList<>();
         for (Map.Entry<String, ObjectInfo> entry : files.entrySet()) {
@@ -188,17 +216,17 @@ public class SkillWorkspaceReader {
             f.setPath(path);
             f.setSize(o.size());
             f.setRuntime(SkillBundleRules.isRuntimeFile(path));
-            if (o.size() <= props.getPreviewFileMaxBytes()) {
-                if (SkillBundleRules.isSecretsFile(path)) {
-                    f.setText(SkillSecretsFile.maskedPreview(secretsJson));   // 读不出来是 null：一个字都不给
-                    f.setBinary(false);
-                } else {
-                    String text = decodeText(readBytes(l, dirPrefix + path));
-                    f.setText(text == null ? null : known.replace(text));
-                    f.setBinary(text == null);
-                }
-            } else {
+            // 读不出来 / 超过上限的文件：不读，text 为 null（unreadable 时所有文件都不读——不知道哪些是值，原文一个字都不给）
+            boolean skip = unreadable || o.size() > limit || (skillMdTooLarge && SkillBundleRules.SKILL_MD.equals(path));
+            if (skip) {
                 f.setBinary(false);
+            } else if (SkillBundleRules.isSecretsFile(path)) {
+                f.setText(SkillSecretsFile.maskedPreview(secretsJson));
+                f.setBinary(false);
+            } else {
+                String text = decodeText(readBytes(l, dirPrefix + path));
+                f.setText(text == null ? null : known.replace(text));
+                f.setBinary(text == null);
             }
             out.add(f);
         }

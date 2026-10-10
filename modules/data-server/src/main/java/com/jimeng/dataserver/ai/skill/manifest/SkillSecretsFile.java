@@ -13,7 +13,9 @@ import com.jimeng.dataserver.ai.http.policy.PathPattern;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -30,16 +32,28 @@ import java.util.regex.Pattern;
  * 报错会回到构建器界面和接口响应里（{@code ServiceException} 构造时还会把文案记进 ERROR 日志），toString 可能被顺手打进日志。
  * 作者写的东西（key 名、不认识的字段名、hosts / methods / paths 的条目）回显进文案之前，先用同一个文件里的值抹一遍
  * （{@link SecretValues#replace}）。
+ *
+ * <p><b>值集合要能确定，抹值的成本才有上限。</b>「候选值」是 value、直接写成字符串的值、不认识的字段里的字符串和数字
+ * （短于 {@value #MIN_VALUE_LENGTH} 个字符的不算）。全部满足才算「能确定」：文件不超过 {@value #MAX_FILE_BYTES} 字节（先看大小，
+ * 超了不读）、JSON 读得出来且嵌套不超过 {@value #MAX_DEPTH} 层、最多 {@value #MAX_KEYS} 个 key、候选值最多 {@value #MAX_CANDIDATES} 个、
+ * 每个候选值最多 {@value #MAX_VALUE_LENGTH} 个字符。任何一条不满足就按「读不出来」处理（{@link Parsed#readable()} 为 false）：只给一句固定的话，
+ * 不回显任何条目、不往下逐条校验；调用方对外一律不给 skill 文件的原文（预览、事件、校验文本），不同步 DRAFT 行。
  */
 public final class SkillSecretsFile {
 
     public static final String FILE_NAME = SkillBundleRules.SECRETS_JSON;
     public static final Pattern NAME = Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
-    /** 太短的值没法在回包里安全地抹掉（会把正常文字切碎）。代理和连接器工具对 token 用的也是 8。 */
-    public static final int MIN_VALUE_LENGTH = 8;
+    /** 太短的值没法在回包里安全地抹掉（会把正常文字切碎）。代理和连接器工具对 token 用的也是 8。短于它的字符串不是 key 的值：校验会拒，任何地方都不拿它抹值。 */
+    public static final int MIN_VALUE_LENGTH = SecretValues.MIN_VALUE_LENGTH;
     /** 太长的不是 key（是把整份证书、整个文件贴进来了）；每次发布还要在每个文件里找它，加密后也要塞得进 TEXT 列。 */
     public static final int MAX_VALUE_LENGTH = 8192;
     public static final int MAX_KEYS = 32;
+    /** secrets.json 本身最大多大。与草稿预览单个文件的上限（skill.builder.preview-file-max-bytes，默认 512 KB）是同一个数。 */
+    public static final int MAX_FILE_BYTES = 512 * 1024;
+    /** 候选值（8 个字符以上的字符串和数字）最多几个。 */
+    public static final int MAX_CANDIDATES = 64;
+    /** JSON 嵌套最多几层（根对象算第 1 层）。正常的 key 文件是 3 层；限住它，预览里遍历结构的递归才有上界。 */
+    public static final int MAX_DEPTH = 8;
     /** hosts / paths 的个数和长度也有上限：网关每个请求都要遍历它们。 */
     public static final int MAX_HOSTS = 32;
     public static final int MAX_PATHS = 64;
@@ -49,6 +63,7 @@ public final class SkillSecretsFile {
     public static final String MASK = "******";
     private static final Set<String> FIELDS = Set.of("value", "hosts", "methods", "paths");
     private static final Set<String> DECLARATION_FIELDS = Set.of("hosts", "methods", "paths");
+    private static final String TOO_DEEP = "secrets.json 嵌套得太深，不是合法的 key 文件";
     /**
      * 严格解析：默认的 Jackson 对同名 key 静默只留最后一个、对第一个值后面的内容静默忽略，被吞掉的值既不会加密、
      * 也不会在文件里被替换，原文就原样进了 bundle。两个开关都要开：重复的键、第一个对象之后还有内容，一律拒绝。
@@ -72,8 +87,10 @@ public final class SkillSecretsFile {
     }
 
     /**
-     * @param values   文件里出现过的所有字符串形式的值（不论那一条是否合规）：报错抹值、草稿预览、DRAFT 同步都用它
-     * @param readable 文件是一个读得出来的 JSON 对象。false 时不知道有哪些值，调用方对外就只能给 secrets.json 自己的错误
+     * @param values   文件里的候选值（value、直接写成字符串的值、不认识的字段里的字符串和数字；8 个字符以上的，不论那一条是否合规）：
+     *                 报错抹值、草稿预览、DRAFT 同步都用它
+     * @param readable 值集合能确定（见类说明：大小、JSON、key 数、候选值个数和长度、嵌套层数都在上限内）。false 时不知道有哪些值，
+     *                 {@code errors} 只有一句固定的话；调用方对外就只能给这句话，不给 skill 文件的原文，不同步 DRAFT 行
      */
     public record Parsed(List<Entry> entries, List<String> errors, SecretValues values, boolean readable) {
         public boolean valid() {
@@ -86,30 +103,118 @@ public final class SkillSecretsFile {
     }
 
     public static Parsed parse(byte[] json) {
-        JsonNode root;
-        try {
-            root = JSON.readTree(json);
-        } catch (JsonProcessingException e) {
-            return unreadable(describe(e));
-        } catch (IOException e) {
-            return unreadable("secrets.json 不是合法的 JSON");
-        }
-        if (root == null || !root.isObject()) {
-            return unreadable("secrets.json 必须是一个 JSON 对象：键是 key 的名字，值是 {value, hosts, methods, paths}");
-        }
-        SecretValues known = valuesIn(root);
-        if (root.size() > MAX_KEYS) {
-            return new Parsed(List.of(), List.of("secrets.json 最多 " + MAX_KEYS + " 个 key"), known, true);
-        }
+        return parse(json, SecretValues.NONE);
+    }
+
+    /**
+     * @param alsoKnown 发布时上一版所有 key 的值：回显作者写的条目（hosts / paths / 方法 / 字段名 / key 名）时也要抹，
+     *                  不论这一条合不合规、这一条写没写 value——旧值最常见的出口就是模型照别家写法把它拼进了 paths
+     */
+    public static Parsed parse(byte[] json, SecretValues alsoKnown) {
+        Analysis a = analyze(json);
+        if (a.problem() != null) return unreadable(a.problem());
+        JsonNode root = a.root();
+        SecretValues known = a.values();
         List<String> errors = new ArrayList<>();
         List<Entry> entries = new ArrayList<>();
+        SecretValues scrub = known.plus(alsoKnown);   // 回显用：文件里的值 + 上一版的值
         for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
             Map.Entry<String, JsonNode> f = it.next();
-            Entry e = parseEntry(f.getKey(), f.getValue(), errors, known);
+            Entry e = parseEntry(f.getKey(), f.getValue(), errors, scrub);
             if (e != null) entries.add(e);
         }
         if (errors.isEmpty()) errors.addAll(crossCheck(entries, known));   // 格式都对了，再看值有没有跑进声明里、有没有两个 key 共用一个值
         return new Parsed(List.copyOf(entries), List.copyOf(errors), known, true);
+    }
+
+    /** secrets.json 太大的固定文案（不带内容）。读取方（草稿预览）先看对象大小，超了不读，用同一句话。 */
+    public static String tooLargeMessage(long limitBytes) {
+        return "secrets.json 超过 " + limitBytes / 1024 + " KB：key 文件不会这么大，请检查是不是把别的内容放进来了";
+    }
+
+    /** 分析结果：{@code problem != null} 就是值集合确定不了，对外只给这一句固定的话。 */
+    private record Analysis(JsonNode root, SecretValues values, String problem) {
+        static Analysis problem(String text) {
+            return new Analysis(null, SecretValues.NONE, text);
+        }
+    }
+
+    /** 遍历用的栈帧：{@code depth} 是这个节点所在的嵌套层数（根对象 1），{@code candidate} 为 false 的子树只数层数、不取值。 */
+    private record Frame(String name, JsonNode node, int depth, boolean candidate) {}
+
+    private static Analysis analyze(byte[] json) {
+        if (json.length > MAX_FILE_BYTES) {
+            return Analysis.problem(tooLargeMessage(MAX_FILE_BYTES));
+        }
+        JsonNode root;
+        try {
+            root = JSON.readTree(json);
+        } catch (JsonProcessingException e) {
+            return Analysis.problem(describe(e));
+        } catch (IOException e) {
+            return Analysis.problem("secrets.json 不是合法的 JSON");
+        } catch (StackOverflowError e) {
+            return Analysis.problem(TOO_DEEP);
+        }
+        if (root == null || !root.isObject()) {
+            return Analysis.problem("secrets.json 必须是一个 JSON 对象：键是 key 的名字，值是 {value, hosts, methods, paths}");
+        }
+        if (root.size() > MAX_KEYS) {
+            return Analysis.problem("secrets.json 最多 " + MAX_KEYS + " 个 key");
+        }
+        List<SecretValues.Item> candidates = new ArrayList<>();
+        String problem = collectCandidates(root, candidates);
+        return problem != null ? Analysis.problem(problem) : new Analysis(root, SecretValues.of(candidates), null);
+    }
+
+    /**
+     * 候选值：value、直接写成字符串（或别的）的值、不认识的字段里的字符串和数字；hosts / methods / paths 里的是声明，不算。
+     * 短于 {@value #MIN_VALUE_LENGTH} 个字符的不算。用显式的栈遍历，不递归（嵌套很深的文件不能让线程栈溢出），
+     * 同时数嵌套层数：超过 {@value #MAX_DEPTH} 层就是读不出来，后面预览里遍历结构的递归因此有上界。
+     *
+     * @return 越界的话是一句固定的话（不带内容），否则 null
+     */
+    private static String collectCandidates(JsonNode root, List<SecretValues.Item> out) {
+        Deque<Frame> stack = new ArrayDeque<>();
+        List<Frame> children = new ArrayList<>();
+        for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
+            Map.Entry<String, JsonNode> f = it.next();
+            children.add(new Frame(f.getKey(), f.getValue(), 2, true));
+        }
+        pushInOrder(stack, children);
+        while (!stack.isEmpty()) {
+            Frame fr = stack.pop();
+            JsonNode n = fr.node();
+            if (n.isContainerNode()) {
+                if (fr.depth() > MAX_DEPTH) return TOO_DEEP;
+                children.clear();
+                if (n.isObject()) {
+                    boolean entryObject = fr.depth() == 2;   // key 条目本身：它的 hosts / methods / paths 是声明
+                    for (Iterator<Map.Entry<String, JsonNode>> it = n.fields(); it.hasNext(); ) {
+                        Map.Entry<String, JsonNode> field = it.next();
+                        boolean declaration = entryObject && DECLARATION_FIELDS.contains(field.getKey());
+                        children.add(new Frame(fr.name(), field.getValue(), fr.depth() + 1, fr.candidate() && !declaration));
+                    }
+                } else {
+                    for (JsonNode child : n) children.add(new Frame(fr.name(), child, fr.depth() + 1, fr.candidate()));
+                }
+                pushInOrder(stack, children);
+            } else if (fr.candidate() && (n.isTextual() || n.isNumber())) {
+                String text = n.asText();
+                if (text.codePointCount(0, text.length()) < MIN_VALUE_LENGTH) continue;
+                if (text.length() > MAX_VALUE_LENGTH) return "secrets.json 里有超过 " + MAX_VALUE_LENGTH + " 个字符的值";
+                out.add(new SecretValues.Item(fr.name(), text));
+                if (out.size() > MAX_CANDIDATES) {
+                    return "secrets.json 里 " + MIN_VALUE_LENGTH + " 个字符以上的字符串和数字超过了 " + MAX_CANDIDATES + " 个：key 文件里不该有这么多内容";
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 倒着压栈，这样弹出来的顺序就是文件里的顺序（重名提示、key 名的先后因此稳定）。 */
+    private static void pushInOrder(Deque<Frame> stack, List<Frame> frames) {
+        for (int i = frames.size() - 1; i >= 0; i--) stack.push(frames.get(i));
     }
 
     private static Parsed unreadable(String error) {
@@ -122,21 +227,6 @@ public final class SkillSecretsFile {
         if (m.startsWith("Duplicate field")) return "secrets.json 里有重复的键：同一个 key（以及 key 里的同一个字段）只能写一次";
         if (m.contains("Trailing token")) return "secrets.json 的第一个 JSON 对象后面还有别的内容：一个文件只能有一个对象，要加 key 就写进同一个对象里";
         return "secrets.json 不是合法的 JSON";
-    }
-
-    /** 文件里所有字符串形式的值：{@code {"K":{"value":"…"}}} 的 value，以及直接把值写成字符串的 {@code {"K":"…"}}。 */
-    private static SecretValues valuesIn(JsonNode root) {
-        List<SecretValues.Item> items = new ArrayList<>();
-        for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
-            Map.Entry<String, JsonNode> f = it.next();
-            JsonNode n = f.getValue();
-            if (n.isTextual()) {
-                items.add(new SecretValues.Item(f.getKey(), n.asText()));
-            } else if (n.isObject() && n.path("value").isTextual()) {
-                items.add(new SecretValues.Item(f.getKey(), n.path("value").asText()));
-            }
-        }
-        return SecretValues.of(items);
     }
 
     private static Entry parseEntry(String rawName, JsonNode node, List<String> errors, SecretValues known) {
@@ -164,9 +254,6 @@ public final class SkillSecretsFile {
                 value = v.asText();
                 if (value.codePointCount(0, value.length()) < MIN_VALUE_LENGTH) {
                     errors.add("key " + name + " 的值太短（至少 " + MIN_VALUE_LENGTH + " 个字符）：太短的值没法在回包里安全地抹掉");
-                }
-                if (value.length() > MAX_VALUE_LENGTH) {
-                    errors.add("key " + name + " 的值太长（最多 " + MAX_VALUE_LENGTH + " 个字符）：key 不是整份文件或证书");
                 }
                 if (value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0 || value.indexOf('\0') >= 0) {
                     errors.add("key " + name + " 的值里不能有换行或空字符");
@@ -262,15 +349,29 @@ public final class SkillSecretsFile {
             errors.add("key " + pair[0] + " 和 key " + pair[1] + " 的值相同：每个 key 要有自己的值，否则文件里的原文没法判断该换成哪一个占位符");
         }
         for (Entry e : entries) {
-            scanDeclaration(e.name(), "hosts", e.hosts(), true, values, errors);
-            scanDeclaration(e.name(), "methods", e.methods(), false, values, errors);
-            scanDeclaration(e.name(), "paths", e.paths(), false, values, errors);
+            scanDeclaration(e.name(), "hosts", e.hosts(), true, values, "的值", errors);
+            scanDeclaration(e.name(), "methods", e.methods(), false, values, "的值", errors);
+            scanDeclaration(e.name(), "paths", e.paths(), false, values, "的值", errors);
+        }
+        return errors;
+    }
+
+    /**
+     * 残留检查的声明这一半：上一版的值（这一版没用 {@code {{名字}}} 替换掉的那些）不能出现在任何 key 的 hosts / methods / paths 里。
+     * 文案点名 key 和位置，不带值。
+     */
+    public static List<String> residualCheck(List<Entry> entries, SecretValues residual) {
+        List<String> errors = new ArrayList<>();
+        for (Entry e : entries) {
+            scanDeclaration(e.name(), "hosts", e.hosts(), true, residual, "上一版的值", errors);
+            scanDeclaration(e.name(), "methods", e.methods(), false, residual, "上一版的值", errors);
+            scanDeclaration(e.name(), "paths", e.paths(), false, residual, "上一版的值", errors);
         }
         return errors;
     }
 
     private static void scanDeclaration(String owner, String field, List<String> items, boolean ignoreCase,
-                                        SecretValues values, List<String> errors) {
+                                        SecretValues values, String whose, List<String> errors) {
         if (items == null) return;
         Set<String> reported = new LinkedHashSet<>();
         for (String item : items) {
@@ -278,7 +379,7 @@ public final class SkillSecretsFile {
         }
         for (String x : reported) {
             String where = x.equals(owner) ? "它自己的 " + field : " key " + owner + " 的 " + field;   // 中文和 key 名之间的空格跟着 key 名走
-            errors.add("key " + x + " 的值出现在了" + where + " 里：" + switch (field) {
+            errors.add("key " + x + (whose.startsWith("上一版") ? " 上一版的值" : " 的值") + "出现在了" + where + " 里：" + switch (field) {
                 case "paths" -> "路径里用 * 通配，请求时在 URL 里写 {{" + x + "}}";
                 case "hosts" -> "hosts 里只能写域名，key 的值不能放在这里";
                 default -> "methods 里只能写 GET、POST 这类方法名";
@@ -288,18 +389,14 @@ public final class SkillSecretsFile {
 
     /**
      * 草稿预览里的 secrets.json：每个 value（以及直接写成字符串的值、不认识的字段里的字符串和数字）换成 {@value #MASK}，
-     * hosts / methods / paths 原样给（里面万一有值，先抹掉）。读不出来（不是合法 JSON、不是对象）返回 null：
+     * hosts / methods / paths 原样给（里面万一有值，先抹掉）。读不出来（值集合确定不了，见类说明）返回 null：
      * 不知道哪些是值，就一个字都不给。工作区里的文件本身不动。
      */
     public static String maskedPreview(byte[] json) {
-        JsonNode root;
-        try {
-            root = JSON.readTree(json);
-        } catch (IOException e) {
-            return null;
-        }
-        if (root == null || !root.isObject()) return null;
-        SecretValues known = valuesIn(root);
+        Analysis a = analyze(json);
+        if (a.problem() != null) return null;
+        JsonNode root = a.root();
+        SecretValues known = a.values();
         ObjectNode out = JSON.createObjectNode();
         for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
             Map.Entry<String, JsonNode> f = it.next();

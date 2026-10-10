@@ -57,9 +57,10 @@ public class SkillBuilderSessionService {
     /** 新建 skill 时 DRAFT 行的 origin_ref 前缀；列表页据此把草稿卡片接回会话。 */
     public static final String ORIGIN_REF_PREFIX = "builder-session:";
     private static final long FEEDBACK_MAX_BYTES = 1024 * 1024;
-    /** 第一次同步时 secrets.json 就读不出来：DRAFT 行先用这个名字和说明占位，修好之后的下一轮同步会换成真的。 */
+    /** 第一次同步时草稿的文字就给不出来（secrets.json 读不出来，或 SKILL.md 太大）：DRAFT 行先用这个名字和说明占位，修好之后的下一轮同步会换成真的。 */
     static final String UNREADABLE_DRAFT_NAME = "草稿";
-    static final String UNREADABLE_DRAFT_BODY = "（草稿里的 secrets.json 格式有误，修好后再同步）";
+    static final String UNREADABLE_DRAFT_BODY = "（草稿里的 secrets.json 读不出来或超出限制，修好后再同步）";
+    static final String TOO_LARGE_DRAFT_BODY = "（草稿里的 SKILL.md 太大了，改小后再同步）";
 
     private final SkillBuilderSessionMapper sessionMapper;
     private final AiSkillMapper aiSkillMapper;
@@ -362,14 +363,17 @@ public class SkillBuilderSessionService {
      * secrets.json 的值抹过的：模型把 key 原文写进 SKILL.md 时，库里只有 {@code {{名字}}}。DRAFT 行在列表里就是一张卡片，
      * 还能被设成全团队可见，库里不能有 key 原文。
      *
-     * <p>secrets.json 存在、却读不出来时不知道哪些是值，草稿里的文字没法抹：一个字都不写进库。已有的 DRAFT 行保留上一次
-     * 同步的内容；第一次同步就建一行，正文写一句说明。
+     * <p>草稿的文字给不出来时一个字都不写进库（已有的 DRAFT 行保留上一次同步的内容；第一次同步就建一行，正文写一句说明）：
+     * <ul>
+     *   <li>secrets.json 存在、却读不出来或确定不了值集合（不是合法 JSON、太大、key 或候选值太多、有值太长……）：不知道哪些是值，没法抹；</li>
+     *   <li>SKILL.md 超过预览上限：不读、不解析、不抹值（运行时整份 SKILL.md 都进模型上下文，这个大小本来就用不了）。</li>
+     * </ul>
      */
     private void upsertDraftRow(SkillBuilderSession s, DraftView draft) {
-        boolean unreadable = draft.isSecretsUnreadable();
-        String name = unreadable || StrUtil.isBlank(draft.getName()) ? UNREADABLE_DRAFT_NAME : StrUtil.maxLength(draft.getName(), 61);
-        String desc = unreadable || draft.getDescription() == null ? null : StrUtil.maxLength(draft.getDescription(), 1021);
-        String body = unreadable ? UNREADABLE_DRAFT_BODY : draft.getBody();
+        boolean withheld = draft.isSecretsUnreadable() || draft.isSkillMdTooLarge();
+        String name = withheld || StrUtil.isBlank(draft.getName()) ? UNREADABLE_DRAFT_NAME : StrUtil.maxLength(draft.getName(), 61);
+        String desc = withheld || draft.getDescription() == null ? null : StrUtil.maxLength(draft.getDescription(), 1021);
+        String body = draft.isSecretsUnreadable() ? UNREADABLE_DRAFT_BODY : draft.isSkillMdTooLarge() ? TOO_LARGE_DRAFT_BODY : draft.getBody();
         AiSkill row = s.getDraftSkillId() == null ? null : aiSkillMapper.selectById(s.getDraftSkillId());
         if (row == null) {
             row = new AiSkill();
@@ -386,7 +390,7 @@ public class SkillBuilderSessionService {
             u.setId(s.getId());
             u.setDraftSkillId(row.getId());
             sessionMapper.updateById(u);
-        } else if (SkillConst.STATUS_DRAFT.equals(row.getStatus()) && !unreadable) {
+        } else if (SkillConst.STATUS_DRAFT.equals(row.getStatus()) && !withheld) {
             fill(row, name, desc, body, draft);
             aiSkillMapper.updateById(row);
         }

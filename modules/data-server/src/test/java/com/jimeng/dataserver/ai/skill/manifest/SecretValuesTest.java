@@ -49,29 +49,41 @@ class SecretValuesTest {
     }
 
     @Test
-    @DisplayName("★ 随机文本：替换之后任何一个值都不再整段出现；与朴素写法逐条一致")
+    @DisplayName("★ 随机对拍：值互相重叠、互为前缀、文本只由 a b 两个字母组成——与朴素写法逐条一致，替换之后任何一个值都不再整段出现")
     void noValueSurvivesAndAgreesWithTheNaiveVersion() {
         Random rnd = new Random(7);
-        String alphabet = "abc ";
         for (int i = 0; i < 20_000; i++) {
-            List<SecretValues.Item> items = new ArrayList<>();
-            for (int k = 1 + rnd.nextInt(3); k > 0; k--) {
-                StringBuilder v = new StringBuilder();
-                for (int n = 2 + rnd.nextInt(4); n > 0; n--) v.append(alphabet.charAt(rnd.nextInt(alphabet.length())));
-                items.add(new SecretValues.Item("K" + k, v.toString()));
-            }
             StringBuilder text = new StringBuilder();
-            for (int n = rnd.nextInt(30); n > 0; n--) text.append(alphabet.charAt(rnd.nextInt(alphabet.length())));
+            for (int n = 10 + rnd.nextInt(110); n > 0; n--) text.append(rnd.nextBoolean() ? 'a' : 'b');
+            List<SecretValues.Item> items = new ArrayList<>();
+            String base = randomAb(rnd, 8 + rnd.nextInt(5));
+            items.add(new SecretValues.Item("K_BASE", base));
+            if (rnd.nextInt(3) > 0) items.add(new SecretValues.Item("K_LONGER", base + randomAb(rnd, 1 + rnd.nextInt(6))));      // 以 base 为前缀
+            if (rnd.nextInt(3) > 0) items.add(new SecretValues.Item("K_OVERLAP", base.substring(3) + randomAb(rnd, 3 + rnd.nextInt(6))));   // 头是 base 的尾巴
+            if (rnd.nextInt(3) > 0) items.add(new SecretValues.Item("K_OTHER", randomAb(rnd, 8 + rnd.nextInt(7))));
+            if (rnd.nextInt(4) == 0) {   // 取自文本本身，保证有命中
+                int from = rnd.nextInt(text.length() - 8);
+                items.add(new SecretValues.Item("K_INSIDE", text.substring(from, from + 4 + rnd.nextInt(4)).repeat(2)));
+            }
             SecretValues values = SecretValues.of(items);
             String out = values.replace(text.toString());
             assertThat(out).as("值 %s 文本 %s", items, text).isEqualTo(naive(items, text.toString()));
-            for (SecretValues.Item it : items) assertThat(out).as("%s 在 %s 里", it, out).doesNotContain(it.value());
+            for (SecretValues.Item it : items) {
+                if (it.value().length() >= SecretValues.MIN_VALUE_LENGTH) assertThat(out).as("%s 在 %s 里", it, out).doesNotContain(it.value());
+            }
         }
+    }
+
+    private static String randomAb(Random rnd, int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) sb.append(rnd.nextBoolean() ? 'a' : 'b');
+        return sb.toString();
     }
 
     /** 参照写法：每一步取最靠左的出现，同一位置取更长的（同样长的取靠前的），整段换掉，从它后面接着找。 */
     private static String naive(List<SecretValues.Item> items, String text) {
-        List<SecretValues.Item> sorted = new ArrayList<>(items);
+        List<SecretValues.Item> sorted = new ArrayList<>();
+        for (SecretValues.Item it : items) if (it.value().length() >= SecretValues.MIN_VALUE_LENGTH) sorted.add(it);
         sorted.sort((a, b) -> Integer.compare(b.value().length(), a.value().length()));
         StringBuilder out = new StringBuilder();
         int pos = 0;
@@ -143,5 +155,73 @@ class SecretValuesTest {
         assertThat(merged.names()).containsExactlyInAnyOrder("A_KEY", "B_KEY");
         assertThat(merged.replace("value-of-a-key value-of-b-key")).isEqualTo("{{A_KEY}} {{B_KEY}}");
         assertThat(SecretValues.NONE.plus(SecretValues.NONE).isEmpty()).isTrue();
+    }
+    // ---------------------------------------------------------------- 第 2 轮：抹值的成本有上限
+
+    @Test
+    @DisplayName("★ 短于 8 个字符的字符串不是值：替换、检查、回显都不拿它抹（否则「待填写」「...」「e」会把预览抹花，输出被放大几十倍）")
+    void stringsShorterThanEightCharactersAreNotValues() {
+        String longName = "K" + "X".repeat(63);   // 64 个字符的 key 名
+        SecretValues v = SecretValues.of(List.of(new SecretValues.Item(longName, "e"), new SecretValues.Item("SHORT_KEY", "short7c"),
+                new SecretValues.Item("EMPTY_KEY", "")));
+        assertThat(v.isEmpty()).isTrue();
+        String text = "frontmatter: e short7c";
+        assertThat(v.replace(text)).isSameAs(text);
+        assertThat(v.namesIn(text)).isEmpty();
+        assertThat(SecretValues.of(List.of(new SecretValues.Item("EDGE_KEY", "exactly8"))).isEmpty()).isFalse();
+        // 8 个「字符」按码点数：4 个补充平面的字符只有 4 个码点，不算
+        assertThat(SecretValues.of(List.of(new SecretValues.Item("EMOJI_KEY", "\uD83D\uDE00".repeat(4)))).isEmpty()).isTrue();
+    }
+
+    @Test
+    @DisplayName("★ 输出的膨胀有上限：值至少 8 个字符、占位符最长 68 个字符，输出不超过输入的 8.5 倍；用「e」当值配 64 个字符的 key 名，输出一旦放大几十倍就红")
+    void theOutputIsAtMostEightPointFiveTimesTheInput() {
+        String longName = "K" + "X".repeat(63);
+        String onlyEs = "e".repeat(1_000_000);
+        SecretValues shortOne = SecretValues.of(List.of(new SecretValues.Item(longName, "e")));
+        assertThat(shortOne.replace(onlyEs).length()).isLessThanOrEqualTo((int) (onlyEs.length() * 8.5));
+
+        String eightChars = "ABCDEFGH";
+        String dense = eightChars.repeat(125_000);   // 1 MB，每 8 个字符就有一处要换
+        String out = SecretValues.of(List.of(new SecretValues.Item(longName, eightChars))).replace(dense);
+        assertThat(out.length()).isEqualTo(125_000 * (longName.length() + 4));
+        assertThat(out.length()).isLessThanOrEqualTo((int) (dense.length() * 8.5));
+    }
+
+    @Test
+    @DisplayName("★ 替换是线性的：一个 8 字符的值和一个 8192 字符的值在 5 MB 文本里反复抢位置（复审的「baba…」写法），1 秒内完成；"
+            + "以前短值每抢一次，长值就从头重扫约 8192 个字符，总共要几秒")
+    void twoOverlappingValuesOverFiveMegabytesTakeUnderASecond() {
+        String shortValue = "ab".repeat(4);                    // 8 个字符，出现在偶数位置
+        String longValue = "ba".repeat(4096);                  // 8192 个字符，出现在奇数位置
+        String text = "ab".repeat(2_621_440);                  // 5 MB
+        SecretValues v = SecretValues.of(List.of(new SecretValues.Item("LONG_KEY", longValue), new SecretValues.Item("SHORT_KEY", shortValue)));
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+            String out = v.replace(text);
+            assertThat(out).startsWith("{{SHORT_KEY}}").doesNotContain(shortValue);
+        });
+    }
+
+    @Test
+    @DisplayName("★ 64 个值配 5 MB 文本：替换、namesIn（文本、字节）各在 1 秒内")
+    void sixtyFourValuesOverFiveMegabytesTakeUnderASecond() {
+        Random rnd = new Random(11);
+        List<SecretValues.Item> items = new ArrayList<>();
+        StringBuilder text = new StringBuilder(5_300_000);
+        for (int i = 0; i < 64; i++) {
+            StringBuilder v = new StringBuilder("value" + i + "-");
+            for (int n = 8 + rnd.nextInt(33); n > 0; n--) v.append((char) ('a' + rnd.nextInt(26)));
+            items.add(new SecretValues.Item("KEY_" + i, v.toString()));
+        }
+        while (text.length() < 5_242_880) {
+            for (int n = 400 + rnd.nextInt(600); n > 0; n--) text.append((char) ('a' + rnd.nextInt(26)));
+            text.append(items.get(rnd.nextInt(64)).value());
+        }
+        String hay = text.toString();
+        byte[] bytes = hay.getBytes(StandardCharsets.UTF_8);
+        SecretValues v = SecretValues.of(items);
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.replace(hay)).doesNotContain("value0-"));
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.namesIn(hay)).hasSize(64));
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.namesIn(bytes)).hasSize(64));
     }
 }

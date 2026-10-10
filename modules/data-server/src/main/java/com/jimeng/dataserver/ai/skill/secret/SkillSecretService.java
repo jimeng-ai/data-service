@@ -123,7 +123,7 @@ public class SkillSecretService {
                 if (wanted.isEmpty()) return out;
                 if (!cipher.isAvailable()) {
                     throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                            "无法核对沿用的 key：平台没有配置加密密钥（CONNECTION_CREDENTIAL_KEY），请联系管理员");
+                            "无法核对上一版的 key：平台没有配置加密密钥（CONNECTION_CREDENTIAL_KEY），请联系管理员");
                 }
                 for (String name : wanted) {
                     out.put(name, decrypt(name, rows.get(name)));
@@ -143,7 +143,7 @@ public class SkillSecretService {
             // 不带原因：解密失败的细节对调用方没用；日志里也只留 key 名
             log.warn("skill key 解密失败 skillId={} v{} name={}", row.getSkillId(), row.getVersion(), name);
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "无法核对沿用的 key " + name + "：解密失败，可能是加密密钥已轮换；请在 secrets.json 里重新写 value");
+                    "无法核对上一版的 key " + name + "：解密失败，可能是加密密钥已轮换；请在 secrets.json 里重新写 value");
         }
     }
 

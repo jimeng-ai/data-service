@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -19,16 +20,20 @@ import java.util.stream.Collectors;
 /**
  * 发布前把一个 skill 目录处理成可以入库的样子（设计文档 §3.4 第 1、3 步）。所有入口共用这一份，纯函数、不碰存储：
  * <ol>
- *   <li>读 {@code secrets.json} 并校验（平台 skill 不允许带；格式、值↔声明、重名的检查都在
- *       {@link SkillSecretsFile#parse}）；</li>
- *   <li>不带 value 的条目是「沿用上一版的值」：把上一版的值解密出来（{@link PreviousKeys}）并进下面所有步骤；</li>
+ *   <li><b>最先</b>把上一版所有 key 的值解密出来（{@link PreviousKeys#allValues}），不看 secrets.json 在不在、合不合规、这一条写没写
+ *       value；没配密钥或解不开就整次拒绝。它们用在后面每一步：报错抹值、沿用条目的替换、残留检查；</li>
+ *   <li>读 {@code secrets.json} 并校验（平台 skill 不允许带；格式、值↔声明、重名的检查都在 {@link SkillSecretsFile#parse}）；
+ *       读不出来 / 越界（太大、key 太多……）就只报它自己那句固定的话，不往下逐条校验——逐条校验会回显条目；</li>
+ *   <li>不带 value 的条目是「沿用上一版的值」：只有它们用上一版的值做替换；</li>
  *   <li>值不能出现在任何文件的路径里；根目录不能有只差大小写的 {@code Secrets.json}；</li>
- *   <li>其余文本文件里的 key 原文换成 {@code {{名字}}}（{@link SecretValues#replace}）；
- *       二进制文件里出现原文没法替换，整次发布拒绝；</li>
+ *   <li>其余文本文件里的 key 原文换成 {@code {{名字}}}（{@link SecretValues#replace}）；二进制文件里出现原文没法替换，整次发布拒绝；</li>
+ *   <li><b>残留检查</b>：当前的值替换完之后，文本内容、文件路径、任何 key 的 hosts / methods / paths、二进制文件里还出现上一版的值，
+ *       拒绝发布。同时兜住两种情况：key 删了但旧值又被打进文件；key 换了新值但旧值还留在文件里。上一版的值如果同时也是这一版
+ *       某个 key 的值，它已经按那个 key 替换掉了，不算残留；</li>
  *   <li>文件里还在用 {@code {{X}}}、上一版有 X、这一版的 secrets.json 却没有 X 了：拒绝（否则新版本静默丢 key）；</li>
  *   <li>★ <b>用替换后的</b> SKILL.md 解析 frontmatter：正文进库时已经是占位符，解析报错的片段里也只有占位符。</li>
  * </ol>
- * 解析或校验产生的任何消息放进异常之前都先抹值：{@code ServiceException} 构造时就把文案记进 ERROR 日志。
+ * 解析或校验产生的任何消息放进异常之前都先抹值（当前的值 + 上一版的全部值）：{@code ServiceException} 构造时就把文案记进 ERROR 日志。
  * 加密和「沿用旧值」的范围核对不在这里，见 {@code SkillSecretService.prepare}。
  */
 public final class SkillPackageProcessor {
@@ -58,81 +63,110 @@ public final class SkillPackageProcessor {
         if (files == null || files.get(SkillBundleRules.SKILL_MD) == null) {
             throw reject(SecretValues.NONE, "skill 里没有 SKILL.md");
         }
-        // 1. 先读 secrets.json——要先知道有哪些值，后面每一步才抹得掉
+        // 0. 上一版所有 key 的值，最先解密：解不出来（没配密钥、密文坏了）这里就抛 ServiceException（文案只带 key 名），整次拒绝
+        Map<String, String> previousMap = previous.allValues();
+        SecretValues previousAll = SecretValues.of(previousMap);
+
+        // 1. 读 secrets.json——要先知道有哪些值，后面每一步才抹得掉
         List<SkillSecretsFile.Entry> secrets = List.of();
-        SecretValues values = SecretValues.NONE;
+        SecretValues current = SecretValues.NONE;
         byte[] secretsJson = files.get(SkillSecretsFile.FILE_NAME);
         if (secretsJson != null) {
             if (!allowSecrets) {
-                throw reject(SecretValues.NONE, "平台技能暂不支持带 key（secrets.json），请去掉这个文件；key 不能放进代码仓库");
+                throw reject(previousAll, "平台技能暂不支持带 key（secrets.json），请去掉这个文件；key 不能放进代码仓库");
             }
-            SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson);
+            SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson, previousAll);
             if (!parsed.valid()) {
-                throw reject(SecretValues.NONE, "secrets.json 不符合规则：" + String.join("；", parsed.errors()));   // 这些文案在 parse 里已经抹过值
+                // 这些文案在 parse 里已经抹过值；这里再抹一遍（文件里的值 + 上一版的全部值）是第二道
+                throw reject(parsed.values().plus(previousAll), "secrets.json 不符合规则：" + String.join("；", parsed.errors()));
             }
             secrets = parsed.entries();
-            values = parsed.values();
+            current = parsed.values();
         }
 
-        // 2. 沿用上一版的值：解密出来并进来；解不出来就整次拒绝（previous.values 抛 ServiceException），绝不跳过核对
-        List<String> reuseNames = secrets.stream().filter(e -> e.value() == null).map(SkillSecretsFile.Entry::name).toList();
-        if (!reuseNames.isEmpty()) {
-            SecretValues reused = SecretValues.of(previous.values(reuseNames));
-            if (!reused.isEmpty()) {
-                values = values.plus(reused);
-                List<String> problems = SkillSecretsFile.crossCheck(secrets, values);   // 自己的值 parse 里已经查过了，这里只会报出涉及沿用值的
-                if (!problems.isEmpty()) throw reject(values, "secrets.json 不符合规则：" + String.join("；", problems));
-            }
+        // 2. 沿用：这一版声明了、没写 value 的条目，用上一版的值。只有它们用上一版的值做替换
+        Map<String, String> reuseMap = new LinkedHashMap<>();
+        for (SkillSecretsFile.Entry e : secrets) {
+            if (e.value() == null && previousMap.containsKey(e.name())) reuseMap.put(e.name(), previousMap.get(e.name()));
         }
-        final SecretValues all = values;
+        SecretValues reuse = SecretValues.of(reuseMap);
+        final SecretValues replaceSet = current.plus(reuse);                // 要在文件里换成占位符的
+        final SecretValues scrub = current.plus(previousAll);               // 报错文案里要抹掉的：当前的 + 上一版的全部
+        // 残留检查用的：上一版的全部值。不用先减掉「这一版替换掉的」：被替换的值（沿用的、或者同时也是这一版某个 key 的值），文本里已经
+        // 换成占位符、不会再出现；它们在文件路径、二进制、声明里出现，下面各自的检查（replaceSet）先拒了。所以「不算残留」是自然成立的。
+        final SecretValues residual = previousAll;
+        if (!reuse.isEmpty()) {
+            List<String> problems = SkillSecretsFile.crossCheck(secrets, replaceSet);   // 自己的值 parse 里已经查过了，这里只会报出涉及沿用值的
+            if (!problems.isEmpty()) throw reject(scrub, "secrets.json 不符合规则：" + String.join("；", problems));
+        }
+        if (!residual.isEmpty()) {
+            List<String> problems = SkillSecretsFile.residualCheck(secrets, residual);
+            if (!problems.isEmpty()) throw reject(scrub, "secrets.json 不符合规则：" + String.join("；", problems));
+        }
 
-        // 3. 文件路径：根目录只差大小写的 Secrets.json；路径里不能有值
+        // 3. 文件路径：根目录只差大小写的 Secrets.json；路径里不能有值（当前的，也不能有上一版没替换掉的）
         for (String path : files.keySet()) {
             if (!path.contains("/") && path.equalsIgnoreCase(SkillSecretsFile.FILE_NAME) && !path.equals(SkillSecretsFile.FILE_NAME)) {
-                throw reject(all, "根目录有一个叫「" + path + "」的文件：key 文件只认小写的 secrets.json，请改名（不是 key 文件就换个名字）");
+                throw reject(scrub, "根目录有一个叫「" + path + "」的文件：key 文件只认小写的 secrets.json，请改名（不是 key 文件就换个名字）");
             }
             if (SkillSecretsFile.FILE_NAME.equals(path)) continue;
-            List<String> inPath = all.namesIn(path);
+            List<String> inPath = replaceSet.namesIn(path);
             if (!inPath.isEmpty()) {
-                throw reject(all, "文件「" + path + "」的路径里含有 key " + String.join("、", inPath)
+                throw reject(scrub, "文件「" + path + "」的路径里含有 key " + String.join("、", inPath)
                         + " 的值：路径会变成存储里的对象名、详情页和沙箱里看到的文件名，请改个名字");
+            }
+            List<String> oldInPath = residual.namesIn(path);
+            if (!oldInPath.isEmpty()) {
+                throw reject(scrub, "文件「" + path + "」的路径里含有 key " + String.join("、", oldInPath)
+                        + " 上一版的值：路径会变成存储里的对象名、详情页和沙箱里看到的文件名，请改个名字");
             }
         }
 
-        // 4. 文本文件里的值换成占位符；二进制里有值就拒绝；顺便核对占位符
+        // 4. 文本文件里的值换成占位符；二进制里有值就拒绝；残留检查；顺便核对占位符
         Set<String> previousNames = previous.names();
         Set<String> declared = secrets.stream().map(SkillSecretsFile.Entry::name).collect(Collectors.toSet());
         Map<String, byte[]> out = new TreeMap<>();
         for (Map.Entry<String, byte[]> f : files.entrySet()) {
             if (SkillSecretsFile.FILE_NAME.equals(f.getKey())) continue;
-            out.put(f.getKey(), processFile(f.getKey(), f.getValue(), all, previousNames, declared));
+            out.put(f.getKey(), processFile(f.getKey(), f.getValue(), replaceSet, residual, scrub, previousNames, declared));
         }
 
         // 5. 用替换后的 SKILL.md 解析（校验的文本 = 发布的文本）
         ParsedSkill skill = SkillManifestParser.parse(new String(out.get(SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8), mode);
         if (!skill.valid()) {
-            throw reject(all, "SKILL.md 不符合规则：" + String.join("；", skill.errors()));
+            throw reject(scrub, "SKILL.md 不符合规则：" + String.join("；", skill.errors()));
         }
         return new Output(skill, out, secrets);
     }
 
-    private static byte[] processFile(String path, byte[] content, SecretValues values, Set<String> previousNames, Set<String> declared) {
+    private static byte[] processFile(String path, byte[] content, SecretValues replaceSet, SecretValues residual, SecretValues scrub,
+                                      Set<String> previousNames, Set<String> declared) {
         String text = decodeText(content);
         if (text == null) {
-            List<String> hit = values.namesIn(content);
+            List<String> hit = replaceSet.namesIn(content);
             if (!hit.isEmpty()) {
-                throw reject(values, "文件「" + path + "」里有 key " + String.join("、", hit)
+                throw reject(scrub, "文件「" + path + "」里有 key " + String.join("、", hit)
                         + " 的原文，但它不是文本文件，没法换成占位符；请把这个值从文件里拿掉");
+            }
+            List<String> old = residual.namesIn(content);
+            if (!old.isEmpty()) {
+                throw reject(scrub, "文件「" + path + "」里有 key " + String.join("、", old)
+                        + " 上一版的值，但它不是文本文件，没法换成占位符；请把这个值从文件里拿掉");
             }
             return content;
         }
-        String replaced = values.replace(text);
+        String replaced = replaceSet.replace(text);
+        List<String> old = residual.namesIn(replaced);
+        if (!old.isEmpty()) {
+            throw reject(scrub, "文件「" + path + "」里出现了 key " + String.join("、", old) + " 上一版的值：要继续用，就在 secrets.json 里保留 "
+                    + old.get(0) + "、文件里写 {{" + old.get(0) + "}}；不用了，就把它从文件里删掉");
+        }
         if (!previousNames.isEmpty()) {
             Matcher m = PLACEHOLDER.matcher(replaced);
             while (m.find()) {
                 String x = m.group(1);
                 if (previousNames.contains(x) && !declared.contains(x)) {
-                    throw reject(values, "文件「" + path + "」里还在用 {{" + x + "}}，但 secrets.json 里没有 " + x
+                    throw reject(scrub, "文件「" + path + "」里还在用 {{" + x + "}}，但 secrets.json 里没有 " + x
                             + " 了：要继续用，就在 secrets.json 里保留这一条（不写值即沿用）；不用了，就把文件里的 {{" + x + "}} 删掉");
                 }
             }

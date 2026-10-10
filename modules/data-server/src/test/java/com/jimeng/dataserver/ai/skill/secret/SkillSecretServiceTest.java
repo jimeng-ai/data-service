@@ -233,7 +233,7 @@ class SkillSecretServiceTest {
         assertThat(prev.names()).containsExactly("CRM_TOKEN");
         assertThat(prev.values(List.of())).isEmpty();
         assertThatThrownBy(() -> prev.values(List.of("CRM_TOKEN")))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对沿用的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
     }
 
     @Test

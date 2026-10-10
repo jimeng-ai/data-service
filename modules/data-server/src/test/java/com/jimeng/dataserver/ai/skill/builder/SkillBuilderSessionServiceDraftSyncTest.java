@@ -57,6 +57,11 @@ class SkillBuilderSessionServiceDraftSyncTest {
     private final List<Row> updated = new ArrayList<>();
 
     private void workspace(Map<String, String> files, AiSkill existingDraft) throws Exception {
+        workspace(files, Map.of(), existingDraft);
+    }
+
+    /** declaredSizes：对象存储里「报出来」的大小（可以比内容大得多——不用真的造一个 512 KB 的文件）。 */
+    private void workspace(Map<String, String> files, Map<String, Long> declaredSizes, AiSkill existingDraft) throws Exception {
         SkillBuilderSession session = new SkillBuilderSession();
         session.setId(1L);
         session.setTenantId("t1");
@@ -68,7 +73,7 @@ class SkillBuilderSessionServiceDraftSyncTest {
         for (Map.Entry<String, String> e : files.entrySet()) {
             String name = "ws/1/skill/refund-flow/" + e.getKey();
             byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
-            infos.add(new ObjectInfo(name, bytes.length, new Date()));
+            infos.add(new ObjectInfo(name, declaredSizes.getOrDefault(e.getKey(), (long) bytes.length), new Date()));
             when(storage.readBytes(name)).thenReturn(bytes);
         }
         when(storage.listObjectInfos("ws/1/")).thenReturn(infos);
@@ -167,5 +172,100 @@ class SkillBuilderSessionServiceDraftSyncTest {
         String payload = new ObjectMapper().writeValueAsString(event);
         assertThat(payload).doesNotContain(TOKEN).doesNotContain("sk-live");
         assertThat(payload).contains("{{CRM_TOKEN}}").contains("******");
+    }
+
+    // ---------------------------------------------------------------- 第 2 轮 C：确定不了值集合、SKILL.md 太大——不同步
+
+    private static final long LIMIT = new SkillBuilderProperties().getPreviewFileMaxBytes();
+
+    private static String sixtyFiveCandidates() {
+        StringBuilder b = new StringBuilder("{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]");
+        for (int i = 0; i < 65; i++) b.append(",\"note").append(i).append("\":\"candidate-value-").append(i).append("\"");
+        return b.append("}}").toString();
+    }
+
+    @Test
+    @DisplayName("★ R22：值集合确定不了（候选值超过 64 个）= 读不出来：DRAFT 行已经有了就保留上一次，不更新、不新建")
+    void anUndeterminableValueSetLeavesTheExistingDraftRowAlone() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", sixtyFiveCandidates());
+        AiSkill existing = draftRow();
+        workspace(files, existing);
+
+        svc.syncAfterRun(1L, true);
+
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+        verify(aiSkillMapper, never()).insert(any(AiSkill.class));
+        assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
+    }
+
+    @Test
+    @DisplayName("★ R22：secrets.json 超过大小上限（不读）：第一次同步就建一行占位，不写草稿里的任何文字")
+    void aSecretsJsonOverTheLimitMeansAPlaceholderOnTheFirstSync() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, Map.of("secrets.json", LIMIT + 1), null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.description()).isNull();
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_BODY);
+        });
+        assertThat(inserted.toString()).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ R22：SKILL.md 超过大小上限（不读、不解析、不抹值）：第一次同步建一行占位，正文是单独的说明")
+    void aSkillMdOverTheLimitMeansAPlaceholderOnTheFirstSync() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, Map.of("SKILL.md", LIMIT + 1), null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.description()).isNull();
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.TOO_LARGE_DRAFT_BODY);
+        });
+        assertThat(inserted.toString()).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ R22：SKILL.md 太大、DRAFT 行已经有了：保留上一次同步的内容，不更新")
+    void aSkillMdOverTheLimitLeavesTheExistingDraftRowAlone() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", WITH_VALUE);
+        AiSkill existing = draftRow();
+        workspace(files, Map.of("SKILL.md", LIMIT + 1), existing);
+
+        svc.syncAfterRun(1L, true);
+
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+        verify(aiSkillMapper, never()).insert(any(AiSkill.class));
+        assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
+        assertThat(existing.getName()).isEqualTo("上一次同步的名字");
+    }
+
+    @Test
+    @DisplayName("★ R22：读不出来时推给前端的 draft-update 事件（序列化之后的 JSON）里没有 skill 文件的任何原文：SKILL.md、脚本、正文都是空的")
+    void theDraftUpdateEventOfAnUnreadableSecretsFileCarriesNoSkillFileText() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n调接口时带上 " + TOKEN + "\n");
+        files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        files.put("secrets.json", sixtyFiveCandidates());
+        workspace(files, null);
+
+        DraftUpdateEvent event = svc.syncAfterRun(1L, true);
+
+        String payload = new ObjectMapper().writeValueAsString(event);
+        assertThat(payload).doesNotContain(TOKEN).doesNotContain("sk-live").doesNotContain("调接口时带上").doesNotContain("candidate-value-");
+        assertThat(payload).contains("secrets.json");   // 固定文案还在
     }
 }

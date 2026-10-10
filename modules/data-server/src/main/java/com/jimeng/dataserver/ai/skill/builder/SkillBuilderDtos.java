@@ -57,10 +57,18 @@ public final class SkillBuilderDtos {
         /** 工作区里不止一个 skill 目录时列出全部（发布取最近修改的那个）。 */
         private List<String> otherSkillDirs;
         /**
-         * 工作区里有 secrets.json、却读不出来（不是合法 JSON 等）：不知道哪些是 key 的值，草稿里的文字没法抹值。
-         * 此时不校验 SKILL.md（报错片段会带出源码）、不给 secrets.json 的预览，也不能把草稿里的文字同步进 DRAFT 行。
+         * 工作区里有 secrets.json、却读不出来（不是合法 JSON、超过大小上限、key 或候选值太多、有值太长……）：不知道哪些是
+         * key 的值，草稿里的文字没法抹值。此时<b>一律不给 skill 文件的原文</b>：name / description 为 null，skillMd / body 为空串
+         * （前端靠这两个字段切 frontmatter，不能是 null），每个文件的 text 为 null，secrets.json 也没有预览；
+         * 校验结果只有 secrets.json 自己的固定文案（不带值、不回显条目）；DRAFT 行不同步。
          */
         private boolean secretsUnreadable;
+        /**
+         * SKILL.md 超过预览文件上限（skill.builder.preview-file-max-bytes，默认 512 KB）：不读、不解析、不抹值。
+         * 运行时整份 SKILL.md 都会放进模型的上下文，这么大本来就用不了。此时 name / description 为 null，skillMd / body 为空串，
+         * 校验结果是一句固定的话；DRAFT 行不同步。
+         */
+        private boolean skillMdTooLarge;
     }
 
     @Data

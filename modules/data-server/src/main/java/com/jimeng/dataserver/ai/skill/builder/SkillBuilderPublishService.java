@@ -72,10 +72,24 @@ public class SkillBuilderPublishService {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "构建器还在工作，等这一轮结束再发布");
         }
         SkillWorkspaceReader.Listing l = reader.list(session.getWorkspacePrefix());
-        // 改进已有 skill 时，secrets.json 里不带 value 的条目是沿用上一版的值：核对文件、抹报错都要用它们的值
-        // （解不出来——没配密钥、密文坏了——整次发布拒绝，不会跳过核对）
+        // 发布要把整个目录读进内存：先只看列举结果里的大小，超了就拒绝。★ 排在最前面：超限时什么都不读、不解析、不抹值，
+        // 连上一版的 key 都不解密（草稿读取会读 SKILL.md 和 secrets.json、做校验和替换，成本都跟着大小走）。
+        String dir = reader.locateSkill(l).dir();
+        if (dir == null) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");
+        }
+        Map<String, RagMinioStorageService.ObjectInfo> inWorkspace = reader.skillFiles(l, dir);
+        long totalBytes = inWorkspace.entrySet().stream()
+                .filter(e -> SkillBundleRules.isPartOfSkill(e.getKey())).mapToLong(e -> e.getValue().size()).sum();
+        if (totalBytes > props.getPublishMaxBytes()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill 里的文件一共 " + megabytes(totalBytes)
+                    + " MB，超过了发布的上限 " + megabytes(props.getPublishMaxBytes()) + " MB：把大文件拿掉，或者拆成几个 skill");
+        }
+        // 改进已有 skill：上一版所有 key 的值，最先解密出来（不看 secrets.json 在不在、合不合规、这一条写没写 value）——
+        // 所有报错文案的抹值、沿用条目的替换、残留检查都要用它们。解不出来（没配密钥、密文坏了）整次发布拒绝，文案只带 key 名，
+        // 不会跳过核对。解一次，草稿读取和发布处理器共用同一份。
         PreviousKeys previous = session.getBaseSkillId() == null ? PreviousKeys.NONE
-                : secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion());
+                : PreviousKeys.decrypted(secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion()).allValues());
         DraftView draft = reader.draft(l, session.getSkillTypeOverride(), previous);
         if (draft == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");
@@ -84,15 +98,6 @@ public class SkillBuilderPublishService {
             // 这些文案 reader.draft 里已经抹过 key 的值（ServiceException 构造时就会把它记进 ERROR 日志）
             throw new ServiceException(ExceptionCode.INVALID_REQUEST,
                     "SKILL.md 不符合发布规则：" + String.join("；", draft.getValidationErrors()));
-        }
-        String dir = draft.getDirName();
-        // 发布要把整个目录读进内存：先看总大小，超了就拒绝，不读
-        Map<String, RagMinioStorageService.ObjectInfo> inWorkspace = reader.skillFiles(l, dir);
-        long totalBytes = inWorkspace.entrySet().stream()
-                .filter(e -> SkillBundleRules.isPartOfSkill(e.getKey())).mapToLong(e -> e.getValue().size()).sum();
-        if (totalBytes > props.getPublishMaxBytes()) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "skill 里的文件一共 " + megabytes(totalBytes)
-                    + " MB，超过了发布的上限 " + megabytes(props.getPublishMaxBytes()) + " MB：把大文件拿掉，或者拆成几个 skill");
         }
         // 读出属于 skill 的全部文件交给发布处理器：提取 secrets.json、把 key 原文换成占位符、解析 SKILL.md（设计文档 §3.4）。
         Map<String, byte[]> raw = new TreeMap<>();

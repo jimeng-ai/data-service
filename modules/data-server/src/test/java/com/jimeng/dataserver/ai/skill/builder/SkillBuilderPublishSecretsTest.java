@@ -48,7 +48,6 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -136,6 +135,7 @@ class SkillBuilderPublishSecretsTest {
     private void workspaceWith(Map<String, byte[]> files) throws Exception {
         listing = new SkillWorkspaceReader.Listing("ws/1/", Map.of());
         when(reader.list("ws/1/")).thenReturn(listing);
+        when(reader.locateSkill(listing)).thenReturn(new SkillWorkspaceReader.SkillLocation("refund-flow", List.of()));
         draft = new DraftView();
         draft.setDirName("refund-flow");
         draft.setName("refund-flow");
@@ -297,7 +297,11 @@ class SkillBuilderPublishSecretsTest {
 
         svc.publish(1L);
 
-        verify(reader).draft(eq(listing), isNull(), same(previous));
+        // 发布最先把上一版所有 key 的值解密出来，草稿读取收到的是解密好的那一份（和桩给的名字、值一一对应）
+        ArgumentCaptor<PreviousKeys> given = ArgumentCaptor.forClass(PreviousKeys.class);
+        verify(reader).draft(eq(listing), isNull(), given.capture());
+        assertThat(given.getValue().names()).containsExactly("CRM_TOKEN");
+        assertThat(given.getValue().allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<SkillSecretsFile.Entry>> entries = ArgumentCaptor.forClass(List.class);
         verify(secretService).prepare(eq("t1"), eq(5L), eq(3), entries.capture());
@@ -323,7 +327,7 @@ class SkillBuilderPublishSecretsTest {
     }
 
     @Test
-    @DisplayName("★ 发布要把整个目录读进内存：总字节数超过上限（默认 50 MB）就拒绝，什么都不读、不写")
+    @DisplayName("★ 发布要把整个目录读进内存：总字节数超过上限（默认 50 MB）就拒绝——排在草稿读取之前：什么都不读、不解析、不替换（reader.draft 没被调用）、不写")
     void tooBigToPublishIsRefusedBeforeAnythingIsRead() throws Exception {
         session();
         props.setPublishMaxBytes(100);
@@ -335,10 +339,45 @@ class SkillBuilderPublishSecretsTest {
         assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
                 .hasMessageContaining("超过了发布的上限");
 
+        // 钉住顺序：reader 是 mock，光看「没读文件」证明不了总大小检查排在草稿读取（解析、抹值、读 secrets.json）之前
+        verify(reader, never()).draft(any(), any(), any());
         verify(reader, never()).readBytes(any(), anyString());
         verifyNoInteractions(storage);
         verifyNoInteractions(secretService);
         assertThat(new SkillBuilderProperties().getPublishMaxBytes()).isEqualTo(50L * 1024 * 1024);
+    }
+
+    @Test
+    @DisplayName("改进已有 skill 时也一样：总大小超限，连上一版的 key 都不解密")
+    void tooBigToPublishIsRefusedBeforeThePreviousKeysAreDecrypted() throws Exception {
+        SkillBuilderSession session = session();
+        session.setBaseSkillId(5L);
+        session.setBaseVersion(3);
+        props.setPublishMaxBytes(100);
+        Map<String, byte[]> files = new TreeMap<>();
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: 退款\n---\n" + "字".repeat(60)));
+        files.put("references/big.md", new byte[80]);
+        workspaceWith(files);
+
+        assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("超过了发布的上限");
+
+        verify(reader, never()).draft(any(), any(), any());
+        verifyNoInteractions(secretService);
+    }
+
+    @Test
+    @DisplayName("工作区里没有 skill：和以前一样的提示（现在由总大小检查之前的 locateSkill 发现）")
+    void noSkillInTheWorkspace() throws Exception {
+        session();
+        listing = new SkillWorkspaceReader.Listing("ws/1/", Map.of());
+        when(reader.list("ws/1/")).thenReturn(listing);
+        when(reader.locateSkill(listing)).thenReturn(new SkillWorkspaceReader.SkillLocation(null, List.of()));
+
+        assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("工作区里还没有 skill");
+
+        verify(reader, never()).draft(any(), any(), any());
     }
 
     @Test

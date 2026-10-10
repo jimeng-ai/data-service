@@ -1,10 +1,15 @@
 package com.jimeng.dataserver.ai.http.policy;
 
+import okhttp3.HttpUrl;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -132,5 +137,77 @@ class PathPatternTest {
         for (String ok : new String[]{"/v1/a.b", "/v1/a..b", "/v1/.well-known/x", "/v1/a%20b", "/v1/*.json", "/v1/**"}) {
             assertThat(PathPattern.parse(ok).text()).isEqualTo(ok);
         }
+    }
+
+    // ---------------------------------------------------------------- 第 2 轮 A（R20）：拒绝 OkHttp 在路径里一定会编码掉的字符
+
+    /** 真实的 OkHttp 把这条路径解析成网址之后的 encodedPath()——网关匹配的就是它。 */
+    private static String okHttpEncodedPath(String rawPath) {
+        return HttpUrl.get("http://h.test" + rawPath).encodedPath();
+    }
+
+    @Test
+    @DisplayName("★ 对拍真实的 OkHttp（HttpUrl.get(…).encodedPath()）：可见 ASCII 字符里 OkHttp 一定会编码掉的，parse 必须拒绝；不会编码的必须放行（不许多拒）。"
+            + "拒绝集合不凭记忆写：字符放在段首、段中、段尾都测")
+    void agreesWithOkHttpAboutWhichCharactersAreEncodedAway() {
+        Set<Character> encodedAway = new TreeSet<>();
+        for (char c = 0x21; c <= 0x7E; c++) {
+            if ("/*%?#\\".indexOf(c) >= 0) continue;   // 分隔符、通配、转义的起点，以及已经整条拒绝的 ? # \
+            for (String raw : new String[]{"/" + c + "ab", "/a" + c + "b", "/ab" + c}) {
+                boolean changed = !okHttpEncodedPath(raw).equals(raw);
+                if (changed) {
+                    encodedAway.add(c);
+                    assertThatThrownBy(() -> PathPattern.parse(raw)).as("OkHttp 会编码 %s（%s），这样写永远匹配不上", c, raw)
+                            .isInstanceOf(IllegalArgumentException.class);
+                } else {
+                    assertThat(PathPattern.parse(raw).text()).as("OkHttp 不会编码 %s（%s），不许多拒", c, raw).isEqualTo(raw);
+                }
+            }
+        }
+        // 对拍出来的集合本身也钉住：OkHttp 升级后集合变了，这里先红，提醒来改
+        assertThat(encodedAway).containsExactly('"', '<', '>', '^', '`', '{', '|', '}');
+    }
+
+    @Test
+    @DisplayName("★ 对拍 OkHttp 的 %：合法转义（%7B、%41、%7b……）原样保留，能解析（%2F %5C %2E 按第 1 轮 M9 仍拒）；"
+            + "后面不跟两位十六进制数字的 %，OkHttp 按网址解析时同样原样保留（不是 %25），所以也能解析——不许多拒")
+    void percentSignsAgreeWithOkHttp() {
+        String chars = "0123456789abcdefABCDEFgG-%.";   // 十六进制数字（大小写）、非十六进制字符、%、.
+        List<String> raws = new ArrayList<>();
+        raws.add("/a%");
+        raws.add("/a%/b");
+        for (char x : chars.toCharArray()) {
+            raws.add("/a%" + x);
+            raws.add("/a%" + x + "/b");
+            for (char y : chars.toCharArray()) raws.add("/a%" + x + y + "b");
+        }
+        int accepted = 0;
+        for (String raw : raws) {
+            boolean refusedByM9 = Pattern.compile("%(2f|5c|2e)", Pattern.CASE_INSENSITIVE).matcher(raw).find();
+            boolean changed = !okHttpEncodedPath(raw).equals(raw);
+            if (refusedByM9 || changed) {
+                assertThatThrownBy(() -> PathPattern.parse(raw)).as(raw).isInstanceOf(IllegalArgumentException.class);
+            } else {
+                assertThat(PathPattern.parse(raw).text()).as("OkHttp 原样保留 %s，不许多拒", raw).isEqualTo(raw);
+                accepted++;
+            }
+        }
+        assertThat(accepted).as("合法转义和孤立的 % 都在放行的里面").isGreaterThan(400);
+        for (String ok : new String[]{"/v1/a%7Bb", "/v1/a%7bb", "/v1/a%41", "/v1/%e4%b8%ad"}) {
+            assertThat(PathPattern.parse(ok).text()).isEqualTo(ok);
+        }
+    }
+
+    @Test
+    @DisplayName("★ 文案：说明这个字符会被编码掉、这样写永远匹配不上；{ 和 } 额外提示「路径参数（比如 {id}）请写成 *」（AI 照 OpenAPI 写的 /v1/orders/{id}）")
+    void theMessageExplainsWhatToWriteInstead() {
+        assertThatThrownBy(() -> PathPattern.parse("/v1/orders/{id}")).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("「{」").hasMessageContaining("%7B").hasMessageContaining("永远匹配不上")
+                .hasMessageContaining("路径参数（比如 {id}）请写成 *");
+        assertThatThrownBy(() -> PathPattern.parse("/v1/orders/id}")).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("「}」").hasMessageContaining("%7D").hasMessageContaining("路径参数（比如 {id}）请写成 *");
+        assertThatThrownBy(() -> PathPattern.parse("/v1/a\"b")).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("%22").hasMessageContaining("永远匹配不上").hasMessageNotContaining("路径参数");
+        assertThat(PathPattern.parse("/v1/orders/*").matches("/v1/orders/42")).isTrue();   // 提示里教的写法是通的
     }
 }

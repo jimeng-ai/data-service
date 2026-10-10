@@ -51,6 +51,8 @@ import static org.mockito.Mockito.when;
 class SkillBuilderImproveSecretsTest {
 
     private static final String TOKEN = "sk-live-CRM-0123456789";
+    /** 上一版 WECOM_HOOK 的值（企业微信 webhook 的 key，复审探针里用的那个）。 */
+    private static final String OLD = "693a91f6-7a2b-4c1d-9e8f-0123456789ab";
     private static final String MD_USING_THE_KEY = "---\nname: refund-flow\ndescription: 退款\n---\n带上 {{CRM_TOKEN}} 调接口\n";
 
     private final RagMinioStorageService storage = mock(RagMinioStorageService.class);
@@ -84,15 +86,19 @@ class SkillBuilderImproveSecretsTest {
 
     /** 上一版（v3）里的 CRM_TOKEN：值是 TOKEN，只能发往 api.customer.com；methods / paths 按参数（null = 不限）。 */
     private SkillSecret previousRow(String methodsJson, String pathsJson) {
+        return previousRowOf("CRM_TOKEN", TOKEN, "[\"api.customer.com\"]", methodsJson, pathsJson);
+    }
+
+    private SkillSecret previousRowOf(String name, String value, String hostsJson, String methodsJson, String pathsJson) {
         SkillSecret row = new SkillSecret();
         row.setTenantId("t1");
         row.setSkillId(5L);
         row.setVersion(3);
-        row.setName("CRM_TOKEN");
-        row.setHosts("[\"api.customer.com\"]");
+        row.setName(name);
+        row.setHosts(hostsJson);
         row.setMethods(methodsJson);
         row.setPaths(pathsJson);
-        row.setCiphertext(cipher.encrypt(TOKEN));
+        row.setCiphertext(cipher.encrypt(value));
         row.setCipherVersion(CredentialCipher.CURRENT_VERSION);
         return row;
     }
@@ -201,7 +207,7 @@ class SkillBuilderImproveSecretsTest {
 
         SkillBuilderPublishService noCipher = serviceWith(new CredentialCipher());
         assertThatThrownBy(() -> noCipher.publish(1L)).isInstanceOf(ServiceException.class)
-                .hasMessageContaining("无法核对沿用的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+                .hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
 
         verify(storage, never()).putObject(anyString(), any(byte[].class), anyString());
         verify(storage, never()).deletePrefix(anyString());
@@ -250,5 +256,102 @@ class SkillBuilderImproveSecretsTest {
                 .isInstanceOf(ServiceException.class).hasMessageContaining("作废");
         verify(storage, never()).putObject(anyString(), any(byte[].class), anyString());
         verify(secretMapper, never()).insert(any(SkillSecret.class));
+    }
+    // ---------------------------------------------------------------- 第 2 轮：上一版的值，发布时全部解密，所有出口都用
+
+    private static final String PLAIN_MD = "---\nname: refund-flow\ndescription: 退款\n---\n正文\n";
+
+    private void nothingWasWritten() throws Exception {
+        verify(storage, never()).putObject(anyString(), any(byte[].class), anyString());
+        verify(storage, never()).deletePrefix(anyString());
+        verify(secretMapper, never()).insert(any(SkillSecret.class));
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+    }
+
+    @Test
+    @DisplayName("★ 探针 B：secrets.json 有一条校验错误（企微 webhook 写法，paths 里带 ?key=<旧值>），回显的条目里不能有旧值——不论这一条合不合规，上一版的值都要先解密出来抹")
+    void anEchoedPathDoesNotCarryTheOldValueWhenSecretsJsonIsInvalid() throws Exception {
+        SkillSecret hook = previousRowOf("WECOM_HOOK", OLD, "[\"qyapi.weixin.qq.com\"]", null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", "---\nname: refund-flow\ndescription: 通知\n---\n用 {{WECOM_HOOK}}\n");
+        workspace.put("secrets.json", "{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],"
+                + "\"paths\":[\"/cgi-bin/webhook/send?key=" + OLD + "\"]}}");
+        improvementSession(workspace, hook);
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("{{WECOM_HOOK}}")
+                .hasMessageNotContaining(OLD).hasMessageNotContaining(OLD.substring(0, 12));
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 探针 C：methods 写错一个（GTE），同时 description 里「key: <旧值>」触发 YAML 报错：报错片段里连旧值的前半截都不能有")
+    void aYamlErrorNextToAnotherSecretsErrorDoesNotCarryPartOfTheOldValue() throws Exception {
+        SkillSecret hook = previousRowOf("WECOM_HOOK", OLD, "[\"qyapi.weixin.qq.com\"]", null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", "---\nname: refund-flow\ndescription: 通知时用 key: " + OLD + " 发消息\n---\n正文\n");
+        workspace.put("secrets.json", "{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],\"methods\":[\"GTE\"]}}");
+        improvementSession(workspace, hook);
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("YAML").hasMessageContaining("GTE")
+                .hasMessageNotContaining(OLD).hasMessageNotContaining(OLD.substring(0, 10));
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ key 删了、旧值又被打进脚本：拒绝（文案点名 key 和文件，不带值）")
+    void theOldValueOfADroppedKeyInAScriptIsRejected() throws Exception {
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        workspace.put("secrets.json", "{\"OTHER_KEY\":{\"value\":\"another-new-value-1\",\"hosts\":[\"x.example.com\"]}}");
+        improvementSession(workspace, previousRow(null, null));
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("scripts/call.py").hasMessageContaining("CRM_TOKEN").hasMessageContaining("上一版的值")
+                .hasMessageNotContaining(TOKEN);
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ key 换了新值、旧值还留在脚本里：拒绝（新值替换掉了新值，旧值不能就这么留在 bundle 里）")
+    void aNewValueDoesNotExcuseTheOldOneStillInAScript() throws Exception {
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("scripts/call.py", "OLD = '" + TOKEN + "'\nNEW = 'sk-live-NEW-9876543210'\n");
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, previousRow(null, null));
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("scripts/call.py").hasMessageContaining("CRM_TOKEN").hasMessageContaining("上一版的值")
+                .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live-NEW");
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 旧值出现在文件名里：拒绝，文案里的路径已抹值")
+    void theOldValueInAFileNameIsRejected() throws Exception {
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("scripts/" + TOKEN + ".py", "print(1)\n");
+        improvementSession(workspace, previousRow(null, null));
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("CRM_TOKEN").hasMessageContaining("路径").hasMessageNotContaining(TOKEN);
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 上一版有 key、这一版每个 key 都给了新值、没配密钥：拒绝，而且是先因为解不开上一版的值而拒绝（不是等到加密新值时才发现）")
+    void everyKeyGetsANewValueButTheOldOnesCannotBeDecrypted() throws Exception {
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, previousRow(null, null));
+
+        assertThatThrownBy(() -> serviceWith(new CredentialCipher()).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+        nothingWasWritten();
     }
 }

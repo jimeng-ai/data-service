@@ -1,11 +1,13 @@
 package com.jimeng.dataserver.ai.skill.builder;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService.ObjectInfo;
 import com.jimeng.dataserver.ai.skill.SkillConst;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftFile;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.DraftView;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
+import com.jimeng.dataserver.ai.skill.manifest.SecretsJsonFixtures;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -21,6 +23,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class SkillWorkspaceReaderSecretsTest {
@@ -180,6 +184,10 @@ class SkillWorkspaceReaderSecretsTest {
         };
     }
 
+    // 下面这条的最后一段（预览里 scripts/call.py 仍含原文）是预期，不是漏洞（R21、R22 定案）：
+    // 沿用的值只在发布时于内存里解密，模型和工作区都拿不到它——工作区里的 secrets.json 只有名字和发送范围、没有值，所以每轮预览、
+    // draft-update、DRAFT 行同步里本来就没有「沿用的值」可抹；它只会出现在属主自己把值打进会话（对话或文件）的时候。
+    // 那种情况在发布时由「全部解密 + 抹值 + 残留检查」兜住，不靠每轮预览去解密（每轮解密会让预览依赖密钥配置，也多一个读密钥的出口）。
     @Test
     @DisplayName("沿用上一版的值（secrets.json 里不带 value）：发布时传入 PreviousKeys 才能抹掉脚本和报错里的原文；预览和同步不传，也就不解密")
     void reusedValuesAreScrubbedOnlyWhenTheCallerSuppliesThem() throws Exception {
@@ -198,5 +206,196 @@ class SkillWorkspaceReaderSecretsTest {
         DraftView preview = reader.draft(reader.list("ws/"), null);   // 预览 / 同步：不解密
         assertThat(file(preview, "scripts/call.py").getText()).contains(TOKEN);
         assertThat(decryptions.get()).isEqualTo(1);
+    }
+    // ---------------------------------------------------------------- 第 2 轮
+
+    private static final String OLD = "693a91f6-7a2b-4c1d-9e8f-0123456789ab";   // 上一版 WECOM_HOOK 的值
+
+    @Test
+    @DisplayName("★ 探针 B / C：发布时（传了上一版）secrets.json 有错，回显的条目和 SKILL.md 的 YAML 报错片段里都没有上一版的值，连前半截都没有")
+    void thePublishingDraftScrubsEveryPreviousValueWhateverSecretsJsonSaysAndAlsoDroppedKeys() throws Exception {
+        PreviousKeys previous = PreviousKeys.decrypted(Map.of("WECOM_HOOK", OLD));
+        Map<String, String> echoed = new LinkedHashMap<>();
+        echoed.put("SKILL.md", GOOD_MD);
+        echoed.put("secrets.json", "{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],\"paths\":[\"/cgi-bin/webhook/send?key=" + OLD + "\"]}}");
+        SkillWorkspaceReader r1 = readerOver(echoed);
+        DraftView v1 = r1.draft(r1.list("ws/"), null, previous);
+        assertThat(String.join("；", v1.getValidationErrors())).contains("{{WECOM_HOOK}}").doesNotContain(OLD).doesNotContain(OLD.substring(0, 12));
+
+        Map<String, String> yaml = new LinkedHashMap<>();
+        yaml.put("SKILL.md", "---\nname: refund-flow\ndescription: 通知时用 key: " + OLD + " 发消息\n---\n正文\n");
+        yaml.put("secrets.json", "{\"OTHER_KEY\":{\"value\":\"another-new-value-1\",\"hosts\":[\"x.example.com\"],\"methods\":[\"GTE\"]}}");   // WECOM_HOOK 已经删了
+        SkillWorkspaceReader r2 = readerOver(yaml);
+        DraftView v2 = r2.draft(r2.list("ws/"), null, previous);
+        assertThat(v2.getValidationErrors()).anyMatch(e -> e.contains("YAML")).anyMatch(e -> e.contains("GTE"));
+        assertThat(String.join("；", v2.getValidationErrors())).doesNotContain(OLD).doesNotContain(OLD.substring(0, 10));
+        assertThat(v2.getSkillMd()).doesNotContain(OLD).contains("{{WECOM_HOOK}}");
+    }
+
+    @Test
+    @DisplayName("发布时没有 secrets.json 也一样：旧值出现在 SKILL.md 的报错和预览文字里，照抹")
+    void thePublishingDraftScrubsPreviousValuesWithoutASecretsFile() throws Exception {
+        PreviousKeys previous = PreviousKeys.decrypted(Map.of("WECOM_HOOK", OLD));
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: a: " + "字".repeat(20) + OLD + " 调接口\n---\n正文\n");
+        files.put("scripts/call.py", "TOKEN = '" + OLD + "'\n");
+        SkillWorkspaceReader reader = readerOver(files);
+        DraftView v = reader.draft(reader.list("ws/"), null, previous);
+        assertThat(String.join("；", v.getValidationErrors())).doesNotContain("693a91f6");
+        assertThat(file(v, "scripts/call.py").getText()).isEqualTo("TOKEN = '{{WECOM_HOOK}}'\n");
+    }
+
+    // ---------------------------------------------------------------- 第 2 轮 C：值集合确定不了 = 读不出来；对外一律不给 skill 文件的原文
+
+    private record Ws(SkillWorkspaceReader reader, RagMinioStorageService storage) {
+        DraftView draft() {
+            return reader.draft(reader.list("ws/"), null);
+        }
+
+        void assertNeverRead(String rel) throws Exception {
+            verify(storage, never()).readBytes("ws/skill/refund-flow/" + rel);
+        }
+    }
+
+    /** declaredSizes：对象存储里「报出来」的大小（可以比内容大得多——不用真的造一个 512 KB 的文件）。 */
+    private static Ws wsOver(Map<String, String> files, Map<String, Long> declaredSizes, SkillBuilderProperties props) throws Exception {
+        RagMinioStorageService storage = mock(RagMinioStorageService.class);
+        List<ObjectInfo> infos = new ArrayList<>();
+        for (Map.Entry<String, String> e : files.entrySet()) {
+            String name = "ws/skill/refund-flow/" + e.getKey();
+            byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
+            infos.add(new ObjectInfo(name, declaredSizes.getOrDefault(e.getKey(), (long) bytes.length), new Date()));
+            when(storage.readBytes(name)).thenReturn(bytes);
+        }
+        when(storage.listObjectInfos("ws/")).thenReturn(infos);
+        return new Ws(new SkillWorkspaceReader(storage, props), storage);
+    }
+
+    private static final String MARKER = "MARKER-do-not-echo";
+
+    /** 值集合确定不了的几种 secrets.json（每一种里都藏着 MARKER，任何输出里出现它就是回显了条目）。 */
+    private static Map<String, String> undeterminableSecretsJson() {
+        return SecretsJsonFixtures.undeterminable(TOKEN, MARKER);
+    }
+
+    @Test
+    @DisplayName("★ R22：secrets.json 读不出来（写到一半 / key 太多 / 候选值太多 / 值太长）：预览、draft-update、校验文本里一律不给 skill 文件的原文——"
+            + "SKILL.md、正文、脚本、参考资料都不给，只有 secrets.json 自己的固定文案；对象存储里这些文件连读都不读")
+    void anUnreadableSecretsJsonWithholdsEverySkillFileText() throws Exception {
+        for (Map.Entry<String, String> broken : undeterminableSecretsJson().entrySet()) {
+            Map<String, String> files = new LinkedHashMap<>();
+            files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n调接口时带上 " + TOKEN + "\n");
+            files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+            files.put("references/guide.md", "key 是 " + TOKEN + "\n");
+            files.put("secrets.json", broken.getValue());
+            Ws ws = wsOver(files, Map.of(), new SkillBuilderProperties());
+
+            DraftView v = ws.draft();
+
+            String why = broken.getKey();
+            assertThat(v.isSecretsUnreadable()).as(why).isTrue();
+            assertThat(v.getName()).as(why).isNull();
+            assertThat(v.getDescription()).as(why).isNull();
+            assertThat(v.getSkillMd()).as(why).isEmpty();   // 前端要用 skillMd / body 切 frontmatter：空串，不是 null
+            assertThat(v.getBody()).as(why).isEmpty();
+            assertThat(v.getFiles()).as(why).hasSize(4).allSatisfy(f -> {
+                assertThat(f.getText()).as(why + " " + f.getPath()).isNull();
+                assertThat(f.isBinary()).isFalse();
+            });
+            assertThat(v.getValidationErrors()).as(why).hasSize(2);   // secrets.json 自己的固定文案 + 一句「SKILL.md 等它修好再校验」
+            assertThat(v.getValidationErrors().get(0)).as(why).contains("secrets.json");
+            assertThat(v.getValidationErrors().get(1)).as(why).contains("等 secrets.json 修好之后再校验");
+            String everything = new ObjectMapper().writeValueAsString(v);
+            assertThat(everything).as(why).doesNotContain(TOKEN).doesNotContain(MARKER).doesNotContain("sk-live").doesNotContain("调接口时带上");
+            for (String rel : List.of("SKILL.md", "scripts/call.py", "references/guide.md")) ws.assertNeverRead(rel);
+        }
+    }
+
+    @Test
+    @DisplayName("★ secrets.json 超过 previewFileMaxBytes：先看对象大小，超了连读都不读（更不解析）；对外是固定文案；刚好等于上限的照读")
+    void aSecretsJsonOverThePreviewLimitIsNotEvenRead() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("secrets.json", WITH_VALUE);
+
+        long limit = new SkillBuilderProperties().getPreviewFileMaxBytes();
+        Ws over = wsOver(files, Map.of("secrets.json", limit + 1), new SkillBuilderProperties());
+        DraftView v = over.draft();
+        over.assertNeverRead("secrets.json");
+        over.assertNeverRead("SKILL.md");
+        assertThat(v.isSecretsUnreadable()).isTrue();
+        assertThat(v.getValidationErrors()).hasSize(2);
+        assertThat(v.getValidationErrors().get(0)).contains("secrets.json 超过 512 KB");
+        assertThat(v.getSkillMd()).isEmpty();
+
+        Ws exact = wsOver(files, Map.of("secrets.json", limit), new SkillBuilderProperties());
+        DraftView ok = exact.draft();
+        assertThat(ok.isSecretsUnreadable()).isFalse();
+        assertThat(ok.getValidationErrors()).isEmpty();
+        assertThat(file(ok, "secrets.json").getText()).contains("\"******\"");
+    }
+
+    @Test
+    @DisplayName("★ SKILL.md 超过 previewFileMaxBytes：不读、不解析、不抹值；校验结果是一句固定文案并写明理由（运行时整份 SKILL.md 进模型上下文）；"
+            + "name / description 为 null，skillMd / body 为空串；其它文件的预览照给（抹过值）；刚好等于上限的照读")
+    void aSkillMdOverThePreviewLimitIsNeitherReadNorParsed() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        files.put("secrets.json", WITH_VALUE);
+        long limit = new SkillBuilderProperties().getPreviewFileMaxBytes();
+
+        Ws ws = wsOver(files, Map.of("SKILL.md", limit + 1), new SkillBuilderProperties());
+        DraftView v = ws.draft();
+
+        ws.assertNeverRead("SKILL.md");
+        assertThat(v.isSkillMdTooLarge()).isTrue();
+        assertThat(v.isSecretsUnreadable()).isFalse();
+        assertThat(v.getValidationErrors()).singleElement().satisfies(e -> assertThat(e).contains("SKILL.md 超过 512 KB").contains("模型的上下文"));
+        assertThat(v.getName()).isNull();
+        assertThat(v.getDescription()).isNull();
+        assertThat(v.getSkillMd()).isEmpty();
+        assertThat(v.getBody()).isEmpty();
+        assertThat(file(v, "SKILL.md").getText()).isNull();
+        assertThat(file(v, "scripts/call.py").getText()).isEqualTo("TOKEN = '{{CRM_TOKEN}}'\n");
+        assertThat(file(v, "secrets.json").getText()).doesNotContain(TOKEN);
+
+        DraftView exact = wsOver(files, Map.of("SKILL.md", limit), new SkillBuilderProperties()).draft();
+        assertThat(exact.isSkillMdTooLarge()).isFalse();
+        assertThat(exact.getValidationErrors()).isEmpty();
+        assertThat(exact.getName()).isEqualTo("refund-flow");
+    }
+
+    @Test
+    @DisplayName("上限跟着 previewFileMaxBytes 配置走（文案里的数字也是）")
+    void theLimitFollowsTheConfiguration() throws Exception {
+        SkillBuilderProperties props = new SkillBuilderProperties();
+        props.setPreviewFileMaxBytes(2048);
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("secrets.json", WITH_VALUE);
+
+        DraftView secretsTooLarge = wsOver(files, Map.of("secrets.json", 2049L), props).draft();
+        assertThat(secretsTooLarge.getValidationErrors().get(0)).contains("secrets.json 超过 2 KB");
+        DraftView skillMdTooLarge = wsOver(files, Map.of("SKILL.md", 2049L), props).draft();
+        assertThat(skillMdTooLarge.getValidationErrors()).singleElement().satisfies(e -> assertThat(e).contains("SKILL.md 超过 2 KB"));
+    }
+
+    @Test
+    @DisplayName("发布时（传了上一版）也一样：读不出来只报固定文案，不往下做逐条校验；上一版的值照样先解密")
+    void thePublishingDraftOfAnUnreadableFileReportsOnlyTheFixedSentences() throws Exception {
+        AtomicInteger decryptions = new AtomicInteger();
+        for (Map.Entry<String, String> broken : undeterminableSecretsJson().entrySet()) {
+            Map<String, String> files = new LinkedHashMap<>();
+            files.put("SKILL.md", YAML_BROKEN_AROUND_THE_VALUE);
+            files.put("secrets.json", broken.getValue());
+            Ws ws = wsOver(files, Map.of(), new SkillBuilderProperties());
+
+            DraftView v = ws.reader().draft(ws.reader().list("ws/"), null, stubbed(decryptions));
+
+            assertThat(v.getValidationErrors()).as(broken.getKey()).hasSize(2);
+            assertThat(String.join("；", v.getValidationErrors())).as(broken.getKey()).doesNotContain(MARKER).doesNotContain(TOKEN).doesNotContain("YAML");
+        }
+        assertThat(decryptions.get()).isEqualTo(undeterminableSecretsJson().size());   // 每次发布都先解密（R23），读不出来也一样
     }
 }

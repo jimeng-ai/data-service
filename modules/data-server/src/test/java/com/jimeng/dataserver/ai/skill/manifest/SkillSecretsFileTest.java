@@ -225,4 +225,156 @@ class SkillSecretsFileTest {
         assertThat(back.entries()).allSatisfy(e -> assertThat(e.value()).isNull());
         assertThat(SkillSecretsFile.valueLessJson(List.of())).isEqualTo("{ }\n");
     }
+    @Test
+    @DisplayName("★ 发布时传进来的上一版的值，也用来抹回显的条目——不论哪一条不合规、这一条写没写 value")
+    void echoesAreAlsoScrubbedWithThePreviousValues() {
+        String old = "693a91f6-7a2b-4c1d-9e8f-0123456789ab";
+        SecretValues previous = SecretValues.of(java.util.Map.of("WECOM_HOOK", old));
+        byte[] json = ("{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],\"paths\":[\"/cgi-bin/webhook/send?key=" + old + "\"],\"methods\":[\"" + old + "\"]},"
+                + "\"" + old + "\":{\"hosts\":[\"https://x.example.com/" + old + "\"]}}").getBytes(StandardCharsets.UTF_8);
+
+        assertThat(String.join("\n", SkillSecretsFile.parse(json).errors())).contains(old);   // 不传：文件里没写这个值，抹不掉（所以发布时要传）
+        SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(json, previous);
+        assertThat(parsed.valid()).isFalse();
+        String all = String.join("\n", parsed.errors());
+        assertThat(all).doesNotContain(old).doesNotContain(old.substring(0, 12));
+        assertThat(all).contains("/cgi-bin/webhook/send?key={{WECOM_HOOK}}").contains("「{{WECOM_HOOK}}」").contains("https://x.example.com/{{WECOM_HOOK}}");
+        assertThat(parsed.values().isEmpty()).as("上一版的值不并进「文件里的值」").isTrue();
+    }
+
+    @Test
+    @DisplayName("残留检查的声明这一半：上一版的值出现在任何 key 的 hosts / methods / paths 里，点名 key 和位置，不带值")
+    void residualCheckFindsPreviousValuesInDeclarations() {
+        String old = "sk-live-OLD-0123456789";
+        SkillSecretsFile.Entry hook = new SkillSecretsFile.Entry("HOOK_KEY", "another-secret-1", List.of("hook.example.com"), null, List.of("/hook/" + old));
+        SkillSecretsFile.Entry other = new SkillSecretsFile.Entry("OTHER_KEY", "third-secret-123", List.of(old.toLowerCase() + ".example.com"), null, null);
+        List<String> errors = SkillSecretsFile.residualCheck(List.of(hook, other), SecretValues.of(java.util.Map.of("CRM_TOKEN", old)));
+        assertThat(errors).hasSize(2);
+        assertThat(errors.get(0)).contains("key CRM_TOKEN 上一版的值出现在了 key HOOK_KEY 的 paths 里");
+        assertThat(errors.get(1)).contains("key CRM_TOKEN 上一版的值出现在了 key OTHER_KEY 的 hosts 里");
+        assertThat(String.join("", errors).toLowerCase()).doesNotContain(old.toLowerCase());
+    }
+    // ---------------------------------------------------------------- 第 2 轮：值集合要有界、能确定
+
+    private static final String MARKER = "MARKER-do-not-echo";
+
+    private static void assertUnreadableWithOneFixedSentence(SkillSecretsFile.Parsed p, String mustMention) {
+        assertThat(p.readable()).as("读不出来").isFalse();
+        assertThat(p.valid()).isFalse();
+        assertThat(p.entries()).isEmpty();
+        assertThat(p.values().isEmpty()).as("不知道哪些是值").isTrue();
+        assertThat(p.errors()).singleElement().satisfies(e -> assertThat(e).contains(mustMention).doesNotContain(MARKER));
+    }
+
+    @Test
+    @DisplayName("★ 值集合「能确定」才算读得出来：文件超过 512 KB、JSON 读不出来、key 超过 32 个、候选值超过 64 个、候选值超过 8192 个字符——"
+            + "任何一条不满足就按「读不出来」处理，只给一句固定的话，不往下逐条校验（逐条校验会回显条目）")
+    void valuesThatCannotBeDeterminedMakeTheFileUnreadable() {
+        // 超过 512 KB：不管里面是什么
+        String padded = "{\"K_1\":{\"value\":\"" + MARKER + "-12345678\",\"hosts\":[\"a.example.com\"]}}" + " ".repeat(SkillSecretsFile.MAX_FILE_BYTES);
+        assertUnreadableWithOneFixedSentence(parse(padded), "512 KB");
+
+        // key 超过 32 个（以前只报一条错，值照样全部参与替换）
+        StringBuilder many = new StringBuilder("{");
+        for (int i = 0; i < 33; i++) many.append(i == 0 ? "" : ",").append("\"K").append(i).append("\":{\"value\":\"").append(MARKER).append("-").append(i).append("-xx\",\"hosts\":[\"a.example.com\"]}");
+        assertUnreadableWithOneFixedSentence(parse(many.append("}").toString()), "32");
+
+        // 候选值（8 个字符以上的字符串和数字）超过 64 个：一个 key 的不认识的字段里塞 65 个
+        StringBuilder candidates = new StringBuilder("{\"K_1\":{\"value\":\"" + MARKER + "-value\",\"hosts\":[\"a.example.com\"]");
+        for (int i = 0; i < 65; i++) candidates.append(",\"note").append(i).append("\":\"").append(MARKER).append("-").append(i).append("-yy\"");
+        assertUnreadableWithOneFixedSentence(parse(candidates.append("}}").toString()), "64");
+
+        // 单个候选值超过 8192 个字符
+        assertUnreadableWithOneFixedSentence(parse("{\"K_1\":{\"value\":\"" + MARKER + "x".repeat(8193) + "\",\"hosts\":[\"a.example.com\"]}}"), "8192");
+
+        // JSON 读不出来、不是对象：本来就是（第 1 轮）
+        assertUnreadableWithOneFixedSentence(parse("{\"K_1\":{\"value\":\"" + MARKER + "-1234\","), "JSON");
+        assertUnreadableWithOneFixedSentence(parse("[\"" + MARKER + "-12345678\"]"), "JSON 对象");
+    }
+
+    @Test
+    @DisplayName("上限本身放行：恰好 32 个 key、恰好 64 个候选值、恰好 8192 个字符的候选值都读得出来")
+    void theLimitsThemselvesAreFine() {
+        StringBuilder keys = new StringBuilder("{");
+        for (int i = 0; i < 32; i++) keys.append(i == 0 ? "" : ",").append("\"K").append(i).append("\":{\"value\":\"value-number-").append(i).append("\",\"hosts\":[\"a.example.com\"]}");
+        SkillSecretsFile.Parsed thirtyTwo = parse(keys.append("}").toString());
+        assertThat(thirtyTwo.readable()).isTrue();
+        assertThat(thirtyTwo.valid()).as(thirtyTwo.errors().toString()).isTrue();
+
+        StringBuilder sixtyFour = new StringBuilder("{\"K_1\":{\"hosts\":[\"a.example.com\"]");
+        for (int i = 0; i < 64; i++) sixtyFour.append(",\"note").append(i).append("\":\"candidate-").append(i).append("-zz\"");
+        SkillSecretsFile.Parsed p64 = parse(sixtyFour.append("}}").toString());
+        assertThat(p64.readable()).isTrue();   // 读得出来（有不认识的字段，所以不合规），值集合能确定
+        assertThat(p64.values().names()).containsExactly("K_1");
+
+        SkillSecretsFile.Parsed longest = parse("{\"K_1\":{\"value\":\"" + "v".repeat(8192) + "\",\"hosts\":[\"a.example.com\"]}}");
+        assertThat(longest.readable()).isTrue();
+        assertThat(longest.valid()).isTrue();
+    }
+
+    @Test
+    @DisplayName("候选值的范围：value、直接写成字符串的值、不认识的字段里的字符串和数字（8 个字符以上的），都当值抹；hosts / methods / paths 里的不算")
+    void candidateRange() {
+        SkillSecretsFile.Parsed p = parse("{\"K_1\":{\"value\":\"the-real-value\",\"hosts\":[\"host-looking-string.example.com\"],\"paths\":[\"/path-looking-string\"],"
+                + "\"note\":\"candidate-string-1\",\"pin\":12345678,\"nested\":{\"deep\":[\"deep-candidate-1\"]},\"tiny\":\"short\",\"small\":1234},"
+                + "\"PLAIN_KEY\":\"plain-string-value\"}");
+        assertThat(p.valid()).isFalse();   // 有不认识的字段
+        assertThat(p.readable()).isTrue();
+        String text = "the-real-value candidate-string-1 12345678 deep-candidate-1 plain-string-value host-looking-string.example.com /path-looking-string short 1234";
+        assertThat(p.values().replace(text)).isEqualTo("{{K_1}} {{K_1}} {{K_1}} {{K_1}} {{PLAIN_KEY}} host-looking-string.example.com /path-looking-string short 1234");
+    }
+
+    @Test
+    @DisplayName("嵌套超过 8 层、或者深到解析器自己栈溢出的文件：读不出来，只给一句固定的话（不抛 StackOverflowError，不回显内容）")
+    void nestingThatIsTooDeepMakesTheFileUnreadable() {
+        // 恰好 8 层（根对象 1、key 条目 2、不认识的字段里再套 6 层）放行
+        String eight = "{\"K_1\":{\"hosts\":[\"a.example.com\"],\"note\":" + "[".repeat(6) + "\"" + MARKER + "-12345678\"" + "]".repeat(6) + "}}";
+        assertThat(parse(eight).readable()).isTrue();
+        // 第 9 层：声明字段（hosts）里套得太深也一样——预览里遍历结构的递归要有上界
+        String nine = "{\"K_1\":{\"hosts\":" + "[".repeat(7) + "\"" + MARKER + "-12345678\"" + "]".repeat(7) + "}}";
+        assertUnreadableWithOneFixedSentence(parse(nine), "嵌套");
+        assertUnreadableWithOneFixedSentence(parse("{\"K_1\":{\"note\":" + "{\"a\":".repeat(8) + "\"" + MARKER + "-12345678\"" + "}".repeat(8) + "}}"), "嵌套");
+        // 深到 Jackson 自己递归解析就栈溢出（2.11 没有深度上限）
+        String bomb = "{\"K_1\":" + "[".repeat(100_000) + "\"" + MARKER + "-12345678\"" + "]".repeat(100_000) + "}";
+        assertUnreadableWithOneFixedSentence(parse(bomb), "嵌套");
+        assertThat(SkillSecretsFile.maskedPreview(bomb.getBytes(StandardCharsets.UTF_8))).isNull();
+    }
+
+    @Test
+    @DisplayName("★ 值集合确定不了的 secrets.json 没有预览（返回 null）：不知道哪些是值，一个字都不给——超过 512 KB、key 超过 32 个、候选值超过 64 个、候选值超过 8192 个字符、嵌套超过 8 层")
+    void maskedPreviewIsNullWhenTheValuesCannotBeDetermined() {
+        String padded = "{\"K_1\":{\"value\":\"" + MARKER + "-12345678\",\"hosts\":[\"a.example.com\"]}}" + " ".repeat(SkillSecretsFile.MAX_FILE_BYTES);
+        assertThat(SkillSecretsFile.maskedPreview(padded.getBytes(StandardCharsets.UTF_8))).isNull();
+
+        StringBuilder many = new StringBuilder("{");
+        for (int i = 0; i < 33; i++) many.append(i == 0 ? "" : ",").append("\"K").append(i).append("\":{\"value\":\"").append(MARKER).append("-").append(i).append("-xx\",\"hosts\":[\"a.example.com\"]}");
+        assertThat(SkillSecretsFile.maskedPreview(many.append("}").toString().getBytes(StandardCharsets.UTF_8))).isNull();
+
+        StringBuilder candidates = new StringBuilder("{\"K_1\":{\"value\":\"" + MARKER + "-value\",\"hosts\":[\"a.example.com\"]");
+        for (int i = 0; i < 65; i++) candidates.append(",\"note").append(i).append("\":\"").append(MARKER).append("-").append(i).append("-yy\"");
+        assertThat(SkillSecretsFile.maskedPreview(candidates.append("}}").toString().getBytes(StandardCharsets.UTF_8))).isNull();
+
+        assertThat(SkillSecretsFile.maskedPreview(("{\"K_1\":{\"value\":\"" + MARKER + "x".repeat(8193) + "\",\"hosts\":[\"a.example.com\"]}}").getBytes(StandardCharsets.UTF_8))).isNull();
+        assertThat(SkillSecretsFile.maskedPreview(("{\"K_1\":{\"hosts\":" + "[".repeat(7) + "\"" + MARKER + "-12345678\"" + "]".repeat(7) + "}}").getBytes(StandardCharsets.UTF_8))).isNull();
+    }
+
+    @Test
+    @DisplayName("重名提示按文件里的顺序点名（遍历用栈，但按文件顺序压入）")
+    void duplicateValuesAreNamedInFileOrder() {
+        SkillSecretsFile.Parsed p = parse("{\"KEY_A\":{\"value\":\"shared-secret-1\",\"hosts\":[\"a.example.com\"]},"
+                + "\"KEY_B\":{\"value\":\"shared-secret-1\",\"hosts\":[\"b.example.com\"]}}");
+        assertThat(p.errors()).singleElement().satisfies(e -> assertThat(e).contains("key KEY_A 和 key KEY_B 的值相同"));
+    }
+
+    @Test
+    @DisplayName("★ R20：paths 里写了 /v1/orders/{id}（OkHttp 会把 { } 编码掉，永远匹配不上）：报错点名这一条、教作者写成 *；这条路径里万一带着 key 的值，回显之前先抹")
+    void aBracePathIsReportedAndEchoedScrubbed() {
+        SkillSecretsFile.Parsed p = parse("{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"],"
+                + "\"paths\":[\"/v1/orders/{id}\",\"/hook/{" + TOKEN + "}\",\"/v1/a%7Bb\"]}}");
+        assertThat(p.valid()).isFalse();
+        assertThat(p.errors()).hasSize(2);   // 合法的转义 %7B 那一条没有问题
+        String all = String.join("\n", p.errors());
+        assertThat(all).contains("「/v1/orders/{id}」不合法").contains("路径参数（比如 {id}）请写成 *").contains("永远匹配不上");
+        assertThat(all).doesNotContain(TOKEN).doesNotContain(TOKEN.substring(0, 12)).contains("「/hook/{{{CRM_TOKEN}}}」");
+    }
 }

@@ -158,11 +158,11 @@ class SkillPackageProcessorTest {
 
             @Override
             public Map<String, String> values(Collection<String> wanted) {
-                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "无法核对沿用的 key：平台没有配置加密密钥");
+                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "无法核对上一版的 key：平台没有配置加密密钥");
             }
         };
         assertThatThrownBy(() -> SkillPackageProcessor.process(reuseSkill("正文\n"), SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对沿用的 key");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
     }
 
     @Test
@@ -257,5 +257,180 @@ class SkillPackageProcessorTest {
         ok.put("secrets.json.example", b("{}"));
         assertThat(SkillPackageProcessor.process(ok, SkillManifestParser.Mode.STRICT, true).files())
                 .containsKeys("references/Secrets.json", "secrets.json.example");
+    }
+    // ---------------------------------------------------------------- 第 2 轮：上一版的值全部解密，所有出口都用
+
+    private static final String OLD = "693a91f6-7a2b-4c1d-9e8f-0123456789ab";   // 上一版 WECOM_HOOK 的值
+
+    /** 上一版有 CRM_TOKEN（值是 TOKEN）和 WECOM_HOOK（值是 OLD）两个 key。 */
+    private static PreviousKeys previousHasTwo() {
+        return PreviousKeys.decrypted(Map.of("CRM_TOKEN", TOKEN, "WECOM_HOOK", OLD));
+    }
+
+    private static Map<String, byte[]> plainSkill() {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: 退款\n---\n正文\n"));
+        return files;
+    }
+
+    @Test
+    @DisplayName("★ 上一版的值最先全部解密：secrets.json 不在 / 不合规 / 这一条写没写 value 都不影响；解不出来就整次拒绝，哪怕别的都对")
+    void everyPreviousValueIsDecryptedFirst() {
+        int[] calls = {0};
+        PreviousKeys counting = new PreviousKeys() {
+            @Override
+            public Set<String> names() {
+                return Set.of("CRM_TOKEN");
+            }
+
+            @Override
+            public Map<String, String> values(Collection<String> wanted) {
+                calls[0]++;
+                return Map.of("CRM_TOKEN", TOKEN);
+            }
+        };
+        // 没有 secrets.json、也没有任何要沿用的条目：照样解密
+        SkillPackageProcessor.process(plainSkill(), SkillManifestParser.Mode.STRICT, true, counting);
+        assertThat(calls[0]).isEqualTo(1);
+
+        PreviousKeys cannotDecrypt = new PreviousKeys() {
+            @Override
+            public Set<String> names() {
+                return Set.of("CRM_TOKEN");
+            }
+
+            @Override
+            public Map<String, String> values(Collection<String> wanted) {
+                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "无法核对上一版的 key CRM_TOKEN：解密失败");
+            }
+        };
+        Map<String, byte[]> noSecretsFile = plainSkill();
+        assertThatThrownBy(() -> SkillPackageProcessor.process(noSecretsFile, SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
+        Map<String, byte[]> everyKeyHasANewValue = plainSkill();
+        everyKeyHasANewValue.put("secrets.json", b("{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(everyKeyHasANewValue, SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
+    }
+
+    @Test
+    @DisplayName("★ 探针 B：secrets.json 校验不过（paths 里带 ?key=<旧值>），回显的条目里的旧值照样被抹")
+    void anEchoedPathCarriesNoPreviousValueEvenWhenSecretsJsonIsInvalid() {
+        Map<String, byte[]> files = plainSkill();
+        files.put("secrets.json", b("{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],\"paths\":[\"/cgi-bin/webhook/send?key=" + OLD + "\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("{{WECOM_HOOK}}")
+                .hasMessageNotContaining(OLD).hasMessageNotContaining(OLD.substring(0, 12));
+    }
+
+    @Test
+    @DisplayName("★ 探针 C：secrets.json 另有一条错误，同时 description 里「key: <旧值>」触发 YAML 报错——旧值是已经从 secrets.json 里删掉的 key 的也一样，片段里连前半截都不能有")
+    void aYamlErrorCarriesNoPartOfAPreviousValueOfADroppedKey() {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: 通知时用 key: " + OLD + " 发消息\n---\n正文\n"));
+        files.put("secrets.json", b("{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"],\"methods\":[\"GTE\"]}}"));   // WECOM_HOOK 已经没了
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("GTE")
+                .hasMessageNotContaining(OLD).hasMessageNotContaining(OLD.substring(0, 10));
+        // secrets.json 合规、WECOM_HOOK 被删了，YAML 照样出错：这时报错来自 SKILL.md 的解析，旧值也不在里面
+        files.put("secrets.json", b("{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class)
+                .hasMessageNotContaining(OLD).hasMessageNotContaining(OLD.substring(0, 10));
+    }
+
+    @Test
+    @DisplayName("★ 残留：key 删了、旧值又出现在脚本里——拒绝，点名 key 和文件，不带值，告诉作者怎么改")
+    void thePreviousValueOfADroppedKeyInAScriptIsRejected() {
+        Map<String, byte[]> files = plainSkill();
+        files.put("scripts/call.py", b("TOKEN = '" + TOKEN + "'\n"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("scripts/call.py").hasMessageContaining("CRM_TOKEN")
+                .hasMessageContaining("上一版的值").hasMessageContaining("{{CRM_TOKEN}}").hasMessageContaining("删掉")
+                .hasMessageNotContaining(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ 残留：key 给了新值、旧值还留在脚本里——拒绝；新值照样被替换")
+    void aNewValueDoesNotExcuseTheOldOneStillInAScript() {
+        Map<String, byte[]> files = plainSkill();
+        files.put("scripts/call.py", b("OLD = '" + TOKEN + "'\nNEW = 'sk-live-NEW-9876543210'\n"));
+        files.put("secrets.json", b("{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("scripts/call.py").hasMessageContaining("CRM_TOKEN")
+                .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live-NEW");
+        // 旧值不在文件里了：放行，新值被替换
+        files.put("scripts/call.py", b("NEW = 'sk-live-NEW-9876543210'\n"));
+        SkillPackageProcessor.Output out = SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo());
+        assertThat(new String(out.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("NEW = '{{CRM_TOKEN}}'\n");
+    }
+
+    @Test
+    @DisplayName("残留：旧值出现在文件名里、二进制文件里、任何 key 的 paths / hosts 里——都拒绝，文案里的位置已抹值")
+    void thePreviousValueInANameInABinaryOrInADeclarationIsRejected() {
+        Map<String, byte[]> named = plainSkill();
+        named.put("scripts/" + TOKEN + ".py", b("print(1)"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(named, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("路径").hasMessageContaining("scripts/{{CRM_TOKEN}}.py")
+                .hasMessageNotContaining(TOKEN);
+
+        Map<String, byte[]> binary = plainSkill();
+        binary.put("assets/leak.bin", ("\0PNG" + TOKEN).getBytes(StandardCharsets.UTF_8));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(binary, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("assets/leak.bin").hasMessageContaining("上一版的值")
+                .hasMessageNotContaining(TOKEN);
+
+        Map<String, byte[]> inPaths = plainSkill();
+        inPaths.put("secrets.json", b("{\"HOOK_KEY\":{\"value\":\"another-secret-1\",\"hosts\":[\"hook.example.com\"],\"paths\":[\"/hook/" + TOKEN + "\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(inPaths, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("CRM_TOKEN 上一版的值").hasMessageContaining("HOOK_KEY").hasMessageContaining("paths")
+                .hasMessageNotContaining(TOKEN);
+
+        Map<String, byte[]> inHosts = plainSkill();
+        inHosts.put("secrets.json", b("{\"HOOK_KEY\":{\"value\":\"another-secret-1\",\"hosts\":[\"" + TOKEN.toLowerCase() + ".example.com\"]}}"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(inHosts, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("CRM_TOKEN 上一版的值").hasMessageContaining("hosts")
+                .hasMessageNotContaining(TOKEN.toLowerCase());
+    }
+
+    @Test
+    @DisplayName("不算残留：沿用的条目（旧值已按它换成占位符）；旧值同时也是这一版某个 key 的值（key 改了名、值没变，已按新 key 换掉）")
+    void replacedPreviousValuesAreNotResidue() {
+        Map<String, byte[]> reuse = plainSkill();
+        reuse.put("scripts/call.py", b("TOKEN = '" + TOKEN + "'\n"));
+        reuse.put("secrets.json", b("{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}"));
+        SkillPackageProcessor.Output kept = SkillPackageProcessor.process(reuse, SkillManifestParser.Mode.STRICT, true, previousHasTwo());
+        assertThat(new String(kept.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("TOKEN = '{{CRM_TOKEN}}'\n");
+
+        Map<String, byte[]> renamed = plainSkill();
+        renamed.put("scripts/call.py", b("TOKEN = '" + TOKEN + "'\n"));
+        renamed.put("secrets.json", b("{\"CRM_API_KEY\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}"));
+        SkillPackageProcessor.Output moved = SkillPackageProcessor.process(renamed, SkillManifestParser.Mode.STRICT, true, previousHasTwo());
+        assertThat(new String(moved.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("TOKEN = '{{CRM_API_KEY}}'\n");
+    }
+
+    // ---------------------------------------------------------------- 第 2 轮 C：值集合确定不了
+
+    @Test
+    @DisplayName("★ R22：值集合确定不了（写到一半 / key 超过 32 个 / 候选值超过 64 个 / 值超过 8192 个字符 / 文件超过 512 KB / 嵌套太深）："
+            + "发布只报 secrets.json 自己的那一句固定文案，不往下逐条校验、不回显条目，SKILL.md 的解析错误也不报")
+    void anUndeterminableSecretsJsonIsRejectedWithOnlyTheFixedSentence() {
+        String marker = "MARKER-do-not-echo";
+        for (Map.Entry<String, String> broken : SecretsJsonFixtures.undeterminable(TOKEN, marker).entrySet()) {
+            Map<String, byte[]> files = new LinkedHashMap<>();
+            files.put("SKILL.md", b("---\nname: refund-flow\ndescription: a: " + "字".repeat(20) + TOKEN + " 调接口\n---\n正文\n"));
+            files.put("scripts/call.py", b("TOKEN = '" + TOKEN + "'\n"));
+            files.put("secrets.json", b(broken.getValue()));
+
+            assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previousHasTwo()))
+                    .as(broken.getKey())
+                    .isInstanceOf(ServiceException.class)
+                    .satisfies(e -> {
+                        String m = e.getMessage();
+                        assertThat(m).startsWith("secrets.json 不符合规则：");
+                        assertThat(m.substring("secrets.json 不符合规则：".length())).doesNotContain("；");   // 就一句
+                        assertThat(m).doesNotContain(marker).doesNotContain(TOKEN).doesNotContain(OLD).doesNotContain("YAML").doesNotContain("SKILL.md");
+                    });
+        }
     }
 }
