@@ -65,6 +65,7 @@ public class SkillBuilderSessionService {
     static final String UNREADABLE_DRAFT_BODY = "（草稿里的 secrets.json 读不出来或超出限制，修好后再同步）";
     static final String TOO_LARGE_DRAFT_BODY = "（草稿里的 SKILL.md 太大了，改小后再同步）";
     static final String OVERLAPPING_VALUES_DRAFT_BODY = "（草稿的 SKILL.md 里有 key 的值叠在了一起、没能整段换成占位符，分开写之后再同步）";
+    static final String DECODED_VALUE_DRAFT_BODY = "（草稿的 SKILL.md 解析出来含有 key 的值（多半是用转义或续行拼出来的），改成 {{名字}} 之后再同步）";
 
     private final SkillBuilderSessionMapper sessionMapper;
     private final AiSkillMapper aiSkillMapper;
@@ -168,7 +169,8 @@ public class SkillBuilderSessionService {
                         SkillSecretsFile.valueLessJson(keys).getBytes(StandardCharsets.UTF_8), "application/json");
             }
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "把 skill 放进构建器工作区失败: " + e.getMessage());
+            // 只记异常类名：存储异常的 message 带着对象名（文件名里可能有 key 的值），ServiceException 构造时就进 ERROR 日志
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "把 skill 放进构建器工作区失败（" + e.getClass().getSimpleName() + "）");
         }
     }
 
@@ -324,7 +326,7 @@ public class SkillBuilderSessionService {
         try {
             json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(feedback);
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "反馈无法序列化: " + e.getMessage());
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "反馈无法序列化（" + e.getClass().getSimpleName() + "）");
         }
         if (json.length > FEEDBACK_MAX_BYTES) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "反馈太长（超过 1MB）");
@@ -332,7 +334,8 @@ public class SkillBuilderSessionService {
         try {
             storage.putObject(s.getWorkspacePrefix() + SkillWorkspaceLayout.feedbackPath(dir, iteration), json, "application/json");
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存反馈失败: " + e.getMessage());
+            // 只记异常类名：存储异常的 message 带着对象名，路径里有 skill 目录名
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存反馈失败（" + e.getClass().getSimpleName() + "）");
         }
     }
 
@@ -393,14 +396,18 @@ public class SkillBuilderSessionService {
      *   <li>secrets.json 存在、却读不出来或确定不了值集合（不是合法 JSON、太大、key 或候选值太多、有值太长……）：不知道哪些是值，没法抹；</li>
      *   <li>SKILL.md 超过预览上限：不读、不解析、不抹值（运行时整份 SKILL.md 都进模型上下文，这个大小本来就用不了）；</li>
      *   <li>SKILL.md 里有已知的值没被整段换成占位符（几个值首尾相接、互相包含了一部分：被抢掉的那个会剩下一截原文，比如 {@code {{KEY_A}}-yyyy}）——
-     *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#skillMdPartlyReplaced}）。预览和 draft-update 只给属主看，不加这道核对（R21 / R22）。</li>
+     *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#skillMdPartlyReplaced}）；</li>
+     *   <li>解析出来的 name / description / 正文 / metadata.jm 里有已知的值（R33：YAML 的转义、续行拼出来的，原文里没有、替换不掉）——
+     *       和发布时同一道核对（{@link SkillWorkspaceReader.Draft#parsedFieldsCarryValues}）。</li>
      * </ul>
+     * 后两条只管 DRAFT 行：预览和 draft-update 只给属主看，不加这两道核对（R21 / R22）。
      */
     private void upsertDraftRow(SkillBuilderSession s, SkillWorkspaceReader.Draft read) {
         DraftView draft = read.view();
         String withheldBody = draft.isSecretsUnreadable() ? UNREADABLE_DRAFT_BODY
                 : draft.isSkillMdTooLarge() ? TOO_LARGE_DRAFT_BODY
                 : read.skillMdPartlyReplaced() ? OVERLAPPING_VALUES_DRAFT_BODY
+                : read.parsedFieldsCarryValues() ? DECODED_VALUE_DRAFT_BODY
                 : null;
         boolean withheld = withheldBody != null;
         String name = withheld || StrUtil.isBlank(draft.getName()) ? UNREADABLE_DRAFT_NAME : StrUtil.maxLength(draft.getName(), 61);

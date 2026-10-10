@@ -320,6 +320,34 @@ class SkillBuilderSessionServiceDraftSyncTest {
         assertThat(updated).singleElement().satisfies(row -> assertThat(row.body()).isEqualTo("先带 {{KEY_A}}，再带 {{KEY_B}}\n"));
     }
 
+    // ---------------------------------------------------------------- 第 4 轮（续）A（R33）：DRAFT 行同步前，解析之后再核对一遍
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）R33：description 用 YAML 的 \\x43 拼出了 key 的值（原文里没有，替换不掉，解码之后就是它）——DRAFT 行同步前在解析之后再核对一遍："
+            + "不同步，第一次同步建占位的一行，库里收不到这个值；已有的行保留上一次")
+    void aValueRebuiltByDecodingNeverReachesTheDraftRow() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: \"key sk-live-\\x43RM-0123456789\"\n---\n正文\n");
+        files.put("secrets.json", WITH_VALUE);
+        workspace(files, null);
+
+        svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.description()).isNull();
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.DECODED_VALUE_DRAFT_BODY);
+        });
+        assertThat(inserted.toString()).doesNotContain(TOKEN).doesNotContain("sk-live");
+
+        AiSkill existing = draftRow();
+        workspace(files, existing);
+        svc.syncAfterRun(1L, true);
+        verify(aiSkillMapper, never()).updateById(any(AiSkill.class));
+        assertThat(existing.getDescription()).isNull();
+        assertThat(existing.getBody()).isEqualTo("上一次同步的正文");
+    }
+
     @Test
     @DisplayName("★ 第 3 轮：key 的名字就是它自己的值——占位符 {{名字}} 会把值打出来，所以同样按读不出来处理：第一次同步建占位的一行，推给前端的事件里没有值、没有 skill 文件的原文")
     void aKeyNameThatIsItsOwnValueIsTreatedLikeAnUnreadableFile() throws Exception {

@@ -8,10 +8,8 @@ import com.jimeng.dataserver.ai.skill.imports.GithubTarballFetcher;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundle;
 import com.jimeng.dataserver.ai.skill.imports.SkillBundleExtractor;
 import com.jimeng.dataserver.ai.skill.imports.SkillClassifier;
-import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
-import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import com.jimeng.persistence.entity.AiSkill;
@@ -65,7 +63,7 @@ public class SkillImportService {
         s.setOriginRef(owner + "/" + repo + "@" + ref + ":" + (subPath == null ? "" : subPath));
         s.setStatus(SkillConst.STATUS_ACTIVE);
         s.setVersion(1);
-        s.setManifest(SkillManifest.of(out.skill().jm(), SkillSecretsFile.decls(out.secrets())).toJson());
+        s.setManifest(out.manifestJson());
         aiSkillMapper.insert(s);
 
         if (SkillConst.TYPE_DOER.equals(type)) {
@@ -88,7 +86,8 @@ public class SkillImportService {
                 minio.putObject(prefix + e.getKey(), e.getValue(), "application/octet-stream");
             }
         } catch (Exception ex) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "存储 skill bundle 失败: " + ex.getMessage());
+            // 只记异常类名：存储异常的 message 带着对象名，ServiceException 构造时就进 ERROR 日志、也回给调用方
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "存储 skill bundle 失败（" + ex.getClass().getSimpleName() + "）");
         }
     }
 

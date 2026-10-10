@@ -11,7 +11,6 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.PublishResult;
 import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
-import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
 import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
@@ -150,7 +149,7 @@ public class SkillBuilderPublishService {
         String bundlePrefix = "skills/" + row.getId() + "/" + version + "/";
         String hash = writeBundle(bundlePrefix, out.files());
         // 解析结果存库，运行时只读它（设计文档 §3.6）；key 只记名字和发送范围，不含值。
-        String manifestJson = SkillManifest.of(out.skill().jm(), SkillSecretsFile.decls(out.secrets())).toJson();
+        String manifestJson = out.manifestJson();
 
         row.setName(out.skill().name());
         row.setDescription(out.skill().description());
@@ -337,7 +336,8 @@ public class SkillBuilderPublishService {
             }
             return HexFormat.of().formatHex(md.digest());
         } catch (Exception e) {
-            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存 skill 文件失败: " + e.getMessage());
+            // 只记异常类名：存储异常的 message 带着对象名，ServiceException 构造时就进 ERROR 日志、也回给调用方
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR, "保存 skill 文件失败（" + e.getClass().getSimpleName() + "）");
         }
     }
 

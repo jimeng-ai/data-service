@@ -150,6 +150,22 @@ class SkillBuilderSessionServiceReviewTest {
     }
 
     @Test
+    @DisplayName("★ 第 4 轮（续）B：保存评审页的反馈失败——异常文案和日志里只有异常类名，没有存储异常的 message（它会带着对象名）")
+    void aFailedFeedbackSaveCarriesNoStorageMessage() throws Exception {
+        String fake = "sk-live-FAKE-0123456789";
+        workspace(new LinkedHashMap<>(Map.of(REVIEW, "<html>评审</html>")), Map.of());
+        org.mockito.Mockito.doThrow(new IOException("put failed: resource=/skills-bucket/" + WS + FEEDBACK + " near " + fake))
+                .when(storage).putObject(eq(WS + FEEDBACK), org.mockito.ArgumentMatchers.any(byte[].class), anyString());
+
+        try (LogCapture logs = LogCapture.everything()) {
+            assertThatThrownBy(() -> svc.saveFeedback(1L, 1, Map.of("reviews", List.of())))
+                    .isInstanceOf(ServiceException.class).hasMessageContaining("保存反馈失败").hasMessageContaining("IOException")
+                    .hasMessageNotContaining(fake).hasMessageNotContaining("put failed");
+            assertThat(logs.all()).noneMatch(m -> m.contains(fake));
+        }
+    }
+
+    @Test
     @DisplayName("feedback.json 解析失败：照旧跳过反馈，WARN 只记异常类名——不记 Jackson 的出错信息（它带着文件开头最多 500 个字节的原文）")
     void anUnparsableFeedbackIsLoggedWithoutItsContent() throws Exception {
         Map<String, String> files = new LinkedHashMap<>();

@@ -11,7 +11,9 @@ import com.jimeng.dataserver.ai.skill.builder.SkillBuilderDtos.ReviewMeta;
 import com.jimeng.dataserver.ai.skill.manifest.ParsedSkill;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifestParser;
+import com.jimeng.dataserver.ai.skill.manifest.SkillPackageProcessor;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.util.SkillBundleRules;
 import lombok.RequiredArgsConstructor;
@@ -132,12 +134,16 @@ public class SkillWorkspaceReader {
      * @param skillMdPartlyReplaced SKILL.md 里有已知的值没被整段换成占位符（几个值在文本里首尾相接、互相包含了一部分，被抢掉的那个会剩下一截原文）。
      *                           和发布处理器同一道核对（{@link SecretValues.Replacement#notFullyReplaced}，在原文上判）；为 true 时 DRAFT 行不同步——
      *                           DRAFT 行在库里，还能被设成全团队可见。没读、没解析 SKILL.md 时为 false
+     * @param parsedFieldsCarryValues 解析出来的 name / description / 正文 / metadata.jm 里有已知的值（R33：转义、续行拼出来的，原文里没有、
+     *                           替换不掉）。和发布处理器同一道核对（{@link SkillPackageProcessor#valuesInParsedFields}）；为 true 时 DRAFT 行不同步。
+     *                           没读、没解析 SKILL.md 时为 false
      */
-    public record Draft(DraftView view, SecretValues known, boolean skillMdPartlyReplaced) {
+    public record Draft(DraftView view, SecretValues known, boolean skillMdPartlyReplaced, boolean parsedFieldsCarryValues) {
         /** 不打出 view（Lombok 的 toString 会带上 SKILL.md 全文）；SecretValues.toString 只列名字。 */
         @Override
         public String toString() {
-            return "Draft[known=" + known + ", skillMdPartlyReplaced=" + skillMdPartlyReplaced + "]";
+            return "Draft[known=" + known + ", skillMdPartlyReplaced=" + skillMdPartlyReplaced
+                    + ", parsedFieldsCarryValues=" + parsedFieldsCarryValues + "]";
         }
     }
 
@@ -226,6 +232,7 @@ public class SkillWorkspaceReader {
         String skillMd = "";
         ParsedSkill fm = null;
         boolean partlyReplaced = false;
+        boolean decodedValues = false;
         if (skillMdTooLarge) {
             errors.add(skillMdTooLargeMessage(limit));
         } else if (unreadable) {
@@ -238,6 +245,9 @@ public class SkillWorkspaceReader {
             // 预览、draft-update、校验结果不因它改变（只给会话属主看，R21 / R22），发布时处理器会拒绝
             partlyReplaced = !replaced.notFullyReplaced(known).isEmpty();
             fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
+            // R33：解析之后再核对一遍（同发布处理器那一道）：转义、续行拼出来的值只在解析之后才出现。同样只决定 DRAFT 行同不同步。
+            // DRAFT 行不存 manifest、key 的声明读 secrets.json 时已经查过，所以这里的 manifest 只带 metadata.jm
+            decodedValues = !SkillPackageProcessor.valuesInParsedFields(fm, SkillManifest.of(fm.jm(), List.of()).toJson(), known).isEmpty();
             fm.errors().forEach(e -> errors.add(known.replace(e)));
             // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
             List<String> nested = files.keySet().stream()
@@ -299,7 +309,7 @@ public class SkillWorkspaceReader {
             out.add(f);
         }
         v.setFiles(out);
-        return new Draft(v, unreadable ? null : known, partlyReplaced);
+        return new Draft(v, unreadable ? null : known, partlyReplaced, decodedValues);
     }
 
     /** 最新一轮评审页的元数据；没有评审页返回 null。 */

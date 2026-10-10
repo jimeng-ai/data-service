@@ -96,4 +96,53 @@ class SkillImportServiceSecretsTest {
         verify(minio, org.mockito.Mockito.never()).putObject(anyString(), any(), anyString());
         verify(secrets, org.mockito.Mockito.never()).save(any(), org.mockito.ArgumentMatchers.anyInt(), anyList());
     }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）B：GitHub 导入写 bundle 失败——异常文案和日志里只有异常类名，没有存储异常的 message（它会带着对象名）")
+    void aFailedBundleStoreCarriesNoStorageMessage() throws Exception {
+        String fake = "sk-live-FAKE-0123456789";
+        GithubTarballFetcher fetcher = mock(GithubTarballFetcher.class);
+        when(fetcher.fetch(any(), any(), any())).thenReturn(new byte[]{1});
+        SkillBundleExtractor extractor = mock(SkillBundleExtractor.class);
+        when(extractor.extract(any(), any())).thenReturn(new SkillBundle("---\nname: crm\ndescription: d\n---\n正文\n",
+                Map.of("scripts/run.py", "print(1)\n".getBytes(StandardCharsets.UTF_8))));   // 带脚本：DOER，要写 bundle
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        doAnswer(inv -> { ((AiSkill) inv.getArgument(0)).setId(99L); return 1; }).when(mapper).insert(any());
+        RagMinioStorageService minio = mock(RagMinioStorageService.class);
+        org.mockito.Mockito.doThrow(new java.io.IOException("put failed: resource=/skills-bucket/skills/99/1/SKILL.md near " + fake))
+                .when(minio).putObject(anyString(), any(), anyString());
+
+        try (com.jimeng.dataserver.ai.skill.LogCapture logs = com.jimeng.dataserver.ai.skill.LogCapture.everything()) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> new SkillImportService(fetcher, extractor, mapper,
+                            mock(AiSkillRegistryService.class), minio, mock(SkillSecretService.class)).importFromGithub("o", "r", "main", "crm", "t1", 7L))
+                    .isInstanceOf(ServiceException.class).hasMessageContaining("存储 skill bundle 失败").hasMessageContaining("IOException")
+                    .hasMessageNotContaining(fake).hasMessageNotContaining("put failed");
+            assertThat(logs.all()).noneMatch(m -> m.contains(fake));
+        }
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）R33：GitHub 导入（对话里的 skill_install 也走这里）同样在解析之后核对——description 用 YAML 的 \\x43 拼出 key 的值，"
+            + "原文里没有、替换不掉：导入失败，文案点名 description、不带值，什么都不存")
+    void importRejectsAValueRebuiltByAYamlEscape() throws Exception {
+        GithubTarballFetcher fetcher = mock(GithubTarballFetcher.class);
+        when(fetcher.fetch(any(), any(), any())).thenReturn(new byte[]{1});
+        SkillBundleExtractor extractor = mock(SkillBundleExtractor.class);
+        when(extractor.extract(any(), any())).thenReturn(new SkillBundle(
+                "---\nname: crm\ndescription: \"key sk-live-\\x43RM-0123456789\"\n---\n正文\n",
+                Map.of("secrets.json", ("{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}")
+                        .getBytes(StandardCharsets.UTF_8))));
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        RagMinioStorageService minio = mock(RagMinioStorageService.class);
+        SkillSecretService secrets = mock(SkillSecretService.class);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new SkillImportService(fetcher, extractor, mapper,
+                        mock(AiSkillRegistryService.class), minio, secrets).importFromGithub("o", "r", "main", "crm", "t1", 7L))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("description").hasMessageContaining("CRM_TOKEN")
+                .hasMessageNotContaining("sk-live").hasMessageNotContaining("0123456789");
+
+        verify(mapper, org.mockito.Mockito.never()).insert(any());
+        verify(minio, org.mockito.Mockito.never()).putObject(anyString(), any(), anyString());
+        verify(secrets, org.mockito.Mockito.never()).save(any(), org.mockito.ArgumentMatchers.anyInt(), anyList());
+    }
 }

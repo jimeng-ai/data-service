@@ -146,4 +146,24 @@ class SkillBuilderSessionServiceSeedTest {
         verify(storage, never()).copyObject(eq("skills/11/2/secrets.json"), anyString());
         verify(storage, never()).putObject(eq(DIR + "secrets.json"), any(byte[].class), anyString());
     }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）B：把已发布的 skill 放进工作区失败（复制对象出错）——异常文案和日志里只有异常类名，没有存储异常的 message（它会带着对象名）")
+    void aFailedSeedCarriesNoStorageMessage() throws Exception {
+        String fake = "sk-live-FAKE-0123456789";
+        AiSkill base = published(null);
+        base.setBundleKey("skills/11/2/");
+        base.setVersion(2);
+        when(storage.listObjects("skills/11/2/")).thenReturn(List.of("skills/11/2/SKILL.md"));
+        org.mockito.Mockito.doThrow(new java.io.IOException("copy failed: resource=/skills-bucket/skills/11/2/scripts/" + fake + ".py"))
+                .when(storage).copyObject(anyString(), anyString());
+
+        try (com.jimeng.dataserver.ai.skill.LogCapture logs = com.jimeng.dataserver.ai.skill.LogCapture.everything()) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> svc.seedFromPublished("ws/1/", base))
+                    .isInstanceOf(com.jimeng.common.core.exception.ServiceException.class)
+                    .hasMessageContaining("把 skill 放进构建器工作区失败").hasMessageContaining("IOException")
+                    .hasMessageNotContaining(fake).hasMessageNotContaining("copy failed");
+            assertThat(logs.all()).noneMatch(m -> m.contains(fake));
+        }
+    }
 }

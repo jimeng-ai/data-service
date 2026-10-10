@@ -145,7 +145,7 @@ class SkillBuilderPublishSecretsTest {
         draft.setEffectiveType("PROMPT");
         draft.setValidationErrors(List.of());
         draft.setIterations(1);
-        when(reader.readDraft(eq(listing), isNull(), any(PreviousKeys.class))).thenReturn(new SkillWorkspaceReader.Draft(draft, SecretValues.NONE, false));
+        when(reader.readDraft(eq(listing), isNull(), any(PreviousKeys.class))).thenReturn(new SkillWorkspaceReader.Draft(draft, SecretValues.NONE, false, false));
         TreeMap<String, ObjectInfo> objects = new TreeMap<>();
         files.forEach((k, v) -> objects.put(k, new ObjectInfo("ws/1/skill/refund-flow/" + k, v.length, new Date())));
         when(reader.skillFiles(listing, "refund-flow")).thenReturn(objects);
@@ -439,6 +439,24 @@ class SkillBuilderPublishSecretsTest {
         commit();
 
         verify(storage, never()).putObject(eq(WORKSPACE_SECRETS), any(byte[].class), anyString());
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）B：写 bundle 失败——异常文案和日志里只有异常类名，没有存储异常的 message（它会带着对象名）")
+    void aFailedBundleWriteCarriesNoStorageMessage() throws Exception {
+        String fake = "sk-live-FAKE-0123456789";
+        session();
+        workspaceWith(refundSkillWithKey());
+        newSkillGetsId42();
+        doThrow(new java.io.IOException("put failed: resource=/skills-bucket/skills/42/1/SKILL.md near " + fake))
+                .when(storage).putObject(eq("skills/42/1/SKILL.md"), any(byte[].class), anyString());
+
+        try (com.jimeng.dataserver.ai.skill.LogCapture logs = com.jimeng.dataserver.ai.skill.LogCapture.everything()) {
+            assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                    .hasMessageContaining("保存 skill 文件失败").hasMessageContaining("IOException")
+                    .hasMessageNotContaining(fake).hasMessageNotContaining("put failed");
+            assertThat(logs.all()).noneMatch(m -> m.contains(fake));
+        }
     }
 
     @Test

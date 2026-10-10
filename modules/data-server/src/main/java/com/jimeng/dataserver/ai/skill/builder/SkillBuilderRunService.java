@@ -211,7 +211,8 @@ public class SkillBuilderRunService {
                 DraftUpdateEvent ev = sessions.syncAfterRun(sessionId, persisted);
                 tee.teeJson(runId, "draft-update", ev);
             } catch (Exception e) {
-                log.warn("构建器同步草稿失败 runId={} err={}", runId, e.getMessage());
+                // 只记异常类名：同步草稿会读工作区，出错时异常的 message 可能带着文件名（文件名里可能有 key 的值）
+                log.warn("构建器同步草稿失败 runId={} cause={}", runId, e.getClass().getSimpleName());
             }
             recordUsage(sessionId, runId, summaryHolder[0], streamError[0], model, System.currentTimeMillis() - startMs);
             runFinalizer.complete(runId);

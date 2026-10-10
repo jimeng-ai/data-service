@@ -521,6 +521,25 @@ class SkillBuilderImproveSecretsTest {
         }
     }
 
+    @Test
+    @DisplayName("★ 第 4 轮（续）R33：构建器发布同样在解析之后核对——description 用 YAML 的 \\x4e 拼出这一版 key 的值（原文里没有、替换不掉）："
+            + "草稿校验不拦（只给属主看，R21 / R22），处理器拒绝，文案点名 description、不带值；什么都不写，哪一行日志都没有这个值")
+    void aValueRebuiltByAYamlEscapeIsRejectedThroughTheRealFlow() throws Exception {
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", "---\nname: refund-flow\ndescription: \"key sk-live-\\x4eEW-9876543210\"\n---\n带上 {{CRM_TOKEN}} 调接口\n");
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, previousRow(null, null));
+        SkillBuilderPublishService svc = serviceWith(cipher);
+
+        try (LogCapture logs = LogCapture.everything()) {
+            assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                    .hasMessageContaining("description").hasMessageContaining("{{CRM_TOKEN}}")
+                    .hasMessageNotContaining("sk-live").hasMessageNotContaining("9876543210");
+            assertThat(logs.all()).noneMatch(m -> m.contains("sk-live-NEW") || m.contains("9876543210"));
+        }
+        nothingWasWritten();
+    }
+
     // ---------------------------------------------------------------- 第 4 轮 1：发布时读文件失败、读文件超额
 
     /**

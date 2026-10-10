@@ -634,4 +634,65 @@ class SkillPackageProcessorTest {
         ServiceException e = publishing(skillWith("print(1)\n", "{\"NEW_KEY\":{\"value\":\"CRM_TOKEN_PROD\",\"hosts\":[\"a.example.com\"]}}"), previous);
         assertThat(e.getMessage()).contains("名字").doesNotContain("CRM_TOKEN_PROD");
     }
+
+    // ---------------------------------------------------------------- 第 4 轮（续）A（R33）：解析之后再核对一遍
+
+    private static final String CRM_SECRETS = "{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}";
+
+    private static Map<String, byte[]> skillMdWith(String skillMd, String secretsJson) {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put("SKILL.md", b(skillMd));
+        files.put("secrets.json", b(secretsJson));
+        return files;
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）R33：先替换、再解析只管得住原文。description 里用 YAML 双引号的 \\x43、或者 \\ 续行把 key 拼出来——原文里没有这个值、"
+            + "替换不掉，解码之后 description 就是它：解析之后再核对一遍，拒绝；文案点名字段和 key，不带值，教作者写 {{名字}}")
+    void aValueRebuiltInTheDescriptionIsRejectedAfterParsing() {
+        String escaped = "---\nname: refund-flow\ndescription: \"key sk-live-\\x43RM-0123456789\"\n---\n正文\n";
+        String continued = "---\nname: refund-flow\ndescription: \"key sk-live-CRM-\\\n  0123456789\"\n---\n正文\n";
+        for (String md : new String[]{escaped, continued}) {
+            assertThat(md).doesNotContain(TOKEN);   // 原文里确实没有
+            ServiceException e = publishing(skillMdWith(md, CRM_SECRETS), PreviousKeys.NONE);
+            assertThat(e.getMessage()).as(md).contains("description").contains("CRM_TOKEN").contains("{{CRM_TOKEN}}").contains("转义")
+                    .doesNotContain(TOKEN).doesNotContain("sk-live").doesNotContain("0123456789");
+        }
+    }
+
+    @Test
+    @DisplayName("★ 第 4 轮（续）R33：拼进 metadata.jm.hosts——域名会被归一成小写再存进 manifest（sk-live-crm-…），manifest 里的域名按小写比，同样拒绝")
+    void aValueRebuiltInTheDeclaredHostsIsRejectedAfterParsing() {
+        String md = "---\nname: refund-flow\ndescription: 退款\nmetadata:\n  jm:\n    hosts: [\"sk-live-\\x43RM-0123456789.example.com\"]\n---\n正文\n";
+        ServiceException e = publishing(skillMdWith(md, CRM_SECRETS), PreviousKeys.NONE);
+        assertThat(e.getMessage()).contains("metadata.jm").contains("CRM_TOKEN").doesNotContain("sk-live").doesNotContain("0123456789");
+    }
+
+    @Test
+    @DisplayName("第 4 轮（续）R33：拼进 name（值本身是小写、符合 name 的写法时）、拼出上一版的值，同样拒绝")
+    void aValueRebuiltInTheNameOrFromThePreviousVersionIsRejected() {
+        String lowerSecrets = "{\"LOWER_KEY\":{\"value\":\"sk-live-crm-0123456789\",\"hosts\":[\"api.customer.com\"]}}";
+        String name = "---\nname: \"sk-live-\\x63rm-0123456789\"\ndescription: 退款\n---\n正文\n";
+        assertThat(publishing(skillMdWith(name, lowerSecrets), PreviousKeys.NONE).getMessage())
+                .contains("name").contains("LOWER_KEY").doesNotContain("sk-live").doesNotContain("0123456789");
+
+        Map<String, byte[]> previousOnly = new LinkedHashMap<>();   // 上一版的 WECOM_HOOK（OLD），这一版删了；description 用 \x33（3）拼出它
+        String previousMd = "---\nname: refund-flow\ndescription: \"hook 69\\x33a91f6-7a2b-4c1d-9e8f-0123456789ab\"\n---\n正文\n";
+        assertThat(previousMd).doesNotContain(OLD);   // 原文里确实没有（不然原文上的残留检查先拦下了）
+        previousOnly.put("SKILL.md", b(previousMd));
+        assertThat(publishing(previousOnly, PreviousKeys.decrypted(Map.of("WECOM_HOOK", OLD))).getMessage())
+                .contains("description").contains("WECOM_HOOK").doesNotContain(OLD).doesNotContain("0123456789ab");
+    }
+
+    @Test
+    @DisplayName("第 4 轮（续）R33：正常的 SKILL.md 不误报——用 {{名字}}、转义拼出来的不是值、域名正常，照常发布；manifest 的 JSON 就是存进库的那一份")
+    void anOrdinarySkillMdIsNotAFalsePositive() {
+        String md = "---\nname: refund-flow\ndescription: \"\\x41BC 用 {{CRM_TOKEN}} 调接口\"\nmetadata:\n  jm:\n    hosts: [api.customer.com]\n---\n"
+                + "带上 {{CRM_TOKEN}} 调接口\n";
+        SkillPackageProcessor.Output out = SkillPackageProcessor.process(skillMdWith(md, CRM_SECRETS), SkillManifestParser.Mode.STRICT, true);
+        assertThat(out.skill().description()).isEqualTo("ABC 用 {{CRM_TOKEN}} 调接口");
+        assertThat(out.manifestJson()).isEqualTo(SkillManifest.of(out.skill().jm(), SkillSecretsFile.decls(out.secrets())).toJson());
+        assertThat(SkillManifest.fromJson(out.manifestJson()).hosts()).containsExactly("api.customer.com");
+        assertThat(SkillManifest.fromJson(out.manifestJson()).keys()).extracting(SkillManifest.KeyDecl::name).containsExactly("CRM_TOKEN");
+    }
 }
