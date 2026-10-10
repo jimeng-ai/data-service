@@ -5,6 +5,7 @@ import com.jimeng.dataserver.ai.chat.service.ChatConversationService;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService;
 import com.jimeng.dataserver.ai.rag.service.storage.RagMinioStorageService.ObjectInfo;
+import com.jimeng.dataserver.ai.skill.LogCapture;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
 import com.jimeng.dataserver.ai.skill.service.AiSkillRegistryService;
@@ -35,6 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -127,7 +129,7 @@ class SkillBuilderImproveSecretsTest {
         for (Map.Entry<String, String> e : workspaceFiles.entrySet()) {
             String name = "ws/1/skill/refund-flow/" + e.getKey();
             infos.add(new ObjectInfo(name, b(e.getValue()).length, new Date()));
-            when(storage.readBytes(name)).thenReturn(b(e.getValue()));
+            StorageStubs.object(storage, name, b(e.getValue()));
         }
         when(storage.listObjectInfos("ws/1/")).thenReturn(infos);
 
@@ -207,7 +209,7 @@ class SkillBuilderImproveSecretsTest {
 
         SkillBuilderPublishService noCipher = serviceWith(new CredentialCipher());
         assertThatThrownBy(() -> noCipher.publish(1L)).isInstanceOf(ServiceException.class)
-                .hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+                .hasMessageContaining("加密密钥没有配置").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
 
         verify(storage, never()).putObject(anyString(), any(byte[].class), anyString());
         verify(storage, never()).deletePrefix(anyString());
@@ -351,7 +353,112 @@ class SkillBuilderImproveSecretsTest {
         improvementSession(workspace, previousRow(null, null));
 
         assertThatThrownBy(() -> serviceWith(new CredentialCipher()).publish(1L)).isInstanceOf(ServiceException.class)
-                .hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+                .hasMessageContaining("加密密钥没有配置").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
         nothingWasWritten();
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮：残留按原文判、名字里不能有值、解不开的 key 不卡死
+
+    private static final String AWS_ID = "AKIAIOSFODNN7EXAMPLE";
+    private static final String AWS_COMBINED = AWS_ID + ":wJalrXUtnFEMIK7MDENG";
+
+    private static CredentialCipher cipherWithKey(byte fill) {
+        CredentialCipher c = new CredentialCipher();
+        byte[] key = new byte[32];
+        java.util.Arrays.fill(key, fill);
+        ReflectionTestUtils.setField(c, "keyBase64", Base64.getEncoder().encodeToString(key));
+        ReflectionTestUtils.invokeMethod(c, "init");
+        return c;
+    }
+
+    @Test
+    @DisplayName("★ 复审探针 R1（真实流程）：上一版 AWS_CRED 是「id:secret」，这一版只留了 AK_ID（前一半），脚本里还是整串旧值——拒绝，什么都不写，文案里没有 secret 那一半")
+    void aCurrentKeyCoveringHalfOfAnOldValueIsRejectedThroughTheRealFlow() throws Exception {
+        SkillSecret awsCred = previousRowOf("AWS_CRED", AWS_COMBINED, "[\"s3.amazonaws.com\"]", null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("scripts/call.py", "CRED = '" + AWS_COMBINED + "'\n");
+        workspace.put("secrets.json", "{\"AK_ID\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}");
+        improvementSession(workspace, awsCred);
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("scripts/call.py").hasMessageContaining("AWS_CRED").hasMessageContaining("上一版的值")
+                .hasMessageNotContaining("wJalrXUtnFEMIK7MDENG").hasMessageNotContaining(AWS_ID);
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ 复审探针 R4（真实流程）：上一版的值（AWS access key id）写成了不带 value 的 key 名——以前处理器放行、到 SkillSecretService.prepare 才抛「key <值> 没有给值」"
+            + "（没抹值，进 ERROR 日志）；现在在读 secrets.json 的时候就拒绝，文案只说第几个 key 的名字")
+    void aPreviousValueWrittenAsAValueLessKeyNameIsRejectedBeforeAnythingPrintsIt() throws Exception {
+        SkillSecret awsKeyId = previousRowOf("AWS_KEY_ID", AWS_ID, "[\"s3.amazonaws.com\"]", null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        workspace.put("secrets.json", "{\"" + AWS_ID + "\":{\"hosts\":[\"s3.amazonaws.com\"]}}");
+        improvementSession(workspace, awsKeyId);
+
+        assertThatThrownBy(() -> serviceWith(cipher).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("第 1 个 key 的名字").hasMessageNotContaining(AWS_ID).hasMessageNotContaining("AKIA");
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("★ R27：配了密钥、但上一版某个 key 的密文解不开（密钥换过），这一版给了新值——照常发布，新值用现在的密钥加密；WARN 只带 skill id 和 key 名")
+    void anUndecryptableKeyWithANewValueStillPublishes() throws Exception {
+        SkillSecret row = previousRow(null, null);                     // 用 zeros 密钥加密的
+        CredentialCipher rotated = cipherWithKey((byte) 1);            // 现在配的是另一把
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("scripts/call.py", "TOKEN = 'sk-live-NEW-9876543210'\n");
+        workspace.put("secrets.json", "{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}");
+        improvementSession(workspace, row);
+
+        try (LogCapture logs = LogCapture.of(SkillSecretService.class)) {
+            serviceWith(rotated).publish(1L);
+
+            assertThat(logs.warnings()).singleElement().satisfies(m -> assertThat(m).contains("CRM_TOKEN").contains("5")
+                    .doesNotContain(TOKEN).doesNotContain("sk-live").doesNotContain(row.getCiphertext()));
+            assertThat(String.join("\n", logs.all())).doesNotContain("sk-live").doesNotContain(row.getCiphertext());
+        }
+        ArgumentCaptor<SkillSecret> saved = ArgumentCaptor.forClass(SkillSecret.class);
+        verify(secretMapper).insert(saved.capture());
+        assertThat(rotated.decrypt(saved.getValue().getCiphertext(), saved.getValue().getCipherVersion())).isEqualTo("sk-live-NEW-9876543210");
+        assertThat(saved.getValue().getVersion()).isEqualTo(4);
+        ArgumentCaptor<String> names = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<byte[]> bodies = ArgumentCaptor.forClass(byte[].class);
+        verify(storage, atLeastOnce()).putObject(names.capture(), bodies.capture(), anyString());
+        for (int i = 0; i < names.getAllValues().size(); i++) {
+            assertThat(new String(bodies.getAllValues().get(i), StandardCharsets.UTF_8)).as(names.getAllValues().get(i)).doesNotContain("sk-live-NEW");
+        }
+    }
+
+    @Test
+    @DisplayName("★ R27：同样解不开，这一版没写 value（种子原样）——拒绝，说清楚是解不开、没法沿用，要么重新写 value 要么去掉；什么都不写")
+    void anUndecryptableKeyWithoutAValueIsRejectedWithAWayOut() throws Exception {
+        SkillSecret row = previousRow(null, null);
+        when(secretMapper.selectList(any())).thenReturn(List.of(row));
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", MD_USING_THE_KEY);
+        workspace.put("secrets.json", seedFile());
+        improvementSession(workspace, row);
+
+        assertThatThrownBy(() -> serviceWith(cipherWithKey((byte) 1)).publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageContaining("key CRM_TOKEN 上一版的值解不开").hasMessageContaining("没法沿用")
+                .hasMessageContaining("重新写 value").hasMessageContaining("去掉 CRM_TOKEN");
+        nothingWasWritten();
+    }
+
+    @Test
+    @DisplayName("R27：解不开的 key 被去掉（文件里也不再用它）——照常发布，新版本里没有这个 key")
+    void anUndecryptableKeyThatIsDroppedIsJustGone() throws Exception {
+        SkillSecret row = previousRow(null, null);
+        Map<String, String> workspace = new LinkedHashMap<>();
+        workspace.put("SKILL.md", PLAIN_MD);
+        improvementSession(workspace, row);
+
+        serviceWith(cipherWithKey((byte) 1)).publish(1L);
+
+        verify(secretMapper, never()).insert(any(SkillSecret.class));
+        verify(storage, atLeastOnce()).putObject(eq("skills/5/4/SKILL.md"), any(byte[].class), anyString());
     }
 }

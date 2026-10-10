@@ -86,10 +86,13 @@ public class SkillBuilderPublishService {
                     + " MB，超过了发布的上限 " + megabytes(props.getPublishMaxBytes()) + " MB：把大文件拿掉，或者拆成几个 skill");
         }
         // 改进已有 skill：上一版所有 key 的值，最先解密出来（不看 secrets.json 在不在、合不合规、这一条写没写 value）——
-        // 所有报错文案的抹值、沿用条目的替换、残留检查都要用它们。解不出来（没配密钥、密文坏了）整次发布拒绝，文案只带 key 名，
-        // 不会跳过核对。解一次，草稿读取和发布处理器共用同一份。
-        PreviousKeys previous = session.getBaseSkillId() == null ? PreviousKeys.NONE
-                : PreviousKeys.decrypted(secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion()).allValues());
+        // 所有报错文案的抹值、沿用条目的替换、残留检查都要用它们。没配加密密钥整次发布拒绝，不会跳过核对；配了密钥、但某个 key
+        // 的密文解不开（R27）只有这个 key 不能沿用，由处理器按 key 处理，不把整个 skill 卡死。解一次，草稿读取和发布处理器共用同一份。
+        PreviousKeys previous = PreviousKeys.NONE;
+        if (session.getBaseSkillId() != null) {
+            PreviousKeys.Opened opened = secretService.previousKeys(session.getBaseSkillId(), session.getBaseVersion()).open();
+            previous = PreviousKeys.decrypted(opened.values(), opened.undecryptable());
+        }
         DraftView draft = reader.draft(l, session.getSkillTypeOverride(), previous);
         if (draft == null) {
             throw new ServiceException(ExceptionCode.INVALID_REQUEST, "工作区里还没有 skill（/work/skill/<name>/SKILL.md）");

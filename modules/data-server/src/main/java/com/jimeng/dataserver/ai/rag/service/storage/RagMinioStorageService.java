@@ -163,6 +163,16 @@ public class RagMinioStorageService {
         }
     }
 
+    /**
+     * 最多读 {@code maxBytes + 1} 个字节（多读的这 1 个字节用来判断「超没超」：返回的长度大于 {@code maxBytes} 就是超了）。
+     * 列举时报的大小只是当时的快照，读之前对象可能被换大；这里读到上限就停，不会把一个被换大的对象整个读进内存。
+     */
+    public byte[] readBytesUpTo(String objectName, long maxBytes) throws Exception {
+        try (InputStream is = download(objectName)) {
+            return is.readNBytes((int) Math.min(maxBytes + 1, Integer.MAX_VALUE - 8L));
+        }
+    }
+
     /** 服务端复制（同 bucket），不经本进程中转字节。 */
     public void copyObject(String sourceObject, String targetObject) throws Exception {
         ensureReady();

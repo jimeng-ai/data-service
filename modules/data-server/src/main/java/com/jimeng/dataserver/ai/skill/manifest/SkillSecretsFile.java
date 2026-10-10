@@ -38,6 +38,9 @@ import java.util.regex.Pattern;
  * 超了不读）、JSON 读得出来且嵌套不超过 {@value #MAX_DEPTH} 层、最多 {@value #MAX_KEYS} 个 key、候选值最多 {@value #MAX_CANDIDATES} 个、
  * 每个候选值最多 {@value #MAX_VALUE_LENGTH} 个字符。任何一条不满足就按「读不出来」处理（{@link Parsed#readable()} 为 false）：只给一句固定的话，
  * 不回显任何条目、不往下逐条校验；调用方对外一律不给 skill 文件的原文（预览、事件、校验文本），不同步 DRAFT 行。
+ *
+ * <p><b>key 名里不能出现任何已知的值</b>（{@link #keyNameProblem}）：名字会进 manifest、{@code skill_secret.name}、日志和占位符，
+ * 值的形状符合名字规则时（AWS 的 access key id）能原样写成名字。查到了同样按「读不出来」处理，只给一句不带名字的话。
  */
 public final class SkillSecretsFile {
 
@@ -118,6 +121,10 @@ public final class SkillSecretsFile {
         List<String> errors = new ArrayList<>();
         List<Entry> entries = new ArrayList<>();
         SecretValues scrub = known.plus(alsoKnown);   // 回显用：文件里的值 + 上一版的值
+        // ★ 名字里有值：后面所有会打出 key 名、{{名字}} 的地方（逐条报错、占位符、日志）都会把值打出来，所以最先查，
+        // 查到了就只给一句不带名字的话，不往下逐条校验
+        String nameProblem = keyNameProblem(root, scrub, alsoKnown);
+        if (nameProblem != null) return unreadable(nameProblem);
         for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
             Map.Entry<String, JsonNode> f = it.next();
             Entry e = parseEntry(f.getKey(), f.getValue(), errors, scrub);
@@ -125,6 +132,35 @@ public final class SkillSecretsFile {
         }
         if (errors.isEmpty()) errors.addAll(crossCheck(entries, known));   // 格式都对了，再看值有没有跑进声明里、有没有两个 key 共用一个值
         return new Parsed(List.copyOf(entries), List.copyOf(errors), known, true);
+    }
+
+    /**
+     * key 的名字里含有任何已知的值（当前的 + 上一版的；区分大小写，子串）。值的形状正好符合 {@code [A-Z][A-Z0-9_]{0,63}} 时
+     * （比如 AWS 的 access key id）能原样写成 key 名，名字会进 manifest 的 key 声明、{@code skill_secret.name}、日志，
+     * 替换时的占位符 {@code {{名字}}} 也会把它打出来。文案<b>不回显名字</b>（名字本身就是值），只说「第 N 个 key 的名字」。
+     *
+     * @param alsoKnown 上一版的值：它们的名字（上一版 key 的名字）同样要查——名字会出现在残留检查的文案和占位符里
+     * @return 一句固定的话，没有问题就是 null
+     */
+    private static String keyNameProblem(JsonNode root, SecretValues scrub, SecretValues alsoKnown) {
+        List<Integer> positions = new ArrayList<>();
+        int n = 0;
+        for (Iterator<String> it = root.fieldNames(); it.hasNext(); ) {
+            n++;
+            if (!scrub.namesIn(it.next()).isEmpty()) positions.add(n);
+        }
+        boolean previous = alsoKnown.names().stream().anyMatch(name -> !scrub.namesIn(name).isEmpty());
+        if (positions.isEmpty() && !previous) return null;
+        StringBuilder sb = new StringBuilder();
+        if (!positions.isEmpty()) {
+            sb.append("secrets.json 里第 ").append(String.join("、", positions.stream().map(String::valueOf).toList()))
+                    .append(" 个 key 的名字里含有 key 的值：key 的名字不能是值本身，也不能把值写进名字里，请换个名字");
+        }
+        if (previous) {
+            if (sb.length() > 0) sb.append("。");
+            sb.append("上一版有 key 的名字里含有这次 key 的值：请换一个值，或者联系管理员");
+        }
+        return sb.toString();
     }
 
     /** secrets.json 太大的固定文案（不带内容）。读取方（草稿预览）先看对象大小，超了不读，用同一句话。 */
@@ -397,6 +433,7 @@ public final class SkillSecretsFile {
         if (a.problem() != null) return null;
         JsonNode root = a.root();
         SecretValues known = a.values();
+        if (keyNameProblem(root, known, SecretValues.NONE) != null) return null;   // 预览里的 key 名和占位符会把名字（= 值）打出来
         ObjectNode out = JSON.createObjectNode();
         for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
             Map.Entry<String, JsonNode> f = it.next();

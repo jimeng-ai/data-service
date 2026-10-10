@@ -158,11 +158,11 @@ class SkillPackageProcessorTest {
 
             @Override
             public Map<String, String> values(Collection<String> wanted) {
-                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "无法核对上一版的 key：平台没有配置加密密钥");
+                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "加密密钥没有配置（CONNECTION_CREDENTIAL_KEY），请联系管理员");
             }
         };
         assertThatThrownBy(() -> SkillPackageProcessor.process(reuseSkill("正文\n"), SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置");
     }
 
     @Test
@@ -301,16 +301,16 @@ class SkillPackageProcessorTest {
 
             @Override
             public Map<String, String> values(Collection<String> wanted) {
-                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "无法核对上一版的 key CRM_TOKEN：解密失败");
+                throw new ServiceException(com.jimeng.common.core.enums.ExceptionCode.INVALID_REQUEST, "加密密钥没有配置（CONNECTION_CREDENTIAL_KEY），请联系管理员");
             }
         };
         Map<String, byte[]> noSecretsFile = plainSkill();
         assertThatThrownBy(() -> SkillPackageProcessor.process(noSecretsFile, SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置");
         Map<String, byte[]> everyKeyHasANewValue = plainSkill();
         everyKeyHasANewValue.put("secrets.json", b("{\"CRM_TOKEN\":{\"value\":\"sk-live-NEW-9876543210\",\"hosts\":[\"api.customer.com\"]}}"));
         assertThatThrownBy(() -> SkillPackageProcessor.process(everyKeyHasANewValue, SkillManifestParser.Mode.STRICT, true, cannotDecrypt))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置");
     }
 
     @Test
@@ -432,5 +432,169 @@ class SkillPackageProcessorTest {
                         assertThat(m).doesNotContain(marker).doesNotContain(TOKEN).doesNotContain(OLD).doesNotContain("YAML").doesNotContain("SKILL.md");
                     });
         }
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 1：残留检查在原文上做，按「每个字符都被某次替换盖住」判
+
+    private static final String AWS_ID = "AKIAIOSFODNN7EXAMPLE";
+    private static final String AWS_COMBINED = AWS_ID + ":wJalrXUtnFEMIK7MDENG";   // 上一版 AWS_CRED 的值：access key id + secret 拼在一起
+    private static final String MD = "---\nname: refund-flow\ndescription: x\n---\n正文\n";
+
+    private static Map<String, byte[]> skillWith(String scriptText, String secretsJson) {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put("SKILL.md", b(MD));
+        files.put("scripts/call.py", b(scriptText));
+        files.put("secrets.json", b(secretsJson));
+        return files;
+    }
+
+    private static ServiceException publishing(Map<String, byte[]> files, PreviousKeys previous) {
+        try {
+            SkillPackageProcessor.process(files, SkillManifestParser.Mode.STRICT, true, previous);
+        } catch (ServiceException e) {
+            return e;
+        }
+        throw new AssertionError("本该拒绝发布，却发布成功了");
+    }
+
+    @Test
+    @DisplayName("★ 复审探针 R1：上一版 AWS_CRED 是「id:secret」拼在一起的，这一版只留了 AK_ID（前一半），脚本里还是整串旧值——"
+            + "替换之后旧值不再整段出现，但后一半（secret）会原样留在 bundle 里：拒绝，点名 key 和文件，不带值")
+    void aCurrentValueThatOnlyCoversTheFirstHalfOfAPreviousValueIsRejected() {
+        ServiceException e = publishing(
+                skillWith("CRED = '" + AWS_COMBINED + "'\n", "{\"AK_ID\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}"),
+                PreviousKeys.decrypted(Map.of("AWS_CRED", AWS_COMBINED)));
+        assertThat(e.getMessage()).contains("scripts/call.py").contains("AWS_CRED").contains("上一版的值")
+                .doesNotContain("wJalrXUtnFEMIK7MDENG").doesNotContain(AWS_ID);
+    }
+
+    @Test
+    @DisplayName("★ 复审探针 R2：首尾相接——当前值的尾巴就是旧值的头：旧值露出来的那一截同样拒绝")
+    void aCurrentValueAdjacentToAPreviousValueIsRejected() {
+        ServiceException e = publishing(
+                skillWith("X = 'tenant-0042-ABCD-1234-wxyz-5678'\n", "{\"TENANT_KEY\":{\"value\":\"tenant-0042-ABCD\",\"hosts\":[\"a.example.com\"]}}"),
+                PreviousKeys.decrypted(Map.of("OLD_KEY", "ABCD-1234-wxyz-5678")));
+        assertThat(e.getMessage()).contains("scripts/call.py").contains("OLD_KEY").contains("上一版的值")
+                .doesNotContain("1234-wxyz-5678").doesNotContain("tenant-0042");
+    }
+
+    @Test
+    @DisplayName("★ 两个当前值在文本里互相重叠：靠左的先换，被抢掉的那个剩下的部分会原样留下——拒绝，点名被抢掉的 key 和文件")
+    void twoCurrentValuesThatOverlapInTheTextAreRejected() {
+        ServiceException e = publishing(
+                skillWith("v = 'xxxx-AAAA-1111-yyyy'\n", "{\"KEY_A\":{\"value\":\"xxxx-AAAA-1111\",\"hosts\":[\"a.example.com\"]},"
+                        + "\"KEY_B\":{\"value\":\"AAAA-1111-yyyy\",\"hosts\":[\"b.example.com\"]}}"),
+                PreviousKeys.NONE);
+        assertThat(e.getMessage()).contains("scripts/call.py").contains("KEY_B").doesNotContain("xxxx-AAAA").doesNotContain("1111-yyyy");
+        // 各自单独出现没有问题
+        SkillPackageProcessor.Output ok = SkillPackageProcessor.process(
+                skillWith("a = 'xxxx-AAAA-1111'\nb = 'AAAA-1111-yyyy'\n", "{\"KEY_A\":{\"value\":\"xxxx-AAAA-1111\",\"hosts\":[\"a.example.com\"]},"
+                        + "\"KEY_B\":{\"value\":\"AAAA-1111-yyyy\",\"hosts\":[\"b.example.com\"]}}"),
+                SkillManifestParser.Mode.STRICT, true, PreviousKeys.NONE);
+        assertThat(new String(ok.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("a = '{{KEY_A}}'\nb = '{{KEY_B}}'\n");
+    }
+
+    @Test
+    @DisplayName("★ 当前值包含旧值（旧 sk-abc12345，新 Bearer sk-abc12345）：旧值整段落在新值的替换里，不拒绝；旧值单独出现在替换之外才拒绝")
+    void aCurrentValueContainingAPreviousValueIsFine() {
+        String json = "{\"AUTH_HEADER\":{\"value\":\"Bearer sk-abc12345\",\"hosts\":[\"api.example.com\"]}}";
+        PreviousKeys previous = PreviousKeys.decrypted(Map.of("API_KEY", "sk-abc12345"));
+        SkillPackageProcessor.Output ok = SkillPackageProcessor.process(skillWith("h = 'Bearer sk-abc12345'\n", json),
+                SkillManifestParser.Mode.STRICT, true, previous);
+        assertThat(new String(ok.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("h = '{{AUTH_HEADER}}'\n");
+
+        ServiceException e = publishing(skillWith("h = 'Bearer sk-abc12345'\nk = 'sk-abc12345'\n", json), previous);
+        assertThat(e.getMessage()).contains("scripts/call.py").contains("API_KEY").contains("上一版的值").doesNotContain("abc12345");
+    }
+
+    @Test
+    @DisplayName("旧值同时也是这一版某个 key 的值（key 改了名、值没变）：按新名字换，不算残留；SKILL.md 里一样")
+    void aRenamedKeyIsStillNotResidue() {
+        SkillPackageProcessor.Output ok = SkillPackageProcessor.process(
+                skillWith("id = '" + AWS_ID + "'\n", "{\"AWS_KEY_ID\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}"),
+                SkillManifestParser.Mode.STRICT, true, PreviousKeys.decrypted(Map.of("OLD_NAME", AWS_ID)));
+        assertThat(new String(ok.files().get("scripts/call.py"), StandardCharsets.UTF_8)).isEqualTo("id = '{{AWS_KEY_ID}}'\n");
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 2：key 名里不能出现任何已知的值
+
+    @Test
+    @DisplayName("★ 复审探针 R3 / R3b / R4：上一版的值写成 key 名（带新值）、当前的值写成它自己的名字、上一版的值写成不带 value 的 key 名——都拒绝，文案里没有值"
+            + "（R4 以前是处理器放行，到 SkillSecretService.prepare 抛「key <值> 没有给值」，那条异常没抹值，进了 ERROR 日志）")
+    void aValueUsedAsAKeyNameIsRejectedWhereverItComesFrom() {
+        PreviousKeys previous = PreviousKeys.decrypted(Map.of("AWS_KEY_ID", AWS_ID));
+        for (String secrets : new String[]{
+                "{\"" + AWS_ID + "\":{\"value\":\"brand-new-value-1\",\"hosts\":[\"s3.amazonaws.com\"]}}",   // R3
+                "{\"" + AWS_ID + "\":{\"hosts\":[\"s3.amazonaws.com\"]}}"}) {                                // R4
+            Map<String, byte[]> files = new LinkedHashMap<>();
+            files.put("SKILL.md", b(MD));
+            files.put("secrets.json", b(secrets));
+            ServiceException e = publishing(files, previous);
+            assertThat(e.getMessage()).contains("第 1 个 key 的名字").doesNotContain(AWS_ID).doesNotContain("AKIA");
+        }
+        Map<String, byte[]> own = new LinkedHashMap<>();
+        own.put("SKILL.md", b(MD));
+        own.put("secrets.json", b("{\"" + AWS_ID + "\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}"));   // R3b：没有上一版
+        assertThat(publishing(own, PreviousKeys.NONE).getMessage()).contains("第 1 个 key 的名字").doesNotContain(AWS_ID).doesNotContain("AKIA");
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 3（R27）：上一版有密文解不开，按 key 处理，不能把 skill 永久卡死
+
+    /** 上一版有 CRM_TOKEN，配了密钥、但它的密文解不开（密钥换过 / 密文坏了）。 */
+    private static PreviousKeys crmTokenCannotBeOpened() {
+        return PreviousKeys.decrypted(Map.of("WECOM_HOOK", OLD), java.util.Set.of("CRM_TOKEN"));
+    }
+
+    @Test
+    @DisplayName("★ R27：解不开的 key 在新的 secrets.json 里没写 value——不能沿用，拒绝，文案说清楚原因和两条出路（重新写 value，或者去掉它），不带值")
+    void anUndecryptableKeyCannotBeReused() {
+        ServiceException e = publishing(skillWith("print(1)\n", "{\"CRM_TOKEN\":{\"hosts\":[\"api.customer.com\"]}}"), crmTokenCannotBeOpened());
+        assertThat(e.getMessage()).contains("key CRM_TOKEN 上一版的值解不开").contains("加密密钥可能换过")
+                .contains("给 CRM_TOKEN 重新写 value").contains("去掉 CRM_TOKEN").doesNotContain(OLD).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("★ R27：解不开的 key 给了新值、或者去掉了——照常发布；解得开的 key 的旧值照样参与抹值和残留检查")
+    void anUndecryptableKeyWithANewValueOrDroppedPublishesAsUsual() {
+        // 给了新值
+        SkillPackageProcessor.Output withNewValue = SkillPackageProcessor.process(
+                skillWith("TOKEN = 'sk-live-FRESH-0123456789'\nHOOK = '" + OLD + "'\n",
+                        "{\"CRM_TOKEN\":{\"value\":\"sk-live-FRESH-0123456789\",\"hosts\":[\"api.customer.com\"]},"
+                                + "\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"]}}"),
+                SkillManifestParser.Mode.STRICT, true, crmTokenCannotBeOpened());
+        assertThat(new String(withNewValue.files().get("scripts/call.py"), StandardCharsets.UTF_8))
+                .isEqualTo("TOKEN = '{{CRM_TOKEN}}'\nHOOK = '{{WECOM_HOOK}}'\n");   // WECOM_HOOK 解得开：沿用并替换
+        assertThat(withNewValue.secrets()).extracting(SkillSecretsFile.Entry::name).containsExactly("CRM_TOKEN", "WECOM_HOOK");
+
+        // 去掉了（secrets.json 里只剩解得开的那个）
+        SkillPackageProcessor.Output dropped = SkillPackageProcessor.process(
+                skillWith("print(1)\n", "{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"]}}"),
+                SkillManifestParser.Mode.STRICT, true, crmTokenCannotBeOpened());
+        assertThat(dropped.secrets()).extracting(SkillSecretsFile.Entry::name).containsExactly("WECOM_HOOK");
+
+        // 解得开的旧值还在脚本里、key 却被删了：照样拒绝（残留检查没有因为另一个 key 解不开而放松）
+        ServiceException e = publishing(skillWith("HOOK = '" + OLD + "'\n", "{\"CRM_TOKEN\":{\"value\":\"sk-live-FRESH-0123456789\",\"hosts\":[\"api.customer.com\"]}}"),
+                crmTokenCannotBeOpened());
+        assertThat(e.getMessage()).contains("WECOM_HOOK").contains("上一版的值").doesNotContain(OLD);
+    }
+
+    @Test
+    @DisplayName("R27：解不开的 key 被去掉了、文件里却还在用 {{它}}：拒绝，出路写成「重新写 value，或者把 {{它}} 删掉」（不写值即沿用走不通）")
+    void aDroppedUndecryptableKeyThatIsStillUsedGetsATailoredMessage() {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: x\n---\n带上 {{CRM_TOKEN}} 调接口\n"));
+        ServiceException e = publishing(files, crmTokenCannotBeOpened());
+        assertThat(e.getMessage()).contains("{{CRM_TOKEN}}").contains("解不开").contains("重新写 value").doesNotContain("不写值即沿用");
+
+        // 没人用它：去掉就去掉了
+        SkillPackageProcessor.process(plainSkill(), SkillManifestParser.Mode.STRICT, true, crmTokenCannotBeOpened());
+    }
+
+    @Test
+    @DisplayName("R27：解不开的 key 的名字里含有这一版的值——名字会出现在文案里：拒绝，不回显")
+    void anUndecryptableKeyNameCarryingACurrentValueIsRejected() {
+        PreviousKeys previous = PreviousKeys.decrypted(Map.of(), java.util.Set.of("CRM_TOKEN_PROD"));
+        ServiceException e = publishing(skillWith("print(1)\n", "{\"NEW_KEY\":{\"value\":\"CRM_TOKEN_PROD\",\"hosts\":[\"a.example.com\"]}}"), previous);
+        assertThat(e.getMessage()).contains("名字").doesNotContain("CRM_TOKEN_PROD");
     }
 }

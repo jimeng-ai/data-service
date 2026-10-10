@@ -57,7 +57,8 @@ public final class SkillBuilderDtos {
         /** 工作区里不止一个 skill 目录时列出全部（发布取最近修改的那个）。 */
         private List<String> otherSkillDirs;
         /**
-         * 工作区里有 secrets.json、却读不出来（不是合法 JSON、超过大小上限、key 或候选值太多、有值太长……）：不知道哪些是
+         * 工作区里有 secrets.json、却读不出来（不是合法 JSON、超过大小上限——列举时报的和读的时候实际读到的都算、key 或候选值太多、有值太长、
+         * key 的名字里含有 key 的值……）：不知道哪些是
          * key 的值，草稿里的文字没法抹值。此时<b>一律不给 skill 文件的原文</b>：name / description 为 null，skillMd / body 为空串
          * （前端靠这两个字段切 frontmatter，不能是 null），每个文件的 text 为 null，secrets.json 也没有预览；
          * 校验结果只有 secrets.json 自己的固定文案（不带值、不回显条目）；DRAFT 行不同步。

@@ -27,9 +27,11 @@ import java.util.stream.Collectors;
  *   <li>不带 value 的条目是「沿用上一版的值」：只有它们用上一版的值做替换；</li>
  *   <li>值不能出现在任何文件的路径里；根目录不能有只差大小写的 {@code Secrets.json}；</li>
  *   <li>其余文本文件里的 key 原文换成 {@code {{名字}}}（{@link SecretValues#replace}）；二进制文件里出现原文没法替换，整次发布拒绝；</li>
- *   <li><b>残留检查</b>：当前的值替换完之后，文本内容、文件路径、任何 key 的 hosts / methods / paths、二进制文件里还出现上一版的值，
- *       拒绝发布。同时兜住两种情况：key 删了但旧值又被打进文件；key 换了新值但旧值还留在文件里。上一版的值如果同时也是这一版
- *       某个 key 的值，它已经按那个 key 替换掉了，不算残留；</li>
+ *   <li><b>残留检查</b>：文本文件在<b>原文</b>上判——每个已知的值（当前的 + 上一版的）的每一处出现，每个字符都要被选中的替换盖住
+ *       （{@link SecretValues.Replacement#notFullyReplaced}），否则拒绝发布。这样同时兜住：key 删了但旧值又被打进文件；key 换了
+ *       新值但旧值还留在文件里；当前值只盖住旧值的一部分（剩下的部分原样留下）；旧值和当前值首尾相接；两个当前值在文本里互相重叠。
+ *       旧值整段落在一个更长的当前值里、或者旧值同时也是这一版某个 key 的值（改了名），都整段被换掉，不算残留。
+ *       文件路径、任何 key 的 hosts / methods / paths、二进制文件里还出现上一版的值，照旧按子串检查；</li>
  *   <li>文件里还在用 {@code {{X}}}、上一版有 X、这一版的 secrets.json 却没有 X 了：拒绝（否则新版本静默丢 key）；</li>
  *   <li>★ <b>用替换后的</b> SKILL.md 解析 frontmatter：正文进库时已经是占位符，解析报错的片段里也只有占位符。</li>
  * </ol>
@@ -63,8 +65,10 @@ public final class SkillPackageProcessor {
         if (files == null || files.get(SkillBundleRules.SKILL_MD) == null) {
             throw reject(SecretValues.NONE, "skill 里没有 SKILL.md");
         }
-        // 0. 上一版所有 key 的值，最先解密：解不出来（没配密钥、密文坏了）这里就抛 ServiceException（文案只带 key 名），整次拒绝
+        // 0. 上一版所有 key 的值，最先解密：没配密钥这里就抛 ServiceException（整次拒绝）。配了密钥、但某个 key 的密文解不开（R27），
+        // 只有这个 key 不能沿用（下面第 2 步）；它的旧值平台已经不知道是什么，不参与抹值和残留检查
         Map<String, String> previousMap = previous.allValues();
+        final Set<String> undecryptable = previous.undecryptable();
         SecretValues previousAll = SecretValues.of(previousMap);
 
         // 1. 读 secrets.json——要先知道有哪些值，后面每一步才抹得掉
@@ -84,14 +88,24 @@ public final class SkillPackageProcessor {
             current = parsed.values();
         }
 
-        // 2. 沿用：这一版声明了、没写 value 的条目，用上一版的值。只有它们用上一版的值做替换
+        final SecretValues scrub = current.plus(previousAll);               // 报错文案里要抹掉的：当前的 + 上一版的全部
+        // 解不开的 key 的名字也会出现在下面的文案里：名字里不能含有任何已知的值（有值的 key 的名字，parse 已经查过了）
+        for (String name : undecryptable) {
+            if (!scrub.namesIn(name).isEmpty()) throw reject(scrub, "上一版有 key 的名字里含有这次 key 的值：请换一个值，或者联系管理员");
+        }
+
+        // 2. 沿用：这一版声明了、没写 value 的条目，用上一版的值。只有它们用上一版的值做替换；解不开的 key 不能沿用
         Map<String, String> reuseMap = new LinkedHashMap<>();
         for (SkillSecretsFile.Entry e : secrets) {
-            if (e.value() == null && previousMap.containsKey(e.name())) reuseMap.put(e.name(), previousMap.get(e.name()));
+            if (e.value() != null) continue;
+            if (undecryptable.contains(e.name())) {
+                throw reject(scrub, "key " + e.name() + " 上一版的值解不开（加密密钥可能换过），没法沿用：请在 secrets.json 里给 " + e.name()
+                        + " 重新写 value，或者去掉 " + e.name());
+            }
+            if (previousMap.containsKey(e.name())) reuseMap.put(e.name(), previousMap.get(e.name()));
         }
         SecretValues reuse = SecretValues.of(reuseMap);
         final SecretValues replaceSet = current.plus(reuse);                // 要在文件里换成占位符的
-        final SecretValues scrub = current.plus(previousAll);               // 报错文案里要抹掉的：当前的 + 上一版的全部
         // 残留检查用的：上一版的全部值。不用先减掉「这一版替换掉的」：被替换的值（沿用的、或者同时也是这一版某个 key 的值），文本里已经
         // 换成占位符、不会再出现；它们在文件路径、二进制、声明里出现，下面各自的检查（replaceSet）先拒了。所以「不算残留」是自然成立的。
         final SecretValues residual = previousAll;
@@ -128,7 +142,7 @@ public final class SkillPackageProcessor {
         Map<String, byte[]> out = new TreeMap<>();
         for (Map.Entry<String, byte[]> f : files.entrySet()) {
             if (SkillSecretsFile.FILE_NAME.equals(f.getKey())) continue;
-            out.put(f.getKey(), processFile(f.getKey(), f.getValue(), replaceSet, residual, scrub, previousNames, declared));
+            out.put(f.getKey(), processFile(f.getKey(), f.getValue(), replaceSet, current, residual, scrub, previousNames, undecryptable, declared));
         }
 
         // 5. 用替换后的 SKILL.md 解析（校验的文本 = 发布的文本）
@@ -139,8 +153,8 @@ public final class SkillPackageProcessor {
         return new Output(skill, out, secrets);
     }
 
-    private static byte[] processFile(String path, byte[] content, SecretValues replaceSet, SecretValues residual, SecretValues scrub,
-                                      Set<String> previousNames, Set<String> declared) {
+    private static byte[] processFile(String path, byte[] content, SecretValues replaceSet, SecretValues current, SecretValues residual,
+                                      SecretValues scrub, Set<String> previousNames, Set<String> undecryptable, Set<String> declared) {
         String text = decodeText(content);
         if (text == null) {
             List<String> hit = replaceSet.namesIn(content);
@@ -155,17 +169,30 @@ public final class SkillPackageProcessor {
             }
             return content;
         }
-        String replaced = replaceSet.replace(text);
-        List<String> old = residual.namesIn(replaced);
+        // ★ 残留在原文上判：每个已知的值（当前的 + 上一版的）在原文里的每一处出现，每个字符都要被选中的替换盖住。
+        // 不能在替换之后的文本里搜：当前值只盖住旧值的前一半时，旧值不再整段出现，后一半却原样留在文本里。
+        SecretValues.Replacement replacement = replaceSet.replacement(text);
+        List<String> clash = replacement.notFullyReplaced(current);
+        if (!clash.isEmpty()) {
+            throw reject(scrub, "文件「" + path + "」里 key " + String.join("、", clash) + " 的值没能整段换成占位符：它和别的 key 的值叠在了一起"
+                    + "（首尾相接，或者互相包含了一部分），换完会剩下一截原文。请在文件里把这几个值分开写");
+        }
+        List<String> old = replacement.notFullyReplaced(residual);
         if (!old.isEmpty()) {
             throw reject(scrub, "文件「" + path + "」里出现了 key " + String.join("、", old) + " 上一版的值：要继续用，就在 secrets.json 里保留 "
                     + old.get(0) + "、文件里写 {{" + old.get(0) + "}}；不用了，就把它从文件里删掉");
         }
+        String replaced = replacement.text();
         if (!previousNames.isEmpty()) {
             Matcher m = PLACEHOLDER.matcher(replaced);
             while (m.find()) {
                 String x = m.group(1);
                 if (previousNames.contains(x) && !declared.contains(x)) {
+                    if (undecryptable.contains(x)) {   // 解不开的 key 不写值就沿用不了：出路是重新写 value
+                        throw reject(scrub, "文件「" + path + "」里还在用 {{" + x + "}}，但 secrets.json 里没有 " + x + " 了，而 " + x
+                                + " 上一版的值解不开（加密密钥可能换过）：要继续用，就在 secrets.json 里保留这一条并重新写 value；不用了，就把文件里的 {{"
+                                + x + "}} 删掉");
+                    }
                     throw reject(scrub, "文件「" + path + "」里还在用 {{" + x + "}}，但 secrets.json 里没有 " + x
                             + " 了：要继续用，就在 secrets.json 里保留这一条（不写值即沿用）；不用了，就把文件里的 {{" + x + "}} 删掉");
                 }

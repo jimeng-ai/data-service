@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.skill.manifest;
 
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -19,6 +20,11 @@ import java.util.Set;
  *   <li>文件里还在用 {@code {{X}}}、上一版有 X、这一版的 secrets.json 却没有 X 了：拒绝（否则新版本静默丢 key）。</li>
  * </ul>
  * 每轮草稿（预览、同步）不解密，传 {@link #NONE}：上一版的值只在发布时于内存里解密，模型和工作区都拿不到。
+ *
+ * <p><b>解不开的 key 按 key 处理（R27）</b>：没配加密密钥，整次拒绝（部署配置错了，新值没法加密，运行时也解不开）；
+ * 配了密钥、但某个 key 的密文解不开（密钥换过、密文坏了），只有这一个 key 不能沿用——它在新的 secrets.json 里没写 value 时拒绝，
+ * 给了新值或者去掉了就照常发布（不然这个 skill 就再也不能用「用 AI 改进」发布了，用户自己没有出路）。解不开的旧值
+ * 平台已经不知道它是什么，所以不参与抹值和残留检查；它的名字仍在 {@link #names()} 里，「文件里还在用 {{X}} 却被去掉了」的核对要用。
  */
 public interface PreviousKeys {
 
@@ -45,9 +51,25 @@ public interface PreviousKeys {
      */
     Map<String, String> values(Collection<String> names);
 
-    /** 上一版<b>所有</b> key 的值（名字 → 值）。没有上一版的 key 时不需要密钥。 */
+    /** 上一版所有<b>解得开</b>的 key 的值（名字 → 值）。没有上一版的 key 时不需要密钥。 */
     default Map<String, String> allValues() {
         return values(names());
+    }
+
+    /** 上一版里配了密钥、但密文解不开的 key 的名字（R27）。只有 {@link #decrypted(Map, Set)} 的结果带着它。 */
+    default Set<String> undecryptable() {
+        return Set.of();
+    }
+
+    /** 解密一遍的结果：解得开的值，和解不开的 key 的名字。 */
+    record Opened(Map<String, String> values, Set<String> undecryptable) {}
+
+    /**
+     * 把上一版所有 key 解密一遍。没配密钥就抛 {@code ServiceException}；某个 key 的密文解不开不抛，记在
+     * {@link Opened#undecryptable} 里，由发布处理器按 key 处理。
+     */
+    default Opened open() {
+        return new Opened(allValues(), undecryptable());
     }
 
     /**
@@ -55,11 +77,20 @@ public interface PreviousKeys {
      * 草稿读取（报错抹值）和发布处理器共用同一份。
      */
     static PreviousKeys decrypted(Map<String, String> all) {
+        return decrypted(all, Set.of());
+    }
+
+    /** 同上，另带着解不开的 key 的名字（{@link #names()} 包含它们，{@link #values} 里没有）。 */
+    static PreviousKeys decrypted(Map<String, String> all, Set<String> undecryptable) {
         Map<String, String> copy = Map.copyOf(all);
+        Set<String> failed = Set.copyOf(undecryptable);
+        Set<String> names = new LinkedHashSet<>(copy.keySet());
+        names.addAll(failed);
+        Set<String> allNames = Set.copyOf(names);
         return new PreviousKeys() {
             @Override
             public Set<String> names() {
-                return copy.keySet();
+                return allNames;
             }
 
             @Override
@@ -67,6 +98,11 @@ public interface PreviousKeys {
                 Map<String, String> out = new LinkedHashMap<>();
                 for (String n : wanted) if (copy.containsKey(n)) out.put(n, copy.get(n));
                 return out;
+            }
+
+            @Override
+            public Set<String> undecryptable() {
+                return failed;
             }
         };
     }

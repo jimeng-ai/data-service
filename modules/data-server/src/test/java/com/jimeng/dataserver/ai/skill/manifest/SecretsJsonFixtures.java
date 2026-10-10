@@ -22,6 +22,7 @@ public final class SecretsJsonFixtures {
         m.put("65 个候选值", candidates.append("}}").toString());
         m.put("8193 个字符的值", "{\"K_1\":{\"value\":\"" + marker + "x".repeat(8193) + "\",\"hosts\":[\"a.example.com\"]}}");
         m.put("超过 512 KB", "{\"K_1\":{\"value\":\"" + marker + "-12345678\",\"hosts\":[\"a.example.com\"]}}" + " ".repeat(SkillSecretsFile.MAX_FILE_BYTES));
+        m.put("key 的名字就是它自己的值", "{\"" + token + "\":{\"value\":\"" + token + "\",\"hosts\":[\"a.example.com\"]}}");
         m.put("嵌套超过 8 层", "{\"K_1\":{\"hosts\":[\"a.example.com\"],\"note\":" + "[".repeat(8) + "\"" + marker + "-12345678\"" + "]".repeat(8) + "}}");
         return m;
     }

@@ -7,6 +7,7 @@ import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
+import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.persistence.entity.SkillSecret;
@@ -20,6 +21,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -55,6 +57,9 @@ public class SkillSecretService {
                     "平台没有配置加密密钥（CONNECTION_CREDENTIAL_KEY），不能保存技能里的 key，请联系管理员");
         }
         Map<String, SkillSecret> previous = previous(skillId, previousVersion);
+        // 所有拼了名字的异常文案都过这一个替换 helper：ServiceException 构造时就把文案记进 ERROR 日志。名字里本不该有值
+        // （发布处理器在读 secrets.json 时就拒了），这是第二道
+        SecretValues known = SecretValues.ofEntries(entries);
         List<SkillSecret> rows = new ArrayList<>();
         for (SkillSecretsFile.Entry e : entries) {
             SkillSecret row = new SkillSecret();
@@ -70,11 +75,11 @@ public class SkillSecretService {
                 SkillSecret old = previous.get(e.name());
                 if (old == null) {
                     throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                            "key " + e.name() + " 没有给值：第一次出现的 key 必须在 secrets.json 里写 value");
+                            known.replace("key " + e.name() + " 没有给值：第一次出现的 key 必须在 secrets.json 里写 value"));
                 }
                 if (!sameScope(old, row)) {
-                    throw new ServiceException(ExceptionCode.INVALID_REQUEST, "key " + e.name()
-                            + " 的发送范围（hosts / methods / paths）改了，旧值已作废，请在 secrets.json 里重新写 value");
+                    throw new ServiceException(ExceptionCode.INVALID_REQUEST, known.replace("key " + e.name()
+                            + " 的发送范围（hosts / methods / paths）改了，旧值已作废，请在 secrets.json 里重新写 value"));
                 }
                 row.setCiphertext(old.getCiphertext());
                 row.setCipherVersion(old.getCipherVersion());
@@ -105,8 +110,12 @@ public class SkillSecretService {
     }
 
     /**
-     * 上一版的 key，给发布处理器核对文件用（{@link PreviousKeys}）。名字不需要密钥；解密只在被问到值的时候做，
-     * 没配密钥或解不开就拒绝，绝不返回「查不到」——跳过核对等于放行。解出来的值只在这一次发布的内存里。
+     * 上一版的 key，给发布处理器核对文件用（{@link PreviousKeys}）。名字不需要密钥；解密只在被问到值的时候做。解出来的值只在这一次发布的内存里。
+     *
+     * <p>解不开的按 key 处理（R27）：<b>没配加密密钥</b>就拒绝（部署配置错了，跳过核对等于放行，新值也没法加密）；
+     * <b>配了密钥、但某个 key 的密文解不开</b>（密钥换过、密文坏了）只有这个 key 不能沿用——它不在返回的值里，记在
+     * {@link PreviousKeys.Opened#undecryptable} 里，记一条 WARN（只带 skill id 和 key 名），由发布处理器在它没写 value 时拒绝、
+     * 给了新值或去掉了就照常发布。不然加密密钥一换，这个 skill 就再也不能用「用 AI 改进」发布了。
      */
     public PreviousKeys previousKeys(Long skillId, Integer version) {
         Map<String, SkillSecret> rows = previous(skillId, version);
@@ -118,33 +127,37 @@ public class SkillSecretService {
 
             @Override
             public Map<String, String> values(Collection<String> names) {
-                Map<String, String> out = new LinkedHashMap<>();
-                List<String> wanted = names.stream().filter(rows::containsKey).toList();
-                if (wanted.isEmpty()) return out;
-                if (!cipher.isAvailable()) {
-                    throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                            "无法核对上一版的 key：平台没有配置加密密钥（CONNECTION_CREDENTIAL_KEY），请联系管理员");
-                }
-                for (String name : wanted) {
-                    out.put(name, decrypt(name, rows.get(name)));
-                }
-                return out;
+                return decrypt(rows, names.stream().filter(rows::containsKey).toList()).values();
+            }
+
+            @Override
+            public Opened open() {
+                return decrypt(rows, List.copyOf(rows.keySet()));
             }
         };
     }
 
-    private String decrypt(String name, SkillSecret row) {
-        try {
-            if (row.getCipherVersion() == null) throw new IllegalStateException("没有密文版本号");
-            String value = cipher.decrypt(row.getCiphertext(), row.getCipherVersion());
-            if (value == null) throw new IllegalStateException("没有密文");
-            return value;
-        } catch (RuntimeException e) {
-            // 不带原因：解密失败的细节对调用方没用；日志里也只留 key 名
-            log.warn("skill key 解密失败 skillId={} v{} name={}", row.getSkillId(), row.getVersion(), name);
-            throw new ServiceException(ExceptionCode.INVALID_REQUEST,
-                    "无法核对上一版的 key " + name + "：解密失败，可能是加密密钥已轮换；请在 secrets.json 里重新写 value");
+    private PreviousKeys.Opened decrypt(Map<String, SkillSecret> rows, List<String> wanted) {
+        Map<String, String> values = new LinkedHashMap<>();
+        Set<String> failed = new LinkedHashSet<>();
+        if (wanted.isEmpty()) return new PreviousKeys.Opened(values, failed);
+        if (!cipher.isAvailable()) {
+            throw new ServiceException(ExceptionCode.INVALID_REQUEST, "加密密钥没有配置（CONNECTION_CREDENTIAL_KEY），请联系管理员");
         }
+        for (String name : wanted) {
+            SkillSecret row = rows.get(name);
+            try {
+                if (row.getCipherVersion() == null) throw new IllegalStateException("没有密文版本号");
+                String value = cipher.decrypt(row.getCiphertext(), row.getCipherVersion());
+                if (value == null) throw new IllegalStateException("没有密文");
+                values.put(name, value);
+            } catch (RuntimeException e) {
+                // 不带原因：解密失败的细节对调用方没用；日志里也只留 skill id 和 key 名
+                log.warn("skill key 解密失败，这一版不能沿用它 skillId={} name={}", row.getSkillId(), name);
+                failed.add(name);
+            }
+        }
+        return new PreviousKeys.Opened(values, failed);
     }
 
     /** 某一版的 key 声明（名字和发送范围，不含值），来源是 skill_secret 行——key 能发到哪里只看这张表，manifest 只是给人看的副本。 */

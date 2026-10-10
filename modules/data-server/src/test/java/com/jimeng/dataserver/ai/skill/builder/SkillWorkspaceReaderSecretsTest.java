@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -37,8 +38,8 @@ class SkillWorkspaceReaderSecretsTest {
         String secrets = "ws/skill/refund-flow/secrets.json";
         when(storage.listObjectInfos("ws/")).thenReturn(List.of(
                 new ObjectInfo(skillMd, 10, new Date()), new ObjectInfo(secrets, 10, new Date())));
-        when(storage.readBytes(skillMd)).thenReturn("---\nname: refund-flow\ndescription: 退款\n---\n正文\n".getBytes(StandardCharsets.UTF_8));
-        when(storage.readBytes(secrets)).thenReturn("{\"crm\":{\"value\":\"abcdefgh\",\"hosts\":[\"a.example.com\"]}}"
+        StorageStubs.object(storage, skillMd, "---\nname: refund-flow\ndescription: 退款\n---\n正文\n".getBytes(StandardCharsets.UTF_8));
+        StorageStubs.object(storage, secrets, "{\"crm\":{\"value\":\"abcdefgh\",\"hosts\":[\"a.example.com\"]}}"
                 .getBytes(StandardCharsets.UTF_8));
         SkillWorkspaceReader reader = new SkillWorkspaceReader(storage, new SkillBuilderProperties());
 
@@ -63,7 +64,7 @@ class SkillWorkspaceReaderSecretsTest {
             String name = "ws/skill/refund-flow/" + e.getKey();
             byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
             infos.add(new ObjectInfo(name, bytes.length, new Date()));
-            when(storage.readBytes(name)).thenReturn(bytes);
+            StorageStubs.object(storage, name, bytes);
         }
         when(storage.listObjectInfos("ws/")).thenReturn(infos);
         return new SkillWorkspaceReader(storage, new SkillBuilderProperties());
@@ -254,6 +255,7 @@ class SkillWorkspaceReaderSecretsTest {
 
         void assertNeverRead(String rel) throws Exception {
             verify(storage, never()).readBytes("ws/skill/refund-flow/" + rel);
+            verify(storage, never()).readBytesUpTo(org.mockito.ArgumentMatchers.eq("ws/skill/refund-flow/" + rel), org.mockito.ArgumentMatchers.anyLong());
         }
     }
 
@@ -265,7 +267,7 @@ class SkillWorkspaceReaderSecretsTest {
             String name = "ws/skill/refund-flow/" + e.getKey();
             byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
             infos.add(new ObjectInfo(name, declaredSizes.getOrDefault(e.getKey(), (long) bytes.length), new Date()));
-            when(storage.readBytes(name)).thenReturn(bytes);
+            StorageStubs.object(storage, name, bytes);
         }
         when(storage.listObjectInfos("ws/")).thenReturn(infos);
         return new Ws(new SkillWorkspaceReader(storage, props), storage);
@@ -397,5 +399,127 @@ class SkillWorkspaceReaderSecretsTest {
             assertThat(String.join("；", v.getValidationErrors())).as(broken.getKey()).doesNotContain(MARKER).doesNotContain(TOKEN).doesNotContain("YAML");
         }
         assertThat(decryptions.get()).isEqualTo(undeterminableSecretsJson().size());   // 每次发布都先解密（R23），读不出来也一样
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 4：大小上限在读的时候才算数；5：读失败的文案先抹值
+
+    private static final String WS = "ws/skill/refund-flow/";
+
+    private static SkillBuilderProperties limit1k() {
+        SkillBuilderProperties props = new SkillBuilderProperties();
+        props.setPreviewFileMaxBytes(1024);
+        return props;
+    }
+
+    /** 恰好 n 个字节的 SKILL.md（正文用 x 垫）。 */
+    private static String skillMdOfBytes(int n) {
+        String base = GOOD_MD;
+        return base + "x".repeat(n - base.getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    @Test
+    @DisplayName("★ 列举时报的大小在上限以内、读的时候对象已经被换大（沙箱还在写工作区）：secrets.json 按超限处理，固定文案；读进内存的字节不超过上限 + 1（只调有界读取，没调整个读）")
+    void aSecretsJsonThatGrewAfterTheListingIsCappedWhenItIsRead() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        files.put("secrets.json", "{\"K_1\":{\"value\":\"" + "v".repeat(3000) + "\",\"hosts\":[\"a.example.com\"]}}");
+        Ws ws = wsOver(files, Map.of("secrets.json", 100L), limit1k());   // 列举时说它只有 100 字节
+
+        DraftView v = ws.draft();
+
+        assertThat(v.isSecretsUnreadable()).isTrue();
+        assertThat(v.getValidationErrors().get(0)).contains("secrets.json 超过 1 KB");
+        assertThat(v.getSkillMd()).isEmpty();
+        assertThat(v.getFiles()).allSatisfy(f -> assertThat(f.getText()).isNull());
+        verify(ws.storage()).readBytesUpTo(WS + "secrets.json", 1024L);
+        verify(ws.storage(), never()).readBytes(WS + "secrets.json");
+        ws.assertNeverRead("SKILL.md");   // 读不出来：别的文件一个都不读
+    }
+
+    @Test
+    @DisplayName("★ SKILL.md 同样：列举时小、读的时候超了——按超限处理（不解析、不抹值、固定文案），其它文件的预览照给；只调有界读取")
+    void aSkillMdThatGrewAfterTheListingIsCappedWhenItIsRead() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", skillMdOfBytes(3000));
+        files.put("scripts/call.py", "TOKEN = '" + TOKEN + "'\n");
+        files.put("secrets.json", WITH_VALUE);
+        Ws ws = wsOver(files, Map.of("SKILL.md", 50L), limit1k());
+
+        DraftView v = ws.draft();
+
+        assertThat(v.isSkillMdTooLarge()).isTrue();
+        assertThat(v.isSecretsUnreadable()).isFalse();
+        assertThat(v.getValidationErrors()).singleElement().satisfies(e -> assertThat(e).contains("SKILL.md 超过 1 KB"));
+        assertThat(v.getSkillMd()).isEmpty();
+        assertThat(v.getName()).isNull();
+        assertThat(file(v, "SKILL.md").getText()).isNull();
+        assertThat(file(v, "scripts/call.py").getText()).isEqualTo("TOKEN = '{{CRM_TOKEN}}'\n");
+        verify(ws.storage()).readBytesUpTo(WS + "SKILL.md", 1024L);
+        verify(ws.storage(), never()).readBytes(WS + "SKILL.md");
+    }
+
+    @Test
+    @DisplayName("★ 预览里的其它文件同样：列举时小、读的时候超了——不给文本（和「过大」一样，text 为 null、不是二进制），不抛；只调有界读取")
+    void aPreviewFileThatGrewAfterTheListingIsCappedWhenItIsRead() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("scripts/big.py", "x = 1\n".repeat(600));      // 3600 字节
+        files.put("scripts/ok.py", "y = 2\n");
+        Ws ws = wsOver(files, Map.of("scripts/big.py", 10L), limit1k());
+
+        DraftView v = ws.draft();
+
+        assertThat(file(v, "scripts/big.py").getText()).isNull();
+        assertThat(file(v, "scripts/big.py").isBinary()).isFalse();
+        assertThat(file(v, "scripts/ok.py").getText()).isEqualTo("y = 2\n");
+        verify(ws.storage()).readBytesUpTo(WS + "scripts/big.py", 1024L);
+        verify(ws.storage(), never()).readBytes(WS + "scripts/big.py");
+    }
+
+    @Test
+    @DisplayName("上限本身放行、多一个字节就超：SKILL.md 恰好 1024 字节照读照解析，1025 字节按超限处理（列举时报的大小都说谎成 50）")
+    void theCapIsInclusive() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", skillMdOfBytes(1024));
+        DraftView exact = wsOver(files, Map.of("SKILL.md", 50L), limit1k()).draft();
+        assertThat(exact.isSkillMdTooLarge()).isFalse();
+        assertThat(exact.getName()).isEqualTo("refund-flow");
+
+        files.put("SKILL.md", skillMdOfBytes(1025));
+        DraftView over = wsOver(files, Map.of("SKILL.md", 50L), limit1k()).draft();
+        assertThat(over.isSkillMdTooLarge()).isTrue();
+        assertThat(over.getName()).isNull();
+    }
+
+    @Test
+    @DisplayName("★ 读某个文件失败：异常文案里的相对路径先用已确定的值集合抹（路径、存储报的出错信息里带着对象名，都一样）")
+    void aFailedReadNeverPutsAValueInTheMessage() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("secrets.json", WITH_VALUE);
+        files.put("scripts/" + TOKEN + ".py", "x = 1\n");
+        Ws ws = wsOver(files, Map.of(), new SkillBuilderProperties());
+        String object = WS + "scripts/" + TOKEN + ".py";
+        when(ws.storage().readBytesUpTo(org.mockito.ArgumentMatchers.eq(object), org.mockito.ArgumentMatchers.anyLong()))
+                .thenThrow(new java.io.IOException("The specified key does not exist: " + object));
+
+        assertThatThrownBy(ws::draft).isInstanceOf(com.jimeng.common.core.exception.ServiceException.class)
+                .hasMessageContaining("读取工作区文件失败").hasMessageContaining("scripts/{{CRM_TOKEN}}.py")
+                .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live");
+    }
+
+    @Test
+    @DisplayName("读 secrets.json 本身失败：值集合还没确定，路径就是固定的「secrets.json」（目录名、存储报的出错信息都不往外带）")
+    void aFailedReadOfSecretsJsonShowsAFixedPath() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", GOOD_MD);
+        files.put("secrets.json", WITH_VALUE);
+        Ws ws = wsOver(files, Map.of(), new SkillBuilderProperties());
+        when(ws.storage().readBytesUpTo(org.mockito.ArgumentMatchers.eq(WS + "secrets.json"), org.mockito.ArgumentMatchers.anyLong()))
+                .thenThrow(new java.io.IOException("boom " + WS + "secrets.json"));
+
+        assertThatThrownBy(ws::draft).isInstanceOf(com.jimeng.common.core.exception.ServiceException.class)
+                .hasMessageContaining("读取工作区文件失败 secrets.json").hasMessageNotContaining("refund-flow").hasMessageNotContaining("boom");
     }
 }

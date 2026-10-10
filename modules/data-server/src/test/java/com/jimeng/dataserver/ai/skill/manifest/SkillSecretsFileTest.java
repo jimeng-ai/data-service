@@ -231,7 +231,7 @@ class SkillSecretsFileTest {
         String old = "693a91f6-7a2b-4c1d-9e8f-0123456789ab";
         SecretValues previous = SecretValues.of(java.util.Map.of("WECOM_HOOK", old));
         byte[] json = ("{\"WECOM_HOOK\":{\"hosts\":[\"qyapi.weixin.qq.com\"],\"paths\":[\"/cgi-bin/webhook/send?key=" + old + "\"],\"methods\":[\"" + old + "\"]},"
-                + "\"" + old + "\":{\"hosts\":[\"https://x.example.com/" + old + "\"]}}").getBytes(StandardCharsets.UTF_8);
+                + "\"OTHER_KEY\":{\"hosts\":[\"https://x.example.com/" + old + "\"]}}").getBytes(StandardCharsets.UTF_8);   // 旧值当 key 名的写法见下面第 3 轮的 aPreviousValueUsedAsAKeyNameIsRejected
 
         assertThat(String.join("\n", SkillSecretsFile.parse(json).errors())).contains(old);   // 不传：文件里没写这个值，抹不掉（所以发布时要传）
         SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(json, previous);
@@ -376,5 +376,67 @@ class SkillSecretsFileTest {
         String all = String.join("\n", p.errors());
         assertThat(all).contains("「/v1/orders/{id}」不合法").contains("路径参数（比如 {id}）请写成 *").contains("永远匹配不上");
         assertThat(all).doesNotContain(TOKEN).doesNotContain(TOKEN.substring(0, 12)).contains("「/hook/{{{CRM_TOKEN}}}」");
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 2：key 名里不能出现任何已知的值
+
+    private static final String AWS_ID = "AKIAIOSFODNN7EXAMPLE";   // 形状正好符合 [A-Z][A-Z0-9_]{0,63}：能原样当 key 名
+
+    private static void assertNameProblem(SkillSecretsFile.Parsed p, String positions, String... mustNotAppear) {
+        assertThat(p.readable()).as("名字里有值：不知道还有什么地方会把名字（= 值）打出来，按读不出来处理").isFalse();
+        assertThat(p.valid()).isFalse();
+        assertThat(p.entries()).isEmpty();
+        assertThat(p.errors()).singleElement().satisfies(e -> {
+            assertThat(e).contains(positions).contains("名字").doesNotContain("；");
+            for (String v : mustNotAppear) assertThat(e).doesNotContain(v);
+        });
+    }
+
+    @Test
+    @DisplayName("★ 当前的值写成了 key 名（值的形状正好是合法的名字，比如 AWS 的 access key id）：拒绝，文案只说「第 N 个 key 的名字」，不回显名字（名字本身就是值）")
+    void aCurrentValueUsedAsItsOwnKeyNameIsRejected() {
+        assertNameProblem(parse("{\"" + AWS_ID + "\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}"),
+                "第 1 个 key 的名字", AWS_ID);
+        // 在别的条目的名字里（子串，区分大小写）；位置从 1 数起，多个用顿号隔开
+        assertNameProblem(parse("{\"OK_KEY\":{\"value\":\"FIRSTSECRET1\",\"hosts\":[\"a.example.com\"]},"
+                        + "\"MY_FIRSTSECRET1_KEY\":{\"value\":\"another-value-1\",\"hosts\":[\"a.example.com\"]},"
+                        + "\"X_FIRSTSECRET1\":{\"value\":\"third-value-123\",\"hosts\":[\"a.example.com\"]}}"),
+                "第 2、3 个 key 的名字", "FIRSTSECRET1");
+        // 区分大小写：名字里是小写的同一串，不算（它也是个不合法的名字，另有一条报错）
+        SkillSecretsFile.Parsed lower = parse("{\"my_firstsecret1_key\":{\"value\":\"FIRSTSECRET1\",\"hosts\":[\"a.example.com\"]}}");
+        assertThat(lower.readable()).isTrue();
+        assertThat(String.join("", lower.errors())).contains("不合法");
+    }
+
+    @Test
+    @DisplayName("★ 上一版的值写成了 key 名——带新 value 的，和不带 value 的（以前处理器放行，到 SkillSecretService.prepare 才抛「key <值> 没有给值」，那条异常没抹值）：都拒绝，不回显")
+    void aPreviousValueUsedAsAKeyNameIsRejected() {
+        SecretValues previous = SecretValues.of(java.util.Map.of("AWS_KEY_ID", AWS_ID));
+        assertNameProblem(SkillSecretsFile.parse(("{\"" + AWS_ID + "\":{\"value\":\"brand-new-value-1\",\"hosts\":[\"s3.amazonaws.com\"]}}")
+                .getBytes(StandardCharsets.UTF_8), previous), "第 1 个 key 的名字", AWS_ID);
+        assertNameProblem(SkillSecretsFile.parse(("{\"" + AWS_ID + "\":{\"hosts\":[\"s3.amazonaws.com\"]}}")
+                .getBytes(StandardCharsets.UTF_8), previous), "第 1 个 key 的名字", AWS_ID);
+        // 不传上一版的值：文件里没有它，看不出来（所以发布时要传）
+        assertThat(parse("{\"" + AWS_ID + "\":{\"hosts\":[\"s3.amazonaws.com\"]}}").valid()).isTrue();
+    }
+
+    @Test
+    @DisplayName("上一版某个 key 的名字里含有这一版 secrets.json 的值（上一版的名字当了这一版的值，写出来的占位符会把它打出来）：拒绝，不回显")
+    void aPreviousKeyNameCarryingACurrentValueIsRejected() {
+        SecretValues previous = SecretValues.of(java.util.Map.of("CRM_TOKEN_PROD", "an-old-secret-9999"));
+        SkillSecretsFile.Parsed p = SkillSecretsFile.parse(("{\"NEW_KEY\":{\"value\":\"CRM_TOKEN_PROD\",\"hosts\":[\"a.example.com\"]}}")
+                .getBytes(StandardCharsets.UTF_8), previous);
+        assertThat(p.readable()).isFalse();
+        assertThat(p.errors()).singleElement().satisfies(e -> assertThat(e).contains("上一版").contains("名字").doesNotContain("CRM_TOKEN_PROD").doesNotContain("an-old-secret"));
+    }
+
+    @Test
+    @DisplayName("名字里有值的 secrets.json 也没有预览（返回 null）：预览里的 key 名和占位符都会把名字打出来")
+    void noPreviewWhenAKeyNameCarriesAValue() {
+        assertThat(SkillSecretsFile.maskedPreview(("{\"" + AWS_ID + "\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}")
+                .getBytes(StandardCharsets.UTF_8))).isNull();
+        // 平常的写法不受影响
+        assertThat(SkillSecretsFile.maskedPreview(("{\"AWS_KEY_ID\":{\"value\":\"" + AWS_ID + "\",\"hosts\":[\"s3.amazonaws.com\"]}}")
+                .getBytes(StandardCharsets.UTF_8))).isNotNull().doesNotContain(AWS_ID);
     }
 }

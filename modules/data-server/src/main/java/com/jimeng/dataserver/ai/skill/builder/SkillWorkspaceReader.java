@@ -102,6 +102,25 @@ public class SkillWorkspaceReader {
         }
     }
 
+    /**
+     * 有界读取：最多读 {@code limit + 1} 个字节，内容超过 {@code limit} 就返回 null（调用方按超限处理）。
+     * 列举时报的大小只是当时的快照，读之前对象可能被换大（会话 GET 发生在一轮运行中，沙箱还在写工作区）：
+     * 上限在读的时候才算数，不先把整个对象读进内存再判断。
+     *
+     * <p>读失败时异常文案里的路径先用 {@code known} 抹值（存储报的出错信息里常常带着对象名，一起抹）。
+     * 读 secrets.json 本身时值集合还没确定：{@code showWhenFailed} 传固定的 {@code secrets.json}，且不带存储报的出错信息。
+     */
+    private byte[] readBounded(Listing l, String rel, long limit, SecretValues known, String showWhenFailed, boolean withDetail) {
+        byte[] bytes;
+        try {
+            bytes = storage.readBytesUpTo(l.prefix() + rel, limit);
+        } catch (Exception e) {
+            throw new ServiceException(ExceptionCode.INTERNAL_SERVER_ERROR,
+                    known.replace("读取工作区文件失败 " + showWhenFailed + (withDetail ? ": " + e.getMessage() : "")));
+        }
+        return bytes.length > limit ? null : bytes;
+    }
+
     /** 草稿预览；工作区里还没有 skill 时返回 null。预览和同步 DRAFT 行用这个：不解密沿用的 key。 */
     public DraftView draft(Listing l, String skillTypeOverride) {
         return draft(l, skillTypeOverride, PreviousKeys.NONE);
@@ -148,12 +167,14 @@ public class SkillWorkspaceReader {
         byte[] secretsJson = null;
         ObjectInfo secretsInfo = files.get(SkillBundleRules.SECRETS_JSON);
         if (secretsInfo != null) {
-            if (secretsInfo.size() > limit) {
-                // 先看大小，超了不读：读进来、解析、再数候选值，成本都是文件大小的倍数
+            // 先看列举时的大小，超了不读：读进来、解析、再数候选值，成本都是文件大小的倍数。没超也只读 limit + 1 个字节，
+            // 读回来超了同样按超限处理（列举之后、读取之前，对象可能被换大）
+            secretsJson = secretsInfo.size() > limit ? null
+                    : readBounded(l, dirPrefix + SkillBundleRules.SECRETS_JSON, limit, SecretValues.NONE, SkillBundleRules.SECRETS_JSON, false);
+            if (secretsJson == null) {
                 unreadable = true;
                 errors.add(SkillSecretsFile.tooLargeMessage(limit));
             } else {
-                secretsJson = readBytes(l, dirPrefix + SkillBundleRules.SECRETS_JSON);
                 SkillSecretsFile.Parsed parsed = SkillSecretsFile.parse(secretsJson, previousValues);
                 errors.addAll(parsed.errors());   // 文案在 parse 里已经抹过值（文件里的 + 上一版的）
                 if (parsed.readable()) {
@@ -165,7 +186,12 @@ public class SkillWorkspaceReader {
         }
         final SecretValues known = current.plus(previousValues);   // 抹值用的全集：文件里的值 + 上一版的全部值
 
-        boolean skillMdTooLarge = files.get(SkillBundleRules.SKILL_MD).size() > limit;
+        boolean skillMdTooLarge = files.get(SkillBundleRules.SKILL_MD).size() > limit;   // 列举时就超了：不读
+        byte[] skillMdBytes = null;
+        if (!skillMdTooLarge && !unreadable) {
+            skillMdBytes = readBounded(l, dirPrefix + SkillBundleRules.SKILL_MD, limit, known, dirPrefix + SkillBundleRules.SKILL_MD, true);
+            skillMdTooLarge = skillMdBytes == null;   // 读的时候才发现超了（列举之后被换大）
+        }
         String skillMd = "";
         ParsedSkill fm = null;
         if (skillMdTooLarge) {
@@ -174,7 +200,7 @@ public class SkillWorkspaceReader {
             // 不知道哪些是 key 的值：只报 secrets.json 自己的固定文案；SKILL.md 连读都不读，也不给任何文件的原文
             errors.add("SKILL.md 等 secrets.json 修好之后再校验：现在不知道哪些是 key 的值，校验的报错里可能带出原文");
         } else {
-            skillMd = known.replace(new String(readBytes(l, dirPrefix + SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8));
+            skillMd = known.replace(new String(skillMdBytes, StandardCharsets.UTF_8));
             fm = SkillManifestParser.parse(skillMd, SkillManifestParser.Mode.STRICT);
             fm.errors().forEach(e -> errors.add(known.replace(e)));
             // quick_validate 的「只能有一个 SKILL.md」：除根目录 SKILL.md 外，属于 skill 的路径里不能再有 SKILL.md。
@@ -224,9 +250,16 @@ public class SkillWorkspaceReader {
                 f.setText(SkillSecretsFile.maskedPreview(secretsJson));
                 f.setBinary(false);
             } else {
-                String text = decodeText(readBytes(l, dirPrefix + path));
-                f.setText(text == null ? null : known.replace(text));
-                f.setBinary(text == null);
+                // SKILL.md 上面已经有界读过一遍，不再读第二次；别的文件读的时候才算数，超了和「过大」一样不给文本
+                byte[] bytes = SkillBundleRules.SKILL_MD.equals(path) ? skillMdBytes
+                        : readBounded(l, dirPrefix + path, limit, known, dirPrefix + path, true);
+                if (bytes == null) {
+                    f.setBinary(false);
+                } else {
+                    String text = decodeText(bytes);
+                    f.setText(text == null ? null : known.replace(text));
+                    f.setBinary(text == null);
+                }
             }
             out.add(f);
         }

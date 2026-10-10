@@ -74,7 +74,7 @@ class SkillBuilderSessionServiceDraftSyncTest {
             String name = "ws/1/skill/refund-flow/" + e.getKey();
             byte[] bytes = e.getValue().getBytes(StandardCharsets.UTF_8);
             infos.add(new ObjectInfo(name, declaredSizes.getOrDefault(e.getKey(), (long) bytes.length), new Date()));
-            when(storage.readBytes(name)).thenReturn(bytes);
+            StorageStubs.object(storage, name, bytes);
         }
         when(storage.listObjectInfos("ws/1/")).thenReturn(infos);
         if (existingDraft != null) when(aiSkillMapper.selectById(existingDraft.getId())).thenReturn(existingDraft);
@@ -267,5 +267,24 @@ class SkillBuilderSessionServiceDraftSyncTest {
         String payload = new ObjectMapper().writeValueAsString(event);
         assertThat(payload).doesNotContain(TOKEN).doesNotContain("sk-live").doesNotContain("调接口时带上").doesNotContain("candidate-value-");
         assertThat(payload).contains("secrets.json");   // 固定文案还在
+    }
+
+    @Test
+    @DisplayName("★ 第 3 轮：key 的名字就是它自己的值——占位符 {{名字}} 会把值打出来，所以同样按读不出来处理：第一次同步建占位的一行，推给前端的事件里没有值、没有 skill 文件的原文")
+    void aKeyNameThatIsItsOwnValueIsTreatedLikeAnUnreadableFile() throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("SKILL.md", "---\nname: refund-flow\ndescription: 退款 " + TOKEN + "\n---\n带上 " + TOKEN + "\n");
+        files.put("secrets.json", "{\"" + TOKEN + "\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}");
+        workspace(files, null);
+
+        DraftUpdateEvent event = svc.syncAfterRun(1L, true);
+
+        assertThat(inserted).singleElement().satisfies(row -> {
+            assertThat(row.name()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_NAME);
+            assertThat(row.body()).isEqualTo(SkillBuilderSessionService.UNREADABLE_DRAFT_BODY);
+        });
+        String payload = new ObjectMapper().writeValueAsString(event);
+        assertThat(payload).doesNotContain(TOKEN).doesNotContain("sk-live").doesNotContain("带上");
+        assertThat(inserted.toString()).doesNotContain(TOKEN);
     }
 }

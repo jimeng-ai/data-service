@@ -2,6 +2,7 @@ package com.jimeng.dataserver.ai.skill.manifest;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
@@ -35,7 +36,8 @@ import java.util.Set;
  * （8 字符的值配 8192 字符的值，5 MB 文本要 3.7 秒）。
  *
  * <p>替换是一遍扫过去、最左边的先换、同一位置长的先换（值互为前缀时不会只换掉一半）、不重叠；换进去的占位符不会被再扫一遍。
- * 已知的缺口：两个不同的值首尾相接地重叠出现（A 的尾巴就是 B 的头）时，只换掉先出现的那个，后一个剩下它的后半截。
+ * 两个不同的值首尾相接地重叠出现（A 的尾巴就是 B 的头）时，只换掉先出现的那个，后一个剩下它的后半截——替换本身不处理这种情况，
+ * 由 {@link #replacement} 返回的 {@link Replacement#notFullyReplaced} 在原文上核对出来，发布处理器据此拒绝。
  */
 public final class SecretValues {
 
@@ -130,28 +132,147 @@ public final class SecretValues {
     public String replace(String text) {
         if (text == null || text.isEmpty() || items.isEmpty()) return text;
         final char[] t = text.toCharArray();
+        Spans spans = select(t);
+        return spans.count == 0 ? text : build(t, spans);
+    }
+
+    /**
+     * 同 {@link #replace}，并且留下选中的替换区间，供 {@link Replacement#notFullyReplaced} 在原文上核对
+     * 「别的值的每一处出现是不是都被这些替换盖住了」。
+     */
+    public Replacement replacement(String text) {
+        if (text == null || text.isEmpty()) return new Replacement(text, new char[0], new Spans());
+        final char[] t = text.toCharArray();
+        return new Replacement(text, t, items.isEmpty() ? new Spans() : select(t));
+    }
+
+    /** 一遍扫描选出来的替换区间：按起点从小到大、互不重叠；第 j 个区间 [starts[j], ends[j]) 换成 items[which[j]] 的占位符。 */
+    private static final class Spans {
+        int[] starts = new int[16];
+        int[] ends = new int[16];
+        int[] which = new int[16];
+        int count;
+
+        void add(int start, int end, int item) {
+            if (count == starts.length) {
+                int n = count * 2;
+                starts = Arrays.copyOf(starts, n);
+                ends = Arrays.copyOf(ends, n);
+                which = Arrays.copyOf(which, n);
+            }
+            starts[count] = start;
+            ends[count] = end;
+            which[count] = item;
+            count++;
+        }
+    }
+
+    /** 最左的先换；同一位置长的先换（排在前面的），从换掉的这一段后面接着找。 */
+    private Spans select(char[] t) {
         final int k = items.size();
         final int[] next = new int[k];      // 每个值下一次出现的位置（不早于上一次替换的结尾）；-1 = 后面没有了
         final int[] scanned = new int[k];   // 这个值已经扫到 t 的哪里：t[0, scanned) 看过了
         final int[] state = new int[k];     // 扫到 scanned 时的 KMP 状态：t 里以 scanned 结尾、同时是这个值前缀的最长一段的长度
         for (int i = 0; i < k; i++) next[i] = advance(t, chars[i], charFailure[i], 0, scanned, state, i);
-        StringBuilder out = null;
-        int pos = 0;
+        Spans spans = new Spans();
         while (true) {
             int best = -1;
             for (int i = 0; i < k; i++) {
                 if (next[i] >= 0 && (best < 0 || next[i] < next[best])) best = i;   // 同一位置：排在前面的（更长的）先到先得
             }
             if (best < 0) break;
-            if (out == null) out = new StringBuilder(text.length());
-            Item it = items.get(best);
-            out.append(t, pos, next[best] - pos).append("{{").append(it.name()).append("}}");
-            pos = next[best] + chars[best].length;
+            final int pos = next[best] + chars[best].length;
+            spans.add(next[best], pos, best);
             for (int i = 0; i < k; i++) {
                 if (next[i] >= 0 && next[i] < pos) next[i] = advance(t, chars[i], charFailure[i], pos, scanned, state, i);   // 续跑，不回头
             }
         }
-        return out == null ? text : out.append(t, pos, t.length - pos).toString();
+        return spans;
+    }
+
+    private String build(char[] t, Spans spans) {
+        StringBuilder out = new StringBuilder(t.length);
+        int pos = 0;
+        for (int j = 0; j < spans.count; j++) {
+            out.append(t, pos, spans.starts[j] - pos).append("{{").append(items.get(spans.which[j]).name()).append("}}");
+            pos = spans.ends[j];
+        }
+        return out.append(t, pos, t.length - pos).toString();
+    }
+
+    /**
+     * 一次替换的结果，连同选中的替换区间。
+     *
+     * <p>★ 残留要在<b>原文</b>上判，不能在替换之后的文本里搜：当前值只盖住旧值的前一半时，替换之后旧值已经不再整段出现，
+     * 剩下的后一半却原样留在文本里。{@link #notFullyReplaced} 对已知集合里的每个值、它在原文里的每一处出现
+     * （含互相重叠的），看这一处的每个字符是不是都被选中的替换盖住了（相接的区间算一整片）；有一个字符没被盖住，
+     * 就是有一截原文会留下来。同时兜住三种情况：旧值被当前值盖住一部分；旧值和当前值首尾相接；两个当前值在文本里互相重叠
+     * （被抢掉的那个，剩下的部分原样留下）。旧值整段落在一个更长的当前值里（新值是「Bearer 旧值」）、或者旧值同时也是
+     * 当前某个 key 的值（改了名），都整段被盖住，不报。
+     */
+    public final class Replacement {
+        private final String original;
+        private final char[] t;
+        private final Spans spans;
+        private String result;
+
+        private Replacement(String original, char[] t, Spans spans) {
+            this.original = original;
+            this.t = t;
+            this.spans = spans;
+        }
+
+        /** 替换之后的文本；原文里没有任何命中时是同一个对象。 */
+        public String text() {
+            if (result == null) result = spans.count == 0 ? original : build(t, spans);
+            return result;
+        }
+
+        /**
+         * 已知的值里，在原文里有一处出现没有被选中的替换整个盖住的那些，按已知集合里的顺序，只有名字。
+         * 耗时与文本长度成正比：每个值一遍 KMP，区间用一个只往前走的指针对。
+         */
+        public List<String> notFullyReplaced(SecretValues known) {
+            if (known == null || known.items.isEmpty() || t.length == 0) return List.of();
+            // 相接的区间并成一片：[runStarts[r], runEnds[r])
+            int[] runStarts = new int[spans.count];
+            int[] runEnds = new int[spans.count];
+            int runs = 0;
+            for (int j = 0; j < spans.count; j++) {
+                if (runs > 0 && runEnds[runs - 1] == spans.starts[j]) {
+                    runEnds[runs - 1] = spans.ends[j];
+                } else {
+                    runStarts[runs] = spans.starts[j];
+                    runEnds[runs] = spans.ends[j];
+                    runs++;
+                }
+            }
+            Set<String> names = new LinkedHashSet<>();
+            for (int i = 0; i < known.items.size(); i++) {
+                if (names.contains(known.items.get(i).name())) continue;
+                if (hasOccurrenceOutside(t, known.chars[i], known.charFailure[i], runStarts, runEnds, runs)) names.add(known.items.get(i).name());
+            }
+            return List.copyOf(names);
+        }
+    }
+
+    /** p 在 t 里有没有一处出现（含互相重叠的）不被某一片 [runStarts, runEnds) 整个盖住。 */
+    private static boolean hasOccurrenceOutside(char[] t, char[] p, int[] fail, int[] runStarts, int[] runEnds, int runs) {
+        final int m = p.length;
+        int q = 0;
+        int r = 0;   // 起点不晚于当前出现的最后一片；出现的起点只增不减，所以只往前走
+        for (int i = 0; i < t.length; i++) {
+            char c = t[i];
+            while (q > 0 && c != p[q]) q = fail[q - 1];
+            if (c == p[q]) q++;
+            if (q == m) {
+                int start = i - m + 1;
+                while (r + 1 < runs && runStarts[r + 1] <= start) r++;
+                if (runs == 0 || runStarts[r] > start || runEnds[r] < i + 1) return true;
+                q = fail[m - 1];
+            }
+        }
+        return false;
     }
 
     /**

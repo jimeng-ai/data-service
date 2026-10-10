@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
+import com.jimeng.dataserver.ai.skill.LogCapture;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
@@ -233,20 +234,68 @@ class SkillSecretServiceTest {
         assertThat(prev.names()).containsExactly("CRM_TOKEN");
         assertThat(prev.values(List.of())).isEmpty();
         assertThatThrownBy(() -> prev.values(List.of("CRM_TOKEN")))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("无法核对上一版的 key").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+                .isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置").hasMessageContaining("CONNECTION_CREDENTIAL_KEY");
+        assertThatThrownBy(prev::open).isInstanceOf(ServiceException.class).hasMessageContaining("加密密钥没有配置");
     }
 
     @Test
-    @DisplayName("解密失败（密钥轮换过、密文坏了）：拒绝，文案点名 key、不带密文")
-    void previousKeysRefuseWhenDecryptionFails() {
+    @DisplayName("★ R27 配了密钥、但某个 key 的密文解不开（密钥换过、密文坏了）：不抛，解得开的照常给，解不开的单独报出来（不参与抹值），记一条 WARN，只带 skill id 和 key 名")
+    void aKeyThatCannotBeDecryptedIsReportedNotThrown() {
         CredentialCipher cipher = realCipher();
         SkillSecretMapper mapper = mock(SkillSecretMapper.class);
+        SkillSecret good = previousRow(cipher, null);
         SkillSecret broken = previousRow(cipher, null);
+        broken.setName("BROKEN_KEY");
+        broken.setSkillId(42L);
         broken.setCiphertext("bm90LWEtdmFsaWQtY2lwaGVydGV4dC1hdC1hbGwtbm90LWEtdmFsaWQ=");
-        when(mapper.selectList(any())).thenReturn(List.of(broken));
-        assertThatThrownBy(() -> new SkillSecretService(mapper, cipher).previousKeys(42L, 3).values(List.of("CRM_TOKEN")))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("CRM_TOKEN").hasMessageContaining("解密失败")
-                .hasMessageNotContaining(broken.getCiphertext());
+        when(mapper.selectList(any())).thenReturn(List.of(good, broken));
+
+        try (LogCapture logs = LogCapture.of(SkillSecretService.class)) {
+            PreviousKeys prev = new SkillSecretService(mapper, cipher).previousKeys(42L, 3);
+            PreviousKeys.Opened opened = prev.open();
+
+            assertThat(prev.names()).containsExactlyInAnyOrder("CRM_TOKEN", "BROKEN_KEY");   // 名字照样在：文件里还在用 {{BROKEN_KEY}} 的核对要用
+            assertThat(opened.values()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
+            assertThat(opened.undecryptable()).containsExactly("BROKEN_KEY");
+            assertThat(prev.values(List.of("BROKEN_KEY"))).isEmpty();                          // 单独问也不抛
+            assertThat(prev.allValues()).isEqualTo(Map.of("CRM_TOKEN", TOKEN));
+
+            assertThat(logs.warnings()).isNotEmpty().allSatisfy(m -> assertThat(m).contains("BROKEN_KEY").contains("42")
+                    .doesNotContain(TOKEN).doesNotContain(broken.getCiphertext()).doesNotContain("CRM_TOKEN"));
+        }
+    }
+
+    @Test
+    @DisplayName("PreviousKeys.decrypted(值, 解不开的)：names 包含两者，values 只有解得开的，undecryptable 原样带着；不带第二个参数就是没有解不开的")
+    void decryptedKeepsTheUndecryptableNames() {
+        PreviousKeys prev = PreviousKeys.decrypted(Map.of("GOOD_KEY", "good-value-123"), java.util.Set.of("BROKEN_KEY"));
+        assertThat(prev.names()).containsExactlyInAnyOrder("GOOD_KEY", "BROKEN_KEY");
+        assertThat(prev.allValues()).isEqualTo(Map.of("GOOD_KEY", "good-value-123"));
+        assertThat(prev.undecryptable()).containsExactly("BROKEN_KEY");
+        assertThat(prev.open().undecryptable()).containsExactly("BROKEN_KEY");
+        assertThat(PreviousKeys.decrypted(Map.of("GOOD_KEY", "good-value-123")).undecryptable()).isEmpty();
+        assertThat(PreviousKeys.NONE.open().values()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("★ prepare 里所有拼了名字的异常文案，一律过 SecretValues 抹一遍（名字里万一带着这次的值，不会原样进异常和 ERROR 日志）")
+    void prepareMessagesNeverCarryAValue() {
+        SkillSecretsFile.Entry carrier = new SkillSecretsFile.Entry("MY_FIRSTSECRET1_KEY", null, List.of("a.example.com"), null, null);
+        SkillSecretsFile.Entry owner = new SkillSecretsFile.Entry("OWNER_KEY", "FIRSTSECRET1", List.of("a.example.com"), null, null);
+
+        // 第一次出现、没给值
+        assertThatThrownBy(() -> new SkillSecretService(mock(SkillSecretMapper.class), realCipher()).prepare("t1", 42L, null, List.of(carrier, owner)))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("没有给值").hasMessageNotContaining("FIRSTSECRET1");
+
+        // 范围改了
+        CredentialCipher cipher = realCipher();
+        SkillSecretMapper mapper = mock(SkillSecretMapper.class);
+        SkillSecret old = previousRow(cipher, null);
+        old.setName("MY_FIRSTSECRET1_KEY");
+        when(mapper.selectList(any())).thenReturn(List.of(old));
+        SkillSecretsFile.Entry moved = new SkillSecretsFile.Entry("MY_FIRSTSECRET1_KEY", null, List.of("evil.example.com"), null, null);
+        assertThatThrownBy(() -> new SkillSecretService(mapper, cipher).prepare("t1", 42L, 3, List.of(moved, owner)))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("作废").hasMessageNotContaining("FIRSTSECRET1");
     }
 
     @Test

@@ -120,11 +120,11 @@ class SecretValuesTest {
     }
 
     @Test
-    @DisplayName("★ 查找是线性的：2MB 的「aaa…」配「aaa…ab」不会拖住线程（朴素的 indexOf 要算上百亿次比较）")
+    @DisplayName("★ 查找是线性的：2MB 的「aaa…」配「aaa…ab」不会拖住线程，替换和两种 namesIn 合计 1 秒内（新实现约 0.02 s；朴素写法 String.indexOf 每项约 3 s、逐字节的双重循环约 7 s，合计十几秒）")
     void searchIsLinear() {
         String hay = "a".repeat(2_000_000);
         SecretValues v = SecretValues.of(List.of(new SecretValues.Item("TRAP_KEY", "a".repeat(8191) + "b")));
-        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
             assertThat(v.replace(hay)).isSameAs(hay);
             assertThat(v.namesIn(hay)).isEmpty();
             assertThat(v.namesIn(hay.getBytes(StandardCharsets.UTF_8))).isEmpty();
@@ -203,25 +203,204 @@ class SecretValuesTest {
     }
 
     @Test
-    @DisplayName("★ 64 个值配 5 MB 文本：替换、namesIn（文本、字节）各在 1 秒内")
-    void sixtyFourValuesOverFiveMegabytesTakeUnderASecond() {
-        Random rnd = new Random(11);
+    @DisplayName("★ 64 个值反复抢位置也是线性的：一个 8 字符的值每隔 8 个字符抢走一次，63 个 3200 字符上下、互相是前缀的周期值每次都被抢——1 MB 文本，"
+            + "替换 5 秒内完成（新实现约 0.1~0.2 s，上限的 1/30 以下；旧的重扫写法每抢一次、每个长值就从头扫一遍约 3200 个字符，要三十多秒）；namesIn（文本、字节）同样")
+    void sixtyFourValuesStealingFromEachOtherStayLinear() {
+        java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < 63; i++) m.put("LONG_" + i, "ba".repeat(1600 + i));
+        m.put("SHORT_KEY", "ab".repeat(4));
+        SecretValues v = SecretValues.of(m);
+        String text = "ab".repeat(512 * 1024);   // 1 MB
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> assertThat(v.replace(text)).startsWith("{{SHORT_KEY}}{{SHORT_KEY}}").doesNotContain("abababab"));
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> assertThat(v.namesIn(text)).hasSize(64));
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> assertThat(v.namesIn(bytes)).hasSize(64));
+    }
+
+    // ---------------------------------------------------------------- 第 3 轮 1：残留检查在原文上做，按「整段落在某一次替换之内」判
+
+    private static final String AWS_ID = "AKIAIOSFODNN7EXAMPLE";
+    private static final String AWS_COMBINED = AWS_ID + ":wJalrXUtnFEMIK7MDENG";
+
+    private static SecretValues valuesOf(String... nameValue) {
         List<SecretValues.Item> items = new ArrayList<>();
-        StringBuilder text = new StringBuilder(5_300_000);
-        for (int i = 0; i < 64; i++) {
-            StringBuilder v = new StringBuilder("value" + i + "-");
-            for (int n = 8 + rnd.nextInt(33); n > 0; n--) v.append((char) ('a' + rnd.nextInt(26)));
-            items.add(new SecretValues.Item("KEY_" + i, v.toString()));
+        for (int i = 0; i < nameValue.length; i += 2) items.add(new SecretValues.Item(nameValue[i], nameValue[i + 1]));
+        return SecretValues.of(items);
+    }
+
+    @Test
+    @DisplayName("★ 前缀覆盖：当前值只盖住旧值的前一半，旧值剩下的一半替换之后不再整段出现——按原文判，这一处出现里有字符没被选中的替换盖住")
+    void aValueThatIsOnlyPartlyCoveredByAReplacementIsReported() {
+        SecretValues replaceSet = valuesOf("AK_ID", AWS_ID);
+        SecretValues previous = valuesOf("AWS_CRED", AWS_COMBINED);
+        String text = "CRED = '" + AWS_COMBINED + "'\n";
+
+        SecretValues.Replacement r = replaceSet.replacement(text);
+
+        assertThat(r.text()).isEqualTo("CRED = '{{AK_ID}}:wJalrXUtnFEMIK7MDENG'\n");   // 替换之后的文本里旧值已经不是整段了：以前就是在这里放行的
+        assertThat(r.notFullyReplaced(previous)).containsExactly("AWS_CRED");
+        assertThat(r.notFullyReplaced(replaceSet)).isEmpty();                          // 当前值自己整段被换掉了
+    }
+
+    @Test
+    @DisplayName("首尾相接：当前值的尾巴就是旧值的头（或反过来）——旧值露出来的那一截也要报")
+    void adjacentOverlapsAreReportedToo() {
+        SecretValues replaceSet = valuesOf("TENANT_KEY", "tenant-0042-ABCD");
+        SecretValues previous = valuesOf("OLD_KEY", "ABCD-1234-wxyz-5678");
+        SecretValues.Replacement r = replaceSet.replacement("X = 'tenant-0042-ABCD-1234-wxyz-5678'");
+        assertThat(r.text()).isEqualTo("X = '{{TENANT_KEY}}-1234-wxyz-5678'");
+        assertThat(r.notFullyReplaced(previous)).containsExactly("OLD_KEY");
+
+        // 旧值在前、当前值在后
+        SecretValues replaceSet2 = valuesOf("TAIL_KEY", "wxyz-5678-ZZZZ");
+        SecretValues previous2 = valuesOf("OLD_KEY", "ABCD-1234-wxyz-5678");
+        assertThat(replaceSet2.replacement("X = 'ABCD-1234-wxyz-5678-ZZZZ'").notFullyReplaced(previous2)).containsExactly("OLD_KEY");
+    }
+
+    @Test
+    @DisplayName("两个都要替换的值在文本里互相重叠：靠左的先换，被抢掉的那个剩下的部分会原样留下——报被抢掉的那个")
+    void twoReplacedValuesThatOverlapInTheTextLeaveTheSecondOneBehind() {
+        SecretValues both = valuesOf("KEY_A", "xxxx-AAAA-1111", "KEY_B", "AAAA-1111-yyyy");
+        SecretValues.Replacement r = both.replacement("v = 'xxxx-AAAA-1111-yyyy'");
+        assertThat(r.text()).isEqualTo("v = '{{KEY_A}}-yyyy'");
+        assertThat(r.notFullyReplaced(both)).containsExactly("KEY_B");
+        // 各自单独出现时，都整段被换掉
+        assertThat(both.replacement("a xxxx-AAAA-1111 b AAAA-1111-yyyy c").notFullyReplaced(both)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("★ 当前值包含旧值（旧 sk-abc12345，新 Bearer sk-abc12345）：旧值的每个字符都在新值的替换区间里，不算；旧值单独出现在区间之外才算")
+    void aPreviousValueInsideACurrentValueIsFine() {
+        SecretValues replaceSet = valuesOf("AUTH_HEADER", "Bearer sk-abc12345");
+        SecretValues previous = valuesOf("API_KEY", "sk-abc12345");
+        assertThat(replaceSet.replacement("h = 'Bearer sk-abc12345'").notFullyReplaced(previous)).isEmpty();
+        assertThat(replaceSet.replacement("h = 'Bearer sk-abc12345' and k = 'sk-abc12345'").notFullyReplaced(previous)).containsExactly("API_KEY");
+    }
+
+    @Test
+    @DisplayName("同一个值有两个名字（key 改了名、值没变）：按当前的名字换，旧名字不算残留")
+    void aRenamedKeyIsNotResidue() {
+        SecretValues replaceSet = valuesOf("NEW_NAME", AWS_ID);
+        SecretValues previous = valuesOf("OLD_NAME", AWS_ID);
+        SecretValues.Replacement r = replaceSet.replacement("id = '" + AWS_ID + "'");
+        assertThat(r.text()).isEqualTo("id = '{{NEW_NAME}}'");
+        assertThat(r.notFullyReplaced(previous)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("没命中、没有值、空文本：没有残留；text() 是原来的同一个对象")
+    void nothingToReport() {
+        SecretValues v = valuesOf("AK_ID", AWS_ID);
+        String text = "没有任何 key 的文字";
+        assertThat(v.replacement(text).text()).isSameAs(text);
+        assertThat(v.replacement(text).notFullyReplaced(valuesOf("AWS_CRED", AWS_COMBINED))).isEmpty();
+        assertThat(SecretValues.NONE.replacement(text).notFullyReplaced(v)).isEmpty();
+        assertThat(SecretValues.NONE.replacement("x " + AWS_ID).notFullyReplaced(v)).containsExactly("AK_ID");   // 没有任何替换：每一处出现都在区间之外
+        assertThat(v.replacement("").notFullyReplaced(v)).isEmpty();
+        assertThat(v.replacement(text).notFullyReplaced(SecretValues.NONE)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("★ 随机对拍：替换集合是已知集合的一个子集，值互相重叠、互为前缀、文本只由 a b 组成——与朴素写法（先选区间、再逐处核对）逐条一致；text() 与 replace() 一致")
+    void theCoverageCheckAgreesWithTheNaiveVersion() {
+        Random rnd = new Random(31);
+        int flagged = 0;
+        for (int i = 0; i < 20_000; i++) {
+            StringBuilder text = new StringBuilder();
+            for (int n = 10 + rnd.nextInt(110); n > 0; n--) text.append(rnd.nextBoolean() ? 'a' : 'b');
+            List<SecretValues.Item> known = new ArrayList<>();
+            String base = randomAb(rnd, 8 + rnd.nextInt(5));
+            known.add(new SecretValues.Item("K_BASE", base));
+            if (rnd.nextInt(3) > 0) known.add(new SecretValues.Item("K_LONGER", base + randomAb(rnd, 1 + rnd.nextInt(6))));
+            if (rnd.nextInt(3) > 0) known.add(new SecretValues.Item("K_OVERLAP", base.substring(3) + randomAb(rnd, 3 + rnd.nextInt(6))));
+            if (rnd.nextInt(3) > 0) known.add(new SecretValues.Item("K_OTHER", randomAb(rnd, 8 + rnd.nextInt(7))));
+            if (rnd.nextInt(4) == 0) {
+                int from = rnd.nextInt(text.length() - 8);
+                known.add(new SecretValues.Item("K_INSIDE", text.substring(from, from + 4 + rnd.nextInt(4)).repeat(2)));
+            }
+            List<SecretValues.Item> replace = new ArrayList<>();
+            for (SecretValues.Item it : known) if (rnd.nextInt(3) > 0) replace.add(it);   // 其余的是「上一版里删掉了的」
+            SecretValues replaceSet = SecretValues.of(replace);
+            SecretValues.Replacement r = replaceSet.replacement(text.toString());
+
+            assertThat(r.text()).as("替换 %s 文本 %s", replace, text).isEqualTo(replaceSet.replace(text.toString()));
+            List<String> expected = naiveNotFullyReplaced(replace, known, text.toString());
+            assertThat(r.notFullyReplaced(SecretValues.of(known))).as("替换 %s 已知 %s 文本 %s", replace, known, text)
+                    .containsExactlyInAnyOrderElementsOf(expected);
+            if (!expected.isEmpty()) flagged++;
         }
-        while (text.length() < 5_242_880) {
-            for (int n = 400 + rnd.nextInt(600); n > 0; n--) text.append((char) ('a' + rnd.nextInt(26)));
-            text.append(items.get(rnd.nextInt(64)).value());
+        assertThat(flagged).as("生成器真的产生了不少「剩下一截」的情形（实测一千出头）").isGreaterThan(500);
+    }
+
+    /**
+     * 参照写法：先按最左、同位置更长的规则选出替换区间，把被盖住的字符标出来；已知集合里每个值的每一处出现（含互相重叠的），
+     * 只要有一个字符没被盖住，就算「没有被替换盖满」。
+     */
+    private static List<String> naiveNotFullyReplaced(List<SecretValues.Item> replaceItems, List<SecretValues.Item> knownItems, String text) {
+        List<SecretValues.Item> sorted = new ArrayList<>();
+        for (SecretValues.Item it : replaceItems) if (it.value().length() >= SecretValues.MIN_VALUE_LENGTH) sorted.add(it);
+        sorted.sort((a, b) -> Integer.compare(b.value().length(), a.value().length()));
+        boolean[] covered = new boolean[text.length()];
+        int pos = 0;
+        while (true) {
+            int bestAt = -1;
+            SecretValues.Item best = null;
+            for (SecretValues.Item it : sorted) {
+                int at = text.indexOf(it.value(), pos);
+                if (at >= 0 && (bestAt < 0 || at < bestAt)) {
+                    bestAt = at;
+                    best = it;
+                }
+            }
+            if (best == null) break;
+            for (int c = bestAt; c < bestAt + best.value().length(); c++) covered[c] = true;
+            pos = bestAt + best.value().length();
         }
-        String hay = text.toString();
-        byte[] bytes = hay.getBytes(StandardCharsets.UTF_8);
-        SecretValues v = SecretValues.of(items);
-        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.replace(hay)).doesNotContain("value0-"));
-        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.namesIn(hay)).hasSize(64));
-        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> assertThat(v.namesIn(bytes)).hasSize(64));
+        List<String> names = new ArrayList<>();
+        for (SecretValues.Item k : knownItems) {
+            if (k.value().length() < SecretValues.MIN_VALUE_LENGTH || names.contains(k.name())) continue;
+            search:
+            for (int at = text.indexOf(k.value()); at >= 0; at = text.indexOf(k.value(), at + 1)) {
+                for (int c = at; c < at + k.value().length(); c++) {
+                    if (!covered[c]) {
+                        names.add(k.name());
+                        break search;
+                    }
+                }
+            }
+        }
+        return names;
+    }
+
+    @Test
+    @DisplayName("★ 核对是线性的：3 MB 的文本里同一个值出现三十五万次、每一次都是独立的一片替换（中间隔着一个字符），逐处核对不能每次都从头数这三十五万片（那是六百多亿次比较）；"
+            + "2 秒内完成（新实现约 0.05 s；每次从头数的写法要十几秒）")
+    void theCoverageCheckIsLinear() {
+        SecretValues replaceSet = valuesOf("ONLY_KEY", "ABCDEFGH");
+        String text = "ABCDEFGH-".repeat(350_000);
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            SecretValues.Replacement r = replaceSet.replacement(text);
+            assertThat(r.notFullyReplaced(replaceSet)).isEmpty();   // 每一处出现都整段落在自己的那一片里
+            assertThat(r.text()).startsWith("{{ONLY_KEY}}-{{ONLY_KEY}}-");
+        });
+    }
+
+    @Test
+    @DisplayName("判的是「这一处出现的每个字符是否都被某次替换盖住」：相接的两个区间算一整片（8 个 0 的值，写了 16 个 0 → 两个整段相接，跨在两段上的出现也整个被盖住，不报）；"
+            + "写了 12 个 0 → 剩下 4 个 0 是值的一截，报")
+    void adjacentReplacementsCountAsOneCoveredRun() {
+        SecretValues v = valuesOf("ZERO_KEY", "00000000");
+        assertThat(v.replacement("n = 00000000").notFullyReplaced(v)).isEmpty();
+        assertThat(v.replacement("n = 0000000000000000").notFullyReplaced(v)).isEmpty();
+        assertThat(v.replacement("n = 000000000000").notFullyReplaced(v)).containsExactly("ZERO_KEY");
+        assertThat(v.replacement("n = 000000000").notFullyReplaced(v)).containsExactly("ZERO_KEY");   // 9 个：剩 1 个
+
+        // 一个旧值正好跨在两个相接的当前值上：字符全被盖住，没有剩下的
+        SecretValues replaceSet = valuesOf("KEY_A", "AAAAAAAA1111", "KEY_B", "2222BBBBBBBB");
+        SecretValues previous = valuesOf("OLD_KEY", "11112222");
+        assertThat(replaceSet.replacement("x AAAAAAAA11112222BBBBBBBB y").notFullyReplaced(previous)).isEmpty();
+        assertThat(replaceSet.replacement("x AAAAAAAA11112222BBBBBBBB y").text()).isEqualTo("x {{KEY_A}}{{KEY_B}} y");
+        // 中间隔了一个字符就不是一片了
+        assertThat(replaceSet.replacement("x AAAAAAAA1111-2222BBBBBBBB y").notFullyReplaced(valuesOf("OLD_KEY", "1111-2222"))).containsExactly("OLD_KEY");
     }
 }
