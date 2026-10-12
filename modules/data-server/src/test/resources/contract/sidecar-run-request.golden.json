@@ -1,0 +1,116 @@
+{
+  "runId" : "2099066794181541899",
+  "tenantId" : "t_contract",
+  "userId" : "1900000000000000001",
+  "traceId" : "trace-contract",
+  "agentId" : "2099066794181541890",
+  "prompt" : "对拍用的一句话",
+  "history" : [ {
+    "role" : "user",
+    "content" : "上一句"
+  } ],
+  "inputFiles" : [ {
+    "objectName" : "agent-input/a.csv",
+    "filename" : "a.csv",
+    "bucket" : "rag",
+    "sizeBytes" : 12
+  } ],
+  "artifactBucket" : "rag",
+  "ragContext" : {
+    "kbId" : "2099066794181541801",
+    "topK" : 5,
+    "rerank" : true,
+    "accessToken" : "RAG-SENTINEL"
+  },
+  "llm" : {
+    "baseUrl" : "https://api.302.ai/v1",
+    "authToken" : "LLM-SENTINEL",
+    "model" : "claude-opus-4-8",
+    "authScheme" : "bearer"
+  },
+  "systemPrompt" : "你是对拍助手",
+  "imageGen" : {
+    "baseUrl" : "https://img.example.com",
+    "authToken" : "IMG-SENTINEL",
+    "model" : "gpt-image-2",
+    "authScheme" : "bearer",
+    "provider" : "openai",
+    "batchConcurrency" : 2
+  },
+  "webSearch" : {
+    "baseUrl" : "https://search.example.com",
+    "authToken" : "WEB-SENTINEL",
+    "provider" : "anysearch",
+    "maxResults" : 5,
+    "authScheme" : "bearer"
+  },
+  "limits" : {
+    "wallClockSec" : 300,
+    "maxTurns" : 25,
+    "maxBudgetUsd" : 2.5
+  },
+  "skills" : [ {
+    "name" : "crm",
+    "files" : [ {
+      "objectName" : "skills/7/2/SKILL.md",
+      "relPath" : "SKILL.md",
+      "bucket" : "rag"
+    } ]
+  } ],
+  "runProfile" : "default",
+  "semanticContext" : {
+    "callbackBaseUrl" : "http://localhost:10011/data",
+    "accessToken" : "SEM-SENTINEL",
+    "generationId" : "2099066794181541890",
+    "connectorId" : "2099066794181541891",
+    "sliceNo" : 1
+  },
+  "connectorContext" : {
+    "callbackBaseUrl" : "http://localhost:10011/data",
+    "accessToken" : "CONN-SENTINEL",
+    "agentId" : "2099066794181541890",
+    "tools" : [ {
+      "name" : "conn_query",
+      "description" : "只读查询",
+      "inputSchema" : {
+        "type" : "object"
+      }
+    } ]
+  },
+  "workspace" : {
+    "bucket" : "rag",
+    "prefix" : "skill-builder/1/"
+  },
+  "skillBuilder" : {
+    "triggerEval" : {
+      "header" : "技能列表",
+      "lineTemplate" : "- **{name}**: {description}",
+      "candidates" : [ {
+        "name" : "crm",
+        "description" : "处理退款"
+      } ],
+      "tools" : [ {
+        "name" : "activate_skills"
+      } ],
+      "model" : "claude-opus-4-8",
+      "maxTokens" : 256,
+      "activateToolName" : "activate_skills"
+    },
+    "skillTypeOverride" : "PROMPT",
+    "cliMaxWorkers" : 2
+  },
+  "httpContext" : {
+    "callbackBaseUrl" : "http://localhost:10011/data",
+    "accessToken" : "HTTP-SENTINEL",
+    "timeoutSeconds" : 90,
+    "keys" : [ {
+      "skill" : "crm",
+      "name" : "CRM_TOKEN",
+      "hosts" : [ "api.customer.com" ],
+      "methods" : [ "GET" ],
+      "paths" : [ "/v1/orders/**" ]
+    } ],
+    "hosts" : [ "cdn.example.com" ],
+    "web" : true
+  }
+}
