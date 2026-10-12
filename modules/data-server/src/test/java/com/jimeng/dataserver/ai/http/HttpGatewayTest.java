@@ -558,4 +558,125 @@ class HttpGatewayTest {
         assertThat(r.status()).isEqualTo(500);
         assertThat(seen).isEmpty();
     }
+
+    @Test
+    void finalCredentialPathMustStayWithinScope() {
+        for (String value : List.of("abcdefgh/../../admin", "abcdefgh")) {
+            keys(key(1L, "crm", "TOKEN", value, null, List.of(value.contains("/") ? "/v1/orders/*" : "/v1/orders/%7B%7BTOKEN%7D%7D")));
+            HttpGatewayResult r = gateway().execute(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/v1/orders/{{TOKEN}}"), null));
+            assertThat(r.status()).isEqualTo(403);
+            assertThat(seen).isEmpty();
+        }
+    }
+
+    @Test
+    void secretBearingResponseHeaderNamesAreOmitted() {
+        keys(key(1L, "crm", "TOKEN", "PRIVATE-SECRET-123", null, null));
+        routes.put("/headers", ex -> { ex.getResponseHeaders().add("x-private-secret-123", "ok"); ex.getResponseHeaders().add("X-Safe", "ok"); reply(ex, 200, "text/plain", "ok"); });
+        HttpGatewayResult r = gateway().execute(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/headers"), null));
+        assertThat(r.headers()).noneMatch(h -> h.getKey().contains("private-secret-123"));
+        assertThat(r.header("x-safe")).isEqualTo("ok");
+    }
+
+    @Test
+    void pendingDnsAndRedirectDnsShareTotalDeadline() throws Exception {
+        keys();
+        SkillGrant g = grant(1L, "crm", List.of("api.customer.test"), false, 1);
+        GatewayResolver stalled = host -> { try { Thread.sleep(1600); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } return List.of(InetAddress.getByName("127.0.0.1")); };
+        long start = System.nanoTime();
+        HttpGatewayResult r = new HttpGateway(props, secrets, stalled, policy).execute(ctx(TOOL, g), req("GET", url("api.customer.test", "/"), null));
+        assertThat(r.gatewayError()).isEqualTo("timeout");
+        assertThat((System.nanoTime()-start)/1_000_000).isLessThan(1400);
+        assertThat(seen).isEmpty();
+        AtomicInteger calls = new AtomicInteger();
+        GatewayResolver redirected = host -> { try { Thread.sleep(calls.getAndIncrement() == 0 ? 400 : 1600); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } return List.of(InetAddress.getByName("127.0.0.1")); };
+        routes.put("/dns-next", ex -> redirect(ex, 302, "/done"));
+        start = System.nanoTime();
+        r = new HttpGateway(props, secrets, redirected, policy).execute(ctx(TOOL, g), req("GET", url("api.customer.test", "/dns-next"), null));
+        assertThat(r.gatewayError()).isEqualTo("timeout");
+        assertThat((System.nanoTime()-start)/1_000_000).isLessThan(1400);
+        assertThat(seen).hasSize(1);
+    }
+
+    @Test
+    void strictScrubbingCoversBodyHeaderErrorsAndAudit() {
+        String overlap = "abcdefgh123456789";
+        String mixed = "token%2Fwith%2bchars123";
+        keys(key(1L, "crm", "FIRST_KEY", "abcdefgh", null, null), key(1L, "crm", "OTHER_KEY", "bcdefgh123456789", null, null), key(1L, "crm", "TOKEN", "token/with+chars123", null, null));
+        routes.put("/strict", ex -> { ex.getResponseHeaders().add("X-Echo", overlap + " " + mixed); reply(ex, 200, "text/plain", overlap + " " + mixed); });
+        Logger audit = (Logger) LoggerFactory.getLogger("jm.http-gateway.audit");
+        ch.qos.logback.classic.Level old = audit.getLevel(); audit.setLevel(ch.qos.logback.classic.Level.INFO);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>(); appender.start(); audit.addAppender(appender);
+        try {
+            HttpGatewayResult r = gateway().execute(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/strict?t=" + overlap + "&m=" + mixed), null));
+            assertThat(text(r)).doesNotContain("123456789").doesNotContain(mixed);
+            assertThat(r.header("x-echo")).doesNotContain("123456789").doesNotContain(mixed);
+            HttpGatewayResult error = gateway().execute(ctx(TOOL, CRM), req(overlap + " " + mixed, url("api.customer.test", "/strict"), null));
+            assertThat(error.message()).doesNotContain("123456789").doesNotContain(mixed);
+            assertThat(appender.list).allSatisfy(e -> assertThat(e.getFormattedMessage()).doesNotContain("123456789").doesNotContain(mixed));
+        } finally { audit.detachAppender(appender); audit.setLevel(old); }
+    }
+
+    @Test
+    void expandedRequestBodyAndOrdinaryUploadsRespectPlaneCaps() {
+        keys(key(1L, "crm", "TOKEN", "a".repeat(8192), null, null));
+        HttpGatewayResult large = gateway().execute(ctx(TOOL, CRM), req("POST", url("api.customer.test", "/"), "{{TOKEN}}".repeat(1024).getBytes(StandardCharsets.UTF_8)));
+        assertThat(large.gatewayError()).isEqualTo("bad_request");
+        assertThat(seen).isEmpty();
+        keys();
+        SkillGrant g = grant(1L, "crm", List.of("api.customer.test"), false, 60);
+        props.setToolRequestMaxBytes(8); props.setScriptRequestMaxBytes(16);
+        assertThat(gateway().execute(ctx(TOOL, g), req("POST", url("api.customer.test", "/"), new byte[9])).gatewayError()).isEqualTo("bad_request");
+        assertThat(gateway().execute(ctx(SCRIPT, g), req("POST", url("api.customer.test", "/"), new byte[17])).gatewayError()).isEqualTo("bad_request");
+        assertThat(seen).isEmpty();
+        assertThat(gateway().execute(ctx(TOOL, g), req("POST", url("api.customer.test", "/"), new byte[8])).status()).isEqualTo(200);
+        assertThat(gateway().execute(ctx(SCRIPT, g), req("POST", url("api.customer.test", "/"), new byte[16])).status()).isEqualTo(200);
+    }
+
+    @Test
+    void upstreamFailureUsesPublicAccessWording() throws Exception {
+        keys();
+        int closedPort; try (ServerSocket socket = new ServerSocket(0)) { closedPort = socket.getLocalPort(); }
+        HttpGatewayResult r = gateway().execute(ctx(TOOL, grant(1L, "crm", List.of("api.customer.test"), false, 60)), req("GET", "http://api.customer.test:"+closedPort+"/", null));
+        assertThat(r.message()).contains("访问").doesNotContain("连接");
+    }
+
+    @Test
+    void stalledDnsHasBoundedCapacityAndTimeoutQueueDoesNotAccumulate() throws Exception {
+        keys();
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger entered = new AtomicInteger();
+        GatewayResolver stuck = host -> {
+            entered.incrementAndGet();
+            boolean done = false;
+            while (!done) { try { release.await(); done = true; } catch (InterruptedException ignored) {} }
+            return List.of(InetAddress.getByName("127.0.0.1"));
+        };
+        HttpGateway gateway = new HttpGateway(props, secrets, stuck, policy);
+        SkillGrant g = grant(1L, "crm", List.of("api.customer.test"), false, 1);
+        java.util.concurrent.ExecutorService callers = Executors.newFixedThreadPool(24);
+        List<java.util.concurrent.Future<HttpGatewayResult>> pending = new ArrayList<>();
+        try {
+            for (int i = 0; i < 24; i++) pending.add(callers.submit(() -> gateway.execute(ctx(TOOL, g), req("GET", url("api.customer.test", "/"), null))));
+            List<HttpGatewayResult> results = new ArrayList<>();
+            for (var future : pending) results.add(future.get(3, java.util.concurrent.TimeUnit.SECONDS));
+            assertThat(entered.get()).isLessThanOrEqualTo(4);
+            assertThat(results).allMatch(r -> "timeout".equals(r.gatewayError()) || "upstream_error".equals(r.gatewayError()));
+            assertThat(results).anyMatch(r -> "upstream_error".equals(r.gatewayError()));
+            assertThat(seen).isEmpty();
+        } finally { release.countDown(); callers.shutdownNow(); callers.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS); }
+        // 超时排队任务已移除，恢复的 resolver 能服务下一次调用。
+        assertThat(gateway().execute(ctx(TOOL, grant(1L, "crm", List.of("api.customer.test"), false, 60)), req("GET", url("api.customer.test", "/"), null)).status()).isEqualTo(200);
+    }
+
+    @Test
+    void emptyEnvelopeBodyWorksForGetHeadAndRequiredBodyMethods() {
+        keys();
+        SkillGrant g = grant(1L, "crm", List.of("api.customer.test"), false, 60);
+        routes.put("/empty", ex -> { if (ex.getRequestMethod().equals("HEAD")) { ex.sendResponseHeaders(200, -1); ex.close(); } else reply(ex, 200, "text/plain", "ok"); });
+        for (String method : List.of("GET", "HEAD", "POST", "PUT", "PATCH")) {
+            assertThat(gateway().execute(ctx(SCRIPT, g), req(method, url("api.customer.test", "/empty"), new byte[0])).status()).as(method).isEqualTo(200);
+        }
+        assertThat(seen).hasSize(5).allSatisfy(request -> assertThat(request.body()).isEmpty());
+    }
 }

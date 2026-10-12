@@ -415,4 +415,39 @@ class SecretValuesTest {
         SecretValues utf = SecretValues.of(java.util.Map.of("A", "界".repeat(8), "B", "abcdefghijklmnopqrst"));
         assertThat(new String(utf.replaceBytes(("界".repeat(8) + "abcdefghijklmnopqrst").getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo("{{A}}{{B}}");
     }
+
+    @Test
+    void strictBytesAgreeWithNaiveUnionAndRemainBounded() {
+        Random random = new Random(19);
+        for (int run = 0; run < 3000; run++) {
+            String text = randomAb(random, 150);
+            List<SecretValues.Item> items = new ArrayList<>();
+            List<int[]> ranges = new ArrayList<>();
+            for (int k = 0; k < 4; k++) {
+                int start = random.nextInt(120), length = 8 + random.nextInt(10);
+                String value = text.substring(start, start + length);
+                items.add(new SecretValues.Item("K_" + k, value));
+                for (int pos = text.indexOf(value); pos >= 0; pos = text.indexOf(value, pos + 1)) ranges.add(new int[]{pos, pos + value.length()});
+            }
+            ranges.sort(java.util.Comparator.comparingInt(r -> r[0]));
+            StringBuilder expected = new StringBuilder();
+            int copied = 0, left = ranges.get(0)[0], right = ranges.get(0)[1];
+            for (int i = 1; i <= ranges.size(); i++) {
+                if (i < ranges.size() && ranges.get(i)[0] < right) { right = Math.max(right, ranges.get(i)[1]); continue; }
+                expected.append(text, copied, left).append('*'); copied = right;
+                if (i < ranges.size()) { left = ranges.get(i)[0]; right = ranges.get(i)[1]; }
+            }
+            expected.append(text.substring(copied));
+            SecretValues v = SecretValues.of(items);
+            byte[] input = text.getBytes(StandardCharsets.UTF_8);
+            String actual = new String(v.scrubBytes(input, Integer.MAX_VALUE).bytes(), StandardCharsets.UTF_8);
+            assertThat(actual.replaceAll("\\{\\{K_[0-9]+}}", "*")).isEqualTo(expected.toString());
+            int cap = random.nextInt(140);
+            SecretValues.ByteReplacement bounded = v.scrubBytes(input, cap);
+            assertThat(bounded.bytes().length).isLessThanOrEqualTo(cap);
+            assertThat(v.namesIn(bounded.bytes())).isEmpty();
+        }
+        SecretValues composed = SecretValues.of(java.util.Map.of("TAIL", "abcdefgh", "COMPOSED", "x{{TAIL}}"));
+        assertThat(composed.scrub("xabcdefgh")).isEmpty();
+    }
 }

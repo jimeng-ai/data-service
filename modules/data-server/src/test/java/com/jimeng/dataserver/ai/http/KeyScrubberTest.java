@@ -67,4 +67,33 @@ class KeyScrubberTest {
         assertThat(out.stopped()).isTrue();
         assertThat(new String(k.scrub("secret-1/+ x\"\\".getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo(k.scrub("secret-1/+ x\"\\"));
     }
+
+    @Test
+    void strictUnionCoversOverlappingOccurrences() {
+        KeyScrubber overlaps = new KeyScrubber(List.of(new SkillKey("FIRST_KEY", 1L, "crm", null, null, null, "abcdefgh"), new SkillKey("OTHER_KEY", 1L, "crm", null, null, null, "bcdefgh123456789")));
+        String text = "before:abcdefgh123456789:after";
+        assertThat(overlaps.scrub(text)).startsWith("before:").endsWith(":after").doesNotContain("123456789");
+        assertThat(new String(overlaps.scrub(text.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo(overlaps.scrub(text));
+    }
+
+    @Test
+    void strictMarkersCannotContainKnownCredential() {
+        KeyScrubber collision = new KeyScrubber(List.of(new SkillKey("FIRST_KEY", 1L, "crm", null, null, null, "{{OTHER_KEY}}"), new SkillKey("OTHER_KEY", 1L, "crm", null, null, null, "actual-credential")));
+        assertThat(collision.scrub("actual-credential")).doesNotContain("{{OTHER_KEY}}").doesNotContain("actual-credential");
+        assertThat(new String(collision.scrub("actual-credential".getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo(collision.scrub("actual-credential"));
+    }
+
+    @Test
+    void strictMixedHexKeepsOpaqueLetterCase() {
+        KeyScrubber percent = new KeyScrubber(List.of(new SkillKey("TOKEN", 1L, "crm", null, null, null, "token/with+chars123")));
+        for (String encoded : List.of("token%2Fwith%2bchars123", "token%2fwith%2Bchars123")) {
+            assertThat(percent.scrub(encoded)).isEqualTo("{{TOKEN}}");
+            assertThat(new String(percent.scrub(encoded.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo("{{TOKEN}}");
+        }
+        assertThat(percent.scrub("TOKEN%2Fwith%2bchars123")).isEqualTo("TOKEN%2Fwith%2bchars123");
+        KeyScrubber literal = new KeyScrubber(List.of(new SkillKey("LITERAL", 1L, "crm", null, null, null, "literal-%2F-key")));
+        assertThat(literal.scrub("literal-%2f-key")).isEqualTo("literal-%2f-key");
+        assertThat(literal.scrub("literal-%252f-key")).isEqualTo("literal-%252f-key");
+        assertThat(literal.scrub("literal-%252F-key")).isEqualTo("{{LITERAL}}");
+    }
 }

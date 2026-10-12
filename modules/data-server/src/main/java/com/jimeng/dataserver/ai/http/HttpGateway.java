@@ -79,6 +79,14 @@ public class HttpGateway {
         }
     }
 
+    // 系统 DNS 可能不响应中断；固定进程级容量，不为每个调用创建线程或无限排队。
+    private static final java.util.concurrent.ThreadPoolExecutor DNS_WORKERS = new java.util.concurrent.ThreadPoolExecutor(
+            4, 4, 0, TimeUnit.MILLISECONDS, new java.util.concurrent.ArrayBlockingQueue<>(16), runnable -> {
+                Thread thread = new Thread(runnable, "http-gateway-dns");
+                thread.setDaemon(true);
+                return thread;
+            }, new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+
     private final HttpGatewayProperties props;
     private final SkillSecretService secrets;
     private final GatewayResolver resolver;
@@ -155,6 +163,7 @@ public class HttpGateway {
     }
 
     private Outcome run(HttpGatewayContext ctx, HttpGatewayRequest req, List<SkillKey> keys, KeyScrubber scrubber) {
+        long requestStarted = System.nanoTime();
         // 第 1 步：方法、网址
         String method = req.method() == null ? "" : req.method().strip().toUpperCase(Locale.ROOT);
         if (!SkillSecretsFile.METHODS.contains(method)) {
@@ -168,6 +177,10 @@ public class HttpGateway {
         byte[] body = req.body() == null || req.body().length == 0 ? null : req.body();
         if (body != null && ("GET".equals(method) || "HEAD".equals(method))) {
             return Outcome.rejected(400, "bad_request", method + " 请求不能带请求体");
+        }
+        int requestCap = ctx.plane() == HttpGatewayContext.Plane.TOOL ? props.getToolRequestMaxBytes() : props.getScriptRequestMaxBytes();
+        if (body != null && body.length > requestCap) {
+            return Outcome.rejected(400, "bad_request", "请求内容过大，请缩短后再试");
         }
         List<Map.Entry<String, String>> headers = without(req.headers(), DROP_REQUEST_HEADERS);
 
@@ -188,14 +201,28 @@ public class HttpGateway {
         HttpUrl target = substituted ? HttpUrl.parse(Placeholders.substituteUrl(url.toString(), values)) : url;
         if (target == null) return Outcome.rejected(400, "bad_request", "替换 key 之后网址不合法");
         List<Map.Entry<String, String>> sendHeaders = Placeholders.substituteHeaders(headers, values);
-        byte[] sendBody = Placeholders.substituteBody(body, values);
+        // 模板检查不代替实际地址检查；不扫描或再次展开插入的 credential 原文。
+        Map<String, String> finalValues = new LinkedHashMap<>();
+        for (String name : values.keySet()) {
+            String denied = resolveKey(name, keys, target, method, finalValues);
+            if (denied != null || !Objects.equals(values.get(name), finalValues.get(name))) {
+                return Outcome.rejected(403, "denied", scrubber.scrub(denied == null
+                        ? "key " + name + " 替换后的地址不在原发送范围内" : denied));
+            }
+        }
+        byte[] sendBody;
+        try {
+            sendBody = Placeholders.substituteBody(body, values, requestCap);
+        } catch (Placeholders.BodyTooLarge e) {
+            return Outcome.rejected(400, "bad_request", e.getMessage());
+        }
         String sendMethod = method;
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(auth.timeoutSeconds());
+        long deadline = requestStarted + TimeUnit.SECONDS.toNanos(auth.timeoutSeconds());
         Authorization hopAuth = auth;
 
         for (int hops = 0; ; hops++) {
             // 第 4 步：解析、校验全部记录、锁定第一条
-            Pin pin = pin(target.host(), hopAuth.declared());
+            Pin pin = pin(target.host(), hopAuth.declared(), deadline, auth);
             if (pin.denied() != null) return new Outcome(pin.denied(), auth.skills(), hops);
             long leftMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
             if (leftMs <= 0) return new Outcome(timeout(auth), auth.skills(), hops);
@@ -229,7 +256,7 @@ public class HttpGateway {
                 return new Outcome(timeout(auth), auth.skills(), hops);
             } catch (IOException e) {
                 return new Outcome(HttpGatewayResult.error(502, "upstream_error",
-                        "连接 " + target.host() + " 失败：" + scrubber.scrub(String.valueOf(e.getMessage()))), auth.skills(), hops);
+                        "访问 " + target.host() + " 失败：" + scrubber.scrub(String.valueOf(e.getMessage()))), auth.skills(), hops);
             } catch (IllegalArgumentException e) {
                 // OkHttp 对不合法的请求头直接抛这个，文案里可能带着头的值（也就是刚替换进去的 key）
                 return new Outcome(HttpGatewayResult.error(400, "bad_request",
@@ -312,12 +339,31 @@ public class HttpGateway {
     }
 
     /** 第 4 步：所有记录都必须能连，锁定第一条。解析不到是上游问题（502），不是拒绝。 */
-    private Pin pin(String host, boolean declared) {
+    private Pin pin(String host, boolean declared, long deadline, Authorization auth) {
         List<InetAddress> records;
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) return new Pin(null, timeout(auth));
+        java.util.concurrent.Future<List<InetAddress>> future;
         try {
-            records = resolver.resolve(host);
-        } catch (UnknownHostException e) {
+            future = DNS_WORKERS.submit(() -> resolver.resolve(host));
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            return new Pin(null, HttpGatewayResult.error(502, "upstream_error", "目标地址解析暂时繁忙，请稍后再试"));
+        }
+        try {
+            remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new java.util.concurrent.TimeoutException();
+            records = future.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            return new Pin(null, timeout(auth));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new Pin(null, timeout(auth));
+        } catch (java.util.concurrent.ExecutionException e) {
             records = List.of();
+        } finally {
+            if (!future.isDone()) future.cancel(true);
+            // remove 已取消的排队任务，避免累计一批已经超时的 Future；卡住的系统 resolver 至多占固定四个 worker。
+            DNS_WORKERS.remove((Runnable)future);
         }
         if (records == null || records.isEmpty()) {
             return new Pin(null, HttpGatewayResult.error(502, "upstream_error", "解析不到域名 " + host));
@@ -369,7 +415,7 @@ public class HttpGateway {
         List<Map.Entry<String, String>> headers = new ArrayList<>();
         for (String name : resp.headers().names()) {
             String lower = name.toLowerCase(Locale.ROOT);
-            if (DROP_RESPONSE_HEADERS.contains(lower)) continue;
+            if (DROP_RESPONSE_HEADERS.contains(lower) || scrubber.secretBearingName(name)) continue;
             for (String v : resp.headers(name)) headers.add(Map.entry(lower, scrubber.scrub(v)));
         }
         return new HttpGatewayResult(resp.code(), headers, body, truncated, null, null);

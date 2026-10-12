@@ -25,6 +25,14 @@ public final class SecretForms {
         return forms;
     }
 
+    /** 编码变体的 %HH 大小写不敏感；原文（即使字面上含 %HH）仍精确匹配。 */
+    public static boolean isPercentForm(String value, String form) {
+        if (form.equals(value)) return false;
+        String encoded = percentEncode(value);
+        return form.equals(encoded) || form.equals(lowerHex(encoded))
+                || form.equals(URLEncoder.encode(value, StandardCharsets.UTF_8));
+    }
+
     private static String lowerHex(String value) {
         char[] chars = value.toCharArray();
         for (int i = 0; i + 2 < chars.length; i++) {

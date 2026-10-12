@@ -53,4 +53,14 @@ class PlaceholdersTest {
         assertThat(new String(Placeholders.substituteBody("%7b%7bFIRST_KEY%7d%7d/{{OTHER_KEY}}".getBytes(StandardCharsets.UTF_8), values), StandardCharsets.UTF_8))
             .isEqualTo("%7B%7BOTHER_KEY%7D%7D/actual-credential");
     }
+
+    @Test
+    void boundedSubstitutionCountsUtf8AndPreservesBinary() {
+        byte[] body = new byte[]{0, (byte)255, '{', '{', 'K', '}', '}', 1};
+        Map<String,String> values = Map.of("K", "密钥abc");
+        byte[] expected = Placeholders.substituteBody(body, values);
+        assertThat(Placeholders.substituteBody(body, values, expected.length)).isEqualTo(expected);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> Placeholders.substituteBody(body, values, expected.length - 1)).isInstanceOf(Placeholders.BodyTooLarge.class);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> Placeholders.substituteBody("{{K}}".repeat(1024).getBytes(StandardCharsets.UTF_8), Map.of("K", "a".repeat(8192)), 1024 * 1024)).isInstanceOf(Placeholders.BodyTooLarge.class);
+    }
 }

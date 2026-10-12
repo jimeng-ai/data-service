@@ -60,9 +60,50 @@ final class Placeholders {
      * 原样的 {{名字}} 换成值的 UTF-8 字节；编码过的写法（表单里常见）换成编码后的值。
      */
     static byte[] substituteBody(byte[] body, Map<String, String> values) {
-        if (body == null || body.length == 0 || values.isEmpty()) return body;
-        return substituteOriginal(new String(body, StandardCharsets.ISO_8859_1), values, 2)
-                .getBytes(StandardCharsets.ISO_8859_1);
+        return substituteBody(body, values, Integer.MAX_VALUE);
+    }
+
+    static final class BodyTooLarge extends IllegalArgumentException {
+        BodyTooLarge() { super("请求内容过大，请缩短后再试"); }
+    }
+
+    /** 只看原始占位符，先计算输出长度；超限时不分配展开后的正文。 */
+    static byte[] substituteBody(byte[] body, Map<String, String> values, int maxBytes) {
+        if (body == null || body.length == 0) return body;
+        if (body.length > maxBytes) throw new BodyTooLarge();
+        if (values.isEmpty()) return body;
+        String original = new String(body, StandardCharsets.ISO_8859_1);
+        Matcher matcher = ALL.matcher(original);
+        Map<String, byte[]> replacements = new java.util.HashMap<>();
+        long size = 0;
+        int pos = 0, matches = 0;
+        while (matcher.find()) {
+            String name = matcher.group(1) == null ? matcher.group(2) : matcher.group(1);
+            String value = values.get(name);
+            if (value == null) continue;
+            String id = (matcher.group(2) == null ? "raw:" : "encoded:") + name;
+            byte[] replacement = replacements.computeIfAbsent(id, n -> (matcher.group(2) == null ? value : percentEncode(value)).getBytes(StandardCharsets.UTF_8));
+            size += matcher.start() - pos + (long)replacement.length;
+            if (size > maxBytes) throw new BodyTooLarge();
+            pos = matcher.end(); matches++;
+        }
+        size += body.length - pos;
+        if (size > maxBytes) throw new BodyTooLarge();
+        if (matches == 0) return body;
+        byte[] out = new byte[(int)size];
+        matcher.reset(); pos = 0;
+        int written = 0;
+        while (matcher.find()) {
+            String name = matcher.group(1) == null ? matcher.group(2) : matcher.group(1);
+            if (!values.containsKey(name)) continue;
+            byte[] replacement = replacements.get((matcher.group(2) == null ? "raw:" : "encoded:") + name);
+            int prefix = matcher.start() - pos;
+            System.arraycopy(body, pos, out, written, prefix); written += prefix;
+            System.arraycopy(replacement, 0, out, written, replacement.length); written += replacement.length;
+            pos = matcher.end();
+        }
+        System.arraycopy(body, pos, out, written, body.length - pos);
+        return out;
     }
 
     /** RFC 3986：只保留 A–Z a–z 0–9 - . _ ~，其余按 UTF-8 编成 %XX（大写十六进制）。 */

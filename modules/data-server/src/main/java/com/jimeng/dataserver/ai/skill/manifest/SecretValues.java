@@ -47,7 +47,8 @@ public final class SecretValues {
     public static final SecretValues NONE = new SecretValues(List.of());
 
     /** 一个值和它的名字。toString 不带值。 */
-    public record Item(String name, String value) {
+    public record Item(String name, String value, boolean percentHexInsensitive) {
+        public Item(String name, String value) { this(name, value, false); }
         @Override
         public String toString() {
             return "Item[" + name + "]";
@@ -58,6 +59,7 @@ public final class SecretValues {
     private final char[][] chars;         // 每个值的字符
     private final int[][] charFailure;    // 每个值的 KMP 前缀表（按字符）
     private volatile Bytes bytes;         // UTF-8 字节版，查二进制文件时才建
+    private volatile Strict strict;
     private volatile Lower lower;         // 小写版，查 hosts 时才建
 
     private SecretValues(List<Item> sorted) {
@@ -184,6 +186,148 @@ public final class SecretValues {
                 if (next[i] >= 0 && next[i] < pos) next[i] = advance(t, b.bytes[i], b.failure[i], pos, scanned, state, i);
             }
         }
+    }
+
+    /**
+     * 网关专用的严格抹值：所有命中区间取并集（包括首尾重叠），不改变发布替换的非重叠语义。
+     * 每字节维护各写法的 KMP 状态，差分环延迟 maxLength 个字节再输出，确保更晚结束的命中不会留下前半截。
+     * 时间 O(写法数 × (输入长度 + 输出长度))，工作堆 O(maxOut + maxLength)，不按命中数量分配。
+     * 默认标记仍是 {{名字}}；它含已知值时改用安全短标记。若拼接后的输出意外组成某个已知值，整段输出置空。
+     * Item 的 percentHexInsensitive 只在编码写法的 %HH 位生效，原文和非编码字符仍区分大小写。
+     */
+    public ByteReplacement scrubBytes(byte[] t, int maxOut) {
+        if (maxOut < 0) throw new IllegalArgumentException("输出上限不能为负");
+        if (t == null) return new ByteReplacement(null, false);
+        if (items.isEmpty() || t.length == 0) return replaceBytes(t, maxOut);
+        Strict patterns = strict();
+        int longest = patterns.maxLength;
+        int ringSize = longest + 1;
+        int[] delta = new int[ringSize], ends = new int[ringSize], which = new int[ringSize], state = new int[items.size()];
+        java.io.ByteArrayOutputStream out = null;
+        int active = 0;
+        // 扫完原文后再推进最长窗口，吐出最后的安全字节；每个差分槽在吐出后清零。
+        for (long scan = 0; scan < (long)t.length + longest - 1; scan++) {
+            if (scan < t.length) {
+                int i = (int)scan;
+                byte raw = t[i], canonical = canonicalHex(t, i);
+                for (int k = 0; k < state.length; k++) {
+                    byte c = patterns.percent[k] ? canonical : raw;
+                    byte[] pattern = patterns.patterns[k];
+                    int q = state[k];
+                    while (q > 0 && c != pattern[q]) q = patterns.failure[k][q - 1];
+                    if (c == pattern[q]) q++;
+                    if (q == pattern.length) {
+                        int start = i - pattern.length + 1;
+                        delta[start % ringSize]++;
+                        delta[(i + 1) % ringSize]--;
+                        ends[(i + 1) % ringSize]++;
+                        which[start % ringSize] = k;
+                        q = patterns.failure[k][q - 1];
+                    }
+                    state[k] = q;
+                }
+            }
+            long emit = scan - longest + 1;
+            if (emit < 0) continue;
+            int pos = (int)emit, slot = pos % ringSize, previous = active;
+            active += delta[slot];
+            boolean startsUnion = active > 0 && previous - ends[slot] == 0;
+            delta[slot] = 0;
+            ends[slot] = 0;
+            if (active > 0) {
+                if (startsUnion) {
+                    if (out == null) {
+                        out = new java.io.ByteArrayOutputStream(Math.min(maxOut, 8192));
+                        int n = Math.min(pos, maxOut);
+                        out.write(t, 0, n);
+                        if (n < pos) return checkedStrict(out.toByteArray(), true, patterns);
+                    }
+                    byte[] marker = patterns.markers[which[slot]];
+                    int n = Math.min(marker.length, maxOut - out.size());
+                    out.write(marker, 0, n);
+                    if (n < marker.length) return checkedStrict(out.toByteArray(), true, patterns);
+                }
+            } else if (out != null) {
+                if (out.size() == maxOut) return checkedStrict(out.toByteArray(), true, patterns);
+                out.write(t[pos]);
+            } else if (pos >= maxOut) {
+                return new ByteReplacement(Arrays.copyOf(t, maxOut), true);
+            }
+            if (out != null && out.size() == maxOut && pos + 1 < t.length) return checkedStrict(out.toByteArray(), true, patterns);
+        }
+        return out == null ? new ByteReplacement(t, false) : checkedStrict(out.toByteArray(), false, patterns);
+    }
+
+    public String scrub(String text) {
+        if (text == null || text.isEmpty() || items.isEmpty()) return text;
+        byte[] in = text.getBytes(StandardCharsets.UTF_8);
+        byte[] out = scrubBytes(in, Integer.MAX_VALUE).bytes();
+        return out == in ? text : new String(out, StandardCharsets.UTF_8);
+    }
+
+    private ByteReplacement checkedStrict(byte[] out, boolean stopped, Strict patterns) {
+        // 防止安全片段与生成标记拼接后意外重建一个值。拒绝带值的整段输出，不递归展开/替换生成的标记。
+        for (int k = 0; k < patterns.patterns.length; k++) {
+            if (containsCanonical(out, patterns.patterns[k], patterns.failure[k], patterns.percent[k])) {
+                return new ByteReplacement(new byte[0], stopped);
+            }
+        }
+        return new ByteReplacement(out, stopped);
+    }
+
+    private record Strict(byte[][] patterns, int[][] failure, boolean[] percent, byte[][] markers, int maxLength) {}
+
+    private Strict strict() {
+        Strict value = strict;
+        if (value != null) return value;
+        Bytes b = bytes();
+        int count = items.size(), max = 0;
+        byte[][] patterns = new byte[count][], markers = new byte[count][];
+        int[][] fail = new int[count][];
+        boolean[] percent = new boolean[count];
+        Map<String, byte[]> byName = new java.util.HashMap<>();
+        for (int k = 0; k < count; k++) {
+            Item item = items.get(k);
+            percent[k] = item.percentHexInsensitive();
+            patterns[k] = b.bytes[k];
+            fail[k] = b.failure[k];
+            if (percent[k]) {
+                patterns[k] = b.bytes[k].clone();
+                for (int i = 0; i < patterns[k].length; i++) patterns[k][i] = canonicalHex(b.bytes[k], i);
+                fail[k] = failure(patterns[k]);
+            }
+            markers[k] = byName.computeIfAbsent(item.name(), name -> {
+                String marker = "{{" + name + "}}";
+                if (!namesIn(marker).isEmpty()) marker = namesIn("[redacted]").isEmpty() ? "[redacted]" : "*";
+                return marker.getBytes(StandardCharsets.UTF_8);
+            });
+            max = Math.max(max, patterns[k].length);
+        }
+        strict = value = new Strict(patterns, fail, percent, markers, max);
+        return value;
+    }
+
+    private static boolean containsCanonical(byte[] t, byte[] pattern, int[] fail, boolean percent) {
+        int q = 0;
+        for (int i = 0; i < t.length; i++) {
+            byte c = percent ? canonicalHex(t, i) : t[i];
+            while (q > 0 && c != pattern[q]) q = fail[q - 1];
+            if (c == pattern[q]) q++;
+            if (q == pattern.length) return true;
+        }
+        return false;
+    }
+
+    private static byte canonicalHex(byte[] t, int i) {
+        byte c = t[i];
+        if (c < 'A' || c > 'F') return c;
+        boolean first = i > 0 && i + 1 < t.length && t[i - 1] == '%' && hex(t[i + 1]);
+        boolean second = i > 1 && t[i - 2] == '%' && hex(t[i - 1]);
+        return first || second ? (byte)(c + ('a' - 'A')) : c;
+    }
+
+    private static boolean hex(byte c) {
+        return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F';
     }
 
     /**
