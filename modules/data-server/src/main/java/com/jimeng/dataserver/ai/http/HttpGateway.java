@@ -4,8 +4,10 @@ import com.jimeng.dataserver.ai.http.policy.AddressPolicy;
 import com.jimeng.dataserver.ai.http.policy.HostPattern;
 import com.jimeng.dataserver.ai.http.policy.PathPattern;
 import com.jimeng.dataserver.ai.http.policy.PrivateAllowList;
+import com.jimeng.dataserver.ai.http.tool.HttpToolResults;
 import com.jimeng.dataserver.ai.skill.manifest.SkillSecretsFile;
 import com.jimeng.dataserver.ai.skill.secret.SkillSecretService;
+import com.jimeng.dataserver.ai.web.HtmlText;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.ConnectionPool;
 import okhttp3.HttpUrl;
@@ -24,6 +26,7 @@ import java.io.InterruptedIOException;
 import java.net.InetAddress;
 import java.net.Proxy;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -114,6 +117,21 @@ public class HttpGateway {
     }
 
     public HttpGatewayResult execute(HttpGatewayContext ctx, HttpGatewayRequest req) {
+        return execute(ctx, req, false, false);
+    }
+
+    /**
+     * 两个平面的工具共用：文本解码与 HTML 转换必须在 key 生命周期里、最终抹值之前完成。
+     * 返回的正文已经转换，调用方只做展示和字数截断，不能再次解码 HTML 实体。
+     */
+    public HttpGatewayResult executeTool(HttpGatewayContext ctx, HttpGatewayRequest req, boolean asText) {
+        if (ctx == null || ctx.plane() != HttpGatewayContext.Plane.TOOL) {
+            return HttpGatewayResult.error(400, "bad_request", "工具运行上下文不完整");
+        }
+        return execute(ctx, req, true, asText);
+    }
+
+    private HttpGatewayResult execute(HttpGatewayContext ctx, HttpGatewayRequest req, boolean forModel, boolean asText) {
         if (ctx == null || req == null || ctx.plane() == null) {
             return HttpGatewayResult.error(400, "bad_request", "请求或运行上下文不完整");
         }
@@ -140,7 +158,7 @@ public class HttpGateway {
         }
         Outcome out;
         try {
-            out = run(ctx, req, keys, scrubber);
+            out = run(ctx, req, keys, scrubber, forModel, asText);
         } catch (RuntimeException e) {
             out = new Outcome(HttpGatewayResult.error(502, "upstream_error",
                     "调用失败：" + scrubber.scrub(String.valueOf(e.getMessage()))), List.of(), 0);
@@ -162,7 +180,7 @@ public class HttpGateway {
         }
     }
 
-    private Outcome run(HttpGatewayContext ctx, HttpGatewayRequest req, List<SkillKey> keys, KeyScrubber scrubber) {
+    private Outcome run(HttpGatewayContext ctx, HttpGatewayRequest req, List<SkillKey> keys, KeyScrubber scrubber, boolean forModel, boolean asText) {
         long requestStarted = System.nanoTime();
         // 第 1 步：方法、网址
         String method = req.method() == null ? "" : req.method().strip().toUpperCase(Locale.ROOT);
@@ -251,7 +269,7 @@ public class HttpGateway {
                     continue;
                 }
                 // 第 7 步：回包
-                return new Outcome(readResponse(resp, ctx.plane(), scrubber), auth.skills(), hops);
+                return new Outcome(readResponse(resp, ctx.plane(), scrubber, forModel, asText), auth.skills(), hops);
             } catch (InterruptedIOException e) {
                 return new Outcome(timeout(auth), auth.skills(), hops);
             } catch (IOException e) {
@@ -396,7 +414,7 @@ public class HttpGateway {
         return client.newCall(rb.build()).execute();
     }
 
-    private HttpGatewayResult readResponse(Response resp, HttpGatewayContext.Plane plane, KeyScrubber scrubber) throws IOException {
+    private HttpGatewayResult readResponse(Response resp, HttpGatewayContext.Plane plane, KeyScrubber scrubber, boolean forModel, boolean asText) throws IOException {
         int cap = plane == HttpGatewayContext.Plane.TOOL ? props.getToolMaxBytes() : props.getScriptMaxBytes();
         byte[] raw = new byte[0];
         ResponseBody rb = resp.body();
@@ -408,10 +426,23 @@ public class HttpGateway {
         // （预检实测 cap=1000 时漏出了 key 的前 21 个字符）。所以只要截了，就连抹值结果末尾 maxLength 个字节一起去掉。
         // 抹值的输出也有上限（占位符可能比值长，不能先整份放大再截）：KeyScrubber 的有界重载，名字和返回形状按 R28 你定，
         // 要能拿到结果和「是否因为到了上限而停下」。
+        boolean rawTruncated = raw.length > cap;
+        boolean textForModel = false;
+        if (forModel) {
+            String text = HttpToolResults.decodeText(raw, resp.header("Content-Type"));
+            if (text != null) {
+                textForModel = true;
+                if (asText && HtmlText.isHtml(resp.header("Content-Type"), text)) text = HtmlText.toText(text);
+                // 文本解码（包括 UTF-8 的替代字符）也会重建 key，必须先规范化再最终抹值。
+                raw = text.getBytes(StandardCharsets.UTF_8);
+            }
+        }
         int max = scrubber.maxLength();
         KeyScrubber.Scrubbed s = scrubber.scrub(raw, cap + max);
-        boolean truncated = raw.length > cap || s.stopped() || s.bytes().length > cap;
-        byte[] body = truncated ? Arrays.copyOf(s.bytes(), Math.min(cap, Math.max(0, s.bytes().length - max))) : s.bytes();
+        boolean truncated = rawTruncated || s.stopped() || s.bytes().length > cap;
+        int length = truncated ? Math.min(cap, Math.max(0, s.bytes().length - max)) : s.bytes().length;
+        if (textForModel) length = completeUtf8Prefix(s.bytes(), length);
+        byte[] body = length == s.bytes().length ? s.bytes() : Arrays.copyOf(s.bytes(), length);
         List<Map.Entry<String, String>> headers = new ArrayList<>();
         for (String name : resp.headers().names()) {
             String lower = name.toLowerCase(Locale.ROOT);
@@ -419,6 +450,16 @@ public class HttpGateway {
             for (String v : resp.headers(name)) headers.add(Map.entry(lower, scrubber.scrub(v)));
         }
         return new HttpGatewayResult(resp.code(), headers, body, truncated, null, null);
+    }
+
+    /** 已规范化的工具文本：尾部保护和字节上限一起裁剪后，不能留半个 UTF-8 字符。 */
+    private static int completeUtf8Prefix(byte[] bytes, int end) {
+        if (end == 0) return 0;
+        int start = end - 1;
+        while (start > 0 && (bytes[start] & 0xc0) == 0x80) start--;
+        int lead = bytes[start] & 0xff;
+        int width = lead < 0x80 ? 1 : lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+        return end - start < width ? start : end;
     }
 
     private static HttpGatewayResult timeout(Authorization auth) {

@@ -325,6 +325,7 @@ public class SkillRuntimeService {
     private void injectFullSkillContext(Map<String, Object> body,
                                          List<ToolPackage> skills,
                                          AiProtocolAdapter adapter) {
+        ActivatedSkills.add(skills);
         String prompt = buildFullSkillPrompt(skills);
         if (StrUtil.isNotBlank(prompt)) adapter.appendSystemContent(body, prompt);
         mergeTools(body, skills, adapter);
@@ -407,6 +408,10 @@ public class SkillRuntimeService {
             }
             if (StrUtil.isNotBlank(skill.getBody())) {
                 sb.append(skill.getBody()).append("\n");
+            }
+            String notes = skill.getRuntimeNotes();
+            if (StrUtil.isNotBlank(notes)) {
+                sb.append(notes).append("\n");
             }
         }
         // 调用工具前先用一句自然语言说明意图，提升可观测性（这是给用户看的说明，不是思维链/分析过程）

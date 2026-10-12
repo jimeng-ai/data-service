@@ -23,6 +23,11 @@ public interface ToolPackage {
     /** 包含的工具定义列表 */
     List<SkillToolDefinition> getTools();
 
+    /** 激活时附在技能说明后面的平台说明；不混进发布、评测所使用的原始 body。 */
+    default String getRuntimeNotes() {
+        return null;
+    }
+
     /**
      * 租户 ID。返回 null 表示全局可见（如代码型 Skill）。
      * 业务层用这个字段做租户过滤。

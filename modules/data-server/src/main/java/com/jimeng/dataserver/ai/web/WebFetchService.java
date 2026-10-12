@@ -83,18 +83,9 @@ public class WebFetchService {
         throw new RuntimeException("too many redirects");
     }
 
-    /** 把 HTML 压成可读文本（零依赖，best-effort）。 */
+    /** 转换与 http_request 共用，截断保留原有行为。 */
     static String htmlToText(String html) {
-        String s = html
-                .replaceAll("(?is)<script.*?</script>", " ")
-                .replaceAll("(?is)<style.*?</style>", " ")
-                .replaceAll("(?is)<head.*?</head>", " ")
-                .replaceAll("(?s)<!--.*?-->", " ")
-                .replaceAll("(?s)<[^>]+>", " ")
-                .replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-                .replaceAll("\\s+", " ")
-                .trim();
-        return truncate(s, MAX_TEXT);
+        return truncate(HtmlText.toText(html), MAX_TEXT);
     }
 
     private static String truncate(String s, int max) {

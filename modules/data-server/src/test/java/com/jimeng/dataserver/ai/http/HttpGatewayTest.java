@@ -698,4 +698,105 @@ class HttpGatewayTest {
             assertThat(appender.list).isNotEmpty().allSatisfy(e -> assertThat(e.getFormattedMessage()).doesNotContain("secret123"));
         } finally { audit.detachAppender(appender); audit.setLevel(old); }
     }
+
+    @Test
+    void htmlEntityDecodingMustBeScrubbedBeforeModelVisibleText() {
+        String token = "a&b12345678";
+        keys(key(1, "crm", "TOKEN", token, null, null));
+        routes.put("/html", ex -> reply(ex, 200, "text/html", "<p>a&amp;b12345678</p>"));
+        HttpGatewayResult r = gateway().executeTool(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/html"), null), true);
+        Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100);
+        assertThat(payload).containsEntry("body", "{{TOKEN}}");
+        assertThat(payload.toString()).doesNotContain(token);
+    }
+
+    @Test
+    void asTextKeepsNulContainingUnknownBinaryResponseBinary() {
+        keys();
+        byte[] binary = "<html><p>bytes\0</p></html>".getBytes(StandardCharsets.UTF_8);
+        routes.put("/binary-html", ex -> reply(ex, 200, "application/octet-stream", binary));
+        HttpGatewayResult r = gateway().executeTool(ctx(TOOL, grant(1, "reader", List.of("api.customer.test"), false, 60)),
+                req("GET", url("api.customer.test", "/binary-html"), null), true);
+        assertThat(r.body()).isEqualTo(binary);
+        assertThat(com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100))
+                .doesNotContainKey("body").containsEntry("binary", Map.of("content_type", "application/octet-stream", "bytes", binary.length));
+    }
+
+    @Test
+    void toolTransformationPreservesOriginalByteCapAndProtectsTruncatedSecretTail() {
+        String token = "a&b12345678";
+        keys(key(1, "crm", "TOKEN", token, null, null));
+        props.setToolMaxBytes(80);
+        routes.put("/clipped-html", ex -> reply(ex, 200, "text/html", "<p>" + "x".repeat(60) + "a&amp;b12345678" + "z".repeat(120)));
+        HttpGatewayResult r = gateway().executeTool(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/clipped-html"), null), true);
+        assertThat(r.truncated()).isTrue();
+        assertThat(r.body().length).isLessThanOrEqualTo(80);
+        Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100);
+        assertThat(payload).containsEntry("truncated", true).containsKey("note");
+        assertThat(payload.get("body").toString()).doesNotContain(token).doesNotContain("a&b123");
+    }
+
+    @Test
+    void rawPathAndSingleHtmlDecodingRemainDistinctAndCharacterClipFollowsScrubbing() {
+        String token = "a&b12345678";
+        keys(key(1, "crm", "TOKEN", token, null, null));
+        String html = "<html><p>ok a&amp;b12345678 a&amp;amp;b12345678</p></html>";
+        routes.put("/single-html", ex -> reply(ex, 200, "application/octet-stream", html));
+        HttpGateway g = gateway();
+        HttpGatewayRequest request = req("GET", url("api.customer.test", "/single-html"), null);
+        assertThat(text(g.execute(ctx(SCRIPT, CRM), request))).isEqualTo(html);
+        assertThat(text(g.executeTool(ctx(TOOL, CRM), request, false))).isEqualTo(html);
+        HttpGatewayResult converted = g.executeTool(ctx(TOOL, CRM), request, true);
+        assertThat(text(converted)).isEqualTo("ok {{TOKEN}} a&amp;b12345678");
+        Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(converted, false, 14);
+        assertThat(payload).containsEntry("body", "ok {{TOKEN}} a").containsEntry("truncated", true).containsKey("note");
+        assertThat(payload.toString()).doesNotContain(token);
+    }
+
+    @Test
+    void toolUtf8ReplacementMustBeScrubbedEvenWithoutHtmlConversion() {
+        String token = "token-\uFFFD-12345678";
+        keys(key(1, "crm", "TOKEN", token, null, null));
+        byte[] raw = new byte[]{'t', 'o', 'k', 'e', 'n', '-', (byte) 0xff, '-', '1', '2', '3', '4', '5', '6', '7', '8'};
+        routes.put("/malformed-text", ex -> reply(ex, 200, "text/plain", raw));
+        HttpGateway g = gateway();
+        HttpGatewayRequest request = req("GET", url("api.customer.test", "/malformed-text"), null);
+        assertThat(g.execute(ctx(SCRIPT, CRM), request).body()).isEqualTo(raw);
+        HttpGatewayResult r = g.executeTool(ctx(TOOL, CRM), request, false);
+        Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100);
+        assertThat(payload).containsEntry("body", "{{TOKEN}}");
+        assertThat(payload.toString()).doesNotContain(token);
+    }
+
+    @Test
+    void originalByteTruncationIsReportedEvenWhenHtmlConversionShrinksBody() {
+        keys();
+        props.setToolMaxBytes(80);
+        routes.put("/shrunk-html", ex -> reply(ex, 200, "text/html", "<html><p>ok</p>" + " ".repeat(200)));
+        HttpGatewayResult r = gateway().executeTool(ctx(TOOL, grant(1, "reader", List.of("api.customer.test"), false, 60)),
+                req("GET", url("api.customer.test", "/shrunk-html"), null), true);
+        assertThat(text(r)).isEqualTo("ok");
+        assertThat(r.truncated()).isTrue();
+        assertThat(com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100))
+                .containsEntry("body", "ok").containsEntry("truncated", true).containsKey("note");
+    }
+
+    @Test
+    void toolByteClippingMustNotCreateUtf8ReplacementSecret() {
+        String token = "token-x-\uFFFD";
+        keys(key(1, "crm", "TOKEN", token, null, null));
+        props.setToolMaxBytes(10);
+        routes.put("/unicode-tail", ex -> reply(ex, 200, "text/plain", "token-x-中" + "z".repeat(100)));
+        HttpGatewayResult r = gateway().executeTool(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/unicode-tail"), null), false);
+        Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 100);
+        assertThat(payload).containsEntry("body", "token-x-").containsEntry("truncated", true);
+        assertThat(payload.toString()).doesNotContain(token);
+        // 转换缩短正文，截点由去掉 maxLength 尾部决定，而不是最终 cap 决定。
+        props.setToolMaxBytes(80);
+        routes.put("/unicode-tail-html", ex -> reply(ex, 200, "text/html", "<p>token-x-中" + "z".repeat(16) + "</p>" + " ".repeat(200)));
+        HttpGatewayResult tail = gateway().executeTool(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/unicode-tail-html"), null), true);
+        assertThat(com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(tail, false, 100))
+                .containsEntry("body", "token-x-").containsEntry("truncated", true);
+    }
+
 }

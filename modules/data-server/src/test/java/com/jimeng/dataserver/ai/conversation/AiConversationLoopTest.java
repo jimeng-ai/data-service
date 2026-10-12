@@ -13,6 +13,9 @@ import com.jimeng.dataserver.ai.run.RunRegistry;
 import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.service.SkillRuntimeService;
+import com.jimeng.dataserver.ai.skill.service.ActivatedSkills;
+import com.jimeng.dataserver.ai.skill.source.AiSkillToolPackage;
+import com.jimeng.persistence.entity.AiSkill;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -140,4 +143,42 @@ class AiConversationLoopTest {
         verify(skillRuntimeService, times(1)).executeToolCalls(any());
         verify(recordService).recordException(any(), any(), anyInt());
     }
+
+    private static com.jimeng.dataserver.ai.skill.model.ToolPackage pkg(String name) {
+        AiSkill s = new AiSkill();
+        s.setName(name);
+        return new AiSkillToolPackage(s);
+    }
+
+    @Test
+    void blockingTurnStartsIsolatedFrameAndClearsItAfterSuccess() {
+        when(skillRuntimeService.applySkillContext(any(), any())).thenAnswer(call -> {
+            ActivatedSkills.add(List.of(pkg("inside")));
+            assertEquals(List.of("inside"), ActivatedSkills.current().stream().map(com.jimeng.dataserver.ai.skill.model.ToolPackage::getName).toList());
+            return SkillApplyResult.disabled();
+        });
+        when(requestService.post(any(), any(), any(), any())).thenReturn(new RequestService.HttpResp(200, FINAL_RESP));
+        loop.runBlocking(body(), adapter, Map.of(), "http://llm", "trace", rc());
+        assertEquals(List.of(), ActivatedSkills.current());
+    }
+
+    @Test
+    void blockingAndStreamingFailuresRestoreOuterActivationFrame() {
+        when(skillRuntimeService.applySkillContext(any(), any())).thenAnswer(call -> {
+            ActivatedSkills.add(List.of(pkg("inside")));
+            assertEquals(List.of("inside"), ActivatedSkills.current().stream().map(com.jimeng.dataserver.ai.skill.model.ToolPackage::getName).toList());
+            throw new IllegalStateException("fixture failure before upstream");
+        });
+        ActivatedSkills.begin();
+        try {
+            ActivatedSkills.add(List.of(pkg("outer")));
+            assertThrows(IllegalStateException.class, () -> loop.runBlocking(body(), adapter, Map.of(), "http://llm", "trace", rc()));
+            assertEquals(List.of("outer"), ActivatedSkills.current().stream().map(com.jimeng.dataserver.ai.skill.model.ToolPackage::getName).toList());
+            assertThrows(IllegalStateException.class, () -> loop.runStream(body(), adapter, Map.of(), "http://llm", "conn", "trace", rc()));
+            assertEquals(List.of("outer"), ActivatedSkills.current().stream().map(com.jimeng.dataserver.ai.skill.model.ToolPackage::getName).toList());
+        } finally {
+            ActivatedSkills.end();
+        }
+    }
+
 }

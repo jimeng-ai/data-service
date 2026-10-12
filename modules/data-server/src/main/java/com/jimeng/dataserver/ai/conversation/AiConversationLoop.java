@@ -22,6 +22,7 @@ import com.jimeng.dataserver.ai.skill.model.SkillApplyResult;
 import com.jimeng.dataserver.ai.skill.model.ToolExecutionResult;
 import com.jimeng.dataserver.ai.skill.model.ToolPackage;
 import com.jimeng.dataserver.ai.skill.model.ToolUseCall;
+import com.jimeng.dataserver.ai.skill.service.ActivatedSkills;
 import com.jimeng.dataserver.ai.skill.service.SkillRuntimeService;
 import com.jimeng.dataserver.ai.skill.install.SkillInstallToolDefinitions;
 import com.jimeng.dataserver.ai.web.WebSearchProperties;
@@ -152,6 +153,17 @@ public class AiConversationLoop {
     public Object runBlocking(Map<String, Object> body, AiProtocolAdapter adapter,
                                Map<String, String> headers, String url,
                                String traceId, CallRecordConfig rc) {
+        ActivatedSkills.begin();
+        try {
+            return runBlockingInTurn(body, adapter, headers, url, traceId, rc);
+        } finally {
+            ActivatedSkills.end();
+        }
+    }
+
+    private Object runBlockingInTurn(Map<String, Object> body, AiProtocolAdapter adapter,
+                                     Map<String, String> headers, String url,
+                                     String traceId, CallRecordConfig rc) {
         // 在追加 tool_result 轮次前捕获用户原始问题，写入 trace 头表。
         traceRecorder.recordUserMessage(latestUserMessage(body));
         SkillApplyResult skillApplyResult = skillRuntimeService.applySkillContext(body, adapter);
@@ -375,6 +387,16 @@ public class AiConversationLoop {
      */
     public void runStream(Map<String, Object> body, List<UpstreamTarget> targets,
                           String connectionId, String traceId) {
+        ActivatedSkills.begin();
+        try {
+            runStreamInTurn(body, targets, connectionId, traceId);
+        } finally {
+            ActivatedSkills.end();
+        }
+    }
+
+    private void runStreamInTurn(Map<String, Object> body, List<UpstreamTarget> targets,
+                                 String connectionId, String traceId) {
         if (targets == null || targets.isEmpty()) {
             throw new IllegalArgumentException("runStream 至少需要一个 UpstreamTarget");
         }
