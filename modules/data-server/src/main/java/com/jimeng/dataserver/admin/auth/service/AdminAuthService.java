@@ -64,6 +64,8 @@ public class AdminAuthService {
      * 「那个 Agent 全部连接器的读写凭据」，而两边的资源绑定检查谁都不会发现。
      */
     public static final String PURPOSE_CONNECTOR_AGENT = "connector-agent";
+    /** 与其他回调用途互斥，防窄权限凭据跨接口使用。 */
+    public static final String PURPOSE_HTTP_GATEWAY = "http-gateway";
 
     /**
      * 对话 agent 连接器回调 token 在本次运行墙钟之外多给的秒数，与语义层、RAG 回调同一口径。
@@ -319,6 +321,32 @@ public class AdminAuthService {
         payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
         payload.put("purpose", PURPOSE_CONNECTOR_AGENT);
         payload.put("aid", String.valueOf(agentId));            // 字符串：雪花 id 超出 JS 安全整数
+        payload.put("rid", runId);
+        return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
+    }
+    /** 网关运行凭证的有效期，与连接器回调同口径（本轮墙钟 + 宽限）：登记与 token 都从这里取，免得登记先于 token 过期。 */
+    public static long httpGatewayTokenTtlMs(int wallClockSec) {
+        return connectorAgentTokenTtlMs(wallClockSec);
+    }
+
+    /**
+     * 为一次沙箱运行签发通用 HTTP 网关的运行凭证（设计文档 §4.1）。claims 与 {@link #mintConnectorAgentToken} 相同，只换 purpose：
+     * 网关照常验签并据 tenant_id 注入租户，范围由 {@code HttpGatewayScopeFilter} 限定在 /data/internal/http-gateway/**，
+     * 本次可用的 skill 不写进 claims，存在 Redis 登记里（token 会经过请求头，大小有限，而且登记能随运行结束撤销）。
+     *
+     * <p>token 只进下发给边车的 payload：宿主进程的 MCP 工具闭包持有它，出网代理按源 IP 登记它。不进容器 env、不进 prompt、不进日志。
+     */
+    public String mintHttpGatewayToken(Long userId, String tenantId, Long agentId, String runId, long ttlMs) {
+        Date now = new Date();
+        Map<String, Object> payload = new HashMap<>();
+        payload.put(JWTPayload.ISSUED_AT, now);
+        payload.put(JWTPayload.NOT_BEFORE, now);
+        payload.put(JWTPayload.EXPIRES_AT, new Date(now.getTime() + ttlMs));
+        payload.put("id", String.valueOf(userId));
+        payload.put("tenant_id", tenantId);
+        payload.put("realm", PlatformConstant.REALM_ENTERPRISE);
+        payload.put("purpose", PURPOSE_HTTP_GATEWAY);
+        payload.put("aid", String.valueOf(agentId));
         payload.put("rid", runId);
         return cn.hutool.jwt.JWTUtil.createToken(payload, jwtSecretProvider.key());
     }

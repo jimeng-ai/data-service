@@ -89,6 +89,13 @@ public class SidecarRunPayload {
     /** 只在 {@code runProfile="skill-builder"} 时下发：PROMPT 类触发测试的发现请求上下文等（边车 {@code SkillBuilderContext}）。 */
     private SkillBuilder skillBuilder;
 
+    /**
+     * 通用 HTTP 网关（一切皆可 skills §4）。只有本轮下发的 skill 里有 HTTP 声明（hosts / key / web）时才带：
+     * 边车据此装宿主侧 http_request MCP 工具，并把 accessToken 登记给出网代理，脚本的 $JM_HTTP 由代理附上它转发。
+     * 字段名须与边车 TS 的 {@code HttpContext} 一致（Task 11 的契约测试逐字段对拍）。
+     */
+    private HttpContext httpContext;
+
     @Data
     public static class SkillRef {
         private String name;
@@ -271,5 +278,31 @@ public class SidecarRunPayload {
         private String connectorId;
         /** 本片序号，从 1 开始。 */
         private Integer sliceNo;
+    }
+    @Data
+    public static class HttpContext {
+        /** 回调根地址，含 /data，例如 http://localhost:20011/data。与 connectorContext 同理：按运行下发，边车不读自己的 env。 */
+        private String callbackBaseUrl;
+        /** 运行凭证（purpose=http-gateway 的 JWT），原样放 Authorization，不加 Bearer。 */
+        @ToString.Exclude
+        private String accessToken;
+        /** 本轮各 skill 的 timeout-seconds 里最大的那个；边车的工具回调超时按它加余量。 */
+        private Integer timeoutSeconds;
+        /** key 的声明（不含值），写进工具说明，模型据此知道能用哪些占位符。 */
+        private List<HttpKeyDecl> keys;
+        /** 不带 key 也能访问的域名（各 skill 的 metadata.jm.hosts 并集）。 */
+        private List<String> hosts;
+        /** 有 skill 声明了 web:true。 */
+        private Boolean web;
+    }
+
+    /** 字段名须与边车 TS 的 {@code HttpKeyDecl} 一致。methods / paths 为 null = 不限（Hutool 不输出 null）。 */
+    @Data
+    public static class HttpKeyDecl {
+        private String skill;
+        private String name;
+        private List<String> hosts;
+        private List<String> methods;
+        private List<String> paths;
     }
 }

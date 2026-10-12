@@ -16,6 +16,7 @@ import com.jimeng.dataserver.ai.billing.AiModelCallRecordService;
 import com.jimeng.dataserver.ai.billing.usage.NormalizedUsage;
 import com.jimeng.dataserver.ai.billing.usage.UsageExtractor;
 import com.jimeng.dataserver.ai.connector.agent.ConnectorAgentContextFactory;
+import com.jimeng.dataserver.ai.http.callback.HttpGatewayLeaseFactory;
 import com.jimeng.dataserver.ai.connector.agent.ConnectorSkillMaterializer;
 import com.jimeng.dataserver.ai.provider.ProviderRegistry;
 import com.jimeng.dataserver.ai.run.RunEventTee;
@@ -92,6 +93,7 @@ public class AgentExecService {
     private final SkillBundleResolver skillBundleResolver;
     private final ConnectorSkillMaterializer connectorSkillMaterializer;
     private final ConnectorAgentContextFactory connectorAgentContextFactory;
+    private final HttpGatewayLeaseFactory httpGatewayLeaseFactory;
 
     public void streamExec(AgentExecRequest req, String connectionId, String traceId) {
         String tenantId = TenantContext.get();
@@ -310,6 +312,21 @@ public class AgentExecService {
             log.debug("[sandbox] 本轮不下发连接器工具代理 runId={}：{}", runId, connectorLease.declineReason());
         }
 
+        // 3c. 通用 HTTP 网关（一切皆可 skills §4）：本轮下发的 skill 里有 HTTP 声明时，登记本次可用的 skill、签运行凭证；
+        //     边车据此装 http_request 工具，并让出网代理给脚本的 $JM_HTTP 附上凭证。租约未授予时 close() 是空操作。
+        final HttpGatewayLeaseFactory.Lease httpLease = httpGatewayLeaseFactory.open(
+                tenantId, userIdL, view == null ? null : view.getAgentId(), String.valueOf(runId),
+                props.getWallClockSec(), doerSkills);
+        if (httpLease.granted()) {
+            payload.setHttpContext(httpLease.context());
+            // 只记 key 的名字和域名——token 绝不进任何日志。
+            log.info("[sandbox] 本轮下发 http 网关 runId={} keys={} hosts={} web={}", runId,
+                    httpLease.context().getKeys().stream().map(SidecarRunPayload.HttpKeyDecl::getName).toList(),
+                    httpLease.context().getHosts(), httpLease.context().getWeb());
+        } else {
+            log.debug("[sandbox] 本轮不下发 http 网关 runId={}：{}", runId, httpLease.declineReason());
+        }
+
         // 4. 桥接边车 SSE
         final CountDownLatch latch = new CountDownLatch(1);
         final List<String> artifactEvents = Collections.synchronizedList(new ArrayList<>());
@@ -370,6 +387,7 @@ public class AgentExecService {
             //   排在回填之前，避免回填抛出时把撤销一起跳过。
             //   不调只是退化成靠 TTL 自然过期，而那个窗口正是这张登记要消灭的东西：
             //   运行早就结束了，泄漏的 token 却仍是该 Agent 全部连接器的读写凭据。
+            httpLease.close();
             connectorLease.close();
             // 仍在 streamExecutor 线程，TenantContext 还在，可安全回填
             persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
