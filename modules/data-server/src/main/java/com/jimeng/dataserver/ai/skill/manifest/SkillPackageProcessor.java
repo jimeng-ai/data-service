@@ -155,7 +155,10 @@ public final class SkillPackageProcessor {
         }
 
         // 5. 用替换后的 SKILL.md 解析（校验的文本 = 发布的文本）
-        ParsedSkill skill = SkillManifestParser.parse(new String(out.get(SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8), mode);
+        // 是否敏感取决于声明，不取决于是否成功解密到值；历史 key 被删除/解不开也要求完整源覆盖。
+        boolean requireCompleteSource = !secrets.isEmpty() || !previousNames.isEmpty();
+        ParsedSkill skill = SkillManifestParser.parse(new String(out.get(SkillBundleRules.SKILL_MD), StandardCharsets.UTF_8),
+                mode, requireCompleteSource);
         if (!skill.valid()) {
             throw reject(scrub, "SKILL.md 不符合规则：" + String.join("；", skill.errors()));
         }

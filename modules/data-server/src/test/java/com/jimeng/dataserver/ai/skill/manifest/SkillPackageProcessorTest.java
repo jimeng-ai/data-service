@@ -760,7 +760,7 @@ class SkillPackageProcessorTest {
                 var files = previous ? Map.of("SKILL.md", b(md)) : skillMdWith(md, CRM_SECRETS);
                 var old = previous ? PreviousKeys.decrypted(Map.of("CRM_TOKEN", TOKEN)) : PreviousKeys.NONE;
                 assertThatThrownBy(() -> SkillPackageProcessor.process(files, mode, true, old))
-                        .isInstanceOf(ServiceException.class).hasMessageContaining("CRM_TOKEN")
+                        .isInstanceOf(ServiceException.class).hasMessageContaining(extra.contains("`bad`") ? "YAML" : "CRM_TOKEN")
                         .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live");
             }
         }
@@ -799,6 +799,46 @@ class SkillPackageProcessorTest {
             var skill = SkillPackageProcessor.process(Map.of("SKILL.md", b(md)), mode, true).skill();
             assertThat(skill.valid()).isTrue();
             assertThat(skill.decoded()).extracting(ParsedSkill.Decoded::text).contains("safe", "42", "1.5", "true");
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void sensitivePackagesRequireCompleteOriginalScalarCoverage(boolean previous) {
+        String numericKey = "1234567890";
+        String json = "{\"NUMBER_TOKEN\":{\"value\":\"" + numericKey + "\",\"hosts\":[\"api.customer.com\"]}}";
+        for (String scalar : List.of("0x499602D2", "!!binary MTIzNDU2Nzg5MA==", "!!binary \"MTIzNDU2Nzg5MA==\"")) {
+            String md = "---\nname: demo\ndescription: safe\nargument-hint: `bad` [" + scalar + "] [b]\n---\nbody\n";
+            var files = previous ? Map.of("SKILL.md", b(md)) : skillMdWith(md, json);
+            var old = previous ? PreviousKeys.decrypted(Map.of("NUMBER_TOKEN", numericKey)) : PreviousKeys.NONE;
+            assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.LENIENT, true, old))
+                    .isInstanceOf(ServiceException.class).hasMessageContaining("YAML")
+                    .hasMessageNotContaining(numericKey).hasMessageNotContaining(scalar).hasMessageNotContaining("`bad`");
+        }
+    }
+
+    @Test
+    void historicalDeclarationsRequireCoverageEvenWhenTheirValuesAreUnavailable() {
+        String md = "---\nname: demo\ndescription: safe\nargument-hint: `ordinary` [a] [b]\n---\nbody\n";
+        PreviousKeys old = PreviousKeys.decrypted(Map.of(), Set.of("UNAVAILABLE_KEY"));
+        assertThatThrownBy(() -> SkillPackageProcessor.process(Map.of("SKILL.md", b(md)), SkillManifestParser.Mode.LENIENT, true, old))
+                .isInstanceOf(ServiceException.class).hasMessageContaining("YAML").hasMessageNotContaining("`ordinary`");
+    }
+
+    @Test
+    void nonSensitiveRetryAndValidSensitiveYamlRemainAccepted() {
+        for (String value : List.of("`ordinary` [0x499602D2] [b]", "`ordinary` [!!binary c2FmZQ==] [b]")) {
+            String md = "---\nname: demo\ndescription: safe\nargument-hint: " + value + "\n---\nbody\n";
+            assertThat(SkillPackageProcessor.process(Map.of("SKILL.md", b(md)), SkillManifestParser.Mode.LENIENT, true).skill().valid()).isTrue();
+            assertThat(SkillPackageProcessor.process(skillMdWith(md, "{}"), SkillManifestParser.Mode.LENIENT, true).skill().valid()).isTrue();
+        }
+        String valid = "---\nname: demo\ndescription: safe\nmetadata:\n  binary: !!binary c2FmZQ==\n  number: 0x2a\n---\nbody\n";
+        for (var mode : SkillManifestParser.Mode.values()) {
+            assertThat(SkillPackageProcessor.process(skillMdWith(valid, CRM_SECRETS), mode, true).skill().valid()).isTrue();
+            assertThat(SkillPackageProcessor.process(Map.of("SKILL.md", b(valid)), mode, true,
+                    PreviousKeys.decrypted(Map.of("CRM_TOKEN", TOKEN))).skill().valid()).isTrue();
+            assertThat(SkillPackageProcessor.process(Map.of("SKILL.md", b(valid)), mode, true,
+                    PreviousKeys.decrypted(Map.of(), Set.of("UNAVAILABLE_KEY"))).skill().valid()).isTrue();
         }
     }
 

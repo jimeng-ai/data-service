@@ -145,16 +145,18 @@ class SkillImportServiceSecretsTest {
         verify(minio, org.mockito.Mockito.never()).putObject(anyString(), any(), anyString());
         verify(secrets, org.mockito.Mockito.never()).save(any(), org.mockito.ArgumentMatchers.anyInt(), anyList());
     }
-    @Test
-    void incompleteTypedRetryCannotPersistOrPublishImportedSource() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void incompleteTypedRetryCannotPersistOrPublishImportedSource(boolean implicit) {
         GithubTarballFetcher fetcher = mock(GithubTarballFetcher.class);
         when(fetcher.fetch(any(), any(), any())).thenReturn(new byte[]{1});
         SkillBundleExtractor extractor = mock(SkillBundleExtractor.class);
-        String encoded = java.util.Base64.getEncoder().encodeToString(TOKEN.getBytes(StandardCharsets.UTF_8));
+        String key = implicit ? "1234567890" : TOKEN;
+        String encoded = implicit ? "0x499602D2" : "!!binary " + java.util.Base64.getEncoder().encodeToString(key.getBytes(StandardCharsets.UTF_8));
         when(extractor.extract(any(), any())).thenReturn(new SkillBundle(
-                "---\nname: crm\ndescription: safe\nargument-hint: `bad` [!!binary " + encoded + "] [b]\n---\nbody\n",
+                "---\nname: crm\ndescription: safe\nargument-hint: `bad` [" + encoded + "] [b]\n---\nbody\n",
                 Map.of("scripts/call.py", "pass".getBytes(StandardCharsets.UTF_8),
-                        "secrets.json", ("{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}")
+                        "secrets.json", ("{\"CRM_TOKEN\":{\"value\":\"" + key + "\",\"hosts\":[\"api.customer.com\"]}}")
                                 .getBytes(StandardCharsets.UTF_8))));
         AiSkillMapper mapper = mock(AiSkillMapper.class);
         AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
@@ -162,7 +164,7 @@ class SkillImportServiceSecretsTest {
         SkillSecretService secrets = mock(SkillSecretService.class);
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> new SkillImportService(fetcher, extractor, mapper, registry, minio, secrets)
                 .importFromGithub("o", "r", "main", "crm", "t1", 7L))
-                .isInstanceOf(ServiceException.class).hasMessageNotContaining(TOKEN).hasMessageNotContaining(encoded);
+                .isInstanceOf(ServiceException.class).hasMessageNotContaining(key).hasMessageNotContaining(encoded);
         org.mockito.Mockito.verifyNoInteractions(mapper, registry, minio, secrets);
     }
 

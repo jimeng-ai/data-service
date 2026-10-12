@@ -107,6 +107,11 @@ public final class SkillManifestParser {
     private SkillManifestParser() {}
 
     public static ParsedSkill parse(String content, Mode mode) {
+        return parse(content, mode, false);
+    }
+
+    /** 发布处理器按当前/历史 key 声明要求原始 source 完整覆盖；普通草稿/无 key 解析保留宽松恢复。 */
+    static ParsedSkill parse(String content, Mode mode, boolean requireCompleteSource) {
         List<String> errors = new ArrayList<>();
         String text = content == null ? "" : content;
         if (!text.isEmpty() && text.charAt(0) == BOM) text = text.substring(1);
@@ -137,7 +142,7 @@ public final class SkillManifestParser {
             loaded = null;
             if (mode == Mode.LENIENT && wouldChange) {
                 try {
-                    decoded.addAll(SourceYaml.beforeRetry(frontmatter, quoted));
+                    decoded.addAll(SourceYaml.beforeRetry(frontmatter, quoted, requireCompleteSource));
                     SourceYaml.Loaded source = SourceYaml.load(quoted);
                     loaded = source.value();
                     decoded.addAll(source.decoded());
