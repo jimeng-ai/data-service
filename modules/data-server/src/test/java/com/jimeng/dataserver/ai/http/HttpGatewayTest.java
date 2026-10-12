@@ -679,4 +679,23 @@ class HttpGatewayTest {
         }
         assertThat(seen).hasSize(5).allSatisfy(request -> assertThat(request.body()).isEmpty());
     }
+
+    @Test
+    void adjacentPercentCannotExposeEncodedCredentialInGatewayOutputs() {
+        keys(key(1L, "crm", "TOKEN", "AB/secret123", null, null));
+        String echo = "%AB%2Fsecret123,%AB%2fsecret123";
+        routes.put("/boundary", ex -> { ex.getResponseHeaders().add("X-Echo", echo); reply(ex, 200, "text/plain", echo); });
+        Logger audit = (Logger)LoggerFactory.getLogger("jm.http-gateway.audit");
+        ch.qos.logback.classic.Level old = audit.getLevel(); audit.setLevel(ch.qos.logback.classic.Level.INFO);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>(); appender.start(); audit.addAppender(appender);
+        try {
+            HttpGatewayResult r = gateway().execute(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/boundary?q=" + echo), null));
+            assertThat(r.status()).isEqualTo(200);
+            assertThat(text(r)).isEqualTo("%{{TOKEN}},%{{TOKEN}}");
+            assertThat(r.header("x-echo")).isEqualTo("%{{TOKEN}},%{{TOKEN}}");
+            HttpGatewayResult error = gateway().execute(ctx(TOOL, CRM), req(echo, url("api.customer.test", "/"), null));
+            assertThat(error.message()).doesNotContain("secret123");
+            assertThat(appender.list).isNotEmpty().allSatisfy(e -> assertThat(e.getFormattedMessage()).doesNotContain("secret123"));
+        } finally { audit.detachAppender(appender); audit.setLevel(old); }
+    }
 }

@@ -450,4 +450,68 @@ class SecretValuesTest {
         SecretValues composed = SecretValues.of(java.util.Map.of("TAIL", "abcdefgh", "COMPOSED", "x{{TAIL}}"));
         assertThat(composed.scrub("xabcdefgh")).isEmpty();
     }
+
+    @Test
+    void strictPercentMatchesIsolatedCandidateOracleWithOverlappingPrefixes() {
+        Random random = new Random(47);
+        List<String> prefixes = List.of("AB", "AF", "A0", "0F", "A", "BB", "AA", "ab", "aB");
+        for (int run = 0; run < 5000; run++) {
+            String value = run % 4 == 0 ? "AB/AB/AB/" : prefixes.get(random.nextInt(prefixes.size())) + "/"
+                    + randomAb(random, 6) + "+F123";
+            String encoded = SecretForms.percentEncode(value);
+            String mixed = randomPercentHex(encoded, random);
+            String prefix = List.of("", "%", "%0", "%A", "%AB", "%%", "%f", "x").get(random.nextInt(8));
+            String changedCase = Character.toLowerCase(mixed.charAt(0)) + mixed.substring(1);
+            String text = prefix + mixed + " " + prefix + changedCase + " "
+                    + mixed.substring(0, random.nextInt(mixed.length())) + "%" + mixed + encoded.substring(encoded.length() / 2);
+            List<SecretValues.Item> items = new ArrayList<>();
+            List<int[]> ranges = new ArrayList<>();
+            for (String form : SecretForms.of(value)) {
+                boolean percent = SecretForms.isPercentForm(value, form);
+                items.add(new SecretValues.Item("TOKEN", form, percent));
+                for (int start = 0; start + form.length() <= text.length(); start++) {
+                    if (candidateMatches(text, start, form, percent)) ranges.add(new int[]{start, start + form.length()});
+                }
+            }
+            ranges.sort(java.util.Comparator.comparingInt(r -> r[0]));
+            StringBuilder expected = new StringBuilder();
+            int copied = 0, left = ranges.get(0)[0], right = ranges.get(0)[1];
+            for (int i = 1; i <= ranges.size(); i++) {
+                if (i < ranges.size() && ranges.get(i)[0] < right) { right = Math.max(right, ranges.get(i)[1]); continue; }
+                expected.append(text, copied, left).append("{{TOKEN}}"); copied = right;
+                if (i < ranges.size()) { left = ranges.get(i)[0]; right = ranges.get(i)[1]; }
+            }
+            expected.append(text.substring(copied));
+            SecretValues values = SecretValues.of(items);
+            assertThat(values.scrub(text)).as("run=%s text=%s value=%s", run, text, value).isEqualTo(expected.toString());
+            assertThat(new String(values.scrubBytes(text.getBytes(StandardCharsets.UTF_8), Integer.MAX_VALUE).bytes(), StandardCharsets.UTF_8)).isEqualTo(expected.toString());
+        }
+    }
+
+    private static String randomPercentHex(String text, Random random) {
+        char[] out = text.toCharArray();
+        for (int i = 0; i + 2 < out.length; i++) {
+            if (out[i] == '%') {
+                for (int j = 1; j <= 2; j++) out[i+j] = random.nextBoolean() ? Character.toUpperCase(out[i+j]) : Character.toLowerCase(out[i+j]);
+                i += 2;
+            }
+        }
+        return new String(out);
+    }
+
+    /** 独立朴素参照：只按 candidate 内 pattern 的百分号 hex 位允许大小写，完全不查看 start 之前的字节。 */
+    private static boolean candidateMatches(String text, int start, String pattern, boolean percent) {
+        for (int i = 0; i < pattern.length(); i++) {
+            char expected = pattern.charAt(i), actual = text.charAt(start + i);
+            boolean hex = percent && (i > 0 && i + 1 < pattern.length() && pattern.charAt(i - 1) == '%' && referenceHex(pattern.charAt(i + 1))
+                    || i > 1 && pattern.charAt(i - 2) == '%' && referenceHex(pattern.charAt(i - 1)));
+            if (hex) { expected = Character.toLowerCase(expected); actual = Character.toLowerCase(actual); }
+            if (expected != actual) return false;
+        }
+        return true;
+    }
+
+    private static boolean referenceHex(char c) {
+        return c >= '0' && c <= '9' || c >= 'A' && c <= 'F' || c >= 'a' && c <= 'f';
+    }
 }

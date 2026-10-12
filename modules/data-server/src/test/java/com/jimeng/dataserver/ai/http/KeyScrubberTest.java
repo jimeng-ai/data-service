@@ -96,4 +96,18 @@ class KeyScrubberTest {
         assertThat(literal.scrub("literal-%252f-key")).isEqualTo("literal-%252f-key");
         assertThat(literal.scrub("literal-%252F-key")).isEqualTo("{{LITERAL}}");
     }
+
+    @Test
+    void percentContextOutsideEncodedCredentialDoesNotChangeItsRawPrefix() {
+        KeyScrubber k = new KeyScrubber(List.of(new SkillKey("TOKEN", 1L, "crm", null, null, null, "AB/secret123")));
+        for (String input : List.of("AB%2Fsecret123", "%AB%2Fsecret123", "%AB%2fsecret123", "%0AB%2fsecret123", "xAB%2Fsecret123")) {
+            String expected = input.substring(0, input.indexOf("AB%")) + "{{TOKEN}}";
+            assertThat(k.scrub(input)).as(input).isEqualTo(expected);
+            assertThat(new String(k.scrub(input.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).as(input).isEqualTo(expected);
+        }
+        for (String input : List.of("%ab%2Fsecret123", "%Ab%2fsecret123", "%aB%2Fsecret123")) {
+            assertThat(k.scrub(input)).isEqualTo(input);
+            assertThat(k.scrub(input.getBytes(StandardCharsets.UTF_8))).isEqualTo(input.getBytes(StandardCharsets.UTF_8));
+        }
+    }
 }
