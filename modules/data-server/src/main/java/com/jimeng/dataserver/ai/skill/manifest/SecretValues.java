@@ -28,7 +28,7 @@ import java.util.Set;
  *
  * <p>★ 这个类持有 key 的真值：{@code toString} 只列名字，{@link Item#toString} 也不带值。
  *
- * <p><b>成本有上限。</b>值最长 8192 个字符、文件最大 25 MB，查找必须是线性的，不然一次请求就能被拖上几分钟：
+ * <p><b>成本有上限。</b>值最长 8192 个字符、发布文件最大 25 MB、网关正文最大 50 MB，查找必须是线性的，不然一次请求就能被拖上几分钟：
  * 所有查找用 KMP，<b>每个文本字符对每个值最多被看一次</b>。{@link #replace} 每个值保留自己的 KMP 状态和已经扫到的位置：
  * 被别的值「抢走」（最左的先换）之后，从上次停下的地方续跑、不回头，只把状态砍到「落在新起点之后」的那一段
  * （沿 failure 链往回退，退的步数不超过之前前进的步数）。
@@ -134,6 +134,56 @@ public final class SecretValues {
         final char[] t = text.toCharArray();
         Spans spans = select(t);
         return spans.count == 0 ? text : build(t, spans);
+    }
+
+    /** 有界字节替换；stopped 表示仍有输入或替换输出未写入。 */
+    public record ByteReplacement(byte[] bytes, boolean stopped) {}
+
+    public byte[] replaceBytes(byte[] content) {
+        return replaceBytes(content, Integer.MAX_VALUE).bytes();
+    }
+
+    /**
+     * UTF-8 字节版，同字符串版的最左最长、非重叠、KMP 续跑循环；直接写有界输出，不缓存所有命中区间。
+     * 时间 O(写法数 × 输入长度)，堆 O(maxOut + 最长写法)，另加写法本身；无命中且未截断时保留同一数组。
+     */
+    public ByteReplacement replaceBytes(byte[] t, int maxOut) {
+        if (maxOut < 0) throw new IllegalArgumentException("输出上限不能为负");
+        if (t == null) return new ByteReplacement(null, false);
+        if (t.length == 0 || items.isEmpty()) {
+            return new ByteReplacement(t.length <= maxOut ? t : Arrays.copyOf(t, maxOut), t.length > maxOut);
+        }
+        Bytes b = bytes();
+        final int k = items.size();
+        int[] next = new int[k], scanned = new int[k], state = new int[k];
+        for (int i = 0; i < k; i++) next[i] = advance(t, b.bytes[i], b.failure[i], 0, scanned, state, i);
+        java.io.ByteArrayOutputStream out = null;
+        int pos = 0;
+        while (true) {
+            int best = -1;
+            for (int i = 0; i < k; i++) {
+                if (next[i] >= 0 && (best < 0 || next[i] < next[best]
+                        || next[i] == next[best] && b.bytes[i].length > b.bytes[best].length)) best = i;
+            }
+            if (best < 0) {
+                if (out == null) return new ByteReplacement(t.length <= maxOut ? t : Arrays.copyOf(t, maxOut), t.length > maxOut);
+                int n = Math.min(t.length - pos, maxOut - out.size());
+                out.write(t, pos, n);
+                return new ByteReplacement(out.toByteArray(), pos + n < t.length);
+            }
+            if (out == null) out = new java.io.ByteArrayOutputStream(Math.min(maxOut, Math.min(t.length, 8192)));
+            int n = Math.min(next[best] - pos, maxOut - out.size());
+            out.write(t, pos, n);
+            if (pos + n < next[best]) return new ByteReplacement(out.toByteArray(), true);
+            byte[] replacement = ("{{" + items.get(best).name() + "}}").getBytes(StandardCharsets.UTF_8);
+            n = Math.min(replacement.length, maxOut - out.size());
+            out.write(replacement, 0, n);
+            pos = next[best] + b.bytes[best].length;
+            if (n < replacement.length || out.size() == maxOut && pos < t.length) return new ByteReplacement(out.toByteArray(), true);
+            for (int i = 0; i < k; i++) {
+                if (next[i] >= 0 && next[i] < pos) next[i] = advance(t, b.bytes[i], b.failure[i], pos, scanned, state, i);
+            }
+        }
     }
 
     /**
@@ -293,6 +343,32 @@ public final class SecretValues {
         final int m = p.length;
         for (; s < n; s++) {
             char c = t[s];
+            while (q > 0 && c != p[q]) q = fail[q - 1];
+            if (c == p[q]) q++;
+            if (q == m) {
+                scanned[i] = s + 1;
+                state[i] = fail[m - 1];
+                return s - m + 1;
+            }
+        }
+        scanned[i] = n;
+        state[i] = q;
+        return -1;
+    }
+
+    private static int advance(byte[] t, byte[] p, int[] fail, int from, int[] scanned, int[] state, int i) {
+        int s = scanned[i];
+        int q = state[i];
+        if (s < from) {
+            s = from;
+            q = 0;
+        } else {
+            while (q > s - from) q = fail[q - 1];
+        }
+        final int n = t.length;
+        final int m = p.length;
+        for (; s < n; s++) {
+            byte c = t[s];
             while (q > 0 && c != p[q]) q = fail[q - 1];
             if (c == p[q]) q++;
             if (q == m) {

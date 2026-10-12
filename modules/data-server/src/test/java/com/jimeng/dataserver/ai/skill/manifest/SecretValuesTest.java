@@ -67,6 +67,7 @@ class SecretValuesTest {
             }
             SecretValues values = SecretValues.of(items);
             String out = values.replace(text.toString());
+            assertThat(new String(values.replaceBytes(text.toString().getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo(naive(items, text.toString()));
             assertThat(out).as("值 %s 文本 %s", items, text).isEqualTo(naive(items, text.toString()));
             for (SecretValues.Item it : items) {
                 if (it.value().length() >= SecretValues.MIN_VALUE_LENGTH) assertThat(out).as("%s 在 %s 里", it, out).doesNotContain(it.value());
@@ -402,5 +403,16 @@ class SecretValuesTest {
         assertThat(replaceSet.replacement("x AAAAAAAA11112222BBBBBBBB y").text()).isEqualTo("x {{KEY_A}}{{KEY_B}} y");
         // 中间隔了一个字符就不是一片了
         assertThat(replaceSet.replacement("x AAAAAAAA1111-2222BBBBBBBB y").notFullyReplaced(valuesOf("OLD_KEY", "1111-2222"))).containsExactly("OLD_KEY");
+    }
+    @Test
+    void boundedBytesAndUtf8Longest() {
+        SecretValues v = SecretValues.of(java.util.Map.of("K" + "X".repeat(63), "exactly8"));
+        SecretValues.ByteReplacement out = v.replaceBytes("exactly8".repeat(1000).getBytes(StandardCharsets.UTF_8), 100);
+        assertThat(out.bytes().length).isLessThanOrEqualTo(100);
+        assertThat(out.stopped()).isTrue();
+        byte[] binary = new byte[]{0, (byte)255, 1};
+        assertThat(v.replaceBytes(binary)).isSameAs(binary);
+        SecretValues utf = SecretValues.of(java.util.Map.of("A", "界".repeat(8), "B", "abcdefghijklmnopqrst"));
+        assertThat(new String(utf.replaceBytes(("界".repeat(8) + "abcdefghijklmnopqrst").getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8)).isEqualTo("{{A}}{{B}}");
     }
 }

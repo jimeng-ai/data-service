@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jimeng.common.core.enums.ExceptionCode;
 import com.jimeng.common.core.exception.ServiceException;
 import com.jimeng.dataserver.ai.connection.CredentialCipher;
+import com.jimeng.dataserver.ai.http.SkillGrant;
+import com.jimeng.dataserver.ai.http.SkillKey;
 import com.jimeng.dataserver.ai.skill.manifest.PreviousKeys;
 import com.jimeng.dataserver.ai.skill.manifest.SecretValues;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
@@ -145,6 +147,30 @@ public class SkillSecretService {
      */
     private String decryptOrNull(SkillSecret row) {
         return row.getCipherVersion() == null ? null : cipher.decryptOrNull(row.getCiphertext(), row.getCipherVersion());
+    }
+
+    private final Set<String> warnedUnavailable = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 授权版本的 key；单条解不开仍返回不可用项，只有持久层读取失败才整体失败。 */
+    public List<SkillKey> loadKeys(List<SkillGrant> grants) {
+        if (grants == null) return List.of();
+        Map<Long, SkillGrant> byId = new LinkedHashMap<>();
+        for (SkillGrant g : grants) {
+            if (g.skillId() != null && !g.manifest().keys().isEmpty()) byId.putIfAbsent(g.skillId(), g);
+        }
+        if (byId.isEmpty()) return List.of();
+        List<SkillKey> out = new ArrayList<>();
+        for (SkillSecret r : mapper.selectList(new LambdaQueryWrapper<SkillSecret>().in(SkillSecret::getSkillId, byId.keySet()))) {
+            SkillGrant g = byId.get(r.getSkillId());
+            if (g == null || !Objects.equals(r.getVersion(), g.version())) continue;
+            String value = decryptOrNull(r);
+            if (value == null && warnedUnavailable.add(r.getSkillId() + ":" + r.getVersion() + ":" + r.getName())) {
+                log.warn("skill key 无法解密 skillId={} v{} name={}", r.getSkillId(), r.getVersion(), r.getName());
+            }
+            out.add(new SkillKey(r.getName(), r.getSkillId(), g.skillName(), asList(r.getHosts()), asList(r.getMethods()),
+                    asList(r.getPaths()), value));
+        }
+        return out;
     }
 
     /** 某一版的 key 声明（名字和发送范围，不含值），来源是 skill_secret 行——key 能发到哪里只看这张表，manifest 只是给人看的副本。 */
