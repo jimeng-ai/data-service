@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.opentest4j.TestAbortedException;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -19,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -208,19 +211,30 @@ class SidecarRunPayloadContractTest {
     // ------------------------------------------------------------------ 本机工作区里并排的沙箱仓库
 
     private static Path sibling(String rel) {
-        Path dir = Paths.get("").toAbsolutePath();
+        return sibling(Paths.get("").toAbsolutePath(), rel);
+    }
+
+    private static Path sibling(Path start, String rel) {
+        Path peer = null;
+        Path dir = start;
         for (int i = 0; dir != null && i < 6; i++, dir = dir.getParent()) {
-            Path c = dir.resolve("jm-agent-sandbox").resolve(rel);
-            if (Files.isRegularFile(c)) return c;
+            Path candidate = dir.resolve("jm-agent-sandbox");
+            if (Files.isDirectory(candidate)) {
+                peer = candidate;
+                break;
+            }
         }
-        return null;
+        assumeTrue(peer != null, "本机工作区没有并排的沙箱仓库，跳过");
+        Path fixture = peer.resolve(rel);
+        assertThat(Files.isRegularFile(fixture))
+                .as("最近的沙箱仓库缺少契约用例文件：%s", fixture).isTrue();
+        return fixture;
     }
 
     @Test
     @DisplayName("两个仓库的运行请求金样逐字节相同（只在本机工作区并排时检查）")
     void 两份金样相同() throws IOException {
         Path other = sibling("test/fixtures/sidecar-run-request.golden.json");
-        assumeTrue(other != null, "本机工作区没有并排的沙箱仓库，跳过");
         assertThat(Files.readAllBytes(other)).as(other.toString()).isEqualTo(Files.readAllBytes(GOLDEN));
     }
 
@@ -228,7 +242,66 @@ class SidecarRunPayloadContractTest {
     @DisplayName("两个仓库的内网判定用例逐字节相同（只在本机工作区并排时检查）")
     void 两份内网用例相同() throws IOException {
         Path other = sibling("test/fixtures/ip-block-cases.json");
-        assumeTrue(other != null, "本机工作区没有并排的沙箱仓库，跳过");
         assertThat(Files.readAllBytes(other)).as(other.toString()).isEqualTo(Files.readAllBytes(IP_CASES));
+    }
+
+
+    // 六层候选目录都在临时目录内，回归测试不动真实的相邻仓库或它的文件。
+    @TempDir
+    Path temporary;
+
+    private Path isolatedStart() throws IOException {
+        return Files.createDirectories(temporary.resolve("outer/inner/data-service/modules/data-server"));
+    }
+
+    @Test
+    void 相邻仓库缺运行金样不能跳过() throws IOException {
+        assertMissingPeerFixture("test/fixtures/sidecar-run-request.golden.json");
+    }
+
+    @Test
+    void 相邻仓库缺内网用例不能跳过() throws IOException {
+        assertMissingPeerFixture("test/fixtures/ip-block-cases.json");
+    }
+
+    private void assertMissingPeerFixture(String rel) throws IOException {
+        Path start = isolatedStart();
+        Path peer = Files.createDirectories(temporary.resolve("outer/inner/jm-agent-sandbox"));
+        assertThatExceptionOfType(AssertionError.class).isThrownBy(() -> sibling(start, rel))
+                .withMessageContaining(peer.resolve(rel).toString());
+    }
+
+    @Test
+    void 最近仓库缺文件不能借用外层仓库的文件() throws IOException {
+        Path start = isolatedStart();
+        Path nearest = Files.createDirectories(temporary.resolve("outer/inner/jm-agent-sandbox"));
+        for (String rel : List.of("test/fixtures/sidecar-run-request.golden.json", "test/fixtures/ip-block-cases.json")) {
+            Path outer = temporary.resolve("outer/jm-agent-sandbox").resolve(rel);
+            Files.createDirectories(outer.getParent());
+            Files.writeString(outer, "outer fixture");
+            assertThatExceptionOfType(AssertionError.class).isThrownBy(() -> sibling(start, rel))
+                    .withMessageContaining(nearest.resolve(rel).toString());
+        }
+    }
+
+    @Test
+    void 最近仓库有文件时只读最近仓库() throws IOException {
+        Path start = isolatedStart();
+        String rel = "test/fixtures/sidecar-run-request.golden.json";
+        Path nearest = temporary.resolve("outer/inner/jm-agent-sandbox").resolve(rel);
+        Path outer = temporary.resolve("outer/jm-agent-sandbox").resolve(rel);
+        Files.createDirectories(nearest.getParent());
+        Files.createDirectories(outer.getParent());
+        Files.writeString(nearest, "nearest fixture");
+        Files.writeString(outer, "outer fixture");
+        assertThat(Files.readString(sibling(start, rel))).isEqualTo("nearest fixture");
+    }
+
+    @Test
+    void 没有相邻仓库时保留独立CI跳过() throws IOException {
+        Path start = isolatedStart();
+        assertThatExceptionOfType(TestAbortedException.class)
+                .isThrownBy(() -> sibling(start, "test/fixtures/sidecar-run-request.golden.json"))
+                .withMessageContaining("本机工作区没有并排的沙箱仓库");
     }
 }
