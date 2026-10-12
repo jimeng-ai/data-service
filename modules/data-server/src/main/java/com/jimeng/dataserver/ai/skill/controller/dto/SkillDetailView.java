@@ -1,5 +1,6 @@
 package com.jimeng.dataserver.ai.skill.controller.dto;
 
+import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
 import com.jimeng.persistence.entity.AiSkill;
 import lombok.Data;
 
@@ -25,6 +26,14 @@ public class SkillDetailView {
     private String body;
     /** DOER bundle 文件（脚本/依赖/README 等，不含已由 body 呈现的根 SKILL.md）；PROMPT 为空 */
     private List<SkillFileView> files;
+    /** 这个 skill 加密保存了哪些 key、能发往哪些域名（设计文档 §3.4 末段：详情页只显示这一行，没有输入框，读不回原值）。只取 manifest 里的声明，不碰 skill_secret 的密文。 */
+    private List<KeySummary> keys;
+
+    @Data
+    public static class KeySummary {
+        private String name;
+        private List<String> hosts;
+    }
 
     public static SkillDetailView of(AiSkill s, List<SkillFileView> files, String ownerName) {
         SkillDetailView v = new SkillDetailView();
@@ -41,6 +50,12 @@ public class SkillDetailView {
         v.setBuilderSessionId(SkillView.of(s).getBuilderSessionId());
         v.setBody(s.getBody());
         v.setFiles(files);
+        v.setKeys(SkillManifest.fromJson(s.getManifest()).keys().stream().map(k -> {
+            KeySummary ks = new KeySummary();
+            ks.setName(k.name());
+            ks.setHosts(k.hosts());
+            return ks;
+        }).toList());
         return v;
     }
 }
