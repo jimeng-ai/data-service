@@ -31,6 +31,9 @@ public final class BlockedAddresses {
         if (allZero(b, 0, 12)) return true;                                   // ::/96：::、::1、IPv4 兼容
         byte[] embedded = embeddedV4(b);
         if (embedded != null) return hardV4(embedded);
+        if (u(b[0]) == 0x00 && u(b[1]) == 0x64 && u(b[2]) == 0xff && u(b[3]) == 0x9b
+                && u(b[4]) == 0x00 && u(b[5]) == 0x01) return true;            // 64:ff9b:1::/48 本地 NAT64：无前缀配置，整段硬拒绝
+        if (u(b[0]) == 0x20 && u(b[1]) == 0x01 && u(b[2]) == 0x00 && u(b[3]) == 0x00) return true; // 2001::/32 Teredo，整段硬拒绝
         return (u(b[0]) == 0xfe && (u(b[1]) & 0xc0) == 0x80) || u(b[0]) == 0xff; // fe80::/10、ff00::/8
     }
 

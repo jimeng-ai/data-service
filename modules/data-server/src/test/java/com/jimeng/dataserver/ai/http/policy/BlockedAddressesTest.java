@@ -32,6 +32,24 @@ class BlockedAddressesTest {
     }
 
     @Test
+    @DisplayName("本地 NAT64 /48 与 Teredo /32 整段硬拒绝，不因嵌入格式或子网布局改变")
+    void translationPrefixesAreHardBlocked() throws Exception {
+        for (String ip : new String[]{
+                "64:ff9b:1::1",
+                "64:ff9b:1::7f00:1",
+                "64:ff9b:1:7f00:0:100::",
+                "64:ff9b:1:a9fe:a9:fe00::",
+                "64:ff9b:1:beef:cafe:1234:5678:9abc",
+                "2001::1",
+                "2001:0:7f00:1:0:fe44:f7f7:f7f7",
+                "2001:0:808:808:0:fe44:80ff:fffe",
+                "2001:0:808:808:0:fe44:5601:5601"
+        }) {
+            assertThat(hard(ip)).as(ip).isTrue();
+        }
+    }
+
+    @Test
     @DisplayName("16 字节的 v4-mapped（Inet6Address.getByAddress 造得出来）按内嵌的 v4 判，不能当成公网")
     void mappedV6FormIsJudgedByEmbeddedV4() throws Exception {
         assertThat(BlockedAddresses.isBlocked(mapped(10, 0, 0, 1))).isTrue();
