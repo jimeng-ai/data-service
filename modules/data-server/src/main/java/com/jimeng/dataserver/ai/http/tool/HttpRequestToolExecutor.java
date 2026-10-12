@@ -51,6 +51,6 @@ public class HttpRequestToolExecutor implements SkillToolExecutor {
         AgentRuntimeView agent = AgentContext.get();
         HttpGatewayContext ctx = new HttpGatewayContext(TenantContext.get(), agent == null ? null : agent.getAgentId(),
                 MDC.get("connectionId"), HttpGatewayContext.Plane.TOOL, grants);
-        return HttpToolResults.toModelPayload(gateway.executeTool(ctx, in.toRequest(), in.asText()), false, props.getToolTextMaxChars());
+        return gateway.executeToolPayload(ctx, in.toRequest(), in.asText());
     }
 }

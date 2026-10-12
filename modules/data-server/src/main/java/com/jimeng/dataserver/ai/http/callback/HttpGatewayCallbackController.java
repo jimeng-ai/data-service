@@ -58,7 +58,7 @@ public class HttpGatewayCallbackController {
         }
         HttpGatewayContext ctx = new HttpGatewayContext(p.tenantId(), p.agentId(), p.runId(),
                 HttpGatewayContext.Plane.TOOL, HttpGatewayTokens.requireGrants(request));
-        return HttpToolResults.toModelPayload(gateway.executeTool(ctx, in.toRequest(), in.asText()), false, props.getToolTextMaxChars());
+        return gateway.executeToolPayload(ctx, in.toRequest(), in.asText());
     }
 
     /** 沙箱脚本的 $JM_HTTP：出网代理把脚本的整个请求封进请求体转过来，这里回一个同样形状的封包。 */

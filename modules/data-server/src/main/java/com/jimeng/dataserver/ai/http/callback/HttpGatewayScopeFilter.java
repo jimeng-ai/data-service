@@ -100,7 +100,7 @@ public class HttpGatewayScopeFilter implements Filter {
             forbid(resp, "回调凭据范围不匹配");
             return;
         }
-        List<SkillGrant> grants = runRegistry.activeGrants(c.tenantId(), c.runId(), c.agentId());
+        List<SkillGrant> grants = runRegistry.activeGrants(c.tenantId(), c.runId(), c.agentId(), c.userId());
         if (grants == null) {
             forbid(resp, "本次运行已结束或凭据已失效");
             return;

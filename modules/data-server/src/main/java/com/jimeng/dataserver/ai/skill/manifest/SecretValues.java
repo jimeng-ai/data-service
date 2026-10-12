@@ -374,6 +374,49 @@ public final class SecretValues {
     }
 
     /**
+     * 网关文本进入 JSON 前的最后一道检查。使用实际 Java 渲染器（模型协议 / Spring / Logstash），
+     * 连查 payload、content、外层事件三层；JSON.stringify 对这些合法 Unicode 文本采用同一套转义。
+     * 后续渲染若能重建已知值，保守丢弃该字段；不把密钥交给消费者。
+     */
+    public String scrubJson(String text) {
+        String clean = scrub(text);
+        return safeJson(clean) ? clean : "";
+    }
+
+    /** 最终 Map 已经完成头名归一化、正文截断及 note 拼接，检查包括字段边界的完整编码。 */
+    public boolean safeJson(Object value) {
+        return safeJson(value, value instanceof Map<?, ?>);
+    }
+
+    private boolean safeJson(Object value, boolean checkToolClip) {
+        if (items.isEmpty()) return true;
+        Set<String> layer = new LinkedHashSet<>();
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper json = new com.fasterxml.jackson.databind.ObjectMapper();
+            layer.add(json.writeValueAsString(value));
+            layer.add(cn.hutool.json.JSONUtil.toJsonStr(value));
+            for (int depth = 0; depth < 3; depth++) {
+                Set<String> next = new LinkedHashSet<>();
+                for (String rendered : layer) {
+                    if (rendered.length() > 4 * 1024 * 1024 || !rendered.equals(scrub(rendered))) return false;
+                    if (checkToolClip && depth == 0 && rendered.length() > 20_000) {
+                        int end = Character.isHighSurrogate(rendered.charAt(19_999)) ? 19_999 : 20_000;
+                        // 宿主 MCP 的最后一步 clip；同一回包必须在这个追加标记后仍然安全。
+                        String clipped = rendered.substring(0, end) + "…（结果超过 20000 字已截断：只看到了前面一部分，不要据此下「总共 / 最多 / 没有」之类的结论）";
+                        if (!clipped.equals(scrub(clipped)) || !safeJson(clipped, false)) return false;
+                    }
+                    if (depth < 2) {
+                        next.add(json.writeValueAsString(rendered));
+                        next.add(cn.hutool.json.JSONUtil.toJsonStr(rendered));
+                    }
+                }
+                layer = next;
+            }
+            return true;
+        } catch (Exception encoding) { return false; }
+    }
+
+    /**
      * 同 {@link #replace}，并且留下选中的替换区间，供 {@link Replacement#notFullyReplaced} 在原文上核对
      * 「别的值的每一处出现是不是都被这些替换盖住了」。
      */

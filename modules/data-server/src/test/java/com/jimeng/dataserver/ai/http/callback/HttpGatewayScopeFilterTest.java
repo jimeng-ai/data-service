@@ -52,7 +52,7 @@ class HttpGatewayScopeFilterTest {
         JwtSecretProvider secretProvider = new JwtSecretProvider();
         ReflectionTestUtils.setField(secretProvider, "secret", SECRET);
         registry = mock(HttpGatewayRunRegistry.class);
-        when(registry.activeGrants(eq(TENANT), eq(RUN), eq(AGENT))).thenReturn(grants);
+        when(registry.activeGrants(eq(TENANT), eq(RUN), eq(AGENT), eq(Long.valueOf(USER)))).thenReturn(grants);
         filter = new HttpGatewayScopeFilter(registry, secretProvider);
         auth = new AdminAuthService(mock(SysUserMapper.class), mock(SysEnterpriseMapper.class), new BCryptPasswordEncoder(), secretProvider);
     }
@@ -158,7 +158,7 @@ class HttpGatewayScopeFilterTest {
     @Test
     @DisplayName("运行已结束（登记被撤销）→ 403")
     void runEnded() throws Exception {
-        when(registry.activeGrants(anyString(), anyString(), anyLong())).thenReturn(null);
+        when(registry.activeGrants(anyString(), anyString(), anyLong(), anyLong())).thenReturn(null);
         String t = gatewayToken();
         MockFilterChain chain = new MockFilterChain();
         assertForbidden(run(request(TOOL, t), chain), chain, t);

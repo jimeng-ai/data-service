@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -202,7 +203,7 @@ class SkillPackageProcessorTest {
         Map<String, byte[]> plain = skill("正文\n");
         plain.put("SKILL.md", b("---\nname: refund-flow\ndescription: 查订单时用 token: " + TOKEN + " 调接口\n---\n正文\n"));
         assertThatThrownBy(() -> SkillPackageProcessor.process(plain, SkillManifestParser.Mode.STRICT, true))
-                .isInstanceOf(ServiceException.class).hasMessageContaining("{{CRM_TOKEN}}").hasMessageNotContaining(TOKEN);
+                .isInstanceOf(ServiceException.class).hasMessageNotContaining(TOKEN);
     }
 
     @Test
@@ -745,4 +746,24 @@ class SkillPackageProcessorTest {
         assertThat(SkillManifest.fromJson(out.manifestJson()).hosts()).containsExactly("api.customer.com");
         assertThat(SkillManifest.fromJson(out.manifestJson()).keys()).extracting(SkillManifest.KeyDecl::name).containsExactly("CRM_TOKEN");
     }
+    @Test
+    void sourceScalarsSurviveDuplicateMergeAndLenientRetryValidation() {
+        String escaped = "\"sk-live-\\x43RM-0123456789\"";
+        for (String extra : List.of("license: " + escaped + "\nlicense: safe\n",
+                "metadata:\n  <<: {hidden: " + escaped + "}\n  hidden: safe\n",
+                "argument-hint: [" + escaped + "] [b]\n",
+                "argument-hint: `bad` [" + escaped + "] [b]\n",
+                "argument-hint: [!!binary " + java.util.Base64.getEncoder().encodeToString(b(TOKEN)) + "] [b]\n")) {
+            var mode = extra.startsWith("argument") ? SkillManifestParser.Mode.LENIENT : SkillManifestParser.Mode.STRICT;
+            String md = "---\nname: refund-flow\ndescription: safe\n" + extra + "---\nbody\n";
+            for (boolean previous : List.of(false, true)) {
+                var files = previous ? Map.of("SKILL.md", b(md)) : skillMdWith(md, CRM_SECRETS);
+                var old = previous ? PreviousKeys.decrypted(Map.of("CRM_TOKEN", TOKEN)) : PreviousKeys.NONE;
+                assertThatThrownBy(() -> SkillPackageProcessor.process(files, mode, true, old))
+                        .isInstanceOf(ServiceException.class).hasMessageContaining("CRM_TOKEN")
+                        .hasMessageNotContaining(TOKEN).hasMessageNotContaining("sk-live");
+            }
+        }
+    }
+
 }

@@ -36,5 +36,6 @@ final class KeyScrubber {
         SecretValues.ByteReplacement result = values.scrubBytes(body, maxOut);
         return new Scrubbed(result.bytes(), result.stopped());
     }
-    String scrub(String text) { return values.scrub(text); }
+    String scrub(String text) { return values.scrubJson(text); }
+    boolean safeJson(Object value) { return values.safeJson(value); }
 }

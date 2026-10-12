@@ -44,5 +44,12 @@
   {"ip": "fec0::1", "blocked": true, "note": "已废弃的 site-local"},
   {"ip": "ff02::1", "blocked": true, "note": "组播"},
   {"ip": "2001:4860:4860::8888", "blocked": false, "note": "公网"},
-  {"ip": "2606:4700:4700::1111", "blocked": false, "note": "公网"}
+  {"ip": "2606:4700:4700::1111", "blocked": false, "note": "公网"},
+  {"ip": "fd00:ec2::254", "blocked": true, "note": "AWS metadata"},
+  {"ip": "fd20:ce::254", "blocked": true, "note": "GCP metadata"},
+  {"ip": "100.100.100.200", "blocked": true, "note": "Alibaba metadata"},
+  {"ip": "::ffff:100.100.100.200", "blocked": true, "note": "mapped metadata"},
+  {"ip": "::ffff:0:100.100.100.200", "blocked": true, "note": "translated metadata"},
+  {"ip": "64:ff9b::6464:64c8", "blocked": true, "note": "NAT64 metadata"},
+  {"ip": "2002:6464:64c8::1", "blocked": true, "note": "6to4 metadata"}
 ]

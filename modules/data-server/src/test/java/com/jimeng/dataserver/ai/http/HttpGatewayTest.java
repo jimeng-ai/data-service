@@ -831,4 +831,45 @@ class HttpGatewayTest {
         }
     }
 
+    @Test
+    void finalCallbackPayloadCannotReconstructJsonKeyAndProducerBytesAreExported() throws Exception {
+        String secret = "\\\\token123";
+        when(secrets.loadKeys(any())).thenReturn(List.of(new SkillKey("TOKEN", 1L, "crm", List.of("api.customer.test"), null, null, secret)));
+        routes.put("/final-json", ex -> reply(ex, 200, "text/plain", "\\token123"));
+        Map<String, Object> payload = gateway().executeToolPayload(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/final-json"), null), false);
+        assertThat(payload).containsEntry("status", 200).containsEntry("body", "");
+        String callback = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(Map.of("success", true, "respCode", "200", "data", payload));
+        assertThat(callback).doesNotContain(secret);
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertThat(mapper.readTree(callback)).isEqualTo(mapper.readTree(getClass().getResourceAsStream("/contract/http-json-callback.golden.json")));
+        // 可选集成产物由真实当前 Java 网关生成，Node 测试直接消费其字节；不写源码目录。
+        String destination = System.getProperty("s1.callback.producer");
+        if (destination != null) java.nio.file.Files.writeString(java.nio.file.Path.of(destination), callback);
+        routes.put("/script-json", ex -> reply(ex, 200, "application/octet-stream", "\\token123"));
+        assertThat(gateway().execute(ctx(SCRIPT, CRM), req("GET", url("api.customer.test", "/script-json"), null)).body())
+                .isEqualTo("\\token123".getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void clippedBodyAndCanonicalHeaderNamesAreValidatedAtTheFinalMap() {
+        String secret = "\"body\":\"token123"; // JSON 字段边界本身也可能拼出已知值
+        when(secrets.loadKeys(any())).thenReturn(List.of(new SkillKey("TOKEN", 1L, "crm", List.of("api.customer.test"), null, null, secret)));
+        routes.put("/json-boundary", ex -> reply(ex, 200, "text/plain", "token123"));
+        Map<String, Object> payload = gateway().executeToolPayload(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/json-boundary"), null), false);
+        assertThat(payload).containsEntry("gateway_error", "unsafe_representation");
+        assertThat(cn.hutool.json.JSONUtil.toJsonStr(payload)).doesNotContain(secret);
+    }
+
+    @Test
+    void mcpClippingMarkerCannotReconstructKeyAfterTheGateway() throws Exception {
+        String secret = "aaaaaaa…（结果超过";
+        when(secrets.loadKeys(any())).thenReturn(List.of(new SkillKey("TOKEN", 1L, "crm", List.of("api.customer.test"), null, null, secret)));
+        routes.put("/mcp-clip", ex -> reply(ex, 200, "text/plain", "a".repeat(21000)));
+        Map<String, Object> payload = gateway().executeToolPayload(ctx(TOOL, CRM), req("GET", url("api.customer.test", "/mcp-clip"), null), false);
+        assertThat(payload).containsEntry("gateway_error", "unsafe_representation");
+        String destination = System.getProperty("s1.callback.producer");
+        if (destination != null) java.nio.file.Files.writeString(java.nio.file.Path.of(destination + ".clip"),
+                new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(Map.of("success", true, "data", payload)));
+    }
+
 }

@@ -41,7 +41,7 @@ import static org.mockito.Mockito.*;
 class AgentExecHttpLeaseTest {
     @ParameterizedTest
     @ValueSource(strings = {"closed", "exception", "timeout", "interrupted"})
-    void dispatchesOnlyShippedGrantsAndRevokesBeforeResultPersistence(String outcome) {
+    void dispatchesOnlyShippedGrantsAndConfirmsTerminalBeforeGrantCleanup(String outcome) {
         SidecarClient sidecar = mock(SidecarClient.class);
         AgentSandboxProperties props = new AgentSandboxProperties();
         // 等待预算为 0，直接验证超时分支，无真实墙钟等待。
@@ -64,8 +64,14 @@ class AgentExecHttpLeaseTest {
                 mock(AdminAuthService.class), sidecar,
                 mock(com.jimeng.dataserver.ai.skill.service.SkillPackageLoaderService.class));
         HttpGatewayProperties httpProps = new HttpGatewayProperties(); httpProps.setCallbackBaseUrl("http://callback.test/data");
-        HttpGatewayRunRegistry registry = mock(HttpGatewayRunRegistry.class);
-        when(registry.begin(anyString(), anyString(), anyLong(), any(), anyLong())).thenReturn(true);
+        var redis = mock(org.springframework.data.redis.core.StringRedisTemplate.class);
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.core.ValueOperations<String, String> ops = mock(org.springframework.data.redis.core.ValueOperations.class);
+        when(redis.opsForValue()).thenReturn(ops);
+        when(redis.delete(anyString())).thenReturn(true);
+        AtomicReference<String> durableStatus = new AtomicReference<>();
+        when(runs.updateById(any(AgentExecRun.class))).thenAnswer(i -> { durableStatus.set(((AgentExecRun)i.getArgument(0)).getStatus()); return 1; });
+        HttpGatewayRunRegistry registry = spy(new HttpGatewayRunRegistry(redis, runs));
         AdminAuthService auth = mock(AdminAuthService.class);
         when(auth.mintHttpGatewayToken(any(), any(), any(), any(), anyLong())).thenReturn("RUN-CREDENTIAL-SENTINEL");
         HttpGatewayLeaseFactory factory = new HttpGatewayLeaseFactory(httpProps, registry, auth);
@@ -91,9 +97,10 @@ class AgentExecHttpLeaseTest {
             assertThat(dispatched.get().getHttpContext().getAccessToken()).isEqualTo("RUN-CREDENTIAL-SENTINEL");
             assertThat(dispatched.get().toString()).doesNotContain("RUN-CREDENTIAL-SENTINEL");
             verify(registry).begin(eq("t1"), eq("91"), eq(5L), argThat(g -> g.size() == 1 && g.get(0).skillId().equals(7L)), anyLong());
-            var order = inOrder(registry, runs, finalizer);
-            order.verify(registry).end("t1", "91");
+            assertThat(durableStatus.get()).isEqualTo((outcome.equals("closed") || outcome.equals("interrupted")) ? "SUCCESS" : "FAILED");
+            var order = inOrder(redis, runs, finalizer);
             order.verify(runs).updateById(any(AgentExecRun.class));
+            order.verify(redis).delete("http-gw:run:t1:91");
             order.verify(finalizer).complete("conversation");
         } finally {
             Thread.interrupted(); AdminRequestContext.clearAsyncUserId(); TenantContext.clear();

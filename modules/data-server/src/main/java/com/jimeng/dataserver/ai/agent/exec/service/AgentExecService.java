@@ -383,16 +383,16 @@ public class AgentExecService {
             log.error("调用边车异常 runId={}", runId, e);
             tee.tee(connectionId, "error", new JSONObject().set("message", String.valueOf(e.getMessage())).toString());
         } finally {
-            // ★ 撤销连接器回调凭据。正常结束、超时被杀、异常中断三条路都会走到这里；
-            //   排在回填之前，避免回填抛出时把撤销一起跳过。
-            //   不调只是退化成靠 TTL 自然过期，而那个窗口正是这张登记要消灭的东西：
-            //   运行早就结束了，泄漏的 token 却仍是该 Agent 全部连接器的读写凭据。
-            httpLease.close();
-            connectorLease.close();
-            // 仍在 streamExecutor 线程，TenantContext 还在，可安全回填
-            persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
-                    System.currentTimeMillis() - startMs);
-            runFinalizer.complete(connectionId);
+            // 权威执行终态先落库，再撤销 Redis grant；删除失败也不能让另一实例把已结束运行当成活跃。
+            try {
+                boolean confirmed = persistRunResult(run, summaryHolder[0], streamError[0], artifactEvents.size(),
+                        System.currentTimeMillis() - startMs, httpLease);
+                if (!confirmed) log.warn("执行终态未确认，保留重试 runId={}", runId);
+            } finally {
+                httpLease.close();
+                connectorLease.close();
+                runFinalizer.complete(connectionId);
+            }
         }
     }
 
@@ -590,8 +590,8 @@ public class AgentExecService {
         }
     }
 
-    private void persistRunResult(AgentExecRun run, String summaryJson, String streamError,
-                                  int artifactCount, long latencyMs) {
+    private boolean persistRunResult(AgentExecRun run, String summaryJson, String streamError,
+                                  int artifactCount, long latencyMs, HttpGatewayLeaseFactory.Lease httpLease) {
         NormalizedUsage usage = null;
         try {
             if (summaryJson != null) {
@@ -627,9 +627,15 @@ public class AgentExecService {
             }
             run.setArtifactCount(artifactCount);
             run.setElapsedMs(latencyMs);
-            runMapper.updateById(run);
         } catch (Exception e) {
-            log.warn("回填运行记录失败 runId={} err={}", run.getId(), e.getMessage());
+            run.setStatus("FAILED");
+            log.warn("运行结果解析失败 runId={}", run.getId());
+        }
+        boolean confirmed = false;
+        try {
+            confirmed = httpLease.granted() ? httpLease.confirmTerminal(run) : runMapper.updateById(run) == 1;
+        } catch (RuntimeException failure) {
+            log.warn("回填运行记录未确认 runId={}", run.getId());
         }
 
         // 用量记账：写进 ai_model_call_log（与 RAG rerank 等同一套，接入用量统计）。
@@ -654,6 +660,7 @@ public class AgentExecService {
                 log.warn("用量记账失败 runId={} err={}", run.getId(), e.getMessage());
             }
         }
+        return confirmed;
     }
 
     private static Long toLong(Integer v) {

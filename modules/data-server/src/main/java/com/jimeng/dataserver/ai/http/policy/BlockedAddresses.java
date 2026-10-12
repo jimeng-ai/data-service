@@ -28,6 +28,7 @@ public final class BlockedAddresses {
     public static boolean isHardBlocked(InetAddress address) {
         byte[] b = address.getAddress();
         if (b.length == 4) return hardV4(b);
+        if (isFixedMetadataV6(b)) return true;
         if (allZero(b, 0, 12)) return true;                                   // ::/96：::、::1、IPv4 兼容
         byte[] embedded = embeddedV4(b);
         if (embedded != null) return hardV4(embedded);
@@ -77,7 +78,15 @@ public final class BlockedAddresses {
 
     private static boolean hardV4(byte[] b) {
         int a = u(b[0]), c = u(b[1]);
-        return a == 0 || a == 127 || a >= 224 || (a == 169 && c == 254);
+        return a == 0 || a == 127 || a >= 224 || (a == 169 && c == 254)
+                || (a == 100 && c == 100 && u(b[2]) == 100 && u(b[3]) == 200);
+    }
+
+    /** 固定云元数据地址；相邻 ULA / CGNAT 客户地址仍可显式放行。 */
+    private static boolean isFixedMetadataV6(byte[] b) {
+        return u(b[0]) == 0xfd && u(b[14]) == 2 && u(b[15]) == 0x54 && allZero(b, 4, 14)
+                && (u(b[1]) == 0 && u(b[2]) == 0x0e && u(b[3]) == 0xc2
+                || u(b[1]) == 0x20 && u(b[2]) == 0 && u(b[3]) == 0xce);
     }
 
     private static boolean allZero(byte[] b, int from, int to) {

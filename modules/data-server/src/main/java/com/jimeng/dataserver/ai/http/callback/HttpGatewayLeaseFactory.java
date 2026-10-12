@@ -14,7 +14,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 一次沙箱运行的网关租约：判定 → 登记「本次可用的 skill」→ 签运行凭证（设计文档 §4.1）。与 ConnectorAgentContextFactory 同一个形状：
@@ -36,7 +35,7 @@ public class HttpGatewayLeaseFactory {
         private final HttpGatewayRunRegistry registry;
         private final String tenantId;
         private final String runId;
-        private final AtomicBoolean closed = new AtomicBoolean(false);
+        private boolean closed;
 
         private Lease(SidecarRunPayload.HttpContext context, String declineReason, HttpGatewayRunRegistry registry,
                       String tenantId, String runId) {
@@ -63,9 +62,15 @@ public class HttpGatewayLeaseFactory {
             return declineReason;
         }
 
+        public boolean confirmTerminal(com.jimeng.persistence.entity.AgentExecRun run) {
+            if (registry == null || !java.util.Objects.equals(tenantId, run.getTenantId())
+                    || !java.util.Objects.equals(runId, String.valueOf(run.getId()))) return false;
+            return registry.confirmTerminal(run);
+        }
+
         @Override
-        public void close() {
-            if (registry != null && closed.compareAndSet(false, true)) registry.end(tenantId, runId);
+        public synchronized void close() {
+            if (registry != null && !closed) closed = registry.end(tenantId, runId);
         }
     }
 

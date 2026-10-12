@@ -471,4 +471,14 @@ class SkillBuilderPublishSecretsTest {
 
         verify(storage).putObject(eq(WORKSPACE_SECRETS), any(byte[].class), anyString());
     }
+    @Test
+    void overwrittenSourceSecretNeverReachesPublicationStorageOrDatabase() throws Exception {
+        session();
+        Map<String, byte[]> files = new TreeMap<>(refundSkillWithKey());
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: safe\nlicense: \"sk-live-\\x43RM-0123456789\"\nlicense: safe\n---\nbody\n"));
+        workspaceWith(files);
+        assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class).hasMessageNotContaining(TOKEN);
+        verifyNoInteractions(storage, aiSkillMapper, versionMapper);
+    }
+
 }

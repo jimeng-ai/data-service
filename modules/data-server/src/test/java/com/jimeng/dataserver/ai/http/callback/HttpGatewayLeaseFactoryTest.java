@@ -34,6 +34,7 @@ class HttpGatewayLeaseFactoryTest {
 
     @BeforeEach
     void setUp() {
+        when(registry.end(anyString(), anyString())).thenReturn(true);
         props.setCallbackBaseUrl("http://localhost:10011/data");
         when(registry.begin(anyString(), anyString(), anyLong(), any(), anyLong())).thenReturn(true);
         when(auth.mintHttpGatewayToken(any(), any(), any(), any(), anyLong())).thenReturn("TOKEN-SENTINEL");
@@ -111,4 +112,12 @@ class HttpGatewayLeaseFactoryTest {
         verify(auth, never()).mintHttpGatewayToken(any(), any(), any(), any(), anyLong());
         verify(registry, never()).end(any(), any());
     }
+    @Test
+    void failedCloseCanRetryUntilDeletionIsConfirmed() {
+        when(registry.end("t1", "r1")).thenReturn(false, true);
+        var lease = factory.open("t1", 1L, 5L, "r1", 300, List.of(skill(7L, "crm", CRM)));
+        lease.close(); lease.close(); lease.close();
+        verify(registry, times(2)).end("t1", "r1");
+    }
+
 }

@@ -51,4 +51,25 @@ class PrivateAllowListTest {
         assertThat(l.permits("crm.corp.local", ip("10.0.0.6"))).isFalse();
         assertThat(l.permits("erp.corp.local", ip("fd00::5"))).isTrue();
     }
+    @Test
+    void fixedMetadataIsDeniedEvenUnderCustomerPrivateCidrsAndDnsAllowlist() throws Exception {
+        List<String> metadata = List.of("fd00:ec2::254", "fd20:ce::254", "100.100.100.200",
+                "::ffff:100.100.100.200", "::ffff:0:100.100.100.200", "64:ff9b::6464:64c8", "2002:6464:64c8::1");
+        for (var allow : List.of(PrivateAllowList.parse(List.of("fc00::/7", "100.64.0.0/10", "::/0")),
+                PrivateAllowList.parse(List.of("metadata.customer.local")))) {
+            var policy = AddressPolicy.standard(allow);
+            for (String target : metadata) {
+                assertThat(policy.check("metadata.customer.local", ip(target), true)).as(target).isNotNull();
+            }
+        }
+        var policy = AddressPolicy.standard(PrivateAllowList.parse(List.of("fc00::/7", "100.64.0.0/10")));
+        assertThat(policy.check("customer", ip("fd00:ec2::255"), true)).isNull();
+        assertThat(policy.check("customer", ip("fd20:ce::255"), true)).isNull();
+        assertThat(policy.check("customer", ip("100.100.100.201"), true)).isNull();
+        for (String target : metadata) {
+            var exact = AddressPolicy.standard(PrivateAllowList.parse(List.of(target)));
+            assertThat(exact.check(target, ip(target), true)).as(target).isNotNull();
+        }
+    }
+
 }

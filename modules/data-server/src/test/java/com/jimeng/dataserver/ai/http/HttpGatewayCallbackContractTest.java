@@ -60,8 +60,12 @@ class HttpGatewayCallbackContractTest {
                     .when(ops).set(anyString(), anyString(), any(java.time.Duration.class));
             when(ops.get(anyString())).thenAnswer(i -> entries.get(i.getArgument(0)));
             when(redis.delete(anyString())).thenAnswer(i -> entries.remove(i.getArgument(0)) != null);
-            HttpGatewayRunRegistry registry = new HttpGatewayRunRegistry(redis);
-            assertThat(registry.begin("t1", "run-1", 5L, grants, 60_000)).isTrue();
+            var runs = mock(com.jimeng.persistence.mapper.AgentExecRunMapper.class);
+            var run = new com.jimeng.persistence.entity.AgentExecRun();
+            run.setId(123L); run.setTenantId("t1"); run.setAgentId("5"); run.setUserId("1"); run.setStatus("RUNNING");
+            when(runs.selectById(123L)).thenReturn(run);
+            HttpGatewayRunRegistry registry = new HttpGatewayRunRegistry(redis, runs);
+            assertThat(registry.begin("t1", "123", 5L, grants, 60_000)).isTrue();
             SkillSecretService secrets = mock(SkillSecretService.class);
             when(secrets.loadKeys(eq(grants))).thenReturn(List.of(new SkillKey("CRM_TOKEN", 7L, "crm",
                     List.of("customer.test"), List.of("GET"), null, secret)));
@@ -71,7 +75,7 @@ class HttpGatewayCallbackContractTest {
             ReflectionTestUtils.setField(jwtSecret, "secret", "callback-contract-signing-key-0123456789");
             AdminAuthService auth = new AdminAuthService(mock(SysUserMapper.class), mock(SysEnterpriseMapper.class),
                     new BCryptPasswordEncoder(), jwtSecret);
-            String token = auth.mintHttpGatewayToken(1L, "t1", 5L, "run-1", 60_000);
+            String token = auth.mintHttpGatewayToken(1L, "t1", 5L, "123", 60_000);
             var mvc = MockMvcBuilders.standaloneSetup(new HttpGatewayCallbackController(gateway, props))
                     .setControllerAdvice(new GlobalResponseHandler(new ObjectMapper()))
                     .addFilters(new HttpGatewayScopeFilter(registry, jwtSecret)).build();
@@ -102,7 +106,7 @@ class HttpGatewayCallbackContractTest {
             assertThat(new ObjectMapper().readValue(responseMeta, Map.class)).containsEntry("status", 200);
             byte[] rawBody = new byte[bytes.remaining()]; bytes.get(rawBody);
             assertThat(new String(rawBody, StandardCharsets.UTF_8)).isEqualTo("<p>a&amp;b12345678 / a&amp;amp;b12345678</p>");
-            registry.end("t1", "run-1");
+            registry.end("t1", "123");
             assertThat(mvc.perform(post("/data/internal/http-gateway/tool").header("Authorization", token)
                     .header("X-Tenant-Id", "t1").header("user-id", "1").content(input))
                     .andReturn().getResponse().getStatus()).isEqualTo(403);

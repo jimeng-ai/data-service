@@ -35,30 +35,34 @@ class HttpGatewayRunRegistryTest {
         redis = mock(StringRedisTemplate.class);
         ops = mock(ValueOperations.class);
         when(redis.opsForValue()).thenReturn(ops);
-        registry = new HttpGatewayRunRegistry(redis);
+        var runs = mock(com.jimeng.persistence.mapper.AgentExecRunMapper.class);
+        var run = new com.jimeng.persistence.entity.AgentExecRun();
+        run.setId(123L); run.setTenantId("t1"); run.setAgentId("5"); run.setUserId("7"); run.setStatus("RUNNING");
+        when(runs.selectById(123L)).thenReturn(run);
+        registry = new HttpGatewayRunRegistry(redis, runs);
     }
 
     @Test
     @DisplayName("登记：键带租户和 runId，TTL 与 token 同口径；读回来的快照与登记的一致")
     void beginAndRead() {
-        assertThat(registry.begin("t1", "r1", 5L, grants, 60_000)).isTrue();
+        assertThat(registry.begin("t1", "123", 5L, grants, 60_000)).isTrue();
         ArgumentCaptor<String> value = ArgumentCaptor.forClass(String.class);
-        verify(ops).set(eq("http-gw:run:t1:r1"), value.capture(), eq(Duration.ofMillis(60_000)));
-        when(ops.get("http-gw:run:t1:r1")).thenReturn(value.getValue());
-        assertThat(registry.activeGrants("t1", "r1", 5L)).isEqualTo(grants);
+        verify(ops).set(eq("http-gw:run:t1:123"), value.capture(), eq(Duration.ofMillis(60_000)));
+        when(ops.get("http-gw:run:t1:123")).thenReturn(value.getValue());
+        assertThat(registry.activeGrants("t1", "123", 5L, 7L)).isEqualTo(grants);
     }
 
     @Test
     @DisplayName("fail-closed：没登记、Agent 对不上、Redis 出错，一律当作不在跑")
     void failClosed() {
-        registry.begin("t1", "r1", 5L, grants, 60_000);
+        registry.begin("t1", "123", 5L, grants, 60_000);
         ArgumentCaptor<String> value = ArgumentCaptor.forClass(String.class);
         verify(ops).set(anyString(), value.capture(), any(Duration.class));
-        when(ops.get("http-gw:run:t1:r1")).thenReturn(value.getValue());
-        assertThat(registry.activeGrants("t1", "r1", 6L)).isNull();
-        assertThat(registry.activeGrants("t1", "r2", 5L)).isNull();
-        when(ops.get("http-gw:run:t1:r1")).thenThrow(new RuntimeException("redis down"));
-        assertThat(registry.activeGrants("t1", "r1", 5L)).isNull();
+        when(ops.get("http-gw:run:t1:123")).thenReturn(value.getValue());
+        assertThat(registry.activeGrants("t1", "123", 6L, 7L)).isNull();
+        assertThat(registry.activeGrants("t1", "124", 5L, 7L)).isNull();
+        when(ops.get("http-gw:run:t1:123")).thenThrow(new RuntimeException("redis down"));
+        assertThat(registry.activeGrants("t1", "123", 5L, 7L)).isNull();
     }
 
     @Test
@@ -67,10 +71,10 @@ class HttpGatewayRunRegistryTest {
         var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
         appender.start(); logger.addAppender(appender);
         try {
-            when(ops.get("http-gw:run:t1:r1")).thenReturn("SECRET-STORED-SENTINEL");
-            assertThat(registry.activeGrants("t1", "r1", 5L)).isNull();
-            when(ops.get("http-gw:run:t1:r1")).thenThrow(new IllegalStateException("SECRET-EXCEPTION-SENTINEL"));
-            assertThat(registry.activeGrants("t1", "r1", 5L)).isNull();
+            when(ops.get("http-gw:run:t1:123")).thenReturn("SECRET-STORED-SENTINEL");
+            assertThat(registry.activeGrants("t1", "123", 5L, 7L)).isNull();
+            when(ops.get("http-gw:run:t1:123")).thenThrow(new IllegalStateException("SECRET-EXCEPTION-SENTINEL"));
+            assertThat(registry.activeGrants("t1", "123", 5L, 7L)).isNull();
             assertThat(appender.list).allSatisfy(event -> {
                 assertThat(event.getFormattedMessage()).doesNotContain("SECRET-STORED-SENTINEL", "SECRET-EXCEPTION-SENTINEL");
                 assertThat(event.getThrowableProxy()).isNull();
@@ -82,8 +86,8 @@ class HttpGatewayRunRegistryTest {
     @DisplayName("登记失败返回 false（调用方据此不下发能力）；结束即删除")
     void beginFailureAndEnd() {
         doThrow(new RuntimeException("redis down")).when(ops).set(anyString(), anyString(), any(Duration.class));
-        assertThat(registry.begin("t1", "r1", 5L, grants, 60_000)).isFalse();
-        registry.end("t1", "r1");
-        verify(redis).delete("http-gw:run:t1:r1");
+        assertThat(registry.begin("t1", "123", 5L, grants, 60_000)).isFalse();
+        registry.end("t1", "123");
+        verify(redis).delete("http-gw:run:t1:123");
     }
 }

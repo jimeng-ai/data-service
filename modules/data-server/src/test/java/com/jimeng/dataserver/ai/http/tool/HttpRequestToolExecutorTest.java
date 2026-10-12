@@ -59,7 +59,7 @@ class HttpRequestToolExecutorTest {
         TenantContext.set("t1");
         AgentContext.set(AgentRuntimeView.builder().agentId(5L).tenantId("t1").build());
         MDC.put("connectionId", "run-9");
-        when(gateway.executeTool(any(), any(), anyBoolean())).thenReturn(HttpGatewayResult.error(403, "denied", "x"));
+        when(gateway.executeToolPayload(any(), any(), anyBoolean())).thenReturn(HttpToolResults.rejected(403, "denied", "x"));
         ActivatedSkills.begin();
         try {
             ActivatedSkills.add(List.of(skill(1L, "crm", HTTP), skill(2L, "plain", SkillManifest.EMPTY),
@@ -71,7 +71,7 @@ class HttpRequestToolExecutorTest {
             ActivatedSkills.end();
         }
         ArgumentCaptor<HttpGatewayContext> ctx = ArgumentCaptor.forClass(HttpGatewayContext.class);
-        verify(gateway).executeTool(ctx.capture(), any(), eq(false));
+        verify(gateway).executeToolPayload(ctx.capture(), any(), eq(false));
         assertThat(ctx.getValue().grants()).singleElement().satisfies(g -> {
             assertThat(g.skillId()).isEqualTo(1L);
             assertThat(g.version()).isEqualTo(3);
@@ -89,7 +89,7 @@ class HttpRequestToolExecutorTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> r = (Map<String, Object>) executor.execute("http_request", Map.of("method", "GET", "url", "https://a.example.com"));
         assertThat(r).containsEntry("gateway_error", "no_http_skill");
-        verify(gateway, never()).executeTool(any(), any(), anyBoolean());
+        verify(gateway, never()).executeToolPayload(any(), any(), anyBoolean());
     }
 
     @Test
@@ -104,19 +104,19 @@ class HttpRequestToolExecutorTest {
         } finally {
             ActivatedSkills.end();
         }
-        verify(gateway, never()).executeTool(any(), any(), anyBoolean());
+        verify(gateway, never()).executeToolPayload(any(), any(), anyBoolean());
     }
     @Test
     void passesAsTextToGatewayAndNeverDecodesConvertedResponseAgain() {
-        when(gateway.executeTool(any(), any(), eq(true))).thenReturn(new HttpGatewayResult(200,
-                List.of(Map.entry("content-type", "text/html")), "<html>a&amp;b12345678".getBytes(java.nio.charset.StandardCharsets.UTF_8), false, null, null));
+        when(gateway.executeToolPayload(any(), any(), eq(true))).thenReturn(HttpToolResults.toModelPayload(new HttpGatewayResult(200,
+                List.of(Map.entry("content-type", "text/html")), "<html>a&amp;b12345678".getBytes(java.nio.charset.StandardCharsets.UTF_8), false, null, null), false, 20000));
         ActivatedSkills.begin();
         try {
             ActivatedSkills.add(List.of(skill(1, "crm", HTTP)));
             @SuppressWarnings("unchecked")
             Map<String, Object> r = (Map<String, Object>) executor.execute("http_request", Map.of("method", "GET", "url", "https://api.customer.com", "as_text", true));
             assertThat(r).containsEntry("body", "<html>a&amp;b12345678");
-            verify(gateway).executeTool(any(), any(), eq(true));
+            verify(gateway).executeToolPayload(any(), any(), eq(true));
         } finally {
             ActivatedSkills.end();
         }

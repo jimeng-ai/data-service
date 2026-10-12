@@ -25,20 +25,26 @@ final class HttpGatewayAudit {
                        long startedNanos, KeyScrubber scrubber) {
         String url = req.url() == null ? "" : scrubber.scrub(req.url());
         if (url.length() > URL_MAX) url = url.substring(0, URL_MAX) + "…";
-        AUDIT.info("http-gateway {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                kv("hgw_tenant", ctx.tenantId()),
-                kv("hgw_agent", ctx.agentId() == null ? null : String.valueOf(ctx.agentId())),
-                kv("hgw_run", ctx.runId()),
-                kv("hgw_plane", ctx.plane().name()),
-                kv("hgw_skills", scrubber.scrub(String.join(",", skills))),
-                kv("hgw_method", scrubber.scrub(req.method())),
-                kv("hgw_url", url),
-                kv("hgw_status", r.status()),
-                kv("hgw_outcome", r.gatewayError() == null ? "ok" : r.gatewayError()),
-                kv("hgw_reason", r.message() == null ? null : scrubber.scrub(r.message())),
-                kv("hgw_ms", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)),
-                kv("hgw_bytes", r.body().length),
-                kv("hgw_hops", hops),
-                kv("hgw_truncated", r.truncated()));
+        url = scrubber.scrub(url); // 截断与省略号拼接也可能重建 key
+        java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
+        fields.put("hgw_tenant", scrubber.scrub(ctx.tenantId()));
+        fields.put("hgw_agent", ctx.agentId() == null ? null : String.valueOf(ctx.agentId()));
+        fields.put("hgw_run", scrubber.scrub(ctx.runId()));
+        fields.put("hgw_plane", ctx.plane().name());
+        fields.put("hgw_skills", scrubber.scrub(String.join(",", skills)));
+        fields.put("hgw_method", scrubber.scrub(req.method()));
+        fields.put("hgw_url", url);
+        fields.put("hgw_status", r.status());
+        fields.put("hgw_outcome", r.gatewayError() == null ? "ok" : r.gatewayError());
+        fields.put("hgw_reason", r.message() == null ? null : scrubber.scrub(r.message()));
+        fields.put("hgw_ms", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos));
+        fields.put("hgw_bytes", r.body().length);
+        fields.put("hgw_hops", hops);
+        fields.put("hgw_truncated", r.truncated());
+        String template = "http-gateway {} {} {} {} {} {} {} {} {} {} {} {} {} {}";
+        Object[] args = fields.entrySet().stream().map(f -> kv(f.getKey(), f.getValue())).toArray();
+        // Logstash 同时编码 formattedMessage 和结构化字段，二者都检查，字段名与值的拼接也包含在内。
+        if (!scrubber.safeJson(fields) || !scrubber.safeJson(org.slf4j.helpers.MessageFormatter.arrayFormat(template, args).getMessage())) return;
+        AUDIT.info(template, args);
     }
 }

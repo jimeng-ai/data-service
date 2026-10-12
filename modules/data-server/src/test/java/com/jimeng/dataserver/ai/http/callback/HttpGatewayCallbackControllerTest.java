@@ -7,6 +7,7 @@ import com.jimeng.dataserver.ai.http.HttpGatewayRequest;
 import com.jimeng.dataserver.ai.http.HttpGatewayResult;
 import com.jimeng.dataserver.ai.http.SkillGrant;
 import com.jimeng.dataserver.ai.skill.manifest.SkillManifest;
+import com.jimeng.dataserver.ai.http.tool.HttpToolResults;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -45,14 +46,14 @@ class HttpGatewayCallbackControllerTest {
     @Test
     @DisplayName("/tool：身份和可用 skill 只取过滤器写的属性，参数原样交给网关，返回给模型的形状与对话平面一致")
     void tool() throws Exception {
-        when(gateway.executeTool(any(), any(), anyBoolean())).thenReturn(new HttpGatewayResult(200,
-                List.of(Map.entry("content-type", "application/json")), "{\"ok\":true}".getBytes(), false, null, null));
+        when(gateway.executeToolPayload(any(), any(), anyBoolean())).thenReturn(HttpToolResults.toModelPayload(new HttpGatewayResult(200,
+                List.of(Map.entry("content-type", "application/json")), "{\"ok\":true}".getBytes(), false, null, null), false, 20000));
         Map<String, Object> out = controller.tool(authed(("{\"input\":{\"method\":\"GET\",\"url\":\"https://a.example.com\","
                 + "\"headers\":{\"X-K\":\"{{K_1}}\"},\"tenantId\":\"evil\"}}").getBytes(StandardCharsets.UTF_8)));
         assertThat(out).containsEntry("status", 200).containsEntry("body", "{\"ok\":true}");
         ArgumentCaptor<HttpGatewayContext> ctx = ArgumentCaptor.forClass(HttpGatewayContext.class);
         ArgumentCaptor<HttpGatewayRequest> req = ArgumentCaptor.forClass(HttpGatewayRequest.class);
-        verify(gateway).executeTool(ctx.capture(), req.capture(), eq(false));
+        verify(gateway).executeToolPayload(ctx.capture(), req.capture(), eq(false));
         assertThat(ctx.getValue()).isEqualTo(new HttpGatewayContext("t1", 5L, "run-1", HttpGatewayContext.Plane.TOOL, grants));
         assertThat(req.getValue().headers()).containsExactly(Map.entry("X-K", "{{K_1}}"));
     }
@@ -64,7 +65,7 @@ class HttpGatewayCallbackControllerTest {
         props.setToolRequestMaxBytes(10);
         assertThat(controller.tool(authed(("{\"input\":{\"method\":\"POST\",\"url\":\"u\",\"body\":\"" + "x".repeat(70_000) + "\"}}")
                 .getBytes()))).containsEntry("gateway_error", "bad_request");
-        verify(gateway, never()).executeTool(any(), any(), anyBoolean());
+        verify(gateway, never()).executeToolPayload(any(), any(), anyBoolean());
     }
 
     @Test

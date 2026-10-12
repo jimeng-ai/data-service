@@ -117,7 +117,7 @@ public class HttpGateway {
     }
 
     public HttpGatewayResult execute(HttpGatewayContext ctx, HttpGatewayRequest req) {
-        return execute(ctx, req, false, false);
+        return execute(ctx, req, false, false, null);
     }
 
     /**
@@ -128,10 +128,19 @@ public class HttpGateway {
         if (ctx == null || ctx.plane() != HttpGatewayContext.Plane.TOOL) {
             return HttpGatewayResult.error(400, "bad_request", "工具运行上下文不完整");
         }
-        return execute(ctx, req, true, asText);
+        return execute(ctx, req, true, asText, null);
     }
 
-    private HttpGatewayResult execute(HttpGatewayContext ctx, HttpGatewayRequest req, boolean forModel, boolean asText) {
+    private static final class ModelOutput { Map<String, Object> payload; }
+
+    /** 最终模型表示也在明文密钥生命周期内构造和检查，调用方不能再转换或裁剪字段。 */
+    public Map<String, Object> executeToolPayload(HttpGatewayContext ctx, HttpGatewayRequest req, boolean asText) {
+        ModelOutput output = new ModelOutput();
+        HttpGatewayResult result = execute(ctx, req, true, asText, output);
+        return output.payload == null ? HttpToolResults.toModelPayload(result, false, props.getToolTextMaxChars()) : output.payload;
+    }
+
+    private HttpGatewayResult execute(HttpGatewayContext ctx, HttpGatewayRequest req, boolean forModel, boolean asText, ModelOutput model) {
         if (ctx == null || req == null || ctx.plane() == null) {
             return HttpGatewayResult.error(400, "bad_request", "请求或运行上下文不完整");
         }
@@ -166,6 +175,15 @@ public class HttpGateway {
         if (out.result().gatewayError() != null) {
             HttpGatewayResult r = out.result();
             out = new Outcome(HttpGatewayResult.error(r.status(), r.gatewayError(), scrubber.scrub(r.message())), out.skills(), out.hops());
+        }
+        if (model != null) {
+            Map<String, Object> payload = HttpToolResults.toModelPayload(out.result(), false, props.getToolTextMaxChars());
+            // 保留可解释的错误；极端 key 与固定文案或 JSON 结构碰撞时，最后退回空对象。
+            if (!scrubber.safeJson(payload)) {
+                payload = HttpToolResults.rejected(502, "unsafe_representation", "响应无法安全展示");
+                if (!scrubber.safeJson(payload)) payload = Map.of();
+            }
+            model.payload = payload;
         }
         audit(ctx, req, out.result(), out.skills(), out.hops(), started, scrubber);
         return out.result();
@@ -445,10 +463,11 @@ public class HttpGateway {
         int length = truncated ? Math.min(cap, Math.max(0, s.bytes().length - max)) : s.bytes().length;
         if (textForModel) length = completeUtf8Prefix(s.bytes(), length);
         byte[] body = length == s.bytes().length ? s.bytes() : Arrays.copyOf(s.bytes(), length);
+        if (textForModel) body = scrubber.scrub(new String(body, StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
         List<Map.Entry<String, String>> headers = new ArrayList<>();
         for (String name : resp.headers().names()) {
             String lower = name.toLowerCase(Locale.ROOT);
-            if (DROP_RESPONSE_HEADERS.contains(lower) || scrubber.secretBearingName(name)) continue;
+            if (DROP_RESPONSE_HEADERS.contains(lower) || scrubber.secretBearingName(lower) || !scrubber.safeJson(lower)) continue;
             for (String v : resp.headers(name)) headers.add(Map.entry(lower, scrubber.scrub(v)));
         }
         checkResponseBudget(deadline);
