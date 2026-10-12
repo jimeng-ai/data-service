@@ -1,7 +1,7 @@
 # 一切皆可 skills · S1：统一解析器、技能里的 key、通用 HTTP 网关
 
 - 依据：`jm/docs/superpowers/specs/2026-10-05-everything-is-skills-design.md`（S1），实施计划 `jm/docs/superpowers/plans/2026-10-07-everything-is-skills-s1-keys-and-http-gateway.md`。
-- 版本：S1 在 data-service、jm-agent-sandbox、jm-agent-front 的 es-s1 分支已实现；Task13 合并与 tag 后回填各仓库版本。尚未上线。
+- 代码版本（2026-10-12 已合入并推送 main）：data-service `v1.3.0`、jm-agent-sandbox `v1.2.0`、jm-agent-front `v1.2.0`。本次版本回填另打文档补丁 tag；尚未上线。
 - 改动一句话：skill 可以带 key 和要访问的域名；key 发布时被提取、加密存 `skill_secret`；模型在对话平面和沙箱里用
   `http_request`、沙箱脚本用 `$JM_HTTP`，三条路都只经过 data-service 的同一个网关。
 
