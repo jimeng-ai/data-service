@@ -15,6 +15,10 @@ import java.util.*;
 final class SourceYaml {
     private static final int MAX_SOURCE = 512 * 1024, MAX_NODES = 16384, MAX_ALIASES = 256;
     private static final int MAX_DEPTH = 50, MAX_DECODED = 1024 * 1024;
+    // 原文无法完整扫描时，不猜测标签作用域：在任何可能的 token 边界看到标签就拒绝恢复。
+    // 覆盖 !!标准、!<完整 URI>、!本地/!句柄! 以及非特定 !，无需维护类型名称白名单。
+    private static final java.util.regex.Pattern POSSIBLE_TAG =
+            java.util.regex.Pattern.compile("(?:\\A|[\\s\\p{Z}\\u0085\\[\\]{},?:-])!");
     static final class Limit extends IllegalArgumentException {}
     record Loaded(Object value, List<ParsedSkill.Decoded> decoded) {}
     private static LoaderOptions options() {
@@ -112,7 +116,9 @@ final class SourceYaml {
                 if (token instanceof StreamEndToken) break;
             }
         } catch (Limit exceeded) { throw exceeded;
-        } catch (RuntimeException syntax) { if (!tolerateSyntax) throw syntax; }
+        } catch (RuntimeException syntax) {
+            if (!tolerateSyntax || POSSIBLE_TAG.matcher(source).find()) throw syntax;
+        }
         return budget.out;
     }
     /** 重试前逐个检查实际被补引号的原行，避免首个 scanner 错误遮住后面的原始转义。 */

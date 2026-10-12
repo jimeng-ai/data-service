@@ -766,4 +766,40 @@ class SkillPackageProcessorTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void incompleteOriginalScanCannotHideExplicitTypedScalarsDuringRetry(boolean previous) {
+        String encoded = java.util.Base64.getEncoder().encodeToString(b(TOKEN));
+        for (String typed : List.of("!!binary " + encoded, "!!binary \"" + encoded + "\"",
+                "!<tag:yaml.org,2002:binary> " + encoded,
+                "!!int 0x499602D2", "!!float .inf", "!!bool YES", "!!null ~",
+                "!!timestamp 2002-12-14", "!!str safe", "! safe", "!local safe", "!custom!binary " + encoded)) {
+            String md = "---\nname: refund-flow\ndescription: safe\nargument-hint: `bad` [" + typed + "] [b]\n---\nbody\n";
+            var files = previous ? Map.of("SKILL.md", b(md)) : skillMdWith(md, CRM_SECRETS);
+            var old = previous ? PreviousKeys.decrypted(Map.of("CRM_TOKEN", TOKEN)) : PreviousKeys.NONE;
+            assertThatThrownBy(() -> SkillPackageProcessor.process(files, SkillManifestParser.Mode.LENIENT, true, old))
+                    .as("explicit typed retry %s previous=%s", typed.split(" ")[0], previous)
+                    .isInstanceOf(ServiceException.class).hasMessageContaining("YAML")
+                    .hasMessageNotContaining(TOKEN).hasMessageNotContaining(encoded).hasMessageNotContaining("`bad`");
+        }
+    }
+
+    @Test
+    void ordinaryLenientRetryAndFullyValidExplicitTypesRemainAccepted() {
+        for (String value : List.of("`ordinary` [a] [b]", "`ordinary` hello!", "[a] [b]")) {
+            String md = "---\nname: refund-flow\ndescription: safe\nargument-hint: " + value + "\n---\nbody\n";
+            assertThat(SkillPackageProcessor.process(Map.of("SKILL.md", b(md)), SkillManifestParser.Mode.LENIENT, true)
+                    .skill().valid()).isTrue();
+        }
+        String md = "---\nname: refund-flow\ndescription: safe\nmetadata:\n"
+                + "  binary: !!binary c2FmZQ==\n  verbatim: !<tag:yaml.org,2002:binary> c2FmZQ==\n"
+                + "  int: !!int 0x2a\n  float: !!float 1.5\n  bool: !!bool YES\n  null: !!null ~\n"
+                + "  timestamp: !!timestamp 2002-12-14\n  string: !!str plain\n---\nbody\n";
+        for (var mode : SkillManifestParser.Mode.values()) {
+            var skill = SkillPackageProcessor.process(Map.of("SKILL.md", b(md)), mode, true).skill();
+            assertThat(skill.valid()).isTrue();
+            assertThat(skill.decoded()).extracting(ParsedSkill.Decoded::text).contains("safe", "42", "1.5", "true");
+        }
+    }
+
 }

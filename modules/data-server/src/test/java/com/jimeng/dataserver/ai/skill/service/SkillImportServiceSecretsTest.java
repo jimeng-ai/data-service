@@ -145,4 +145,25 @@ class SkillImportServiceSecretsTest {
         verify(minio, org.mockito.Mockito.never()).putObject(anyString(), any(), anyString());
         verify(secrets, org.mockito.Mockito.never()).save(any(), org.mockito.ArgumentMatchers.anyInt(), anyList());
     }
+    @Test
+    void incompleteTypedRetryCannotPersistOrPublishImportedSource() {
+        GithubTarballFetcher fetcher = mock(GithubTarballFetcher.class);
+        when(fetcher.fetch(any(), any(), any())).thenReturn(new byte[]{1});
+        SkillBundleExtractor extractor = mock(SkillBundleExtractor.class);
+        String encoded = java.util.Base64.getEncoder().encodeToString(TOKEN.getBytes(StandardCharsets.UTF_8));
+        when(extractor.extract(any(), any())).thenReturn(new SkillBundle(
+                "---\nname: crm\ndescription: safe\nargument-hint: `bad` [!!binary " + encoded + "] [b]\n---\nbody\n",
+                Map.of("scripts/call.py", "pass".getBytes(StandardCharsets.UTF_8),
+                        "secrets.json", ("{\"CRM_TOKEN\":{\"value\":\"" + TOKEN + "\",\"hosts\":[\"api.customer.com\"]}}")
+                                .getBytes(StandardCharsets.UTF_8))));
+        AiSkillMapper mapper = mock(AiSkillMapper.class);
+        AiSkillRegistryService registry = mock(AiSkillRegistryService.class);
+        RagMinioStorageService minio = mock(RagMinioStorageService.class);
+        SkillSecretService secrets = mock(SkillSecretService.class);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new SkillImportService(fetcher, extractor, mapper, registry, minio, secrets)
+                .importFromGithub("o", "r", "main", "crm", "t1", 7L))
+                .isInstanceOf(ServiceException.class).hasMessageNotContaining(TOKEN).hasMessageNotContaining(encoded);
+        org.mockito.Mockito.verifyNoInteractions(mapper, registry, minio, secrets);
+    }
+
 }

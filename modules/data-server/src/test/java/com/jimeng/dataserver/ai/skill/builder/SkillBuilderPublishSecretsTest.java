@@ -481,4 +481,17 @@ class SkillBuilderPublishSecretsTest {
         verifyNoInteractions(storage, aiSkillMapper, versionMapper);
     }
 
+    @Test
+    void incompleteTypedRetryNeverReachesPublicationStorageOrDatabase() throws Exception {
+        session();
+        Map<String, byte[]> files = new TreeMap<>(refundSkillWithKey());
+        String encoded = java.util.Base64.getEncoder().encodeToString(b(TOKEN));
+        files.put("SKILL.md", b("---\nname: refund-flow\ndescription: safe\nargument-hint: `bad` [!!binary "
+                + encoded + "] [b]\n---\nbody\n"));
+        workspaceWith(files);
+        assertThatThrownBy(() -> svc.publish(1L)).isInstanceOf(ServiceException.class)
+                .hasMessageNotContaining(TOKEN).hasMessageNotContaining(encoded);
+        verifyNoInteractions(storage, aiSkillMapper, versionMapper, secretService);
+    }
+
 }
