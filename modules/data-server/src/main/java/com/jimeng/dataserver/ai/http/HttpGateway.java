@@ -269,7 +269,7 @@ public class HttpGateway {
                     continue;
                 }
                 // 第 7 步：回包
-                return new Outcome(readResponse(resp, ctx.plane(), scrubber, forModel, asText), auth.skills(), hops);
+                return new Outcome(readResponse(resp, ctx.plane(), scrubber, forModel, asText, deadline), auth.skills(), hops);
             } catch (InterruptedIOException e) {
                 return new Outcome(timeout(auth), auth.skills(), hops);
             } catch (IOException e) {
@@ -414,7 +414,7 @@ public class HttpGateway {
         return client.newCall(rb.build()).execute();
     }
 
-    private HttpGatewayResult readResponse(Response resp, HttpGatewayContext.Plane plane, KeyScrubber scrubber, boolean forModel, boolean asText) throws IOException {
+    private HttpGatewayResult readResponse(Response resp, HttpGatewayContext.Plane plane, KeyScrubber scrubber, boolean forModel, boolean asText, long deadline) throws IOException {
         int cap = plane == HttpGatewayContext.Plane.TOOL ? props.getToolMaxBytes() : props.getScriptMaxBytes();
         byte[] raw = new byte[0];
         ResponseBody rb = resp.body();
@@ -426,17 +426,19 @@ public class HttpGateway {
         // （预检实测 cap=1000 时漏出了 key 的前 21 个字符）。所以只要截了，就连抹值结果末尾 maxLength 个字节一起去掉。
         // 抹值的输出也有上限（占位符可能比值长，不能先整份放大再截）：KeyScrubber 的有界重载，名字和返回形状按 R28 你定，
         // 要能拿到结果和「是否因为到了上限而停下」。
+        checkResponseBudget(deadline);
         boolean rawTruncated = raw.length > cap;
         boolean textForModel = false;
         if (forModel) {
             String text = HttpToolResults.decodeText(raw, resp.header("Content-Type"));
             if (text != null) {
                 textForModel = true;
-                if (asText && HtmlText.isHtml(resp.header("Content-Type"), text)) text = HtmlText.toText(text);
+                if (asText && HtmlText.isHtml(resp.header("Content-Type"), text)) text = HtmlText.toText(text, deadline);
                 // 文本解码（包括 UTF-8 的替代字符）也会重建 key，必须先规范化再最终抹值。
                 raw = text.getBytes(StandardCharsets.UTF_8);
             }
         }
+        checkResponseBudget(deadline);
         int max = scrubber.maxLength();
         KeyScrubber.Scrubbed s = scrubber.scrub(raw, cap + max);
         boolean truncated = rawTruncated || s.stopped() || s.bytes().length > cap;
@@ -449,7 +451,12 @@ public class HttpGateway {
             if (DROP_RESPONSE_HEADERS.contains(lower) || scrubber.secretBearingName(name)) continue;
             for (String v : resp.headers(name)) headers.add(Map.entry(lower, scrubber.scrub(v)));
         }
+        checkResponseBudget(deadline);
         return new HttpGatewayResult(resp.code(), headers, body, truncated, null, null);
+    }
+
+    private static void checkResponseBudget(long deadline) throws InterruptedIOException {
+        if (deadline - System.nanoTime() <= 0) throw new InterruptedIOException("回包处理超过请求时限");
     }
 
     /** 已规范化的工具文本：尾部保护和字节上限一起裁剪后，不能留半个 UTF-8 字符。 */

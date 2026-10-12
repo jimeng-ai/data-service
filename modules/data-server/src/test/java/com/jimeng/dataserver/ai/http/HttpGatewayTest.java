@@ -799,4 +799,36 @@ class HttpGatewayTest {
                 .containsEntry("body", "token-x-").containsEntry("truncated", true);
     }
 
+    @Test
+    void malformedToolHtmlConversionCompletesWithinTheGrantedTotalBudget() {
+        keys();
+        for (String opener : List.of("<script", "<style", "<head", "<!--", "<")) {
+            String html = opener.repeat(2 * 1024 * 1024 / opener.length());
+            routes.put("/malformed-html", ex -> reply(ex, 200, "text/html", html));
+            HttpGatewayResult r = gateway().executeTool(ctx(TOOL, grant(1, "reader", List.of("api.customer.test"), false, 1)),
+                    req("GET", url("api.customer.test", "/malformed-html"), null), true);
+            assertThat(r.status()).as("malformed %s", opener).isEqualTo(200);
+            assertThat(r.gatewayError()).isNull();
+            Map<String, Object> payload = com.jimeng.dataserver.ai.http.tool.HttpToolResults.toModelPayload(r, false, 20_000);
+            assertThat(payload.get("body").toString()).startsWith(opener).hasSize(20_000);
+            assertThat(payload).containsEntry("truncated", true).containsKey("note");
+        }
+    }
+
+    @Test
+    void postReadResponseWorkRejectsTheExpiredRequestDeadline() throws Exception {
+        java.lang.reflect.Method read = HttpGateway.class.getDeclaredMethod("readResponse", okhttp3.Response.class,
+                HttpGatewayContext.Plane.class, KeyScrubber.class, boolean.class, boolean.class, long.class);
+        read.setAccessible(true);
+        try (okhttp3.Response response = new okhttp3.Response.Builder()
+                .request(new okhttp3.Request.Builder().url(url("api.customer.test", "/budget")).build())
+                .protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK").header("Content-Type", "text/html")
+                .body(okhttp3.ResponseBody.create("<p>ok</p>", okhttp3.MediaType.parse("text/html"))).build()) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> read.invoke(gateway(), response, TOOL,
+                    KeyScrubber.NONE, true, false, System.nanoTime() - 1))
+                    .isInstanceOf(java.lang.reflect.InvocationTargetException.class)
+                    .hasCauseInstanceOf(java.io.InterruptedIOException.class);
+        }
+    }
+
 }
